@@ -1,8 +1,6 @@
 name: Build e publicar QMoney
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
   release:
     types: [published]
@@ -48,19 +46,20 @@ jobs:
       - name: Empacotar serviço local
         shell: pwsh
         run: |
+          $root = (Get-Location).Path
           playwright install chromium
           pyinstaller --noconfirm --clean --onefile --windowed `
-            --name QMoneyService --paths . `
-            --icon desktop/resources/qmoney.ico `
+            --name QMoneyService --paths $root `
+            --icon "$root/desktop/resources/qmoney.ico" `
             --distpath release/pyinstaller --workpath release/pyinstaller-work `
             --specpath packaging --collect-data moneymin --collect-all curl_cffi `
             --collect-submodules playwright --collect-submodules boto3 `
             --collect-submodules ego4d `
-            --add-data "moneymin/iphone_uw_calibration.json;moneymin" `
-            --add-data "moneymin/native_metadata_reference.json;moneymin" `
-            --add-data "moneymin/resources;moneymin/resources" `
-            --add-data "reference;reference" `
-            packaging/qmoney_service.py
+            --add-data "$root/moneymin/iphone_uw_calibration.json;moneymin" `
+            --add-data "$root/moneymin/native_metadata_reference.json;moneymin" `
+            --add-data "$root/moneymin/resources;moneymin/resources" `
+            --add-data "$root/reference;reference" `
+            "$root/packaging/qmoney_service.py"
 
       - name: Montar distribuição
         shell: pwsh
