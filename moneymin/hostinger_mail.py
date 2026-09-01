@@ -28,13 +28,15 @@ class MailError(RuntimeError):
     """Falha na Hostinger Mail API (token inválido, caixa não achada, etc.)."""
 
 
-def _request(path: str, method: str = "GET", body: Any = None) -> tuple[int, Any]:
+def _request(path: str, method: str = "GET", body: Any = None,
+             *, token: str | None = None) -> tuple[int, Any]:
     """Chamada HTTP à Mail API. Devolve (status, corpo_parseado_ou_texto)."""
-    if not config.HOSTINGER_MAIL_TOKEN:
+    credential = token if token is not None else config.HOSTINGER_MAIL_TOKEN
+    if not credential:
         raise MailError("HOSTINGER_MAIL_TOKEN não configurado — ajuste o .env.")
     data = json.dumps(body).encode() if isinstance(body, (dict, list)) else None
     req = urllib.request.Request(config.HOSTINGER_MAIL_BASE + path, method=method, data=data)
-    req.add_header("Authorization", f"Bearer {config.HOSTINGER_MAIL_TOKEN}")
+    req.add_header("Authorization", f"Bearer {credential}")
     req.add_header("Accept", "application/json")
     # Cloudflare (erro 1010) bloqueia o UA padrão do urllib — usar UA neutro.
     req.add_header("User-Agent", "curl/8.5.0")
@@ -48,6 +50,23 @@ def _request(path: str, method: str = "GET", body: Any = None) -> tuple[int, Any
         return exc.code, _parse(exc.read().decode("utf-8", "replace"))
     except Exception as exc:  # noqa: BLE001
         raise MailError(f"falha de rede na Mail API: {exc}") from exc
+
+
+def test_connection(token: str | None = None,
+                    mailbox: str | None = None) -> dict[str, Any]:
+    """Valida credencial sem devolver token, mensagens ou dados da caixa."""
+    status, body = _request("/api/v1/me", token=token)
+    if status != 200 or not isinstance(body, dict):
+        raise MailError(f"a Hostinger recusou a credencial (HTTP {status})")
+    mailboxes = (body.get("data") or {}).get("mailboxes") or []
+    ids = {str(item.get("resourceId") or "") for item in mailboxes}
+    requested = str(mailbox or "").strip()
+    if requested and requested not in ids:
+        raise MailError("a caixa informada não pertence a esta credencial")
+    if not mailboxes:
+        raise MailError("a credencial não possui nenhuma caixa de email")
+    return {"ok": True, "mailboxes": len(mailboxes),
+            "mailbox_selected": bool(requested)}
 
 
 def _parse(text: str) -> Any:

@@ -30,6 +30,7 @@ MEDIA_DATA_DIR = LIBRARY_ROOT / "data"
 VIDEOS_DIR = MEDIA_DATA_DIR / "videos"
 MANIFESTS_DIR = MEDIA_DATA_DIR / "manifests"
 SECRETS_DIR = ROOT / "secrets"
+INTEGRATIONS_PATH = SECRETS_DIR / "integrations.dat"
 REFERENCE_DIR = CODE_ROOT / "reference"
 OPENAPI_PATH = REFERENCE_DIR / "openapi.json"
 
@@ -46,7 +47,40 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+_PROCESS_ENV_KEYS = set(os.environ)
 _load_dotenv(ROOT / ".env")
+
+# O cofre local vence o `.env` legado, mas nunca uma variável fornecida
+# explicitamente ao processo. Assim a UI pode substituir credenciais antigas
+# sem quebrar automações ou ambientes administrados externamente.
+try:
+    from .secure_store import load_secure_settings
+    _SECURE_SETTINGS = load_secure_settings(INTEGRATIONS_PATH)
+except (OSError, RuntimeError, ValueError):
+    _SECURE_SETTINGS = {}
+
+
+def _secure_env(key: str, value: object) -> None:
+    if key not in _PROCESS_ENV_KEYS and str(value or "").strip():
+        os.environ[key] = str(value).strip()
+
+
+_secure_hostinger = _SECURE_SETTINGS.get("hostinger") or {}
+if isinstance(_secure_hostinger, dict):
+    _secure_env("HOSTINGER_MAIL_TOKEN", _secure_hostinger.get("token"))
+    _secure_env("HOSTINGER_MAILBOX_ID", _secure_hostinger.get("mailbox_id"))
+
+_secure_ego4d = _SECURE_SETTINGS.get("ego4d") or {}
+if isinstance(_secure_ego4d, dict):
+    _secure_env("AWS_ACCESS_KEY_ID", _secure_ego4d.get("access_key_id"))
+    _secure_env("AWS_SECRET_ACCESS_KEY", _secure_ego4d.get("secret_access_key"))
+    _secure_env("AWS_SESSION_TOKEN", _secure_ego4d.get("session_token"))
+    _secure_env("EGO4D_AWS_REGION", _secure_ego4d.get("region"))
+    if ("EGO4D_AWS_PROFILE" not in _PROCESS_ENV_KEYS
+            and _secure_ego4d.get("access_key_id")
+            and _secure_ego4d.get("secret_access_key")):
+        # Perfil vazio faz boto3 e o fallback SigV4 usarem as chaves do cofre.
+        os.environ["EGO4D_AWS_PROFILE"] = ""
 
 # O patch privado pode carregar o perfil AWS junto do projeto para facilitar a
 # migração para outro computador. Variáveis já definidas pelo usuário sempre

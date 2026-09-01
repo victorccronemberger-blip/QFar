@@ -38,6 +38,7 @@ protected:
 private:
   QWidget* buildHomePage();
   QWidget* buildReadinessPage();
+  QWidget* buildIntegrationsPage();
   QWidget* buildCampaignPage();
   QWidget* buildAcceleratorPage();
   QWidget* buildAccountsPage();
@@ -65,6 +66,12 @@ private:
 
   void loadHome();
   void loadReadiness();
+  void loadIntegrations();
+  void saveEgo4dIntegration();
+  void testEgo4dIntegration();
+  void prepareEgo4dCatalog();
+  void saveHostingerIntegration();
+  void testHostingerIntegration();
   void chooseLibrary();
   void exportDiagnostics();
   void loadCampaignData();
@@ -121,6 +128,26 @@ private:
   QPushButton* _diagnosticsExport{};
   QString _currentLibraryRoot;
 
+  QLabel* _integrationsHeadline{};
+  QLabel* _integrationsSummary{};
+  QLabel* _ego4dStatus{};
+  QLabel* _ego4dCatalog{};
+  class QLineEdit* _ego4dAccessKey{};
+  class QLineEdit* _ego4dSecretKey{};
+  class QLineEdit* _ego4dSessionToken{};
+  class QLineEdit* _ego4dRegion{};
+  QPushButton* _ego4dSave{};
+  QPushButton* _ego4dTest{};
+  QPushButton* _ego4dPrepare{};
+  QLabel* _hostingerStatus{};
+  class QLineEdit* _hostingerToken{};
+  class QLineEdit* _hostingerMailbox{};
+  QPushButton* _hostingerSave{};
+  QPushButton* _hostingerTest{};
+  QLabel* _holoIntegrationStatus{};
+  QLabel* _runtimeIntegrationStatus{};
+  QLabel* _integrationSecurity{};
+
   QComboBox* _dataset{};
   QListWidget* _campaignAccounts{};
   QListWidget* _campaignTasks{};
@@ -135,7 +162,9 @@ private:
   QPushButton* _campaignStart{};
   QPushButton* _campaignStop{};
   QProgressBar* _campaignProgress{};
+  QLabel* _campaignStage{};
   QLabel* _campaignCurrent{};
+  QLabel* _campaignStats{};
   QPlainTextEdit* _campaignFeed{};
   QJsonArray _taskRecords;
   int _lastCampaignSeq{};

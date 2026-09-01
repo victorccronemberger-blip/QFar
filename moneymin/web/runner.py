@@ -32,6 +32,170 @@ def _fmt_wait(total_s: int) -> str:
     return f"{s}s"
 
 
+def friendly_campaign_error(value: Any) -> str:
+    """Converte falhas técnicas em orientação curta, sem vazar internals.
+
+    O erro original continua no JSON operacional salvo em disco. A API local e
+    a interface recebem somente esta versão adequada para o usuário final.
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return "O QMoney não conseguiu concluir esta etapa. Tente novamente."
+    if any(term in text for term in ("disabled", "desativad", "blocked account")):
+        return "A conta foi desativada no Minute. Valide-a antes de continuar."
+    if any(term in text for term in (
+            "unauthorized", "forbidden", "authentication", "autherror",
+            "token expired", "token inválido", "http 401", "http 403")):
+        return "A autenticação da conta expirou. Use “Verificar todas” na aba Contas."
+    if "http 429" in text or "rate limit" in text or "too many requests" in text:
+        return "O serviço limitou novas tentativas. Aguarde alguns minutos e tente novamente."
+    if any(term in text for term in ("timeout", "timed out", "tempo esgotado")):
+        return "O serviço demorou mais que o esperado. O QMoney pode tentar novamente."
+    if any(term in text for term in (
+            "connection", "network", "name resolution", "dns", "remote end",
+            "falha de rede", "conexão")):
+        return "A conexão foi interrompida. Confira a internet e tente novamente."
+    if any(term in text for term in ("no space", "disk full", "espaço insuficiente")):
+        return "Não há espaço livre suficiente na biblioteca de mídia."
+    if any(term in text for term in (
+            "clip", "video", "vídeo", "manifest", "duração", "duration")):
+        return "Não foi possível preparar um vídeo compatível. O QMoney seguirá para o próximo."
+    if any(term in text for term in ("http 500", "http 502", "http 503", "http 504")):
+        return "O serviço do Minute está instável. Aguarde e tente novamente."
+    if "http 400" in text or "bad request" in text:
+        return "O serviço recusou este envio. Revise a conta e a categoria selecionada."
+    return "O envio não foi concluído após as tentativas automáticas. Valide a conta e tente novamente."
+
+
+def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Cria um marco legível para a linha do tempo; eventos ruidosos somem."""
+    email = str(payload.get("email") or "").strip()
+    if kind == "campaign_start":
+        accounts = len(payload.get("accounts") or [])
+        tasks = len(payload.get("tasks") or [])
+        return {
+            "level": "info", "stage": "Início", "title": "Campanha iniciada",
+            "detail": f"{accounts} conta(s) · {tasks} categoria(s) selecionada(s)",
+        }
+    if kind == "task_start":
+        name = str(payload.get("task_name") or payload.get("scenario") or "Categoria")
+        count = int(payload.get("count") or 0)
+        return {
+            "level": "info", "stage": "Conteúdo", "title": name,
+            "detail": f"Selecionando {count} vídeo(s) compatível(is)",
+        }
+    if kind == "sent_reset":
+        return {
+            "level": "warning", "stage": "Conteúdo",
+            "title": "Catálogo reutilizado",
+            "detail": "Todos os vídeos elegíveis já haviam sido usados; a seleção recomeçou.",
+        }
+    if kind == "task_error":
+        return {
+            "level": "error", "stage": "Conteúdo",
+            "title": "Categoria ignorada",
+            "detail": "Não foi possível selecionar um vídeo compatível para esta categoria.",
+        }
+    if kind == "delay_start":
+        return {
+            "level": "info", "stage": "Intervalo", "title": "Intervalo programado",
+            "detail": f"Próximo vídeo em aproximadamente {_fmt_wait(int(payload.get('delay_s') or 0))}",
+        }
+    if kind == "clip_prepare_start":
+        duration = int(float(payload.get("dur_s") or 0))
+        return {
+            "level": "info", "stage": "Preparação", "title": "Preparando vídeo",
+            "detail": f"Duração aproximada: {_fmt_wait(duration)}",
+        }
+    if kind == "clip_prepare_done" and not payload.get("ok"):
+        return {
+            "level": "warning", "stage": "Preparação", "title": "Vídeo ignorado",
+            "detail": friendly_campaign_error(payload.get("error")),
+        }
+    if kind == "clip_ready":
+        duration = int(float(payload.get("duration_ms") or 0) / 1000)
+        return {
+            "level": "success", "stage": "Preparação", "title": "Vídeo pronto",
+            "detail": f"{_fmt_wait(duration)} · vídeo e sensores preparados",
+        }
+    if kind == "account_start":
+        return {
+            "level": "info", "stage": "Envio", "title": "Envio iniciado",
+            "detail": email or "Conta selecionada",
+        }
+    if kind == "account_retry":
+        attempt = int(payload.get("attempt") or 0)
+        maximum = int(payload.get("max_attempts") or 0)
+        return {
+            "level": "warning", "stage": "Recuperação", "title": "Nova tentativa agendada",
+            "detail": (f"{email} · tentativa {attempt + 1} de {maximum} em "
+                       f"{_fmt_wait(int(payload.get('delay_s') or 0))}"),
+        }
+    if kind == "account_done":
+        skipped = bool(payload.get("skipped"))
+        ok = bool(payload.get("ok"))
+        if skipped:
+            return {
+                "level": "warning", "stage": "Envio", "title": "Conta ignorada",
+                "detail": f"{email} · {friendly_campaign_error(payload.get('error')) if payload.get('error') else 'este vídeo já foi processado'}",
+            }
+        if ok:
+            return {
+                "level": "success", "stage": "Envio", "title": "Envio concluído",
+                "detail": email,
+            }
+        return {
+            "level": "error", "stage": "Envio", "title": "Envio não concluído",
+            "detail": f"{email} · {friendly_campaign_error(payload.get('error'))}",
+        }
+    if kind == "recording_wait_start":
+        return {
+            "level": "info", "stage": "Gravação", "title": "Linha do tempo da conta",
+            "detail": (f"{email} · simulação de gravação por "
+                       f"{_fmt_wait(int(float(payload.get('delay_s') or 0)))}"),
+        }
+    if kind == "window_wait_start":
+        hours = payload.get("active_hours") or [0, 0]
+        return {
+            "level": "warning", "stage": "Aguardando", "title": "Fora do horário de envio",
+            "detail": f"A campanha retomará dentro da janela {hours[0]}h–{hours[1]}h.",
+        }
+    if kind == "item_incomplete":
+        return {
+            "level": "error", "stage": "Envio", "title": "Lote incompleto",
+            "detail": "Uma ou mais contas não concluíram o envio; o vídeo foi preservado.",
+        }
+    if kind == "storage_cleanup":
+        files = int(payload.get("files") or 0)
+        mib = float(payload.get("bytes") or 0) / (1024 ** 2)
+        return {
+            "level": "info", "stage": "Organização", "title": "Espaço liberado",
+            "detail": f"{files} arquivo(s) temporário(s) removido(s) · {mib:.1f} MB",
+        }
+    if kind == "campaign_stopping":
+        return {
+            "level": "warning", "stage": "Encerrando", "title": "Parada solicitada",
+            "detail": "O envio atual será concluído antes de encerrar.",
+        }
+    if kind == "campaign_stopped":
+        return {
+            "level": "warning", "stage": "Encerrada", "title": "Campanha encerrada",
+            "detail": "A operação foi parada com segurança.",
+        }
+    if kind == "campaign_done":
+        return {
+            "level": "success", "stage": "Concluída", "title": "Campanha concluída",
+            "detail": "Todos os resultados foram salvos no Histórico.",
+        }
+    if kind == "campaign_error":
+        return {
+            "level": "error", "stage": "Falha", "title": "Campanha interrompida",
+            "detail": friendly_campaign_error(payload.get("error")),
+        }
+    # Logs brutos, contadores por segundo e fases internas não entram no feed.
+    return None
+
+
 class CampaignRunner:
     """Thread de campanha + buffer de eventos + parada cooperativa."""
 
@@ -47,7 +211,10 @@ class CampaignRunner:
         self.total_sends = 0
         self.done_sends = 0
         self.ok_sends = 0
+        self.failed_sends = 0
+        self.skipped_sends = 0
         self.current = ""  # descrição da atividade atual (p/ a barra de status)
+        self.stage = "Aguardando"
 
     # --- ciclo de vida ----------------------------------------------------
     @property
@@ -67,7 +234,10 @@ class CampaignRunner:
             self.log_path = None
             self.done_sends = 0
             self.ok_sends = 0
+            self.failed_sends = 0
+            self.skipped_sends = 0
             self.current = "iniciando…"
+            self.stage = "Início"
             n_acc = max(1, len(cfg.accounts))
             hours = float(getattr(cfg, "target_hours_per_account", 0) or 0)
             if hours > 0:
@@ -96,25 +266,23 @@ class CampaignRunner:
             if self.state == "running":
                 self.state = "stopping"
                 self._stop.set()
+                self.stage = "Encerrando"
                 requested = True
         if requested:
-            self._record("log", message="parada solicitada — finalizando o envio atual…")
+            self._record("campaign_stopping")
 
     # --- thread de fundo ----------------------------------------------------
     def _run(self, cfg: CampaignConfig) -> None:
-        import traceback
         try:
             run_campaign(cfg, progress=self._on_event,
                          should_stop=self._stop.is_set)
         except Exception as exc:  # noqa: BLE001 — reporta qualquer falha na UI
             with self._lock:
                 self.state = "error"
-                self.error = f"{type(exc).__name__}: {exc}"
+                self.error = friendly_campaign_error(exc)
                 self.current = ""
-            # traceback completo no feed — `str(exc)` sozinho ("[Errno 22]…")
-            # não diz onde a campanha morreu
-            self._record("log",
-                         message="erro fatal:\n" + traceback.format_exc())
+                self.stage = "Falha"
+            self._record("campaign_error", error=exc)
         else:
             # Defesa final: mesmo que uma implementação/customização do motor
             # retorne sem emitir evento terminal, a interface nunca fica presa
@@ -123,33 +291,43 @@ class CampaignRunner:
                 if self.state == "running":
                     self.state = "done"
                     self.current = ""
+                    self.stage = "Concluída"
                 elif self.state == "stopping":
                     self.state = "stopped"
                     self.current = ""
+                    self.stage = "Encerrada"
 
     def _on_event(self, kind: str, payload: dict[str, Any]) -> None:
         self._record(kind, **payload)
         with self._lock:
             if kind == "account_done":
                 self.done_sends += 1
-                if payload.get("ok"):
+                if payload.get("skipped"):
+                    self.skipped_sends += 1
+                elif payload.get("ok"):
                     self.ok_sends += 1
+                else:
+                    self.failed_sends += 1
             elif kind == "campaign_done":
                 self.log_path = payload.get("log_path")
                 if self.state != "stopped":
                     self.state = "done"
                 self.current = ""
+                self.stage = "Concluída"
             elif kind == "campaign_stopped":
                 self.state = "stopped"
                 self.current = ""
+                self.stage = "Encerrada"
             elif kind == "task_start":
                 scen = str(payload.get("scenario") or "")
                 name = str(payload.get("task_name") or
                            campaign.SCENARIO_PT.get(scen, scen))
                 self.current = f"categoria: {name}"
+                self.stage = "Conteúdo"
             elif kind == "clip_prepare_start":
                 self.current = (f"preparando clipe {str(payload.get('clip_uid'))[:12]} "
                                 f"({payload.get('dur_s')}s)…")
+                self.stage = "Preparação"
             elif kind == "clip_prepare_progress":
                 phase = str(payload.get("phase") or "")
                 labels = {
@@ -167,19 +345,22 @@ class CampaignRunner:
                     "encode_ready": "codificação concluída",
                     "sidecar": "montando sidecar de sensores",
                 }
-                label = labels.get(phase, phase or "preparando")
+                label = labels.get(phase, "preparando conteúdo")
                 current = int(payload.get("current") or 0)
                 total = int(payload.get("total") or 0)
                 suffix = f" — {current * 100 // total}%" if total > 0 else ""
                 self.current = f"{label}{suffix}…"
+                self.stage = "Preparação"
             elif kind == "account_start":
                 self.current = f"enviando para {payload.get('email')}…"
+                self.stage = "Envio"
             elif kind == "storage_cleanup":
                 freed = float(payload.get("bytes") or 0) / (1024 ** 2)
                 self.current = (
                     f"liberando espaço: {payload.get('files') or 0} arquivo(s), "
                     f"{freed:.1f} MB"
                 )
+                self.stage = "Organização"
             elif kind == "account_progress":
                 phase = str(payload.get("phase") or "envio")
                 phase_pt = {
@@ -189,7 +370,7 @@ class CampaignRunner:
                     "transport": "subindo vídeo",
                     "complete": "confirmando envio",
                     "sidecar": "preparando sensores",
-                }.get(phase, phase)
+                }.get(phase, "processando envio")
                 suffix = ""
                 if phase == "transport" and payload.get("total_bytes"):
                     percent = float(payload.get("percent") or 0.0)
@@ -199,18 +380,22 @@ class CampaignRunner:
                     if eta_s > 0:
                         suffix += f" · faltam {_fmt_wait(eta_s)}"
                 self.current = f"{payload.get('email')}: {phase_pt}{suffix}…"
+                self.stage = "Envio"
             elif kind == "batch_tick":
                 pending = int(payload.get("pending_accounts") or 0)
                 elapsed = int(payload.get("elapsed_s") or 0)
                 self.current = (f"envios ativos: {pending} — "
                                 f"{_fmt_wait(elapsed)} decorridos…")
+                self.stage = "Envio"
             elif kind == "account_retry_tick":
                 self.current = ("recuperando envio — nova tentativa em "
                                 f"{_fmt_wait(int(payload.get('remaining_s') or 0))}…")
+                self.stage = "Recuperação"
             elif kind == "recording_wait_start":
                 self.current = (
                     f"{payload.get('email')}: gravando vídeo — "
                     f"{_fmt_wait(int(payload.get('delay_s') or 0))}…")
+                self.stage = "Gravação"
             elif kind == "recording_wait_tick":
                 pending = int(payload.get("pending_accounts") or 0)
                 remaining = _fmt_wait(int(payload.get("remaining_s") or 0))
@@ -221,21 +406,27 @@ class CampaignRunner:
                     account = payload.get("email") or "conta"
                     self.current = (f"{account}: gravação em andamento — "
                                     f"faltam {remaining}…")
+                self.stage = "Gravação"
             elif kind == "delay_tick":
                 self.current = (f"intervalo entre vídeos: "
                                 f"{_fmt_wait(int(payload.get('remaining_s') or 0))}…")
+                self.stage = "Intervalo"
             elif kind == "account_gap_start":
                 self.current = (f"intervalo entre contas: "
                                 f"{_fmt_wait(int(payload.get('delay_s') or 0))}…")
+                self.stage = "Intervalo"
             elif kind == "account_gap_tick":
                 self.current = (f"intervalo entre contas: "
                                 f"{_fmt_wait(int(payload.get('remaining_s') or 0))}…")
+                self.stage = "Intervalo"
             elif kind == "window_wait_start":
                 h = payload.get("active_hours") or [0, 0]
                 self.current = f"fora do horário de envio ({h[0]}h–{h[1]}h)…"
+                self.stage = "Aguardando"
             elif kind == "window_wait_tick":
                 self.current = ("fora do horário de envio — retoma em "
                                 f"{_fmt_wait(int(payload.get('remaining_s') or 0))}…")
+                self.stage = "Aguardando"
 
     # --- consulta -------------------------------------------------------------
     def snapshot(self, since: int = 0) -> dict[str, Any]:
@@ -250,17 +441,23 @@ class CampaignRunner:
                     "total_sends": self.total_sends,
                     "done_sends": self.done_sends,
                     "ok_sends": self.ok_sends,
+                    "failed_sends": self.failed_sends,
+                    "skipped_sends": self.skipped_sends,
                 },
                 "current": self.current,
+                "stage": self.stage,
                 "log_path": self.log_path,
                 "error": self.error,
             }
 
     def _record(self, kind: str, **payload: Any) -> None:
+        event = _public_event(kind, payload)
+        if event is None:
+            return
         with self._lock:
             self._seq += 1
             self.events.append({"seq": self._seq, "ts": time.time(),
-                                "kind": kind, **payload})
+                                "kind": kind, **event})
 
 
 # Runner único por processo (uma campanha por vez).

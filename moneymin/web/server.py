@@ -55,6 +55,7 @@ Endpoints JSON consumidos exclusivamente pelo aplicativo desktop:
 """
 from __future__ import annotations
 
+import configparser
 import json
 import math
 import os
@@ -70,13 +71,16 @@ from typing import Any
 from flask import Flask, jsonify, request
 
 from .. import (
-    campaign, config, crowtado, holo_accelerator, holoassist, readiness,
-    sent_registry,
+    campaign, config, crowtado, ego4d, holo_accelerator, holoassist,
+    hostinger_mail, readiness, sent_registry,
 )
 from ..atomic_io import load_json, save_json
 from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
-from .runner import BALANCES_RUNNER, HOLO_CACHE_RUNNER, RUNNER
+from ..secure_store import load_secure_settings, save_secure_settings
+from .runner import (
+    BALANCES_RUNNER, HOLO_CACHE_RUNNER, RUNNER, friendly_campaign_error,
+)
 
 PREFS_PATH = config.DATA_DIR / "webui_prefs.json"
 BALANCES_PATH = config.DATA_DIR / "balances.json"
@@ -150,6 +154,255 @@ def _load_prefs() -> dict[str, Any]:
 def _save_prefs(prefs: dict[str, Any]) -> None:
     with _PERSISTENCE_LOCK:
         save_json(PREFS_PATH, prefs)
+
+
+# --- integrações protegidas -------------------------------------------------
+
+def _legacy_aws_credentials() -> dict[str, str]:
+    """Lê credenciais já configuradas sem expô-las para a resposta HTTP."""
+    access = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+    if access and secret:
+        return {
+            "access_key_id": access,
+            "secret_access_key": secret,
+            "session_token": os.environ.get("AWS_SESSION_TOKEN", "").strip(),
+            "region": config.EGO4D_AWS_REGION or "",
+        }
+    profile = config.EGO4D_AWS_PROFILE or "default"
+    candidates = [
+        Path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "")),
+        config.EGO4D_LOCAL_AWS_CREDENTIALS,
+        Path.home() / ".aws" / "credentials",
+    ]
+    parser = configparser.RawConfigParser()
+    for path in candidates:
+        if not str(path) or not path.is_file():
+            continue
+        try:
+            parser.read(path, encoding="utf-8")
+        except (OSError, configparser.Error):
+            continue
+        if not parser.has_section(profile):
+            continue
+        access = parser.get(profile, "aws_access_key_id", fallback="").strip()
+        secret = parser.get(profile, "aws_secret_access_key", fallback="").strip()
+        if access and secret:
+            return {
+                "access_key_id": access,
+                "secret_access_key": secret,
+                "session_token": parser.get(
+                    profile, "aws_session_token", fallback="").strip(),
+                "region": config.EGO4D_AWS_REGION or "",
+            }
+    return {}
+
+
+def _migrate_legacy_integrations() -> dict[str, Any]:
+    """Copia configurações existentes para o DPAPI, sem apagar os originais."""
+    with _PERSISTENCE_LOCK:
+        secure = load_secure_settings(config.INTEGRATIONS_PATH)
+        changed = False
+        if not isinstance(secure.get("hostinger"), dict) and config.HOSTINGER_MAIL_TOKEN:
+            secure["hostinger"] = {
+                "token": config.HOSTINGER_MAIL_TOKEN,
+                "mailbox_id": config.HOSTINGER_MAILBOX_ID,
+            }
+            changed = True
+        if not isinstance(secure.get("ego4d"), dict):
+            legacy = _legacy_aws_credentials()
+            if legacy:
+                secure["ego4d"] = legacy
+                changed = True
+        if changed:
+            secure["schema"] = 1
+            save_secure_settings(config.INTEGRATIONS_PATH, secure)
+        return secure
+
+
+def _apply_ego4d(values: dict[str, str]) -> None:
+    access = values.get("access_key_id", "").strip()
+    secret = values.get("secret_access_key", "").strip()
+    session = values.get("session_token", "").strip()
+    region = values.get("region", "").strip()
+    os.environ["AWS_ACCESS_KEY_ID"] = access
+    os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+    if session:
+        os.environ["AWS_SESSION_TOKEN"] = session
+    else:
+        os.environ.pop("AWS_SESSION_TOKEN", None)
+    os.environ["EGO4D_AWS_PROFILE"] = ""
+    if region:
+        os.environ["EGO4D_AWS_REGION"] = region
+    else:
+        os.environ.pop("EGO4D_AWS_REGION", None)
+    config.EGO4D_AWS_PROFILE = ""
+    config.EGO4D_AWS_REGION = region
+
+
+def _apply_hostinger(values: dict[str, str]) -> None:
+    token = values.get("token", "").strip()
+    mailbox = values.get("mailbox_id", "").strip()
+    os.environ["HOSTINGER_MAIL_TOKEN"] = token
+    config.HOSTINGER_MAIL_TOKEN = token
+    if mailbox:
+        os.environ["HOSTINGER_MAILBOX_ID"] = mailbox
+    else:
+        os.environ.pop("HOSTINGER_MAILBOX_ID", None)
+    config.HOSTINGER_MAILBOX_ID = mailbox
+
+
+def _integration_error(exc: Exception, service: str) -> str:
+    text = str(exc).lower()
+    code = ""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str((response.get("Error") or {}).get("Code") or "").lower()
+    if any(term in code or term in text for term in (
+            "expiredtoken", "requestexpired", "expired")):
+        return "A credencial expirou. Renove o acesso e salve as novas chaves."
+    if any(term in code or term in text for term in (
+            "invalidaccesskeyid", "signaturedoesnotmatch", "invalid token")):
+        return "A credencial informada não foi reconhecida. Confira os campos."
+    if "accessdenied" in code or "access denied" in text or "forbidden" in text:
+        return "A credencial existe, mas não possui acesso ao conteúdo solicitado."
+    if any(term in text for term in (
+            "timeout", "connection", "network", "dns", "name resolution")):
+        return f"Não foi possível conectar à {service}. Confira a internet e tente novamente."
+    return f"A {service} não aceitou a configuração informada."
+
+
+def _test_ego4d(values: dict[str, str]) -> dict[str, Any]:
+    import boto3
+    client = boto3.client(
+        "s3",
+        region_name=values.get("region") or None,
+        aws_access_key_id=values["access_key_id"],
+        aws_secret_access_key=values["secret_access_key"],
+        aws_session_token=values.get("session_token") or None,
+    )
+    response = client.get_object(
+        Bucket=ego4d.MANIFEST_BUCKET,
+        Key=ego4d.METADATA_KEY,
+        Range="bytes=0-0",
+    )
+    body = response.get("Body")
+    if body is not None:
+        body.close()
+    return {"ok": True, "message": "Acesso ao catálogo Ego4D confirmado."}
+
+
+def _integration_snapshot() -> dict[str, Any]:
+    secure = _migrate_legacy_integrations()
+    ego = secure.get("ego4d") if isinstance(secure.get("ego4d"), dict) else {}
+    host = (secure.get("hostinger")
+            if isinstance(secure.get("hostinger"), dict) else {})
+    if not ego:
+        ego = _legacy_aws_credentials()
+    ego_dir = config.MEDIA_DATA_DIR / "ego4d"
+    holo_dir = config.MEDIA_DATA_DIR / "holoassist"
+    seed_names = (
+        "video.index.json.gz", "video_compress.index.json.gz", "imu.index.json.gz",
+    )
+    holo_indexes = all((holoassist._INDEX_SEED_DIR / name).is_file()
+                       for name in seed_names)
+    holo_catalog = (
+        holoassist.annotations_path().is_file()
+        and (holo_dir / "data-splits-v1_2.zip").is_file()
+    )
+    storage = _storage_snapshot(include_path=True)
+    access = str(ego.get("access_key_id") or "")
+    return {
+        "security": {
+            "provider": "Windows DPAPI",
+            "detail": "Segredos criptografados para este usuário do Windows.",
+        },
+        "ego4d": {
+            "configured": bool(access and ego.get("secret_access_key")),
+            "access_hint": f"••••{access[-4:]}" if len(access) >= 4 else "",
+            "region": str(ego.get("region") or config.EGO4D_AWS_REGION or "automática"),
+            "catalog_ready": ((ego_dir / "ego4d.json").is_file()
+                              and (ego_dir / "clips.csv").is_file()),
+        },
+        "hostinger": {
+            "configured": bool(host.get("token") or config.HOSTINGER_MAIL_TOKEN),
+            "mailbox_configured": bool(host.get("mailbox_id")
+                                       or config.HOSTINGER_MAILBOX_ID),
+        },
+        "holoassist": {
+            "catalog_ready": holo_catalog,
+            "indexes_ready": holo_indexes,
+        },
+        "runtime": {
+            "ffmpeg_ready": readiness._binary_works(readiness.ffmpeg_bin()),
+            "ffprobe_ready": readiness._binary_works(readiness.ffprobe_bin()),
+        },
+        "library": storage,
+    }
+
+
+def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
+    """Resumo operacional legível, sem IDs, caminhos ou respostas de API."""
+    configured = [str(email) for email in data.get("accounts", []) if email]
+    by_account: dict[str, dict[str, Any]] = {
+        email: {"email": email, "success": 0, "failed": 0, "skipped": 0}
+        for email in configured
+    }
+    items: list[dict[str, Any]] = []
+    total_success = total_failed = total_skipped = 0
+    for index, raw_item in enumerate(data.get("items", []), 1):
+        if not isinstance(raw_item, dict):
+            continue
+        results: list[dict[str, Any]] = []
+        for raw_result in raw_item.get("accounts", []):
+            if not isinstance(raw_result, dict):
+                continue
+            email = str(raw_result.get("email") or "Conta")
+            stats = by_account.setdefault(
+                email, {"email": email, "success": 0, "failed": 0, "skipped": 0}
+            )
+            if raw_result.get("skipped"):
+                status = "skipped"
+                detail = (friendly_campaign_error(raw_result.get("error"))
+                          if raw_result.get("error") else "Vídeo já processado anteriormente.")
+                stats["skipped"] += 1
+                total_skipped += 1
+            elif raw_result.get("ok"):
+                status = "success"
+                detail = "Envio concluído."
+                stats["success"] += 1
+                total_success += 1
+            else:
+                status = "failed"
+                detail = friendly_campaign_error(raw_result.get("error"))
+                stats["failed"] += 1
+                total_failed += 1
+            results.append({"email": email, "status": status, "detail": detail})
+        task = str(raw_item.get("task_name") or raw_item.get("task_scenario")
+                   or raw_item.get("scenario") or f"Vídeo {index}")
+        duration_s = max(0, int(float(raw_item.get("duration_ms") or 0) / 1000))
+        items.append({
+            "index": index,
+            "task": task,
+            "duration_s": duration_s,
+            "success": sum(result["status"] == "success" for result in results),
+            "failed": sum(result["status"] == "failed" for result in results),
+            "skipped": sum(result["status"] == "skipped" for result in results),
+            "accounts": results,
+        })
+    return {
+        "schema": 2,
+        "started_at": data.get("started_at"),
+        "summary": {
+            "configured_accounts": len(configured),
+            "videos": len(items),
+            "success": total_success,
+            "failed": total_failed,
+            "skipped": total_skipped,
+        },
+        "accounts": sorted(by_account.values(), key=lambda item: item["email"].lower()),
+        "items": items,
+    }
 
 
 # --- contas -------------------------------------------------------------------
@@ -504,6 +757,137 @@ def create_app() -> Flask:
             prefs.update(body)
             _save_prefs(prefs)
         return jsonify(prefs)
+
+    @app.get("/api/integrations")
+    def get_integrations():
+        """Estados e dicas somente; nunca devolve um segredo salvo."""
+        try:
+            return jsonify(_integration_snapshot())
+        except (OSError, RuntimeError, ValueError) as exc:
+            return jsonify({"error": _integration_error(exc, "configuração local")}), 400
+
+    @app.put("/api/integrations/ego4d")
+    def put_ego4d_integration():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "preencha as credenciais do Ego4D"}), 400
+        secure = _migrate_legacy_integrations()
+        current = (secure.get("ego4d")
+                   if isinstance(secure.get("ego4d"), dict)
+                   else _legacy_aws_credentials())
+        values = {
+            "access_key_id": str(body.get("access_key_id") or current.get("access_key_id") or "").strip(),
+            "secret_access_key": str(body.get("secret_access_key") or current.get("secret_access_key") or "").strip(),
+            "session_token": str(
+                body.get("session_token") if "session_token" in body
+                else current.get("session_token") or "").strip(),
+            "region": str(
+                body.get("region") if "region" in body
+                else current.get("region") or "").strip(),
+        }
+        if len(values["access_key_id"]) < 12 or len(values["secret_access_key"]) < 20:
+            return jsonify({
+                "error": "informe o Access Key ID e o Secret Access Key recebidos do Ego4D",
+            }), 400
+        try:
+            tested = _test_ego4d(values)
+        except Exception as exc:  # noqa: BLE001 — traduz resposta de boto/AWS
+            return jsonify({"error": _integration_error(exc, "AWS do Ego4D")}), 400
+        with _PERSISTENCE_LOCK:
+            secure["schema"] = 1
+            secure["ego4d"] = values
+            save_secure_settings(config.INTEGRATIONS_PATH, secure)
+            _apply_ego4d(values)
+        return jsonify({"ok": True, "test": tested,
+                        "integrations": _integration_snapshot()})
+
+    @app.post("/api/integrations/ego4d/test")
+    def test_ego4d_integration():
+        secure = _migrate_legacy_integrations()
+        current = (secure.get("ego4d")
+                   if isinstance(secure.get("ego4d"), dict)
+                   else _legacy_aws_credentials())
+        body = request.get_json(silent=True) or {}
+        values = {
+            "access_key_id": str(body.get("access_key_id") or current.get("access_key_id") or "").strip(),
+            "secret_access_key": str(body.get("secret_access_key") or current.get("secret_access_key") or "").strip(),
+            "session_token": str(body.get("session_token") or current.get("session_token") or "").strip(),
+            "region": str(body.get("region") or current.get("region") or "").strip(),
+        }
+        if not values or not values.get("access_key_id") or not values.get("secret_access_key"):
+            return jsonify({"error": "configure as credenciais do Ego4D primeiro"}), 400
+        try:
+            tested = _test_ego4d(values)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": _integration_error(exc, "AWS do Ego4D")}), 400
+        return jsonify(tested)
+
+    @app.post("/api/integrations/ego4d/catalog")
+    def prepare_ego4d_catalog():
+        secure = _migrate_legacy_integrations()
+        values = (secure.get("ego4d")
+                  if isinstance(secure.get("ego4d"), dict)
+                  else _legacy_aws_credentials())
+        if not values or not values.get("access_key_id") or not values.get("secret_access_key"):
+            return jsonify({"error": "configure as credenciais do Ego4D primeiro"}), 400
+        _apply_ego4d(values)
+        try:
+            meta, clips = ego4d.sync_meta()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": _integration_error(exc, "AWS do Ego4D")}), 400
+        return jsonify({
+            "ok": True,
+            "message": "Catálogo básico do Ego4D preparado.",
+            "metadata_bytes": meta.stat().st_size,
+            "clips_bytes": clips.stat().st_size,
+        })
+
+    @app.put("/api/integrations/hostinger")
+    def put_hostinger_integration():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "informe o token da Hostinger"}), 400
+        secure = _migrate_legacy_integrations()
+        current = (secure.get("hostinger")
+                   if isinstance(secure.get("hostinger"), dict) else {})
+        values = {
+            "token": str(body.get("token") or current.get("token") or "").strip(),
+            "mailbox_id": str(
+                body.get("mailbox_id") if "mailbox_id" in body
+                else current.get("mailbox_id") or "").strip(),
+        }
+        if len(values["token"]) < 16:
+            return jsonify({"error": "informe um token válido da API Mail da Hostinger"}), 400
+        try:
+            tested = hostinger_mail.test_connection(
+                token=values["token"], mailbox=values["mailbox_id"] or None)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": _integration_error(exc, "Hostinger")}), 400
+        with _PERSISTENCE_LOCK:
+            secure["schema"] = 1
+            secure["hostinger"] = values
+            save_secure_settings(config.INTEGRATIONS_PATH, secure)
+            _apply_hostinger(values)
+        return jsonify({"ok": True, "test": tested,
+                        "integrations": _integration_snapshot()})
+
+    @app.post("/api/integrations/hostinger/test")
+    def test_hostinger_integration():
+        secure = _migrate_legacy_integrations()
+        current = (secure.get("hostinger")
+                   if isinstance(secure.get("hostinger"), dict) else {})
+        body = request.get_json(silent=True) or {}
+        token = str(body.get("token") or current.get("token")
+                    or config.HOSTINGER_MAIL_TOKEN or "").strip()
+        mailbox = str(body.get("mailbox_id") or current.get("mailbox_id")
+                      or config.HOSTINGER_MAILBOX_ID or "").strip()
+        if not token:
+            return jsonify({"error": "configure o token da Hostinger primeiro"}), 400
+        try:
+            return jsonify(hostinger_mail.test_connection(
+                token=token, mailbox=mailbox or None))
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": _integration_error(exc, "Hostinger")}), 400
 
     # -- prontidão, biblioteca e diagnóstico -----------------------------------
     @app.get("/api/readiness")
@@ -1057,7 +1441,8 @@ def create_app() -> Flask:
         if path is None:
             return jsonify({"error": "log não encontrado"}), 404
         try:
-            return jsonify(json.loads(path.read_text(encoding="utf-8-sig")))
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            return jsonify(_campaign_log_view(raw))
         except json.JSONDecodeError:
             return jsonify({"error": "log ilegível (JSON vazio/corrompido)"}), 400
 

@@ -20,6 +20,7 @@
 #include <QFrame>
 #include <QFontMetrics>
 #include <QGroupBox>
+#include <QHash>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QJsonDocument>
@@ -296,11 +297,13 @@ void MainWindow::buildShell() {
   _navigation->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   const QStringList pages = {
       QStringLiteral("Visão geral"), QStringLiteral("Prontidão"),
-      QStringLiteral("Nova campanha"), QStringLiteral("Acelerador"),
+      QStringLiteral("Integrações"), QStringLiteral("Nova campanha"),
+      QStringLiteral("Acelerador"),
       QStringLiteral("Contas"), QStringLiteral("Saldos"),
       QStringLiteral("Histórico")};
   const QStringList icons = {QStringLiteral(":/qmoney/icons/home.svg"),
                              QStringLiteral(":/qmoney/icons/readiness.svg"),
+                             QStringLiteral(":/qmoney/icons/integrations.svg"),
                              QStringLiteral(":/qmoney/icons/play.svg"),
                              QStringLiteral(":/qmoney/icons/bolt.svg"),
                              QStringLiteral(":/qmoney/icons/users.svg"),
@@ -358,6 +361,8 @@ void MainWindow::buildShell() {
   _pages->addWidget(buildHomePage());
   qInfo() << "QMoney: construindo prontidao";
   _pages->addWidget(buildReadinessPage());
+  qInfo() << "QMoney: construindo integracoes";
+  _pages->addWidget(buildIntegrationsPage());
   qInfo() << "QMoney: construindo campanha";
   _pages->addWidget(buildCampaignPage());
   qInfo() << "QMoney: construindo acelerador";
@@ -516,7 +521,7 @@ QWidget* MainWindow::buildHomePage() {
 
   auto* newCampaign = primaryButton(QStringLiteral("Criar campanha  →"));
   newCampaign->setMinimumWidth(158);
-  connect(newCampaign, &QPushButton::clicked, this, [this] { _navigation->setCurrentRow(2); });
+  connect(newCampaign, &QPushButton::clicked, this, [this] { _navigation->setCurrentRow(3); });
   pulse->addWidget(newCampaign, 0, Qt::AlignVCenter);
   auto* pulseCard = card(QString(), pulseContent);
   pulseCard->setObjectName(QStringLiteral("pulseCard"));
@@ -571,8 +576,9 @@ QWidget* MainWindow::buildHomePage() {
     quickLayout->addWidget(button);
   };
   addQuick(QStringLiteral("Checar prontidão"), 1);
-  addQuick(QStringLiteral("Gerenciar contas"), 4);
-  addQuick(QStringLiteral("Consultar histórico"), 6);
+  addQuick(QStringLiteral("Configurar integrações"), 2);
+  addQuick(QStringLiteral("Gerenciar contas"), 5);
+  addQuick(QStringLiteral("Consultar histórico"), 7);
   lowerLayout->addWidget(card(QStringLiteral("Acesso direto"), quick), 2);
   layout->addWidget(lower);
   layout->addStretch();
@@ -656,6 +662,185 @@ QWidget* MainWindow::buildReadinessPage() {
 
   return pageShell(QStringLiteral("Prontidão"),
                    QStringLiteral("Confirme cada dependência antes de liberar uma campanha."), body);
+}
+
+QWidget* MainWindow::buildIntegrationsPage() {
+  auto* body = new QWidget;
+  auto* bodyLayout = new QVBoxLayout(body);
+  bodyLayout->setContentsMargins(0, 0, 0, 0);
+
+  auto* scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  auto* content = new QWidget;
+  auto* layout = new QVBoxLayout(content);
+  layout->setContentsMargins(0, 0, 8, 0);
+  layout->setSpacing(14);
+
+  auto* hero = new QWidget;
+  auto* heroLayout = new QHBoxLayout(hero);
+  heroLayout->setContentsMargins(0, 0, 0, 0);
+  heroLayout->setSpacing(18);
+  auto* heroCopy = new QVBoxLayout;
+  heroCopy->setSpacing(5);
+  auto* kicker = new QLabel(QStringLiteral("COFRE DE ACESSO"));
+  kicker->setObjectName(QStringLiteral("kicker"));
+  heroCopy->addWidget(kicker);
+  _integrationsHeadline = new QLabel(QStringLiteral("Verificando suas conexões…"));
+  _integrationsHeadline->setObjectName(QStringLiteral("pulseTitle"));
+  heroCopy->addWidget(_integrationsHeadline);
+  _integrationsSummary = quietLabel(QStringLiteral(
+      "O QMoney organiza credenciais, catálogos e ferramentas sem exigir arquivos manuais."));
+  _integrationsSummary->setWordWrap(true);
+  heroCopy->addWidget(_integrationsSummary);
+  heroLayout->addLayout(heroCopy, 1);
+  _integrationSecurity = quietLabel(QStringLiteral("Proteção do Windows"));
+  _integrationSecurity->setObjectName(QStringLiteral("securityBadge"));
+  _integrationSecurity->setAlignment(Qt::AlignCenter);
+  heroLayout->addWidget(_integrationSecurity);
+  auto* heroCard = card(QString(), hero);
+  heroCard->setObjectName(QStringLiteral("pulseCard"));
+  layout->addWidget(heroCard);
+
+  auto* egoBody = new QWidget;
+  auto* egoLayout = new QVBoxLayout(egoBody);
+  egoLayout->setContentsMargins(0, 0, 0, 0);
+  egoLayout->setSpacing(12);
+  auto* egoStatusRow = new QHBoxLayout;
+  _ego4dStatus = new QLabel(QStringLiteral("Verificando credencial…"));
+  _ego4dStatus->setObjectName(QStringLiteral("integrationStatus"));
+  egoStatusRow->addWidget(_ego4dStatus, 1);
+  _ego4dCatalog = quietLabel(QStringLiteral("Catálogo: verificando…"));
+  egoStatusRow->addWidget(_ego4dCatalog);
+  egoLayout->addLayout(egoStatusRow);
+  auto* egoHelp = quietLabel(QStringLiteral(
+      "Cole as chaves recebidas após a aprovação da licença Ego4D. O QMoney valida o acesso antes de salvar."));
+  egoHelp->setWordWrap(true);
+  egoLayout->addWidget(egoHelp);
+
+  auto* egoFormBody = new QWidget;
+  auto* egoForm = new QFormLayout(egoFormBody);
+  configureForm(egoForm);
+  egoForm->setContentsMargins(0, 0, 0, 0);
+  _ego4dAccessKey = new QLineEdit;
+  _ego4dAccessKey->setEchoMode(QLineEdit::PasswordEchoOnEdit);
+  _ego4dAccessKey->setPlaceholderText(QStringLiteral("Access Key ID recebido por email"));
+  egoForm->addRow(QStringLiteral("Access Key ID"), _ego4dAccessKey);
+  _ego4dSecretKey = new QLineEdit;
+  _ego4dSecretKey->setEchoMode(QLineEdit::Password);
+  _ego4dSecretKey->setPlaceholderText(QStringLiteral("Secret Access Key"));
+  egoForm->addRow(QStringLiteral("Secret Access Key"), _ego4dSecretKey);
+  auto updateEgoTest = [this] {
+    if (!_ego4dAccessKey->text().trimmed().isEmpty()
+        && !_ego4dSecretKey->text().trimmed().isEmpty())
+      _ego4dTest->setEnabled(true);
+  };
+  connect(_ego4dAccessKey, &QLineEdit::textChanged, this, updateEgoTest);
+  connect(_ego4dSecretKey, &QLineEdit::textChanged, this, updateEgoTest);
+  _ego4dSessionToken = new QLineEdit;
+  _ego4dSessionToken->setEchoMode(QLineEdit::Password);
+  _ego4dSessionToken->setPlaceholderText(QStringLiteral("Opcional; deixe vazio para manter o salvo"));
+  egoForm->addRow(QStringLiteral("Session Token"), _ego4dSessionToken);
+  _ego4dRegion = new QLineEdit;
+  _ego4dRegion->setPlaceholderText(QStringLiteral("Automática"));
+  egoForm->addRow(QStringLiteral("Região AWS"), _ego4dRegion);
+  egoLayout->addWidget(egoFormBody);
+
+  auto* egoActions = new QHBoxLayout;
+  auto* accessHelp = new QPushButton(QStringLiteral("Como obter acesso"));
+  connect(accessHelp, &QPushButton::clicked, this, [] {
+    QDesktopServices::openUrl(QUrl(QStringLiteral(
+        "https://ego4d-data.org/docs/start-here/")));
+  });
+  egoActions->addWidget(accessHelp);
+  _ego4dPrepare = new QPushButton(QStringLiteral("Preparar catálogo"));
+  connect(_ego4dPrepare, &QPushButton::clicked,
+          this, &MainWindow::prepareEgo4dCatalog);
+  egoActions->addWidget(_ego4dPrepare);
+  egoActions->addStretch();
+  _ego4dTest = new QPushButton(QStringLiteral("Testar acesso"));
+  connect(_ego4dTest, &QPushButton::clicked,
+          this, &MainWindow::testEgo4dIntegration);
+  egoActions->addWidget(_ego4dTest);
+  _ego4dSave = primaryButton(QStringLiteral("Validar e salvar"));
+  connect(_ego4dSave, &QPushButton::clicked,
+          this, &MainWindow::saveEgo4dIntegration);
+  egoActions->addWidget(_ego4dSave);
+  egoLayout->addLayout(egoActions);
+  layout->addWidget(card(QStringLiteral("Ego4D · Conteúdo licenciado"), egoBody));
+
+  auto* hostBody = new QWidget;
+  auto* hostLayout = new QVBoxLayout(hostBody);
+  hostLayout->setContentsMargins(0, 0, 0, 0);
+  hostLayout->setSpacing(12);
+  _hostingerStatus = new QLabel(QStringLiteral("Verificando token…"));
+  _hostingerStatus->setObjectName(QStringLiteral("integrationStatus"));
+  hostLayout->addWidget(_hostingerStatus);
+  auto* hostHelp = quietLabel(QStringLiteral(
+      "A Hostinger é usada somente para ler códigos de verificação ao registrar novas contas. Campanhas com contas existentes não dependem dela."));
+  hostHelp->setWordWrap(true);
+  hostLayout->addWidget(hostHelp);
+  auto* hostFormBody = new QWidget;
+  auto* hostForm = new QFormLayout(hostFormBody);
+  configureForm(hostForm);
+  hostForm->setContentsMargins(0, 0, 0, 0);
+  _hostingerToken = new QLineEdit;
+  _hostingerToken->setEchoMode(QLineEdit::Password);
+  _hostingerToken->setPlaceholderText(QStringLiteral("Token da API Mail da Hostinger"));
+  hostForm->addRow(QStringLiteral("Token da API"), _hostingerToken);
+  connect(_hostingerToken, &QLineEdit::textChanged, this, [this] {
+    if (!_hostingerToken->text().trimmed().isEmpty())
+      _hostingerTest->setEnabled(true);
+  });
+  _hostingerMailbox = new QLineEdit;
+  _hostingerMailbox->setPlaceholderText(QStringLiteral("Opcional; a primeira caixa será usada"));
+  hostForm->addRow(QStringLiteral("ID da caixa"), _hostingerMailbox);
+  hostLayout->addWidget(hostFormBody);
+  auto* hostActions = new QHBoxLayout;
+  hostActions->addStretch();
+  _hostingerTest = new QPushButton(QStringLiteral("Testar conexão"));
+  connect(_hostingerTest, &QPushButton::clicked,
+          this, &MainWindow::testHostingerIntegration);
+  hostActions->addWidget(_hostingerTest);
+  _hostingerSave = primaryButton(QStringLiteral("Validar e salvar"));
+  connect(_hostingerSave, &QPushButton::clicked,
+          this, &MainWindow::saveHostingerIntegration);
+  hostActions->addWidget(_hostingerSave);
+  hostLayout->addLayout(hostActions);
+  layout->addWidget(card(QStringLiteral("Hostinger · Códigos de verificação"), hostBody));
+
+  auto* local = new QWidget;
+  auto* localLayout = new QHBoxLayout(local);
+  localLayout->setContentsMargins(0, 0, 0, 0);
+  localLayout->setSpacing(18);
+  auto* holoCopy = new QVBoxLayout;
+  auto* holoTitle = new QLabel(QStringLiteral("HoloAssist"));
+  holoTitle->setObjectName(QStringLiteral("integrationMiniTitle"));
+  holoCopy->addWidget(holoTitle);
+  _holoIntegrationStatus = quietLabel(QStringLiteral("Verificando catálogo e índices…"));
+  _holoIntegrationStatus->setWordWrap(true);
+  holoCopy->addWidget(_holoIntegrationStatus);
+  localLayout->addLayout(holoCopy, 1);
+  auto* runtimeCopy = new QVBoxLayout;
+  auto* runtimeTitle = new QLabel(QStringLiteral("Ferramentas privadas"));
+  runtimeTitle->setObjectName(QStringLiteral("integrationMiniTitle"));
+  runtimeCopy->addWidget(runtimeTitle);
+  _runtimeIntegrationStatus = quietLabel(QStringLiteral("Verificando FFmpeg e FFprobe…"));
+  _runtimeIntegrationStatus->setWordWrap(true);
+  runtimeCopy->addWidget(_runtimeIntegrationStatus);
+  localLayout->addLayout(runtimeCopy, 1);
+  auto* readinessButton = new QPushButton(QStringLiteral("Abrir prontidão"));
+  connect(readinessButton, &QPushButton::clicked, this,
+          [this] { _navigation->setCurrentRow(1); });
+  localLayout->addWidget(readinessButton);
+  layout->addWidget(card(QStringLiteral("Componentes incluídos no QMoney"), local));
+  layout->addStretch();
+
+  scroll->setWidget(content);
+  bodyLayout->addWidget(scroll);
+  return pageShell(QStringLiteral("Integrações"),
+                   QStringLiteral("Configure tudo que o QMoney precisa sem procurar arquivos no computador."),
+                   body);
 }
 
 QWidget* MainWindow::buildCampaignPage() {
@@ -779,15 +964,36 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* execution = new QWidget;
   auto* executionLayout = new QVBoxLayout(execution);
   executionLayout->setContentsMargins(0, 0, 0, 0);
-  _campaignCurrent = quietLabel(QStringLiteral("Nenhuma campanha em andamento."));
-  executionLayout->addWidget(_campaignCurrent);
+  executionLayout->setSpacing(10);
+  auto* executionHead = new QHBoxLayout;
+  auto* executionCopy = new QVBoxLayout;
+  executionCopy->setSpacing(3);
+  _campaignStage = new QLabel(QStringLiteral("Aguardando"));
+  _campaignStage->setObjectName(QStringLiteral("campaignStage"));
+  executionCopy->addWidget(_campaignStage);
+  _campaignCurrent = quietLabel(QStringLiteral(
+      "Configure a campanha; os acontecimentos importantes aparecerão aqui."));
+  _campaignCurrent->setWordWrap(true);
+  executionCopy->addWidget(_campaignCurrent);
+  executionHead->addLayout(executionCopy, 1);
+  _campaignStats = quietLabel(QStringLiteral("0 concluídos · 0 falhas"));
+  _campaignStats->setObjectName(QStringLiteral("campaignStats"));
+  _campaignStats->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  executionHead->addWidget(_campaignStats);
+  executionLayout->addLayout(executionHead);
   _campaignProgress = new QProgressBar;
+  _campaignProgress->setObjectName(QStringLiteral("campaignProgress"));
   _campaignProgress->setRange(0, 100);
+  _campaignProgress->setValue(0);
+  _campaignProgress->setFormat(QStringLiteral("Nenhum envio iniciado"));
   executionLayout->addWidget(_campaignProgress);
   _campaignFeed = new QPlainTextEdit;
+  _campaignFeed->setObjectName(QStringLiteral("campaignTimeline"));
   _campaignFeed->setReadOnly(true);
   _campaignFeed->setMaximumBlockCount(500);
-  _campaignFeed->setMinimumHeight(130);
+  _campaignFeed->setMinimumHeight(190);
+  _campaignFeed->setPlaceholderText(QStringLiteral(
+      "A linha do tempo mostrará preparação, envios, tentativas e resultados — sem logs técnicos."));
   executionLayout->addWidget(_campaignFeed);
   auto* actions = new QHBoxLayout;
   actions->addStretch();
@@ -1019,7 +1225,57 @@ QWidget* MainWindow::buildHistoryPage() {
     _api.get(QStringLiteral("/api/logs/") + encoded(name),
              [this](bool ok, const QJsonDocument& doc, const QString& error) {
       if (!ok) return showError(QStringLiteral("Falha ao abrir registro"), error);
-      _historyDetail->setPlainText(QString::fromUtf8(doc.toJson(QJsonDocument::Indented)));
+      const auto root = doc.object();
+      const auto summary = root.value(QStringLiteral("summary")).toObject();
+      QStringList lines;
+      lines << QStringLiteral("RESULTADO DA CAMPANHA")
+            << friendlyDate(root.value(QStringLiteral("started_at")).toString())
+            << QString()
+            << QStringLiteral("VISÃO GERAL")
+            << QStringLiteral("%1 vídeo(s) · %2 concluído(s) · %3 ignorado(s) · %4 falha(s)")
+                   .arg(summary.value(QStringLiteral("videos")).toInt())
+                   .arg(summary.value(QStringLiteral("success")).toInt())
+                   .arg(summary.value(QStringLiteral("skipped")).toInt())
+                   .arg(summary.value(QStringLiteral("failed")).toInt())
+            << QString()
+            << QStringLiteral("POR CONTA");
+      for (const auto accountValue : root.value(QStringLiteral("accounts")).toArray()) {
+        const auto account = accountValue.toObject();
+        const int success = account.value(QStringLiteral("success")).toInt();
+        const int skipped = account.value(QStringLiteral("skipped")).toInt();
+        const int failed = account.value(QStringLiteral("failed")).toInt();
+        const QString marker = failed > 0 ? QStringLiteral("×")
+                             : success > 0 ? QStringLiteral("✓") : QStringLiteral("•");
+        lines << QStringLiteral("%1  %2").arg(marker, account.value(QStringLiteral("email")).toString())
+              << QStringLiteral("    %1 concluído(s) · %2 ignorado(s) · %3 falha(s)")
+                     .arg(success).arg(skipped).arg(failed);
+      }
+      lines << QString() << QStringLiteral("CONTEÚDO PROCESSADO");
+      for (const auto itemValue : root.value(QStringLiteral("items")).toArray()) {
+        const auto item = itemValue.toObject();
+        const int duration = item.value(QStringLiteral("duration_s")).toInt();
+        const int minutes = duration / 60;
+        const int seconds = duration % 60;
+        const QString durationText = minutes > 0
+            ? QStringLiteral("%1min %2s").arg(minutes).arg(seconds, 2, 10, QLatin1Char('0'))
+            : QStringLiteral("%1s").arg(seconds);
+        const int failed = item.value(QStringLiteral("failed")).toInt();
+        const QString marker = failed > 0 ? QStringLiteral("×") : QStringLiteral("✓");
+        lines << QStringLiteral("%1  %2 · %3")
+                     .arg(marker, item.value(QStringLiteral("task")).toString(), durationText)
+              << QStringLiteral("    %1 concluído(s) · %2 ignorado(s) · %3 falha(s)")
+                     .arg(item.value(QStringLiteral("success")).toInt())
+                     .arg(item.value(QStringLiteral("skipped")).toInt())
+                     .arg(failed);
+        for (const auto resultValue : item.value(QStringLiteral("accounts")).toArray()) {
+          const auto result = resultValue.toObject();
+          if (result.value(QStringLiteral("status")).toString() == QStringLiteral("success")) continue;
+          lines << QStringLiteral("      ! %1 — %2")
+                       .arg(result.value(QStringLiteral("email")).toString(),
+                            result.value(QStringLiteral("detail")).toString());
+        }
+      }
+      _historyDetail->setPlainText(lines.join(QLatin1Char('\n')));
     });
   });
   layout->addWidget(card(QStringLiteral("Campanhas"), _historyTable), 3);
@@ -1068,6 +1324,13 @@ void MainWindow::applyStructuralStyle(bool dark) {
     #metricValue { color: %4; font-family: "Cascadia Mono", Consolas; font-size: 32px; font-weight: 700; }
     #metricTiming { color: %5; font-size: 8px; font-weight: 700; letter-spacing: 0.9px; }
     #pulseTitle { color: %4; font-size: 21px; font-weight: 735; letter-spacing: -0.2px; }
+    #securityBadge { color: #61c694; background: %9; border: 1px solid %6; border-radius: 13px; padding: 8px 13px; font-size: 10px; font-weight: 700; }
+    #integrationStatus { color: %4; font-size: 13px; font-weight: 700; }
+    #integrationStatus[integrationState="ok"] { color: #48c78e; }
+    #integrationStatus[integrationState="missing"] { color: #e3aa55; }
+    #integrationMiniTitle { color: %4; font-size: 13px; font-weight: 720; }
+    #campaignStage { color: %4; font-size: 17px; font-weight: 735; letter-spacing: -0.1px; }
+    #campaignStats { color: %5; font-family: "Cascadia Mono", Consolas; font-size: 10px; font-weight: 650; }
     #kicker { color: #ff7a36; font-size: 9px; font-weight: 850; letter-spacing: 1.35px; }
     #signalRail { background: #111416; border: 1px solid #2d3336; border-radius: 7px; }
     #signalLabel { color: #ff7a36; font-size: 8px; font-weight: 850; letter-spacing: 1.1px; }
@@ -1095,8 +1358,10 @@ void MainWindow::applyStructuralStyle(bool dark) {
     QHeaderView::section { color: %5; background: %2; border: none; border-bottom: 1px solid %6; padding: 9px 10px; font-size: 9px; font-weight: 800; }
     QTableCornerButton::section { background: %2; border: none; border-bottom: 1px solid %6; }
     QPlainTextEdit { font-family: "Cascadia Mono", Consolas, monospace; padding: 10px; }
+    #campaignTimeline { font-family: "Inter", "Segoe UI"; font-size: 12px; line-height: 1.35; padding: 12px; }
     QProgressBar { min-height: 7px; max-height: 7px; background: %8; border: none; border-radius: 3px; }
     QProgressBar::chunk { background: #ff7a36; border-radius: 3px; }
+    #campaignProgress { min-height: 22px; max-height: 22px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 700; }
     QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
     QScrollBar::handle:vertical { background: %6; min-height: 30px; border-radius: 4px; }
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -1292,10 +1557,10 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
 void MainWindow::navigate(int index) {
   if (index < 0) return;
   _pages->setCurrentIndex(index);
-  if (index == 2 && _campaignStop->isEnabled()) _campaignPoll.start();
-  else if (index != 2) _campaignPoll.stop();
-  if (index != 3) _cachePoll.stop();
-  if (index != 5) _balancePoll.stop();
+  if (index == 3 && _campaignStop->isEnabled()) _campaignPoll.start();
+  else if (index != 3) _campaignPoll.stop();
+  if (index != 4) _cachePoll.stop();
+  if (index != 6) _balancePoll.stop();
   if (_backendReady) refreshCurrentPage();
 }
 
@@ -1304,11 +1569,12 @@ void MainWindow::refreshCurrentPage() {
   switch (_pages->currentIndex()) {
     case 0: loadHome(); break;
     case 1: loadReadiness(); break;
-    case 2: loadCampaignData(); break;
-    case 3: loadAccelerator(); break;
-    case 4: loadAccounts(); break;
-    case 5: loadBalances(); break;
-    case 6: loadHistory(); break;
+    case 2: loadIntegrations(); break;
+    case 3: loadCampaignData(); break;
+    case 4: loadAccelerator(); break;
+    case 5: loadAccounts(); break;
+    case 6: loadBalances(); break;
+    case 7: loadHistory(); break;
     default: break;
   }
 }
@@ -1418,6 +1684,186 @@ void MainWindow::loadReadiness() {
             .arg(bytesText(static_cast<qint64>(storage.value(QStringLiteral("holoassist_bytes")).toDouble())))
             .arg(storage.value(QStringLiteral("holoassist_files")).toInt())
             .arg(bytesText(static_cast<qint64>(storage.value(QStringLiteral("free_bytes")).toDouble()))));
+  });
+}
+
+void MainWindow::loadIntegrations() {
+  _api.get(QStringLiteral("/api/integrations"),
+           [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (!ok) return showError(QStringLiteral("Integrações indisponíveis"), error);
+    const auto root = doc.object();
+    const auto ego = root.value(QStringLiteral("ego4d")).toObject();
+    const auto host = root.value(QStringLiteral("hostinger")).toObject();
+    const auto holo = root.value(QStringLiteral("holoassist")).toObject();
+    const auto runtime = root.value(QStringLiteral("runtime")).toObject();
+    const auto security = root.value(QStringLiteral("security")).toObject();
+    const bool egoConfigured = ego.value(QStringLiteral("configured")).toBool();
+    const bool egoCatalog = ego.value(QStringLiteral("catalog_ready")).toBool();
+    const bool hostConfigured = host.value(QStringLiteral("configured")).toBool();
+    const bool holoReady = holo.value(QStringLiteral("catalog_ready")).toBool()
+                        && holo.value(QStringLiteral("indexes_ready")).toBool();
+    const bool runtimeReady = runtime.value(QStringLiteral("ffmpeg_ready")).toBool()
+                           && runtime.value(QStringLiteral("ffprobe_ready")).toBool();
+    const int readyCount = int(egoConfigured) + int(egoCatalog)
+                         + int(hostConfigured) + int(holoReady) + int(runtimeReady);
+    _integrationsHeadline->setText(readyCount == 5
+        ? QStringLiteral("Todas as conexões estão prontas")
+        : QStringLiteral("%1 de 5 componentes configurados").arg(readyCount));
+    _integrationsSummary->setText(readyCount == 5
+        ? QStringLiteral("Credenciais, catálogos e ferramentas estão disponíveis para a operação.")
+        : QStringLiteral("Conclua os itens pendentes abaixo; cada teste explica exatamente o que corrigir."));
+    _integrationSecurity->setText(QStringLiteral("🔒  %1")
+        .arg(security.value(QStringLiteral("provider")).toString(
+            QStringLiteral("Proteção do Windows"))));
+    _integrationSecurity->setToolTip(
+        security.value(QStringLiteral("detail")).toString());
+
+    const QString hint = ego.value(QStringLiteral("access_hint")).toString();
+    _ego4dStatus->setText(egoConfigured
+        ? QStringLiteral("● Credencial protegida %1").arg(hint)
+        : QStringLiteral("● Credencial ainda não configurada"));
+    _ego4dStatus->setProperty("integrationState", egoConfigured ? "ok" : "missing");
+    _ego4dStatus->style()->unpolish(_ego4dStatus);
+    _ego4dStatus->style()->polish(_ego4dStatus);
+    _ego4dCatalog->setText(egoCatalog
+        ? QStringLiteral("✓ Catálogo instalado")
+        : QStringLiteral("! Catálogo pendente"));
+    _ego4dAccessKey->setPlaceholderText(egoConfigured
+        ? QStringLiteral("%1 — digite somente para substituir").arg(hint)
+        : QStringLiteral("Access Key ID recebido por email"));
+    _ego4dSecretKey->setPlaceholderText(egoConfigured
+        ? QStringLiteral("Protegido — digite somente para substituir")
+        : QStringLiteral("Secret Access Key"));
+    const QString region = ego.value(QStringLiteral("region")).toString();
+    if (_ego4dRegion->text().isEmpty() && region != QStringLiteral("automática"))
+      _ego4dRegion->setPlaceholderText(region);
+    _ego4dTest->setEnabled(egoConfigured);
+    _ego4dPrepare->setEnabled(egoConfigured && !egoCatalog);
+
+    _hostingerStatus->setText(hostConfigured
+        ? QStringLiteral("● Token protegido e disponível")
+        : QStringLiteral("● Token ainda não configurado"));
+    _hostingerStatus->setProperty("integrationState", hostConfigured ? "ok" : "missing");
+    _hostingerStatus->style()->unpolish(_hostingerStatus);
+    _hostingerStatus->style()->polish(_hostingerStatus);
+    _hostingerToken->setPlaceholderText(hostConfigured
+        ? QStringLiteral("Protegido — digite somente para substituir")
+        : QStringLiteral("Token da API Mail da Hostinger"));
+    _hostingerTest->setEnabled(hostConfigured);
+
+    _holoIntegrationStatus->setText(holoReady
+        ? QStringLiteral("✓ Catálogo e índices instalados. Nenhuma credencial necessária.")
+        : QStringLiteral("! Catálogo ou índices ausentes na biblioteca selecionada."));
+    _runtimeIntegrationStatus->setText(runtimeReady
+        ? QStringLiteral("✓ FFmpeg e FFprobe acompanham o aplicativo.")
+        : QStringLiteral("! Ferramentas de vídeo ausentes; reinstale o pacote completo."));
+    setStatus(QStringLiteral("Estado das integrações atualizado."));
+  });
+}
+
+void MainWindow::saveEgo4dIntegration() {
+  QJsonObject body;
+  if (!_ego4dAccessKey->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("access_key_id"), _ego4dAccessKey->text().trimmed());
+  if (!_ego4dSecretKey->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("secret_access_key"), _ego4dSecretKey->text().trimmed());
+  if (!_ego4dSessionToken->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("session_token"), _ego4dSessionToken->text().trimmed());
+  if (!_ego4dRegion->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("region"), _ego4dRegion->text().trimmed());
+  _ego4dSave->setEnabled(false);
+  _ego4dSave->setText(QStringLiteral("Validando…"));
+  _api.put(QStringLiteral("/api/integrations/ego4d"), body,
+           [this](bool ok, const QJsonDocument&, const QString& error) {
+    _ego4dSave->setEnabled(true);
+    _ego4dSave->setText(QStringLiteral("Validar e salvar"));
+    if (!ok) return showError(QStringLiteral("Ego4D não configurado"), error);
+    _ego4dAccessKey->clear();
+    _ego4dSecretKey->clear();
+    _ego4dSessionToken->clear();
+    setStatus(QStringLiteral("Credencial Ego4D validada e protegida pelo Windows."));
+    loadIntegrations();
+    loadReadiness();
+  });
+}
+
+void MainWindow::testEgo4dIntegration() {
+  QJsonObject body;
+  if (!_ego4dAccessKey->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("access_key_id"), _ego4dAccessKey->text().trimmed());
+  if (!_ego4dSecretKey->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("secret_access_key"), _ego4dSecretKey->text().trimmed());
+  if (!_ego4dSessionToken->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("session_token"), _ego4dSessionToken->text().trimmed());
+  if (!_ego4dRegion->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("region"), _ego4dRegion->text().trimmed());
+  _ego4dTest->setEnabled(false);
+  _ego4dTest->setText(QStringLiteral("Testando…"));
+  _api.post(QStringLiteral("/api/integrations/ego4d/test"), body,
+            [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _ego4dTest->setEnabled(true);
+    _ego4dTest->setText(QStringLiteral("Testar acesso"));
+    if (!ok) return showError(QStringLiteral("Teste Ego4D"), error);
+    QMessageBox::information(this, QStringLiteral("Ego4D conectado"),
+        doc.object().value(QStringLiteral("message")).toString(
+            QStringLiteral("Acesso ao catálogo confirmado.")));
+  });
+}
+
+void MainWindow::prepareEgo4dCatalog() {
+  _ego4dPrepare->setEnabled(false);
+  _ego4dPrepare->setText(QStringLiteral("Preparando…"));
+  _api.post(QStringLiteral("/api/integrations/ego4d/catalog"), {},
+            [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _ego4dPrepare->setText(QStringLiteral("Preparar catálogo"));
+    if (!ok) {
+      _ego4dPrepare->setEnabled(true);
+      return showError(QStringLiteral("Catálogo Ego4D"), error);
+    }
+    setStatus(doc.object().value(QStringLiteral("message")).toString(
+        QStringLiteral("Catálogo Ego4D preparado.")));
+    loadIntegrations();
+    loadReadiness();
+  });
+}
+
+void MainWindow::saveHostingerIntegration() {
+  QJsonObject body;
+  if (!_hostingerToken->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("token"), _hostingerToken->text().trimmed());
+  if (!_hostingerMailbox->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("mailbox_id"), _hostingerMailbox->text().trimmed());
+  _hostingerSave->setEnabled(false);
+  _hostingerSave->setText(QStringLiteral("Validando…"));
+  _api.put(QStringLiteral("/api/integrations/hostinger"), body,
+           [this](bool ok, const QJsonDocument&, const QString& error) {
+    _hostingerSave->setEnabled(true);
+    _hostingerSave->setText(QStringLiteral("Validar e salvar"));
+    if (!ok) return showError(QStringLiteral("Hostinger não configurada"), error);
+    _hostingerToken->clear();
+    _hostingerMailbox->clear();
+    setStatus(QStringLiteral("Token Hostinger validado e protegido pelo Windows."));
+    loadIntegrations();
+    loadReadiness();
+  });
+}
+
+void MainWindow::testHostingerIntegration() {
+  QJsonObject body;
+  if (!_hostingerToken->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("token"), _hostingerToken->text().trimmed());
+  if (!_hostingerMailbox->text().trimmed().isEmpty())
+    body.insert(QStringLiteral("mailbox_id"), _hostingerMailbox->text().trimmed());
+  _hostingerTest->setEnabled(false);
+  _hostingerTest->setText(QStringLiteral("Testando…"));
+  _api.post(QStringLiteral("/api/integrations/hostinger/test"), body,
+            [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _hostingerTest->setEnabled(true);
+    _hostingerTest->setText(QStringLiteral("Testar conexão"));
+    if (!ok) return showError(QStringLiteral("Teste Hostinger"), error);
+    const int boxes = doc.object().value(QStringLiteral("mailboxes")).toInt();
+    QMessageBox::information(this, QStringLiteral("Hostinger conectada"),
+        QStringLiteral("Credencial válida · %1 caixa(s) disponível(is).").arg(boxes));
   });
 }
 
@@ -1633,21 +2079,56 @@ void MainWindow::pollCampaign() {
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
     _campaignStop->setEnabled(running && state != QStringLiteral("stopping"));
     _campaignStart->setEnabled(!running);
-    _campaignCurrent->setText(snap.value(QStringLiteral("current")).toString(
-        running ? QStringLiteral("Campanha em andamento…") : QStringLiteral("Nenhuma campanha em andamento.")));
+    const QHash<QString, QString> stateLabels{
+        {QStringLiteral("idle"), QStringLiteral("Aguardando")},
+        {QStringLiteral("running"), QStringLiteral("Em andamento")},
+        {QStringLiteral("stopping"), QStringLiteral("Encerrando")},
+        {QStringLiteral("done"), QStringLiteral("Concluída")},
+        {QStringLiteral("stopped"), QStringLiteral("Encerrada")},
+        {QStringLiteral("error"), QStringLiteral("Atenção necessária")},
+    };
+    _campaignStage->setText(snap.value(QStringLiteral("stage")).toString(
+        stateLabels.value(state, QStringLiteral("Aguardando"))));
+    QString current = snap.value(QStringLiteral("current")).toString();
+    if (current.isEmpty()) {
+      if (state == QStringLiteral("done")) current = QStringLiteral("Resultados salvos no Histórico.");
+      else if (state == QStringLiteral("stopped")) current = QStringLiteral("Parada concluída com segurança.");
+      else if (state == QStringLiteral("error")) current = snap.value(QStringLiteral("error")).toString(
+          QStringLiteral("A operação não foi concluída."));
+      else if (running) current = QStringLiteral("Campanha em andamento…");
+      else current = QStringLiteral("Nenhuma campanha em andamento.");
+    }
+    _campaignCurrent->setText(current);
     const auto totals = snap.value(QStringLiteral("totals")).toObject();
     const int total = totals.value(QStringLiteral("total_sends")).toInt();
     const int done = totals.value(QStringLiteral("done_sends")).toInt();
-    _campaignProgress->setValue(total > 0 ? done * 100 / total : 0);
+    const int successful = totals.value(QStringLiteral("ok_sends")).toInt();
+    const int failed = totals.value(QStringLiteral("failed_sends")).toInt();
+    const int skipped = totals.value(QStringLiteral("skipped_sends")).toInt();
+    const int percent = total > 0 ? qBound(0, done * 100 / total, 100) : 0;
+    _campaignProgress->setValue(percent);
+    _campaignProgress->setFormat(total > 0
+        ? QStringLiteral("%1 de %2 envios · %p%").arg(done).arg(total)
+        : QStringLiteral("Calculando os envios…"));
+    _campaignStats->setText(QStringLiteral("%1 sucesso · %2 ignorados · %3 falhas")
+        .arg(successful).arg(skipped).arg(failed));
     for (const auto eventValue : snap.value(QStringLiteral("events")).toArray()) {
       const auto event = eventValue.toObject();
       _lastCampaignSeq = qMax(_lastCampaignSeq, event.value(QStringLiteral("seq")).toInt());
-      QString message = event.value(QStringLiteral("message")).toString();
-      if (message.isEmpty()) {
-        message = QStringLiteral("[%1] %2").arg(event.value(QStringLiteral("kind")).toString(),
-                                                event.value(QStringLiteral("email")).toString());
-      }
-      _campaignFeed->appendPlainText(message.trimmed());
+      const QString level = event.value(QStringLiteral("level")).toString();
+      const QString marker = level == QStringLiteral("success") ? QStringLiteral("✓")
+                           : level == QStringLiteral("warning") ? QStringLiteral("!")
+                           : level == QStringLiteral("error") ? QStringLiteral("×")
+                           : QStringLiteral("•");
+      const qint64 seconds = static_cast<qint64>(event.value(QStringLiteral("ts")).toDouble());
+      const QString time = QDateTime::fromSecsSinceEpoch(seconds).toLocalTime()
+                               .toString(QStringLiteral("HH:mm:ss"));
+      const QString title = event.value(QStringLiteral("title")).toString();
+      const QString detail = event.value(QStringLiteral("detail")).toString();
+      if (title.isEmpty()) continue;
+      QString line = QStringLiteral("%1   %2  %3").arg(time, marker, title);
+      if (!detail.isEmpty()) line += QStringLiteral("\n             %1").arg(detail);
+      _campaignFeed->appendPlainText(line);
     }
     if (!running) _campaignPoll.stop();
   });

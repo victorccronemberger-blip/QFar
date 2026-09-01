@@ -3,6 +3,7 @@
     <file alias="icon.png">qmoney-icon.png</file>
     <file alias="icons/home.svg">icons/home.svg</file>
     <file alias="icons/readiness.svg">icons/readiness.svg</file>
+    <file alias="icons/integrations.svg">icons/integrations.svg</file>
     <file alias="icons/play.svg">icons/play.svg</file>
     <file alias="icons/bolt.svg">icons/bolt.svg</file>
     <file alias="icons/users.svg">icons/users.svg</file>
