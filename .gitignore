@@ -42,6 +42,8 @@ build/
 dist/
 build-debug/
 build-release/
+build-service-dist/
+build-service-work/
 .qt/
 tmp/
 .zcode/

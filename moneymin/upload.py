@@ -603,7 +603,7 @@ def complete_upload(
 
 def sidecars_dir() -> Path:
     """Diretório onde ficam os sidecars de upload (`data/sidecars/`)."""
-    d = config.DATA_DIR / "sidecars"
+    d = config.MEDIA_DATA_DIR / "sidecars"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

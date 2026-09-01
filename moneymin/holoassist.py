@@ -61,7 +61,7 @@ _INDEX_SEED_DIR = Path(__file__).with_name("resources") / "holoassist"
 
 
 def data_dir() -> Path:
-    return config.DATA_DIR / "holoassist"
+    return config.MEDIA_DATA_DIR / "holoassist"
 
 
 def remote_archive(url: str, index_name: str) -> RemoteTar:

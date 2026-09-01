@@ -62,7 +62,7 @@ class AccountSpec:
 class CampaignConfig:
     accounts: list[AccountSpec]
     tasks: list[TaskSpec]
-    work_dir: Path = field(default_factory=lambda: config.DATA_DIR / "ego4d")
+    work_dir: Path = field(default_factory=lambda: config.MEDIA_DATA_DIR / "ego4d")
     timeout_blob: int = DEFAULT_TIMEOUT_BLOB
     evaluate: bool = True
     finalize: bool = True

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QByteArray>
 #include <QNetworkAccessManager>
 #include <QObject>
 #include <QUrl>
@@ -12,6 +13,8 @@ class UpdateManager final : public QObject {
 
 public:
   explicit UpdateManager(QObject* parent = nullptr);
+  static bool verifyHashSignature(const QByteArray& hash,
+                                  const QByteArray& signature);
   void check(bool interactive = false);
   void downloadAndInstall();
   bool isBusy() const { return _busy; }
@@ -27,14 +30,17 @@ signals:
 private:
   void fail(const QString& message);
   void fetchChecksum();
+  void fetchSignature();
   void fetchPackage();
 
   QNetworkAccessManager _network;
   QUrl _packageUrl;
   QUrl _checksumUrl;
+  QUrl _signatureUrl;
   QString _version;
   QString _notes;
   QString _expectedSha256;
+  QByteArray _signature;
   QString _packagePath;
   QFile* _output{};
   bool _busy{};

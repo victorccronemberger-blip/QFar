@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -46,6 +47,12 @@ std::wstring argument(int argc, wchar_t** argv, const std::wstring& name) {
   return {};
 }
 
+bool hasFlag(int argc, wchar_t** argv, const std::wstring& name) {
+  for (int i = 1; i < argc; ++i)
+    if (argv[i] == name) return true;
+  return false;
+}
+
 bool copyPackage(const fs::path& source, const fs::path& target) {
   std::error_code ec;
   for (const auto& entry : fs::recursive_directory_iterator(source, ec)) {
@@ -59,11 +66,111 @@ bool copyPackage(const fs::path& source, const fs::path& target) {
       fs::create_directories(destination.parent_path(), ec);
       if (destination.filename() == L"QMoneyUpdater.exe")
         destination = target / L"QMoneyUpdater.new.exe";
-      fs::copy_file(entry.path(), destination, fs::copy_options::overwrite_existing, ec);
+      // O std::filesystem do MinGW 13 devolve ERROR_FILE_EXISTS mesmo com
+      // overwrite_existing em alguns volumes NTFS. O backup transacional já
+      // foi concluído, então remova explicitamente antes da cópia.
+      if (fs::exists(destination)) fs::remove(destination, ec);
+      if (!ec) fs::copy_file(entry.path(), destination, fs::copy_options::none, ec);
+    }
+    if (ec) {
+      const std::string narrow = ec.message();
+      logLine(target, L"Falha ao copiar " + entry.path().wstring() + L" -> "
+                          + destination.wstring() + L": "
+                          + std::wstring(narrow.begin(), narrow.end()));
+      return false;
+    }
+  }
+  return true;
+}
+
+fs::path installedDestination(const fs::path& relative, const fs::path& target) {
+  if (relative.filename() == L"QMoneyUpdater.exe")
+    return target / L"QMoneyUpdater.new.exe";
+  return target / relative;
+}
+
+bool backupPackageTargets(const fs::path& source, const fs::path& target,
+                          const fs::path& backup) {
+  std::error_code ec;
+  fs::remove_all(backup, ec);
+  fs::create_directories(backup, ec);
+  if (ec) return false;
+  for (const auto& entry : fs::recursive_directory_iterator(source, ec)) {
+    if (ec) return false;
+    if (!entry.is_regular_file()) continue;
+    const fs::path relative = fs::relative(entry.path(), source, ec);
+    if (ec) return false;
+    const fs::path installed = installedDestination(relative, target);
+    if (!fs::exists(installed)) continue;
+    const fs::path saved = backup / relative;
+    fs::create_directories(saved.parent_path(), ec);
+    fs::copy_file(installed, saved, fs::copy_options::overwrite_existing, ec);
+    if (ec) return false;
+  }
+  const fs::path updater = target / L"QMoneyUpdater.exe";
+  if (fs::exists(updater)) {
+    fs::copy_file(updater, backup / L"QMoneyUpdater.installed.exe",
+                  fs::copy_options::overwrite_existing, ec);
+  }
+  return !ec;
+}
+
+bool rollbackPackage(const fs::path& source, const fs::path& target,
+                     const fs::path& backup) {
+  std::error_code ec;
+  for (const auto& entry : fs::recursive_directory_iterator(source, ec)) {
+    if (ec) return false;
+    if (!entry.is_regular_file()) continue;
+    const fs::path relative = fs::relative(entry.path(), source, ec);
+    if (ec) return false;
+    const fs::path installed = installedDestination(relative, target);
+    const fs::path saved = backup / relative;
+    if (fs::exists(saved)) {
+      fs::create_directories(installed.parent_path(), ec);
+      if (fs::exists(installed)) fs::remove(installed, ec);
+      if (!ec) fs::copy_file(saved, installed, fs::copy_options::none, ec);
+    } else {
+      fs::remove(installed, ec);
     }
     if (ec) return false;
   }
-  return true;
+  const fs::path savedUpdater = backup / L"QMoneyUpdater.installed.exe";
+  if (fs::exists(savedUpdater)) {
+    const fs::path installedUpdater = target / L"QMoneyUpdater.exe";
+    if (fs::exists(installedUpdater)) fs::remove(installedUpdater, ec);
+    if (!ec) fs::copy_file(savedUpdater, installedUpdater,
+                           fs::copy_options::none, ec);
+  }
+  return !ec;
+}
+
+bool launchAndValidate(const fs::path& executable, const fs::path& marker,
+                       DWORD timeoutMs = 60000) {
+  std::wstring command = quote(executable.wstring()) + L" --update-health "
+                         + quote(marker.wstring());
+  std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+  mutableCommand.push_back(L'\0');
+  STARTUPINFOW startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
+                      0, nullptr, executable.parent_path().c_str(),
+                      &startup, &process)) return false;
+  CloseHandle(process.hThread);
+  const DWORD step = 250;
+  DWORD elapsed = 0;
+  bool healthy = false;
+  while (elapsed < timeoutMs) {
+    if (fs::exists(marker)) { healthy = true; break; }
+    if (WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) break;
+    Sleep(step);
+    elapsed += step;
+  }
+  if (!healthy && WaitForSingleObject(process.hProcess, 0) != WAIT_OBJECT_0) {
+    TerminateProcess(process.hProcess, 5);
+    WaitForSingleObject(process.hProcess, 5000);
+  }
+  CloseHandle(process.hProcess);
+  return healthy;
 }
 }  // namespace
 
@@ -75,6 +182,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   const fs::path target = argument(argc, argv, L"--target");
   const std::wstring pidText = argument(argc, argv, L"--pid");
   const std::wstring launch = argument(argc, argv, L"--launch");
+  const bool silent = hasFlag(argc, argv, L"--silent");
   LocalFree(argv);
   if (package.empty() || target.empty() || pidText.empty() || launch.empty()) return 2;
 
@@ -87,24 +195,49 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   wchar_t tempPath[MAX_PATH]{};
   GetTempPathW(MAX_PATH, tempPath);
   const fs::path staging = fs::path(tempPath) / (L"QMoney-" + std::to_wstring(GetCurrentProcessId()));
+  const fs::path marker = fs::path(tempPath) / (L"QMoney-health-" + std::to_wstring(GetCurrentProcessId()));
+  const fs::path backup = target / L".qmoney-rollback";
   std::error_code ec;
   fs::remove_all(staging, ec);
+  fs::remove(marker, ec);
   fs::create_directories(staging, ec);
   if (ec) return 3;
 
   const std::wstring extract = L"tar.exe -xf " + quote(package.wstring()) + L" -C " + quote(staging.wstring());
-  if (!runProcess(extract) || !copyPackage(staging, target)) {
+  if (!runProcess(extract) || !backupPackageTargets(staging, target, backup)
+      || !copyPackage(staging, target)) {
     logLine(target, L"Falha ao extrair ou copiar o pacote.");
+    rollbackPackage(staging, target, backup);
     fs::remove_all(staging, ec);
-    MessageBoxW(nullptr, L"A atualização não pôde ser instalada. Seus dados não foram alterados.",
-                L"QMoney", MB_OK | MB_ICONERROR);
+    if (!silent)
+      MessageBoxW(nullptr, L"A atualização não pôde ser instalada. Seus dados não foram alterados.",
+                  L"QMoney", MB_OK | MB_ICONERROR);
     return 4;
   }
 
+  if (!launchAndValidate(target / launch, marker)) {
+    logLine(target, L"Nova versão falhou no teste de saúde; iniciando rollback.");
+    if (!rollbackPackage(staging, target, backup)) {
+      if (!silent)
+        MessageBoxW(nullptr,
+                    L"A nova versão não iniciou e a restauração automática falhou. Consulte update.log.",
+                    L"QMoney", MB_OK | MB_ICONERROR);
+      fs::remove_all(staging, ec);
+      return 5;
+    }
+    runProcess(quote((target / launch).wstring()), 1000);
+    if (!silent)
+      MessageBoxW(nullptr,
+                  L"A nova versão não iniciou. O QMoney restaurou automaticamente a versão anterior.",
+                  L"QMoney", MB_OK | MB_ICONWARNING);
+    fs::remove_all(staging, ec);
+    return 6;
+  }
+
+  fs::remove(marker, ec);
   fs::remove_all(staging, ec);
   fs::remove(package, ec);
-  logLine(target, L"Atualização instalada com sucesso.");
-  runProcess(quote((target / launch).wstring()), 1000);
+  logLine(target, L"Atualização instalada e validada com sucesso.");
   return 0;
 }
 #else

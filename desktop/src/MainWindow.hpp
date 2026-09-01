@@ -37,6 +37,7 @@ protected:
 
 private:
   QWidget* buildHomePage();
+  QWidget* buildReadinessPage();
   QWidget* buildCampaignPage();
   QWidget* buildAcceleratorPage();
   QWidget* buildAccountsPage();
@@ -53,6 +54,8 @@ private:
   void installUpdate(const QString& packagePath);
 
   void startBackend();
+  void stopBackend();
+  void restartBackend();
   void probeBackend();
   void setBackendReady(bool ready, const QString& message = {});
   void navigate(int index);
@@ -61,6 +64,9 @@ private:
   void setStatus(const QString& text);
 
   void loadHome();
+  void loadReadiness();
+  void chooseLibrary();
+  void exportDiagnostics();
   void loadCampaignData();
   void loadTasks();
   void startCampaign();
@@ -68,6 +74,7 @@ private:
   void loadAccelerator();
   void startAccelerator();
   void loadAccounts();
+  void checkAllAccounts();
   void addAccount(bool registerNew);
   void loadBalances();
   void loadHistory();
@@ -84,7 +91,10 @@ private:
   QTimer _balancePoll;
   QTimer _cachePoll;
   int _probeAttempts{};
+  int _backendRestarts{};
   bool _backendReady{};
+  bool _closing{};
+  bool _restartingBackend{};
 
   QListWidget* _navigation{};
   QStackedWidget* _pages{};
@@ -99,6 +109,17 @@ private:
   QLabel* _homePulseTitle{};
   QLabel* _homePulseBody{};
   QProgressBar* _homePulseProgress{};
+
+  QLabel* _readinessHeadline{};
+  QLabel* _readinessSummary{};
+  QProgressBar* _readinessProgress{};
+  QTableWidget* _readinessTable{};
+  QLabel* _libraryPath{};
+  QLabel* _libraryUsage{};
+  QPushButton* _readinessRefresh{};
+  QPushButton* _libraryChoose{};
+  QPushButton* _diagnosticsExport{};
+  QString _currentLibraryRoot;
 
   QComboBox* _dataset{};
   QListWidget* _campaignAccounts{};
@@ -133,6 +154,7 @@ private:
   class QLineEdit* _accountPassword{};
   QPushButton* _accountAdd{};
   QPushButton* _accountRegister{};
+  QPushButton* _accountsCheckAll{};
 
   QTableWidget* _balancesTable{};
   QLabel* _balancesState{};

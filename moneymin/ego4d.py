@@ -43,12 +43,12 @@ from urllib.parse import quote
 
 from . import config
 
-EGO4D_DIR = config.DATA_DIR / "ego4d"
+EGO4D_DIR = config.MEDIA_DATA_DIR / "ego4d"
 MANIFEST_BUCKET = "ego4d-consortium-sharing"
 METADATA_KEY = "public/v2/ego4d.json"
 CLIPS_MANIFEST_KEY = "public/v2/clips/manifest.csv"
 def timed_narrations_path() -> Path:
-    return Path(config.DATA_DIR) / "ego4d" / "timed_narrations.jsonl"
+    return Path(config.MEDIA_DATA_DIR) / "ego4d" / "timed_narrations.jsonl"
 
 # Header do csv que o sidecar espera (ver sidecar.build_imu_csv).
 IMU_HDR = ["t", "ax", "ay", "az", "wx", "wy", "wz"]

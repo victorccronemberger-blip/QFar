@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import threading
 
 from .server import create_app
 
@@ -49,10 +51,33 @@ def _harden_stdio() -> None:
             setattr(sys, name, _SafeStream(stream))
 
 
+def _watch_parent(parent_pid: int | None) -> None:
+    """Encerra o serviço congelado assim que o desktop que o iniciou terminar."""
+    if not parent_pid or parent_pid <= 0 or os.name != "nt":
+        return
+
+    def wait_for_parent() -> None:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        synchronize = 0x00100000
+        handle = kernel32.OpenProcess(synchronize, False, int(parent_pid))
+        if not handle:
+            os._exit(0)
+        try:
+            kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        finally:
+            kernel32.CloseHandle(handle)
+        os._exit(0)
+
+    threading.Thread(target=wait_for_parent, daemon=True,
+                     name="qmoney-parent-watch").start()
+
+
 def run_webui(host: str = "127.0.0.1", port: int = 8876,
-              open_browser: bool = False) -> None:
+              open_browser: bool = False, parent_pid: int | None = None) -> None:
     """Sobe o servico local. ``open_browser`` e mantido apenas por compatibilidade."""
     _harden_stdio()
+    _watch_parent(parent_pid)
     print(f"QMoney service em http://{host}:{port}  (Ctrl+C para sair)")
     _serve(create_app(), host, port, False)
 
@@ -76,8 +101,10 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--porta", "--port", type=int, default=8876)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--parent-pid", type=int, default=0)
     args = parser.parse_args()
-    run_webui(host=args.host, port=args.porta, open_browser=not args.no_browser)
+    run_webui(host=args.host, port=args.porta, open_browser=not args.no_browser,
+              parent_pid=args.parent_pid or None)
 
 
 __all__ = ["create_app", "main", "run_webui"]

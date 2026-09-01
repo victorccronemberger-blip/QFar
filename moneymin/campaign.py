@@ -1159,7 +1159,7 @@ def _cleanup_uploaded_item(
 
 def cleanup_media_cache(work_dir: Path | None = None) -> dict[str, Any]:
     """Limpa downloads/derivados, preservando catálogos e estado da campanha."""
-    work = Path(work_dir or config.DATA_DIR / "ego4d")
+    work = Path(work_dir or config.MEDIA_DATA_DIR / "ego4d")
     candidates: list[Path] = []
     if work.is_dir():
         for path in work.iterdir():
@@ -2149,9 +2149,9 @@ def _rank_cache_path() -> Path:
 def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
     """Assinatura portátil dos arquivos que alimentam o ranking."""
     files = (
-        config.DATA_DIR / "ego4d" / "ego4d.json",
-        config.DATA_DIR / "ego4d" / "clip_narrations.json",
-        config.DATA_DIR / "ego4d" / "timed_narrations.jsonl",
+        config.MEDIA_DATA_DIR / "ego4d" / "ego4d.json",
+        config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json",
+        config.MEDIA_DATA_DIR / "ego4d" / "timed_narrations.jsonl",
         Path(ego4d.__file__),
         Path(task_matching.__file__),
     )

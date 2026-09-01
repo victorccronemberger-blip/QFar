@@ -1,6 +1,13 @@
 <RCC>
   <qresource prefix="/qmoney">
     <file alias="icon.png">qmoney-icon.png</file>
+    <file alias="icons/home.svg">icons/home.svg</file>
+    <file alias="icons/readiness.svg">icons/readiness.svg</file>
+    <file alias="icons/play.svg">icons/play.svg</file>
+    <file alias="icons/bolt.svg">icons/bolt.svg</file>
+    <file alias="icons/users.svg">icons/users.svg</file>
+    <file alias="icons/wallet.svg">icons/wallet.svg</file>
+    <file alias="icons/history.svg">icons/history.svg</file>
     <file alias="theme-light.json">theme-light.json</file>
     <file alias="theme-dark.json">theme-dark.json</file>
   </qresource>

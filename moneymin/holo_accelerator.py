@@ -30,7 +30,7 @@ def stop_path() -> Path:
 def native_path(clip: dict[str, Any], work_dir: Path | None = None) -> Path:
     video_name = str(clip["video_name"])
     safe_stem = "holoassist_" + video_name.replace("/", "_").replace("\\", "_")
-    return Path(work_dir or config.DATA_DIR / "ego4d") / f"{safe_stem}_native.mp4"
+    return Path(work_dir or config.MEDIA_DATA_DIR / "ego4d") / f"{safe_stem}_native.mp4"
 
 
 def source_path(clip: dict[str, Any]) -> Path:
@@ -117,7 +117,7 @@ def warm_cache(
     # Import tardio evita ciclo: campaign importa holoassist.
     from .campaign import prepare_holoassist_clip
 
-    work = Path(work_dir or config.DATA_DIR / "ego4d")
+    work = Path(work_dir or config.MEDIA_DATA_DIR / "ego4d")
     work.mkdir(parents=True, exist_ok=True)
     clips = eligible_clips(
         task, min_dur_s=min_dur_s, max_dur_s=max_dur_s, limit=limit)

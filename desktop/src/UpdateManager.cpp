@@ -13,11 +13,59 @@
 #include <QStandardPaths>
 #include <QVersionNumber>
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <bcrypt.h>
+#include <wincrypt.h>
+#endif
+
 namespace {
 constexpr auto kLatestRelease =
     "https://api.github.com/repos/victorccronemberger-blip/QFar/releases/latest";
 constexpr auto kPackageName = "QMoney-windows-x64.zip";
 constexpr auto kChecksumName = "QMoney-windows-x64.zip.sha256";
+constexpr auto kSignatureName = "QMoney-windows-x64.zip.sig";
+constexpr auto kPublicKeyDerBase64 =
+    "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAzJmeC3IlDgbZMJMyHKWS8wKg"
+    "Gn7zQbbzPN6cjYEmbfymGEYjuCdOKgedRb90y7ne5+3jDpeSfSgGNePoglxr/u7FEr8+"
+    "BSPFYqXXGN62+58vL7OZi71hz4ZmX3UkEvfi0v0K03rWZVgvYim+KcoWbd/uZLMqBSoj"
+    "uVEujgCK7tlA9JerfR2ECm68/vVS+Y5S12bmdpPrqG8v7BiUD9bip0pUb/oGw/R8i14l"
+    "JZ4cOaTS/Kj1u4mbNKX4rByucUYGTMCiKdXJFrUEgG0ERKGYtT4ckCVeGgT2+q4Q9AQE"
+    "cd3WOx5idUw2qAMl1htQwNnOM4bfjCzkfeAbAtFh00xcvo2P8x/xiNvRjQkBF3+JRpJY"
+    "pd3pcFYKuxW590OW/An4x8HcA8Ja5l4pNMFnSy2dDIq7+QUY6URhj4tFhabmTIXoVlGm"
+    "bo9hTAbPQKbYrEluiFtyFDqo0djg+VJeS3tVgZ2b1v8Hc8UMuot+Aa0AJwE45wHTh12m"
+    "qjgADgHiSY0VAgMBAAE=";
+
+bool verifySignature(const QByteArray& hash, const QByteArray& signature) {
+#ifdef Q_OS_WIN
+  const QByteArray der = QByteArray::fromBase64(QByteArray(kPublicKeyDerBase64));
+  CERT_PUBLIC_KEY_INFO* info = nullptr;
+  DWORD infoSize = 0;
+  if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO,
+                           reinterpret_cast<const BYTE*>(der.constData()),
+                           static_cast<DWORD>(der.size()),
+                           CRYPT_DECODE_ALLOC_FLAG, nullptr, &info, &infoSize))
+    return false;
+  BCRYPT_KEY_HANDLE key = nullptr;
+  const BOOL imported = CryptImportPublicKeyInfoEx2(
+      X509_ASN_ENCODING, info, 0, nullptr, &key);
+  LocalFree(info);
+  if (!imported || !key) return false;
+  BCRYPT_PKCS1_PADDING_INFO padding{BCRYPT_SHA256_ALGORITHM};
+  const NTSTATUS status = BCryptVerifySignature(
+      key, &padding,
+      reinterpret_cast<PUCHAR>(const_cast<char*>(hash.constData())),
+      static_cast<ULONG>(hash.size()),
+      reinterpret_cast<PUCHAR>(const_cast<char*>(signature.constData())),
+      static_cast<ULONG>(signature.size()), BCRYPT_PAD_PKCS1);
+  BCryptDestroyKey(key);
+  return status >= 0;
+#else
+  Q_UNUSED(hash)
+  Q_UNUSED(signature)
+  return false;
+#endif
+}
 
 QNetworkRequest requestFor(const QUrl& url) {
   QNetworkRequest request(url);
@@ -37,6 +85,11 @@ QString normalizedVersion(QString value) {
 }  // namespace
 
 UpdateManager::UpdateManager(QObject* parent) : QObject(parent) {}
+
+bool UpdateManager::verifyHashSignature(const QByteArray& hash,
+                                        const QByteArray& signature) {
+  return verifySignature(hash, signature);
+}
 
 void UpdateManager::check(bool interactive) {
   if (_busy) return;
@@ -68,12 +121,14 @@ void UpdateManager::check(bool interactive) {
     _notes = release.value(QStringLiteral("body")).toString().left(12000);
     _packageUrl = QUrl();
     _checksumUrl = QUrl();
+    _signatureUrl = QUrl();
     for (const QJsonValue& value : release.value(QStringLiteral("assets")).toArray()) {
       const QJsonObject asset = value.toObject();
       const QString name = asset.value(QStringLiteral("name")).toString();
       const QUrl url(asset.value(QStringLiteral("browser_download_url")).toString());
       if (name == QString::fromLatin1(kPackageName)) _packageUrl = url;
       if (name == QString::fromLatin1(kChecksumName)) _checksumUrl = url;
+      if (name == QString::fromLatin1(kSignatureName)) _signatureUrl = url;
     }
 
     const QVersionNumber latest = QVersionNumber::fromString(_version);
@@ -85,8 +140,8 @@ void UpdateManager::check(bool interactive) {
       emit checkFinished(false, _interactive);
       return;
     }
-    if (!_packageUrl.isValid() || !_checksumUrl.isValid())
-      return fail(QStringLiteral("A versão %1 não contém o pacote e o checksum obrigatórios.").arg(_version));
+    if (!_packageUrl.isValid() || !_checksumUrl.isValid() || !_signatureUrl.isValid())
+      return fail(QStringLiteral("A versão %1 não contém pacote, checksum e assinatura obrigatórios.").arg(_version));
 
     _busy = false;
     emit statusChanged(QStringLiteral("Atualização %1 disponível.").arg(_version));
@@ -114,6 +169,22 @@ void UpdateManager::fetchChecksum() {
     const auto match = re.match(QString::fromUtf8(payload));
     if (!match.hasMatch()) return fail(QStringLiteral("Checksum SHA-256 inválido na versão publicada."));
     _expectedSha256 = match.captured(1).toLower();
+    fetchSignature();
+  });
+}
+
+void UpdateManager::fetchSignature() {
+  emit statusChanged(QStringLiteral("Verificando assinatura da versão…"));
+  auto* reply = _network.get(requestFor(_signatureUrl));
+  connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    const QByteArray payload = reply->readAll().trimmed();
+    const QString networkError = reply->errorString();
+    const bool failed = reply->error() != QNetworkReply::NoError;
+    reply->deleteLater();
+    if (failed) return fail(QStringLiteral("Falha ao baixar a assinatura: %1").arg(networkError));
+    _signature = QByteArray::fromBase64(payload);
+    if (_signature.size() < 256)
+      return fail(QStringLiteral("A assinatura da atualização é inválida."));
     fetchPackage();
   });
 }
@@ -155,9 +226,13 @@ void UpdateManager::fetchPackage() {
       QFile::remove(_packagePath);
       return fail(QStringLiteral("A atualização foi recusada: o SHA-256 não confere."));
     }
+    if (!verifyHashSignature(QByteArray::fromHex(actual.toLatin1()), _signature)) {
+      QFile::remove(_packagePath);
+      return fail(QStringLiteral("A atualização foi recusada: assinatura RSA não reconhecida."));
+    }
 
     _busy = false;
-    emit statusChanged(QStringLiteral("Atualização verificada e pronta para instalar."));
+    emit statusChanged(QStringLiteral("Atualização autenticada e pronta para instalar."));
     emit installReady(_packagePath);
   });
 }

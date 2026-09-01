@@ -57,6 +57,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import platform
+import shutil
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -65,7 +69,10 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 
-from .. import campaign, config, crowtado, holo_accelerator, holoassist, sent_registry
+from .. import (
+    campaign, config, crowtado, holo_accelerator, holoassist, readiness,
+    sent_registry,
+)
 from ..atomic_io import load_json, save_json
 from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
@@ -81,6 +88,56 @@ _WITHDRAW_LOCK = threading.Lock()
 _WITHDRAW_IN_FLIGHT: set[str] = set()
 _WITHDRAW_LAST_REQUEST: dict[str, float] = {}
 _WITHDRAW_COOLDOWN_S = 60.0
+
+
+def _tree_size(path: Path) -> tuple[int, int]:
+    """Tamanho/arquivos sem seguir links; falhas pontuais não quebram o painel."""
+    total = files = 0
+    if not path.exists():
+        return total, files
+    try:
+        for root, _, names in os.walk(path, followlinks=False):
+            for name in names:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                    files += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return total, files
+
+
+def _storage_snapshot(*, include_path: bool = True) -> dict[str, Any]:
+    data_bytes, data_files = _tree_size(config.MEDIA_DATA_DIR)
+    ego_bytes, ego_files = _tree_size(config.MEDIA_DATA_DIR / "ego4d")
+    holo_bytes, holo_files = _tree_size(config.MEDIA_DATA_DIR / "holoassist")
+    try:
+        usage = shutil.disk_usage(config.LIBRARY_ROOT)
+        free_bytes, total_bytes = usage.free, usage.total
+    except OSError:
+        free_bytes = total_bytes = 0
+    result: dict[str, Any] = {
+        "ready": (
+            (config.MEDIA_DATA_DIR / "ego4d" / "timed_narrations.jsonl").exists()
+            or (config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json").exists()
+            or (config.MEDIA_DATA_DIR / "holoassist").exists()
+        ),
+        "data_bytes": data_bytes,
+        "data_files": data_files,
+        "ego4d_bytes": ego_bytes,
+        "ego4d_files": ego_files,
+        "holoassist_bytes": holo_bytes,
+        "holoassist_files": holo_files,
+        "free_bytes": free_bytes,
+        "disk_bytes": total_bytes,
+    }
+    if include_path:
+        result.update({
+            "root": str(config.LIBRARY_ROOT),
+            "data_dir": str(config.MEDIA_DATA_DIR),
+        })
+    return result
 
 
 # --- preferências ------------------------------------------------------------
@@ -448,6 +505,63 @@ def create_app() -> Flask:
             _save_prefs(prefs)
         return jsonify(prefs)
 
+    # -- prontidão, biblioteca e diagnóstico -----------------------------------
+    @app.get("/api/readiness")
+    def get_readiness():
+        try:
+            provider = campaign.normalize_dataset_provider(
+                request.args.get("dataset")
+            )
+            result = readiness.campaign_readiness(provider)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        result["storage"] = _storage_snapshot(include_path=False)
+        return jsonify(result)
+
+    @app.get("/api/storage/library")
+    def get_storage_library():
+        return jsonify(_storage_snapshot(include_path=True))
+
+    @app.get("/api/diagnostics")
+    def get_diagnostics():
+        """Relatório deliberadamente sem emails, tokens, senhas ou URLs privadas."""
+        try:
+            ready = readiness.campaign_readiness("all")
+        except Exception as exc:  # noqa: BLE001 — diagnóstico precisa continuar
+            ready = {
+                "ready": False,
+                "provider": "all",
+                "checks": [{
+                    "name": "Diagnóstico de prontidão",
+                    "status": "error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }],
+            }
+        campaign_state = RUNNER.snapshot()
+        return jsonify({
+            "schema": 1,
+            "generated_at": int(time.time()),
+            "service": {
+                "app_version": os.environ.get("QMONEY_APP_VERSION", "unknown"),
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "frozen": bool(getattr(sys, "frozen", False)),
+            },
+            "accounts": {"configured": len(_list_accounts())},
+            "readiness": ready,
+            "storage": _storage_snapshot(include_path=False),
+            "runners": {
+                "campaign": {
+                    "state": campaign_state.get("state"),
+                    "totals": campaign_state.get("totals"),
+                    "has_error": bool(campaign_state.get("error")),
+                },
+                "balances": {"state": BALANCES_RUNNER.state},
+                "holo_cache": {"state": HOLO_CACHE_RUNNER.state},
+            },
+            "history": {"campaign_logs": len(campaign.list_campaign_logs())},
+        })
+
     # -- acelerador HoloAssist -------------------------------------------------
     @app.get("/api/holo-cache")
     def holo_cache_status():
@@ -543,10 +657,135 @@ def create_app() -> Flask:
                 return jsonify({
                     "error": "pare a campanha e o acelerador antes de limpar a mídia",
                 }), 409
-            result = campaign.cleanup_media_cache(config.DATA_DIR / "ego4d")
+            result = campaign.cleanup_media_cache(config.MEDIA_DATA_DIR / "ego4d")
         return jsonify({"ok": not result["errors"], **result})
 
     # -- campanha ---------------------------------------------------------------
+    @app.post("/api/campaigns/preflight")
+    def campaign_preflight():
+        """Valida a operação inteira sem baixar, preparar ou enviar mídia."""
+        body = request.get_json(silent=True) or {}
+        blockers: list[str] = []
+        warnings: list[str] = []
+        if RUNNER.running:
+            blockers.append("já existe uma campanha em andamento")
+        if HOLO_CACHE_RUNNER.running:
+            blockers.append("o acelerador HoloAssist está em execução")
+        try:
+            provider = campaign.normalize_dataset_provider(body.get("dataset"))
+            min_dur_s, max_dur_s = _parse_duration_range(body)
+            count = max(1, min(int(body.get("count", 1)), 200))
+            target_hours = max(0.0, min(float(body.get("target_hours") or 0), 12.0))
+        except (TypeError, ValueError, OverflowError) as exc:
+            return jsonify({"error": f"parâmetros inválidos: {exc}"}), 400
+
+        emails = [str(e).strip() for e in body.get("accounts", []) if str(e).strip()]
+        raw_tasks = body.get("tasks", [])
+        if not emails:
+            blockers.append("selecione ao menos uma conta")
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            blockers.append("selecione ao menos uma categoria")
+        known = {account["email"] for account in _list_accounts()}
+        missing_accounts = [email for email in emails if email not in known]
+        if missing_accounts:
+            blockers.append("há contas sem token salvo")
+
+        accounts: list[AccountSpec] = []
+        account_errors: list[str] = []
+        if emails and not missing_accounts:
+            resolved: list[AccountSpec | None] = [None] * len(emails)
+            with ThreadPoolExecutor(max_workers=max(1, min(6, len(emails)))) as pool:
+                futures = {pool.submit(_resolve_org, email): i
+                           for i, email in enumerate(emails)}
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        resolved[index] = AccountSpec(emails[index], future.result())
+                    except (AuthError, RuntimeError, OSError) as exc:
+                        account_errors.append(f"{emails[index]}: {exc}")
+            accounts = [account for account in resolved if account is not None]
+            if account_errors:
+                blockers.append(f"{len(account_errors)} conta(s) não autenticaram")
+
+        selected: list[dict[str, Any]] = []
+        unavailable: list[str] = []
+        if accounts and raw_tasks:
+            try:
+                catalog = campaign.available_tasks(
+                    accounts[0].email, accounts[0].org_key,
+                    min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                    include_unavailable=True, dataset_provider=provider)
+            except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+                blockers.append(f"catálogo indisponível: {exc}")
+                catalog = []
+            by_id = {str(item.get("id")): item for item in catalog if item.get("id")}
+            seen: set[str] = set()
+            for raw in raw_tasks:
+                task_id = str(raw.get("task_id", "")).strip() if isinstance(raw, dict) else ""
+                item = by_id.get(task_id)
+                if not task_id or item is None:
+                    blockers.append("uma categoria selecionada não está mais disponível")
+                    continue
+                if task_id in seen:
+                    continue
+                seen.add(task_id)
+                label = str(item.get("name_pt") or item.get("name") or task_id)
+                if item.get("available_for_duration") is False:
+                    unavailable.append(label)
+                    continue
+                selected.append(item)
+
+            selected_ids = {str(item.get("id")) for item in selected}
+            for account in accounts[1:]:
+                try:
+                    sess = Session.from_email(account.email)
+                    sess.ensure_auth()
+                    account_ids = {
+                        str(item.get("id")) for item in sess.all_tasks(account.org_key)
+                        if item.get("id")
+                    }
+                except (AuthError, RuntimeError, OSError) as exc:
+                    blockers.append(f"preflight falhou para {account.email}: {exc}")
+                    continue
+                missing = selected_ids - account_ids
+                if missing:
+                    blockers.append(
+                        f"{account.email} não possui {len(missing)} categoria(s) selecionada(s)"
+                    )
+
+        if unavailable:
+            warnings.append(f"{len(unavailable)} categoria(s) sem clipe na duração escolhida")
+        if raw_tasks and not selected:
+            blockers.append("nenhuma categoria selecionada possui clipe compatível")
+
+        clip_count = sum(int(item.get("clip_count") or 0) for item in selected)
+        if target_hours > 0:
+            estimated_sends = max(1, math.ceil(target_hours * 4)) * len(accounts)
+        else:
+            estimated_sends = len(selected) * count * len(accounts)
+        try:
+            ready = readiness.campaign_readiness(provider)
+        except Exception as exc:  # noqa: BLE001 — ainda devolve os outros checks
+            ready = {"ready": False, "checks": [], "error": str(exc)}
+        storage = _storage_snapshot(include_path=False)
+        if storage.get("free_bytes", 0) < 10 * 1024 ** 3:
+            warnings.append("há menos de 10 GiB livres na unidade da biblioteca")
+
+        return jsonify({
+            "ok": not blockers,
+            "provider": provider,
+            "accounts": {"selected": len(emails), "validated": len(accounts)},
+            "tasks": {"selected": len(raw_tasks), "compatible": len(selected)},
+            "clips": clip_count,
+            "estimated_sends": estimated_sends,
+            "target_hours": target_hours,
+            "blockers": blockers,
+            "warnings": warnings,
+            "account_errors": account_errors,
+            "readiness": ready,
+            "storage": storage,
+        }), 200
+
     @app.post("/api/campaigns")
     def start_campaign():
         if RUNNER.running:
@@ -729,7 +968,7 @@ def create_app() -> Flask:
         account_workers = min(len(accounts), campaign.max_account_workers())
 
         cfg = CampaignConfig(accounts=accounts, tasks=tasks,
-                             work_dir=config.DATA_DIR / "ego4d",
+                             work_dir=config.MEDIA_DATA_DIR / "ego4d",
                              timeout_blob=campaign.DEFAULT_TIMEOUT_BLOB,
                              evaluate=True, finalize=True,
                              delay_mode=delay_mode, delay_s=delay_s,

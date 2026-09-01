@@ -142,7 +142,7 @@ def build_package(
         raise FileNotFoundError(f"vídeo não encontrado: {video_path}")
 
     slug = video_path.stem
-    out_dir = (out_root or (config.DATA_DIR / "output")) / slug
+    out_dir = (out_root or (config.MEDIA_DATA_DIR / "output")) / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
     dst = out_dir / video_path.name

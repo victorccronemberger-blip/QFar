@@ -69,4 +69,25 @@ Remove-Item $Zip -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path "$Package\*" -DestinationPath $Zip -CompressionLevel Optimal
 $Hash = (Get-FileHash $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
 "$Hash  QMoney-windows-x64.zip" | Set-Content "$Zip.sha256" -Encoding ascii
+$SigningKey = if ($env:QMONEY_SIGNING_KEY) {
+    $env:QMONEY_SIGNING_KEY
+} else {
+    "$ProjectRoot\secrets\qmoney_update_private.pem"
+}
+if (-not (Test-Path -LiteralPath $SigningKey)) {
+    throw "Chave RSA de atualização ausente. Configure QMONEY_SIGNING_KEY."
+}
+$Rsa = [System.Security.Cryptography.RSA]::Create()
+try {
+    $Rsa.ImportFromPem([System.IO.File]::ReadAllText($SigningKey))
+    $Signature = $Rsa.SignHash(
+        [Convert]::FromHexString($Hash),
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    [System.IO.File]::WriteAllText(
+        "$Zip.sig", [Convert]::ToBase64String($Signature),
+        [System.Text.Encoding]::ASCII)
+} finally {
+    $Rsa.Dispose()
+}
 Write-Host "Pacote pronto: $Zip"

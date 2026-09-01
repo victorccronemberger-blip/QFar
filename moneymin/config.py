@@ -23,10 +23,12 @@ from pathlib import Path
 CODE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 ROOT = Path(os.environ.get("QMONEY_USER_ROOT", CODE_ROOT)).expanduser().resolve()
 RUNTIME_ROOT = Path(os.environ.get("QMONEY_RUNTIME_ROOT", CODE_ROOT)).expanduser().resolve()
+LIBRARY_ROOT = Path(os.environ.get("QMONEY_LIBRARY_ROOT", ROOT)).expanduser().resolve()
 
 DATA_DIR = ROOT / "data"
-VIDEOS_DIR = DATA_DIR / "videos"
-MANIFESTS_DIR = DATA_DIR / "manifests"
+MEDIA_DATA_DIR = LIBRARY_ROOT / "data"
+VIDEOS_DIR = MEDIA_DATA_DIR / "videos"
+MANIFESTS_DIR = MEDIA_DATA_DIR / "manifests"
 SECRETS_DIR = ROOT / "secrets"
 REFERENCE_DIR = CODE_ROOT / "reference"
 OPENAPI_PATH = REFERENCE_DIR / "openapi.json"

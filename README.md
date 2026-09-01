@@ -17,14 +17,16 @@ oferecerá a instalação, validará o SHA-256 e abrirá novamente após conclui
 
 ## Publicação
 
-Cada Release precisa conter exatamente estes dois arquivos:
+Cada Release precisa conter exatamente estes três arquivos:
 
 - `QMoney-windows-x64.zip`
 - `QMoney-windows-x64.zip.sha256`
+- `QMoney-windows-x64.zip.sig` (assinatura RSA-3072)
 
-O workflow `Build e publicar QMoney` gera os dois automaticamente quando uma
-Release é publicada no GitHub. A versão do aplicativo vem da tag, por exemplo
-`v1.1.0`.
+O workflow `Build e publicar QMoney` gera os três automaticamente quando uma
+Release é publicada no GitHub. Configure o secret `QMONEY_UPDATE_PRIVATE_KEY`
+com a chave privada correspondente à chave pública embutida no aplicativo. A
+versão vem da tag, por exemplo `v1.1.0`.
 
 Para montar uma versão local, com Qt e FFmpeg já disponíveis na árvore:
 

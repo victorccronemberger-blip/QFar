@@ -56,6 +56,7 @@ if(MSVC)
 endif()
 if(WIN32)
   target_link_libraries(QMoneyUpdater PRIVATE shell32)
+  target_link_libraries(QMoney PRIVATE bcrypt crypt32)
 endif()
 
 target_link_libraries(QMoney PRIVATE

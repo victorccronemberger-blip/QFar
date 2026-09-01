@@ -151,7 +151,7 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
                 ))
 
     if selected in {"ego4d", "all"}:
-        ego_dir = config.DATA_DIR / "ego4d"
+        ego_dir = config.MEDIA_DATA_DIR / "ego4d"
         catalog_ok = (
             (ego_dir / "ego4d.json").exists()
             and (ego_dir / "clips.csv").exists()
