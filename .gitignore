@@ -1,0 +1,61 @@
+# Segredos — NUNCA comitar
+secrets/
+.env
+token_*.json
+
+# Dados locais (baixados / gerados / estado da conta) — nunca publicar
+data/
+
+# Credenciais e artefatos locais na raiz
+contas_crowtado_minute.txt
+wg_qr.png
+mitmproxy-ca.pem
+*.pem
+APK/
+*.xapk
+*.log
+/Minute
+
+# Material de engenharia reversa (binários grandes)
+research/reverse_engineering/apk/
+research/reverse_engineering/jadx_output/
+research/reverse_engineering/logs/
+research/reverse_engineering/captured_requests/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+
+# Binários baixados pelo INSTALAR_TUDO.bat (ffmpeg, instalador python) — só locais
+tools/
+
+# Artefatos locais de build, análise e renderização
+build/
+dist/
+build-debug/
+build-release/
+.qt/
+tmp/
+.zcode/
+research/tools/
+vendor/
+release/
+packaging/*.spec
+
+# Utilitários e documentação herdados do projeto operacional local
+docs/
+scripts/*
+!scripts/build_release.ps1
+*.bat
+HowUseMe.md
+PARA_RODAR_NO_DESTINO.md
+README_QMONEY.md
+VERIFICAR_CAMPANHA.bat

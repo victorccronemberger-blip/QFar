@@ -1,0 +1,22 @@
+[project]
+name = "moneymin"
+version = "0.3.0"
+description = "Preparar vídeos egocêntricos de datasets documentados e enquadrá-los nas categorias/tarefas do app Minute."
+requires-python = ">=3.10"
+dependencies = ["flask>=3", "curl_cffi>=0.11", "playwright>=1.52"]
+
+[project.optional-dependencies]
+ego4d = ["boto3>=1.34", "ego4d>=1.7.3"]
+
+[project.scripts]
+moneymin = "moneymin.web:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["moneymin*"]
+
+[tool.setuptools.package-data]
+moneymin = ["*.json", "resources/holoassist/*.json.gz"]

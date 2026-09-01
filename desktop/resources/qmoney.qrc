@@ -1,0 +1,7 @@
+<RCC>
+  <qresource prefix="/qmoney">
+    <file alias="icon.png">qmoney-icon.png</file>
+    <file alias="theme-light.json">theme-light.json</file>
+    <file alias="theme-dark.json">theme-dark.json</file>
+  </qresource>
+</RCC>

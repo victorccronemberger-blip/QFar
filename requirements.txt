@@ -1,0 +1,11 @@
+# Dependências do fluxo completo: interface web, criador de contas,
+# provedores de dataset e transporte HTTP compatível com o aplicativo.
+flask>=3
+playwright>=1.52
+boto3>=1.34
+ego4d>=1.7.3
+curl_cffi>=0.11
+#
+# FFmpeg/FFprobe: não precisa de instalação manual. No Windows o
+# INSTALAR_TUDO.bat baixa e extrai automaticamente em tools/ffmpeg/ e o código
+# detecta (moneymin/sidecar.py). Fallbacks: ffmpeg no PATH ou imageio-ffmpeg.
