@@ -33,6 +33,7 @@
 #include <QPlainTextEdit>
 #include <QPixmap>
 #include <QProgressBar>
+#include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QScrollArea>
@@ -51,6 +52,21 @@
 #include <oclero/qlementine/style/QlementineStyle.hpp>
 
 namespace {
+void terminatePackagedServiceTree() {
+#ifdef Q_OS_WIN
+  // Uma distribuição PyInstaller --onefile mantém um processo filho vivo. As
+  // primeiras versões do QMoney encerravam apenas o bootloader durante a
+  // atualização; o filho antigo continuava atendendo a porta 8876 e a nova
+  // interface acabava conectada ao motor errado. Como a interface é de
+  // instância única, não existe outro serviço legítimo que deva sobreviver.
+  const int result = QProcess::execute(
+      QStringLiteral("taskkill.exe"),
+      {QStringLiteral("/IM"), QStringLiteral("QMoneyService.exe"),
+       QStringLiteral("/T"), QStringLiteral("/F")});
+  if (result == 0) qInfo() << "QMoney: serviço local anterior encerrado";
+#endif
+}
+
 QString jsonId(const QJsonValue& value) {
   if (value.isString()) return value.toString();
   if (value.isDouble()) return QString::number(value.toDouble(), 'f', 0);
@@ -1419,6 +1435,7 @@ void MainWindow::startBackend() {
   QString workingDirectory;
   QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
   if (QFileInfo::exists(packagedService)) {
+    terminatePackagedServiceTree();
     program = packagedService;
     arguments = {QStringLiteral("--no-browser"), QStringLiteral("--porta"),
                  QStringLiteral("8876"), QStringLiteral("--parent-pid"),
@@ -1506,13 +1523,6 @@ void MainWindow::restartBackend() {
   _backendRestarts = 0;
   _restartingBackend = true;
   stopBackend();
-#ifdef Q_OS_WIN
-  // O executável PyInstaller usa bootloader + processo filho; encerre a árvore
-  // antiga antes de religar com outra biblioteca.
-  QProcess::execute(QStringLiteral("taskkill"),
-                    {QStringLiteral("/IM"), QStringLiteral("QMoneyService.exe"),
-                     QStringLiteral("/T"), QStringLiteral("/F")});
-#endif
   QTimer::singleShot(350, this, [this] {
     _restartingBackend = false;
     startBackend();
@@ -1521,12 +1531,21 @@ void MainWindow::restartBackend() {
 
 void MainWindow::probeBackend() {
   ++_probeAttempts;
-  _api.get(QStringLiteral("/api/accounts"), [this](bool ok, const QJsonDocument&, const QString&) {
-    if (ok) {
+  _api.get(QStringLiteral("/api/diagnostics"),
+           [this](bool ok, const QJsonDocument& document, const QString&) {
+    const QString serviceVersion = document.object()
+                                       .value(QStringLiteral("service"))
+                                       .toObject()
+                                       .value(QStringLiteral("app_version"))
+                                       .toString();
+    const bool compatible = ok && serviceVersion == QCoreApplication::applicationVersion();
+    if (compatible) {
       _backendProbe.stop();
       _backendRestarts = 0;
       setBackendReady(true);
       refreshCurrentPage();
+    } else if (ok && !serviceVersion.isEmpty()) {
+      setBackendReady(false, QStringLiteral("Ajustando versão do motor…"));
     } else if (_probeAttempts > 22) {
       _backendProbe.stop();
       setBackendReady(false, QStringLiteral("Serviço indisponível"));
