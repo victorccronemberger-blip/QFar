@@ -19,6 +19,7 @@ Regras de ouro (não descumprir):
 from __future__ import annotations
 
 import datetime
+import gzip
 import hashlib
 import json
 import os
@@ -1500,23 +1501,28 @@ def run_campaign(
                 emails = [a.email for a in config.accounts]
                 shorts: list[dict[str, Any]] = []
                 if dataset_provider in ("all", "ego4d"):
-                    if (tsk.task_name and task_matching.rule_for(tsk.task_name)
-                            and ego4d.has_timed_narrations()):
-                        # Trechos contínuos da tarefa no vídeo-pai (narração com
-                        # timestamp). O clipe oficial mistura 10–20 min de ações.
-                        shorts = ego4d.list_task_spans(
-                            tsk.task_name, min_dur_s=tsk.min_dur_s,
-                            max_dur_s=tsk.max_dur_s)
+                    if tsk.task_name and task_matching.rule_for(tsk.task_name):
+                        if ego4d.has_timed_narrations():
+                            # Biblioteca completa: calcula trechos diretamente
+                            # das narrações temporizadas licenciadas.
+                            shorts = ego4d.list_task_spans(
+                                tsk.task_name, min_dur_s=tsk.min_dur_s,
+                                max_dur_s=tsk.max_dur_s)
+                        else:
+                            # Instalação nova: usa o índice portátil mínimo. A
+                            # mídia e a IMU continuam sendo baixadas sob demanda
+                            # com a credencial Ego4D do próprio usuário.
+                            shorts = [
+                                clip for clip in _compatible_task_clips(
+                                    tsk.task_name, "ego4d")
+                                if tsk.min_dur_s <= float(clip.get("dur_s") or 0)
+                                <= tsk.max_dur_s
+                            ]
                     else:
                         shorts = ego4d.list_clips(
-                            scenario=None if (
-                                tsk.task_name and task_matching.rule_for(tsk.task_name)
-                            ) else tsk.scenario,
+                            scenario=tsk.scenario,
                             min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
                             gopro_minor=tsk.gopro_minor, max_results=None)
-                        if tsk.task_name and task_matching.rule_for(tsk.task_name):
-                            shorts = task_matching.ranked_clips(
-                                tsk.task_name, shorts, tsk.task_description)
                 if tsk.task_name and dataset_provider in ("all", "holoassist"):
                     try:
                         strict_holoassist = holoassist.list_clips(
@@ -2145,6 +2151,42 @@ def _rank_cache_path() -> Path:
     return config.DATA_DIR / "task_rank_cache.pkl"
 
 
+def _rank_seed_path() -> Path:
+    """Índice portátil mínimo distribuído com o motor local."""
+    return Path(__file__).with_name("resources") / "ego4d_task_rank_seed.json.gz"
+
+
+@lru_cache(maxsize=1)
+def _load_rank_seed() -> dict[str, tuple[dict[str, Any], ...]] | None:
+    """Carrega IDs e janelas; o arquivo não contém mídia, segredo ou narração."""
+    path = _rank_seed_path()
+    try:
+        payload = json.loads(gzip.decompress(path.read_bytes()))
+    except (OSError, ValueError, TypeError, gzip.BadGzipFile):
+        return None
+    if payload.get("schema") != 1 or not isinstance(payload.get("tasks"), dict):
+        return None
+    result: dict[str, tuple[dict[str, Any], ...]] = {}
+    for name, items in payload["tasks"].items():
+        if not isinstance(name, str) or not isinstance(items, list):
+            return None
+        valid: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                return None
+            try:
+                duration = float(item.get("dur_s") or 0)
+            except (TypeError, ValueError):
+                return None
+            if (not item.get("clip_uid") or not item.get("parent_video_uid")
+                    or not str(item.get("s3_path") or "").startswith("s3://")
+                    or duration < 60):
+                return None
+            valid.append(dict(item))
+        result[name] = tuple(valid)
+    return result
+
+
 @lru_cache(maxsize=1)
 def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
     """Assinatura portátil dos arquivos que alimentam o ranking."""
@@ -2219,6 +2261,9 @@ def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
     if ego4d.has_timed_narrations():
         buckets = ego4d.rank_all_task_spans()
     else:
+        seed = _load_rank_seed()
+        if seed is not None:
+            return seed
         buckets = task_matching.rank_all_tasks(_task_candidates())
     result = {name: tuple(items) for name, items in buckets.items()}
     _save_rank_cache(result)
