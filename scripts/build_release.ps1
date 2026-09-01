@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.0.4",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [string]$BuildDir = "$PSScriptRoot\..\build-release",
     [string]$OutputDir = "$PSScriptRoot\..\release"
@@ -11,18 +11,6 @@ $QtRoot = (Resolve-Path $QtRoot).Path
 $MingwBin = (Resolve-Path "$ProjectRoot\.qt\Tools\mingw1310_64\bin").Path
 $env:PATH = "$MingwBin;$QtRoot\bin;$env:PATH"
 $env:QMONEY_VERSION = $Version
-
-cmake -S "$ProjectRoot\desktop" -B $BuildDir -G Ninja `
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$QtRoot
-cmake --build $BuildDir --config Release --parallel
-
-$Package = Join-Path $OutputDir "QMoney"
-New-Item -ItemType Directory -Force $Package | Out-Null
-New-Item -ItemType Directory -Force "$Package\runtime" | Out-Null
-Copy-Item "$BuildDir\QMoney.exe" $Package -Force
-Copy-Item "$BuildDir\QMoneyUpdater.exe" $Package -Force
-& "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler `
-    --no-opengl-sw "$Package\QMoney.exe"
 
 & "$ProjectRoot\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed `
     --name QMoneyService `
@@ -36,6 +24,18 @@ Copy-Item "$BuildDir\QMoneyUpdater.exe" $Package -Force
     --add-data "$ProjectRoot\moneymin\resources;moneymin/resources" `
     --add-data "$ProjectRoot\reference;reference" `
     "$ProjectRoot\packaging\qmoney_service.py"
+$env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path "$OutputDir\pyinstaller\QMoneyService.exe").Path
+cmake -S "$ProjectRoot\desktop" -B $BuildDir -G Ninja `
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$QtRoot
+cmake --build $BuildDir --config Release --parallel
+
+$Package = Join-Path $OutputDir "QMoney"
+New-Item -ItemType Directory -Force $Package | Out-Null
+New-Item -ItemType Directory -Force "$Package\runtime" | Out-Null
+Copy-Item "$BuildDir\QMoney.exe" $Package -Force
+Copy-Item "$BuildDir\QMoneyUpdater.exe" $Package -Force
+& "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler `
+    --no-opengl-sw "$Package\QMoney.exe"
 Copy-Item "$OutputDir\pyinstaller\QMoneyService.exe" "$Package\runtime" -Force
 
 $Ffmpeg = Get-ChildItem "$ProjectRoot\tools\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1

@@ -5,6 +5,7 @@
 #include <QCloseEvent>
 #include <QColor>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDebug>
 #include <QDesktopServices>
@@ -51,7 +52,57 @@
 
 #include <oclero/qlementine/style/QlementineStyle.hpp>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
+
 namespace {
+QString provisionEmbeddedService() {
+#if defined(Q_OS_WIN) && QMONEY_HAS_EMBEDDED_SERVICE
+  HMODULE module = GetModuleHandleW(nullptr);
+  HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(201), RT_RCDATA);
+  if (!resource) return {};
+  HGLOBAL loaded = LoadResource(module, resource);
+  const DWORD size = SizeofResource(module, resource);
+  const void* bytes = loaded ? LockResource(loaded) : nullptr;
+  if (!bytes || size == 0) return {};
+
+  const QString runtime = QStandardPaths::writableLocation(
+                              QStandardPaths::GenericDataLocation)
+                          + QStringLiteral("/QMoney/runtime");
+  QDir().mkpath(runtime);
+  const QString target = runtime + QStringLiteral("/QMoneyService-%1.exe")
+                                       .arg(QCoreApplication::applicationVersion());
+  const QByteArray expected = QCryptographicHash::hash(
+      QByteArrayView(static_cast<const char*>(bytes), size),
+      QCryptographicHash::Sha256);
+
+  QFile existing(target);
+  if (existing.size() == static_cast<qint64>(size)
+      && existing.open(QIODevice::ReadOnly)) {
+    QCryptographicHash actual(QCryptographicHash::Sha256);
+    if (actual.addData(&existing) && actual.result() == expected) return target;
+  }
+
+  QSaveFile output(target);
+  if (!output.open(QIODevice::WriteOnly)
+      || output.write(static_cast<const char*>(bytes), size) != size
+      || !output.commit()) {
+    qWarning() << "QMoney: não foi possível disponibilizar o motor incorporado";
+    return {};
+  }
+  qInfo() << "QMoney: motor incorporado preparado para"
+          << QCoreApplication::applicationVersion();
+  return target;
+#else
+  return {};
+#endif
+}
+
 void terminatePackagedServiceTree() {
 #ifdef Q_OS_WIN
   // Uma distribuição PyInstaller --onefile mantém um processo filho vivo. As
@@ -59,11 +110,30 @@ void terminatePackagedServiceTree() {
   // atualização; o filho antigo continuava atendendo a porta 8876 e a nova
   // interface acabava conectada ao motor errado. Como a interface é de
   // instância única, não existe outro serviço legítimo que deva sobreviver.
-  const int result = QProcess::execute(
-      QStringLiteral("taskkill.exe"),
-      {QStringLiteral("/IM"), QStringLiteral("QMoneyService.exe"),
-       QStringLiteral("/T"), QStringLiteral("/F")});
-  if (result == 0) qInfo() << "QMoney: serviço local anterior encerrado";
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return;
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  int terminated = 0;
+  if (Process32FirstW(snapshot, &entry)) {
+    do {
+      const QString name = QString::fromWCharArray(entry.szExeFile);
+      if (!name.startsWith(QStringLiteral("QMoneyService"), Qt::CaseInsensitive)
+          || !name.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive))
+        continue;
+      HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
+                                   entry.th32ProcessID);
+      if (!process) continue;
+      if (TerminateProcess(process, 0)) {
+        WaitForSingleObject(process, 3000);
+        ++terminated;
+      }
+      CloseHandle(process);
+    } while (Process32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+  if (terminated > 0)
+    qInfo() << "QMoney: processos antigos do motor encerrados" << terminated;
 #endif
 }
 
@@ -1429,7 +1499,9 @@ void MainWindow::installUpdate(const QString& packagePath) {
 
 void MainWindow::startBackend() {
   const QString appDir = QCoreApplication::applicationDirPath();
-  const QString packagedService = appDir + QStringLiteral("/runtime/QMoneyService.exe");
+  QString packagedService = provisionEmbeddedService();
+  if (packagedService.isEmpty())
+    packagedService = appDir + QStringLiteral("/runtime/QMoneyService.exe");
   QString program;
   QStringList arguments;
   QString workingDirectory;

@@ -37,12 +37,6 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
-      - name: Compilar interface nativa
-        shell: pwsh
-        run: |
-          cmake -S desktop -B build-ci -G "Visual Studio 17 2022" -A x64
-          cmake --build build-ci --config Release --parallel
-
       - name: Empacotar serviço local
         shell: pwsh
         run: |
@@ -60,6 +54,13 @@ jobs:
             --add-data "$root/moneymin/resources;moneymin/resources" `
             --add-data "$root/reference;reference" `
             "$root/packaging/qmoney_service.py"
+
+      - name: Compilar interface nativa com motor incorporado
+        shell: pwsh
+        run: |
+          $env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path release/pyinstaller/QMoneyService.exe).Path
+          cmake -S desktop -B build-ci -G "Visual Studio 17 2022" -A x64
+          cmake --build build-ci --config Release --parallel
 
       - name: Montar distribuição
         shell: pwsh
@@ -104,6 +105,7 @@ jobs:
         with:
           name: QMoney-windows-x64
           path: |
+            release/QMoney/QMoney.exe
             release/QMoney-windows-x64.zip
             release/QMoney-windows-x64.zip.sha256
             release/QMoney-windows-x64.zip.sig
@@ -113,6 +115,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            release/QMoney/QMoney.exe
             release/QMoney-windows-x64.zip
             release/QMoney-windows-x64.zip.sha256
             release/QMoney-windows-x64.zip.sig

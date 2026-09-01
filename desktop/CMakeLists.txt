@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 if(DEFINED ENV{QMONEY_VERSION} AND NOT "$ENV{QMONEY_VERSION}" STREQUAL "")
   set(QMONEY_VERSION "$ENV{QMONEY_VERSION}")
 else()
-  set(QMONEY_VERSION "1.0.3")
+  set(QMONEY_VERSION "1.0.4")
 endif()
 project(QMoney VERSION ${QMONEY_VERSION} LANGUAGES CXX)
 
@@ -31,6 +31,19 @@ else()
   FetchContent_MakeAvailable(qlementine)
 endif()
 
+set(QMONEY_EMBEDDED_SERVICE_RESOURCE)
+set(QMONEY_HAS_EMBEDDED_SERVICE 0)
+if(WIN32 AND DEFINED ENV{QMONEY_EMBEDDED_SERVICE}
+   AND EXISTS "$ENV{QMONEY_EMBEDDED_SERVICE}")
+  file(TO_CMAKE_PATH "$ENV{QMONEY_EMBEDDED_SERVICE}"
+       QMONEY_EMBEDDED_SERVICE_PATH)
+  configure_file(resources/embedded_service.rc.in
+                 ${CMAKE_CURRENT_BINARY_DIR}/embedded_service.rc @ONLY)
+  list(APPEND QMONEY_EMBEDDED_SERVICE_RESOURCE
+       ${CMAKE_CURRENT_BINARY_DIR}/embedded_service.rc)
+  set(QMONEY_HAS_EMBEDDED_SERVICE 1)
+endif()
+
 qt_add_executable(QMoney WIN32
   src/main.cpp
   src/ApiClient.hpp
@@ -41,6 +54,7 @@ qt_add_executable(QMoney WIN32
   src/UpdateManager.cpp
   resources/qmoney.qrc
   resources/qmoney.rc
+  ${QMONEY_EMBEDDED_SERVICE_RESOURCE}
 )
 
 add_executable(QMoneyUpdater WIN32
@@ -71,6 +85,7 @@ target_link_libraries(QMoney PRIVATE
 target_compile_definitions(QMoney PRIVATE
   QMONEY_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
   QMONEY_VERSION="${PROJECT_VERSION}"
+  QMONEY_HAS_EMBEDDED_SERVICE=${QMONEY_HAS_EMBEDDED_SERVICE}
 )
 
 set_target_properties(QMoney PROPERTIES

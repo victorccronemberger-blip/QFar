@@ -42,6 +42,7 @@ build/
 dist/
 build-debug/
 build-release/
+build-noembed/
 build-service-dist/
 build-service-work/
 .qt/

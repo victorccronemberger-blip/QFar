@@ -1,0 +1,5 @@
+#include <windows.h>
+
+// O motor Python fica dentro do QMoney.exe. A interface o extrai por versão
+// para uma pasta gravável antes de iniciar, eliminando instalações híbridas.
+201 RCDATA "@QMONEY_EMBEDDED_SERVICE_PATH@"
