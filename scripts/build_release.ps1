@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.4",
+    [string]$Version = "1.0.5",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [string]$BuildDir = "$PSScriptRoot\..\build-release",
     [string]$OutputDir = "$PSScriptRoot\..\release"

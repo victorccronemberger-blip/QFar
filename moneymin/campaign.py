@@ -2196,6 +2196,7 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
         config.MEDIA_DATA_DIR / "ego4d" / "timed_narrations.jsonl",
         Path(ego4d.__file__),
         Path(task_matching.__file__),
+        _rank_seed_path(),
     )
     stamp: list[tuple[str, int, str]] = []
     for path in files:
@@ -2215,6 +2216,41 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
                 digest.update(chunk)
         stamp.append((relative, path.stat().st_size, digest.hexdigest()))
     return tuple(stamp)
+
+
+def _merge_rank_seed(
+    buckets: dict[str, tuple[dict[str, Any], ...]],
+    *,
+    min_dur_s: float = 60,
+    max_dur_s: float = 1800,
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Completa qualquer cache local com o índice portátil do executável.
+
+    Versões antigas podiam gravar um cache válido, porém vazio, antes de o
+    catálogo Ego4D terminar de ser preparado. Como o cache persistia entre
+    atualizações, uma instalação nova continuava mostrando todas as categorias
+    desabilitadas mesmo depois de receber o índice portátil. O índice embutido
+    agora é sempre a base mínima; dados locais completos apenas o enriquecem.
+    """
+    seed = _load_rank_seed() or {}
+    result: dict[str, tuple[dict[str, Any], ...]] = {}
+    for name in buckets.keys() | seed.keys():
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in (*buckets.get(name, ()), *seed.get(name, ())):
+            try:
+                duration = float(item.get("dur_s") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not min_dur_s <= duration <= max_dur_s:
+                continue
+            identity = str(item.get("clip_uid") or item.get("s3_path") or "")
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            merged.append(dict(item))
+        result[name] = tuple(merged)
+    return result
 
 
 def _load_rank_cache(
@@ -2257,15 +2293,13 @@ def _save_rank_cache(
 def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
     cached = _load_rank_cache()
     if cached is not None:
-        return cached
+        return _merge_rank_seed(cached)
     if ego4d.has_timed_narrations():
         buckets = ego4d.rank_all_task_spans()
     else:
-        seed = _load_rank_seed()
-        if seed is not None:
-            return seed
         buckets = task_matching.rank_all_tasks(_task_candidates())
-    result = {name: tuple(items) for name, items in buckets.items()}
+    result = _merge_rank_seed(
+        {name: tuple(items) for name, items in buckets.items()})
     _save_rank_cache(result)
     return result
 
@@ -2285,10 +2319,15 @@ def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
     path = config.DATA_DIR / f"task_rank_cache_{cache_key}.pkl"
     cached = _load_rank_cache(path)
     if cached is not None:
-        return cached
+        return _merge_rank_seed(
+            cached, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
     buckets = ego4d.rank_all_task_spans(
         min_dur_s=min_dur_s, max_dur_s=max_dur_s)
-    result = {name: tuple(items) for name, items in buckets.items()}
+    result = _merge_rank_seed(
+        {name: tuple(items) for name, items in buckets.items()},
+        min_dur_s=min_dur_s,
+        max_dur_s=max_dur_s,
+    )
     _save_rank_cache(result, path)
     return result
 
