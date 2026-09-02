@@ -1267,21 +1267,28 @@ QWidget* MainWindow::buildBalancesPage() {
   headerLayout->addWidget(_balancesRefresh);
   layout->addWidget(card(QStringLiteral("Disponibilidade"), header));
 
-  _balancesTable = new QTableWidget(0, 4);
+  _balancesTable = new QTableWidget(0, 5);
   configureTable(_balancesTable);
   _balancesTable->setHorizontalHeaderLabels(
-      {QStringLiteral("Conta"), QStringLiteral("Disponível"), QStringLiteral("Atualizado"), QStringLiteral("Ação")});
+      {QStringLiteral("Conta"), QStringLiteral("Disponível"), QStringLiteral("Pendente"),
+       QStringLiteral("Atualizado"), QStringLiteral("Ação")});
   _balancesTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   _balancesTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
-  _balancesTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
-  _balancesTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
-  _balancesTable->setColumnWidth(1, 140);
-  _balancesTable->setColumnWidth(2, 190);
-  _balancesTable->setColumnWidth(3, 192);
+  _balancesTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+  _balancesTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
+  _balancesTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Fixed);
+  _balancesTable->setColumnWidth(1, 126);
+  _balancesTable->setColumnWidth(2, 126);
+  _balancesTable->setColumnWidth(3, 176);
+  _balancesTable->setColumnWidth(4, 176);
+  _balancesTable->horizontalHeaderItem(1)->setToolTip(
+      QStringLiteral("Valor liberado para solicitar saque."));
+  _balancesTable->horizontalHeaderItem(2)->setToolTip(
+      QStringLiteral("Valor registrado pelo Crowtado que ainda não foi liberado para saque."));
   layout->addWidget(card(QStringLiteral("Saldos no Crowtado"), _balancesTable), 1);
 
   return pageShell(QStringLiteral("Saldos"),
-                   QStringLiteral("Consulte valores disponíveis e solicite o link de saque."), body);
+                   QStringLiteral("Acompanhe valores disponíveis e pendentes e solicite o link de saque."), body);
 }
 
 QWidget* MainWindow::buildHistoryPage() {
@@ -2386,12 +2393,23 @@ void MainWindow::loadBalances() {
       const QString email = value.toString();
       const auto balance = balances.value(email).toObject();
       _balancesTable->setItem(row, 0, cell(email));
-      QString amount = balance.contains(QStringLiteral("availableCents"))
+      QString available = balance.contains(QStringLiteral("availableCents"))
           ? money(static_cast<qint64>(balance.value(QStringLiteral("availableCents")).toDouble()))
           : QStringLiteral("—");
-      if (!balance.value(QStringLiteral("error")).toString().isEmpty()) amount = QStringLiteral("erro");
-      _balancesTable->setItem(row, 1, cell(amount));
-      _balancesTable->setItem(row, 2, cell(friendlyDate(balance.value(QStringLiteral("updated_at")).toString())));
+      QString pending = balance.contains(QStringLiteral("pendingCents"))
+          ? money(static_cast<qint64>(balance.value(QStringLiteral("pendingCents")).toDouble()))
+          : QStringLiteral("—");
+      if (!balance.value(QStringLiteral("error")).toString().isEmpty()) {
+        available = QStringLiteral("erro");
+        pending = QStringLiteral("erro");
+      }
+      auto* availableItem = cell(available);
+      auto* pendingItem = cell(pending);
+      availableItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+      pendingItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+      _balancesTable->setItem(row, 1, availableItem);
+      _balancesTable->setItem(row, 2, pendingItem);
+      _balancesTable->setItem(row, 3, cell(friendlyDate(balance.value(QStringLiteral("updated_at")).toString())));
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);
       withdraw->setEnabled(passwordAccounts.contains(email));
@@ -2405,7 +2423,7 @@ void MainWindow::loadBalances() {
                                    doc.object().value(QStringLiteral("message")).toString());
         });
       });
-      _balancesTable->setCellWidget(row, 3, withdraw);
+      _balancesTable->setCellWidget(row, 4, withdraw);
       ++row;
     }
     const bool running = runner.value(QStringLiteral("state")).toString() == QStringLiteral("running");
