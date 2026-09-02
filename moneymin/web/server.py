@@ -614,6 +614,10 @@ def create_app() -> Flask:
             login(email, password)
         except (RuntimeError, OSError) as exc:
             return jsonify({"error": str(exc)}), 400
+        # A tela pede a senha da identidade Minute / Crowtado. Antes este
+        # caminho salvava somente o token Minute, então a mesma conta aparecia
+        # em Saldos como se não fosse uma conta Crowtado.
+        _save_crowtado_cred(email, password)
         return jsonify({"ok": True, "email": email})
 
     @app.post("/api/accounts/register")
@@ -1497,7 +1501,13 @@ def create_app() -> Flask:
         if emails:
             creds = {e: creds[e] for e in emails if e in creds}
         if not creds:
-            return jsonify({"error": "nenhuma conta configurada com senha do crowtado salva"}), 400
+            return jsonify({
+                "error": (
+                    "a identidade está conectada ao Minute, mas o acesso ao "
+                    "Crowtado ainda não foi informado; use Conectar Crowtado "
+                    "na linha da conta"
+                ),
+            }), 400
         try:
             BALANCES_RUNNER.start(creds, _on_balance_result)
         except RuntimeError as exc:
@@ -1557,8 +1567,21 @@ def create_app() -> Flask:
         password = str(body.get("password", ""))
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
+        configured = {a["email"] for a in _list_accounts()}
+        if email not in configured:
+            return jsonify({"error": "essa identidade não está conectada ao QMoney"}), 404
+        try:
+            crowtado.login(email, password)
+        except (crowtado.CrowtadoError, RuntimeError, OSError) as exc:
+            return jsonify({
+                "error": f"o Crowtado não aceitou esse acesso: {exc}",
+            }), 400
         _save_crowtado_cred(email, password)
-        return jsonify({"ok": True, "email": email})
+        return jsonify({
+            "ok": True,
+            "email": email,
+            "message": "Acesso ao Crowtado confirmado e salvo.",
+        })
 
     # -- registro de enviados ---------------------------------------------------
     @app.get("/api/sent")

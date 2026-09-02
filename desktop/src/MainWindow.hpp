@@ -84,6 +84,7 @@ private:
   void checkAllAccounts();
   void addAccount(bool registerNew);
   void loadBalances();
+  void configureCrowtadoAccess(const QString& email);
   void loadHistory();
 
   QString usdMoney(qint64 cents) const;

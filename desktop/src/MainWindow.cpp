@@ -24,6 +24,7 @@
 #include <QHash>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <QLabel>
@@ -1291,8 +1292,18 @@ QWidget* MainWindow::buildBalancesPage() {
   auto* header = new QWidget;
   auto* headerLayout = new QHBoxLayout(header);
   headerLayout->setContentsMargins(0, 0, 0, 0);
+  auto* identityCopy = new QWidget;
+  auto* identityLayout = new QVBoxLayout(identityCopy);
+  identityLayout->setContentsMargins(0, 0, 0, 0);
+  identityLayout->setSpacing(3);
   _balancesState = quietLabel(QStringLiteral("Aguardando leitura…"));
-  headerLayout->addWidget(_balancesState, 1);
+  identityLayout->addWidget(_balancesState);
+  auto* identityHelp = quietLabel(QStringLiteral(
+      "O mesmo e-mail usa o Minute nas campanhas e o Crowtado nos saldos. "
+      "Se as senhas forem diferentes, conecte o acesso Crowtado na linha abaixo."));
+  identityHelp->setWordWrap(true);
+  identityLayout->addWidget(identityHelp);
+  headerLayout->addWidget(identityCopy, 1);
   _balancesRefresh = primaryButton(QStringLiteral("Atualizar todos"));
   connect(_balancesRefresh, &QPushButton::clicked, this, [this] {
     _balancesRefresh->setEnabled(false);
@@ -1322,7 +1333,7 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesTable->setColumnWidth(1, 126);
   _balancesTable->setColumnWidth(2, 126);
   _balancesTable->setColumnWidth(3, 176);
-  _balancesTable->setColumnWidth(4, 176);
+  _balancesTable->setColumnWidth(4, 292);
   _balancesTable->horizontalHeaderItem(1)->setToolTip(
       QStringLiteral("Valor em dólar liberado para solicitar saque."));
   _balancesTable->horizontalHeaderItem(2)->setToolTip(
@@ -2522,9 +2533,24 @@ void MainWindow::loadBalances() {
       _balancesTable->setItem(row, 1, availableItem);
       _balancesTable->setItem(row, 2, pendingItem);
       _balancesTable->setItem(row, 3, cell(friendlyDate(balance.value(QStringLiteral("updated_at")).toString())));
+      const bool hasPassword = passwordAccounts.contains(email);
+      const bool hasBalanceError = !balance.value(QStringLiteral("error")).toString().isEmpty();
+      auto* actions = new QWidget;
+      auto* actionsLayout = new QHBoxLayout(actions);
+      actionsLayout->setContentsMargins(5, 5, 5, 5);
+      actionsLayout->setSpacing(7);
+      auto* credentials = new QPushButton(
+          hasPassword ? QStringLiteral("Alterar acesso")
+                      : QStringLiteral("Conectar Crowtado"));
+      credentials->setMinimumHeight(32);
+      credentials->setToolTip(QStringLiteral(
+          "Informa e valida a senha desta identidade diretamente no Crowtado."));
+      connect(credentials, &QPushButton::clicked, this,
+              [this, email] { configureCrowtadoAccess(email); });
+      actionsLayout->addWidget(credentials);
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);
-      withdraw->setEnabled(passwordAccounts.contains(email));
+      withdraw->setEnabled(hasPassword && !hasBalanceError);
       connect(withdraw, &QPushButton::clicked, this, [this, email, withdraw] {
         withdraw->setEnabled(false);
         _api.post(QStringLiteral("/api/balances/withdraw"), {{QStringLiteral("email"), email}},
@@ -2535,7 +2561,8 @@ void MainWindow::loadBalances() {
                                    doc.object().value(QStringLiteral("message")).toString());
         });
       });
-      _balancesTable->setCellWidget(row, 4, withdraw);
+      actionsLayout->addWidget(withdraw);
+      _balancesTable->setCellWidget(row, 4, actions);
       ++row;
     }
     _balancesApprovedUsd->setText(usdMoney(approvedTotal));
@@ -2565,9 +2592,38 @@ void MainWindow::loadBalances() {
     _balancesRefresh->setEnabled(!running);
     _balancesState->setText(running
         ? runner.value(QStringLiteral("current")).toString(QStringLiteral("Consultando contas…"))
-        : QStringLiteral("%1 conta(s) · %2 com senha de saldo configurada")
+        : QStringLiteral("%1 identidade(s) · Crowtado conectado em %2")
               .arg(accounts.size()).arg(passwordAccounts.size()));
     if (running) _balancePoll.start(); else _balancePoll.stop();
+  });
+}
+
+void MainWindow::configureCrowtadoAccess(const QString& email) {
+  bool accepted = false;
+  const QString password = QInputDialog::getText(
+      this, QStringLiteral("Conectar Crowtado"),
+      QStringLiteral("Senha do Crowtado para %1:").arg(email),
+      QLineEdit::Password, QString(), &accepted);
+  if (!accepted || password.isEmpty()) return;
+
+  setStatus(QStringLiteral("Validando acesso de %1 no Crowtado…").arg(email));
+  _api.put(QStringLiteral("/api/balances/credentials"),
+           {{QStringLiteral("email"), email},
+            {QStringLiteral("password"), password}},
+           [this, email](bool ok, const QJsonDocument&, const QString& error) {
+    if (!ok)
+      return showError(QStringLiteral("Crowtado não conectado"), error);
+    setStatus(QStringLiteral("Crowtado conectado para %1. Consultando saldo…").arg(email));
+    QJsonObject refresh;
+    refresh.insert(QStringLiteral("emails"), QJsonArray{email});
+    _api.post(QStringLiteral("/api/balances/refresh"), refresh,
+              [this](bool refreshed, const QJsonDocument&, const QString& refreshError) {
+      if (!refreshed)
+        return showError(QStringLiteral("Acesso salvo; saldo ainda não consultado"),
+                         refreshError);
+      _balancePoll.start();
+      loadBalances();
+    });
   });
 }
 
