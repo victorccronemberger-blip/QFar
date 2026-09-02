@@ -1,0 +1,96 @@
+{
+  "deviceModel": "SM-G991B",
+  "note": "Calibração ultra-wide Samsung (lens intrinsics) em coordenadas do sensor nativo 4032x3024. O sidecar re-escala fx/fy/cx/cy para 1440x1080 (proporcional), igual o app Android (buildIntrinsicsMap: fx*scaleX, (cx-cropLeft)*scaleX). Modelo de distorção Brown-Conrady k1 k2 k3 p1 p2. Valores plausíveis para a família S21-S24 (ultra-wide ~1/2.55\", 12MP).",
+  "reference": {
+    "sensorWidth": 4032,
+    "sensorHeight": 3024,
+    "cx": 2016.0,
+    "cy": 1512.0
+  },
+  "models": {
+    "SM-G991B": {
+      "commercial": "Galaxy S21",
+      "logicalCameraId": "2",
+      "fx": 1250.0, "fy": 1250.0,
+      "k1": -0.18, "k2": 0.08, "k3": -0.02, "p1": 0.0010, "p2": -0.0020,
+      "readoutS": 0.0105
+    },
+    "SM-G996B": {
+      "commercial": "Galaxy S21+",
+      "logicalCameraId": "2",
+      "fx": 1262.0, "fy": 1262.0,
+      "k1": -0.18, "k2": 0.08, "k3": -0.02, "p1": 0.0012, "p2": -0.0018,
+      "readoutS": 0.0108
+    },
+    "SM-G998B": {
+      "commercial": "Galaxy S21 Ultra",
+      "logicalCameraId": "2",
+      "fx": 1298.0, "fy": 1298.0,
+      "k1": -0.19, "k2": 0.09, "k3": -0.025, "p1": 0.0008, "p2": -0.0015,
+      "readoutS": 0.0118
+    },
+    "SM-S901B": {
+      "commercial": "Galaxy S22",
+      "logicalCameraId": "3",
+      "fx": 1465.0, "fy": 1465.0,
+      "k1": -0.22, "k2": 0.11, "k3": -0.03, "p1": 0.0014, "p2": -0.0022,
+      "readoutS": 0.0111
+    },
+    "SM-S906B": {
+      "commercial": "Galaxy S22+",
+      "logicalCameraId": "3",
+      "fx": 1480.0, "fy": 1480.0,
+      "k1": -0.22, "k2": 0.11, "k3": -0.03, "p1": 0.0011, "p2": -0.0020,
+      "readoutS": 0.0114
+    },
+    "SM-S908B": {
+      "commercial": "Galaxy S22 Ultra",
+      "logicalCameraId": "3",
+      "fx": 1522.0, "fy": 1522.0,
+      "k1": -0.23, "k2": 0.12, "k3": -0.035, "p1": 0.0009, "p2": -0.0017,
+      "readoutS": 0.0121
+    },
+    "SM-S911B": {
+      "commercial": "Galaxy S23",
+      "logicalCameraId": "4",
+      "fx": 1545.0, "fy": 1543.0,
+      "k1": -0.24, "k2": 0.12, "k3": -0.035, "p1": 0.0013, "p2": -0.0021,
+      "readoutS": 0.0104
+    },
+    "SM-S916B": {
+      "commercial": "Galaxy S23+",
+      "logicalCameraId": "4",
+      "fx": 1558.0, "fy": 1556.0,
+      "k1": -0.24, "k2": 0.12, "k3": -0.035, "p1": 0.0010, "p2": -0.0019,
+      "readoutS": 0.0107
+    },
+    "SM-S918B": {
+      "commercial": "Galaxy S23 Ultra",
+      "logicalCameraId": "4",
+      "fx": 1600.0, "fy": 1598.0,
+      "k1": -0.24, "k2": 0.12, "k3": -0.035, "p1": 0.0007, "p2": -0.0016,
+      "readoutS": 0.0112
+    },
+    "SM-S921B": {
+      "commercial": "Galaxy S24",
+      "logicalCameraId": "5",
+      "fx": 1548.0, "fy": 1546.0,
+      "k1": -0.23, "k2": 0.11, "k3": -0.03, "p1": 0.0012, "p2": -0.0020,
+      "readoutS": 0.0102
+    },
+    "SM-S926B": {
+      "commercial": "Galaxy S24+",
+      "logicalCameraId": "5",
+      "fx": 1560.0, "fy": 1558.0,
+      "k1": -0.23, "k2": 0.11, "k3": -0.03, "p1": 0.0010, "p2": -0.0018,
+      "readoutS": 0.0106
+    },
+    "SM-S928B": {
+      "commercial": "Galaxy S24 Ultra",
+      "logicalCameraId": "5",
+      "fx": 1605.0, "fy": 1603.0,
+      "k1": -0.23, "k2": 0.11, "k3": -0.03, "p1": 0.0008, "p2": -0.0015,
+      "readoutS": 0.0110
+    }
+  }
+}

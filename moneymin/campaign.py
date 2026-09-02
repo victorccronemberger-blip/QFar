@@ -61,6 +61,8 @@ from .device_profile import DeviceProfile
 from .minute_api import AuthError, Session
 from .sidecar import (
     build_frames_csv,
+    build_frames_csv_from_video,
+    build_imu_csv,
     build_sidecar_zip_custom,
     ffmpeg_bin,
     probe_video,
@@ -100,7 +102,7 @@ __all__ = [
     "warm_task_catalog",
 ]
 
-# Resolução/bitrate do reencode nativo (replica o app iOS).
+# Resolução/bitrate do reencode nativo (replica o app Android 1.22.0).
 NATIVE_WIDTH, NATIVE_HEIGHT = 1440, 1080
 NATIVE_BITRATE = "8000k"
 # Ryzen 9600X: 12 threads lógicas. Seis encodes × 2 threads ocupam a CPU sem
@@ -204,18 +206,24 @@ def _native_video_codec_args(
     bitrate: str | None = None,
     gop: int | None = None,
 ) -> list[str]:
-    """H.264 High@4.0 sem B-frames — o sidecar nativo manda hasBFrames: null."""
+    """H.264 High@4.2 sem B-frames — MediaRecorder do app (profile 8, level 8192).
+
+    O lado do metadata (codecActuals) reporta hasBFrames/gopMaxFrames null,
+    exatamente como o EgoCodecActuals do app. GOP padrão de 30 (= ~1
+    keyframe/s, como o MediaRecorder) em QUALQUER encode — o app não deixa o
+    GOP do encoder crescer para ~8 s.
+    """
     br = bitrate or NATIVE_BITRATE
-    # GOP explícito só no re-encode por aparelho; o `_native.mp4` fica no
-    # intervalo padrão do encoder (~1 s a 30 fps), como o iPhone.
-    gop_args: list[str] = []
-    if gop is not None:
-        gop_args = ["-g", str(int(gop)), "-keyint_min", str(int(gop))]
+    # GOP ~1s (30 a 30fps): o app grava ~1 keyframe/s e o frames.csv espelha
+    # os keyframes reais do MP4. Default 30; o re-encode por aparelho usa o GOP
+    # do perfil (28-32) via `gop`.
+    gop_value = int(gop) if gop is not None else 30
+    gop_args = ["-g", str(gop_value), "-keyint_min", str(gop_value)]
     if nvenc:
         return [
             "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
             "-rc", "vbr", "-b:v", br, "-maxrate", br, "-bufsize", "16000k",
-            "-profile:v", "high", "-level:v", "4.0",
+            "-profile:v", "high", "-level:v", "4.2",
             "-spatial_aq", "1", "-temporal_aq", "1",
             "-rc-lookahead", "20", "-bf", "0",
             *gop_args,
@@ -224,14 +232,15 @@ def _native_video_codec_args(
         "-c:v", "libx264", "-preset", "veryfast",
         "-threads", str(_heavy_encode_threads()),
         "-b:v", br, "-maxrate", br, "-bufsize", "16000k",
-        "-profile:v", "high", "-level", "4.0",
+        "-profile:v", "high", "-level", "4.2",
         "-bf", "0",
         *gop_args,
     ]
 
 
 def _native_container_args(tmp: Path) -> list[str]:
-    """Mesmo envelope do app iOS: 1440x1080 yuv420p TV, Core Media, AAC 48 kHz."""
+    """Envelope Android: 1440x1080 yuv420p TV, VideoHandler/SoundHandler,
+    AAC 48 kHz ESTÉREO 256 kbps (EgoAudioConfig 2ch/48000/256000)."""
     return [
         "-vf", ("scale=1440:1080:force_original_aspect_ratio=increase,"
                 "crop=1440:1080,scale=in_range=full:out_range=tv,format=yuv420p"),
@@ -239,8 +248,9 @@ def _native_container_args(tmp: Path) -> list[str]:
         "-color_range", "tv", "-colorspace", "bt709",
         "-color_primaries", "bt709", "-color_trc", "bt709",
         "-map_metadata", "-1", "-map_chapters", "-1",
-        "-metadata:s:v:0", "handler_name=Core Media Video",
-        "-c:a", "aac", "-ac", "1", "-ar", "48000",
+        "-metadata:s:v:0", "handler_name=VideoHandler",
+        "-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "256k",
+        "-metadata:s:a:0", "handler_name=SoundHandler",
         "-movflags", "+faststart", "-f", "mp4", str(tmp),
     ]
 
@@ -264,7 +274,7 @@ def _normalize_video(src: Path, out_dir: Path, *,
                     start_s: float | None = None,
                     dur_s: float | None = None,
                     stem: str | None = None) -> Path:
-    """Reencoda para 1440x1080 yuv420p + handler 'Core Media Video'.
+    """Reencoda para 1440x1080 yuv420p + handler Android VideoHandler.
 
     `start_s`/`dur_s` cortam o vídeo-pai no mesmo passo (sem arquivo .cut).
     """
@@ -274,7 +284,7 @@ def _normalize_video(src: Path, out_dir: Path, *,
     try:
         source_stat = src.stat()
         cache_key = {
-            "version": 3,
+            "version": 4,
             "source_size": source_stat.st_size,
             "source_mtime_ns": source_stat.st_mtime_ns,
             "start_s": None if start_s is None else round(float(start_s), 6),
@@ -514,7 +524,10 @@ def prepare_clip(clip: dict[str, Any], video: dict[str, Any], work_dir: Path) ->
     # Duração do ARQUIVO (probe) — o encoder nunca entrega N.000 s.
     dur_ms = int(probe["duration_ms"])
     imu_csv = ego4d.build_imu_csv(imu_path, window_s, duration_ms=dur_ms)
-    n_samples = max(1, int(dur_ms / 1000 * 100) + 1)
+    # 500 Hz (EgoImu.SAMPLING_PERIOD_US=2000) — o n_samples alimenta o
+    # imuDiagnostics.sampleCount e precisa bater com as linhas do CSV.
+    n_samples = max(
+        1, int(dur_ms / 1000 * config.ANDROID_IMU_SAMPLE_RATE_HZ) + 1)
     frames_csv = _frames_csv(dur_ms, fps=(probe.get("fps") or 30.0))
 
     return {
@@ -550,7 +563,7 @@ def prepare_holoassist_clip(
 
     Usa o mesmo vídeo nativo, frames e sidecar do motor existente. O único
     adaptador específico converte o acelerômetro/giroscópio sincronizados do
-    HoloLens para a grade de 100 Hz exigida pelo sidecar Minute.
+    HoloLens para a grade de 500 Hz exigida pelo sidecar Minute Android.
     """
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -639,7 +652,8 @@ def prepare_holoassist_clip(
         "imu_real": True,
         "imu_csv": imu_csv,
         "frames_csv": frames_csv,
-        "n_samples": max(1, int(dur_ms / 1000 * 100) + 1),
+        # 500 Hz (Android) — sampleCount do imuDiagnostics deve bater com o CSV.
+        "n_samples": max(1, int(dur_ms / 1000 * config.ANDROID_IMU_SAMPLE_RATE_HZ) + 1),
         "probe": probe,
         "source": "holoassist",
         "_cleanup_paths": [
@@ -669,24 +683,65 @@ def _new_identity(duration_s: float, email: str,
     return session_id, f"{session_id}_0", recorded_at
 
 
-def _chunk_plan(duration_ms: int, target_ms: int = NATIVE_CHUNK_TARGET_MS
+def _chunk_plan(duration_ms: int, target_ms: int | None = None
                 ) -> list[tuple[int, int]]:
-    """Janelas (start_ms, dur_ms). Uma só se couber no alvo; senão N ≥ 60s."""
+    """Janelas (start_ms, dur_ms) respeitando os limites EFETIVOS do
+    recording-config remoto (min/max duração) — sem gerar chunk que o preflight
+    viria a recusar se o servidor apertar o teto.
+
+    Alvo = menor(8min nominal, max remoto); piso = min remoto.
+    """
+    limits = config.recording_limits()
+    eff_min = max(1_000, int(limits.get("min_duration_ms") or MIN_DUR_MS))
+    eff_max = max(eff_min, int(limits.get("max_duration_ms") or MAX_DUR_MS))
+    if target_ms is None:
+        target_ms = min(NATIVE_CHUNK_TARGET_MS, eff_max)
+    target_ms = min(eff_max, max(eff_min, int(target_ms)))
     duration_ms = max(1, int(duration_ms))
-    target_ms = max(MIN_DUR_MS, int(target_ms))
+    if duration_ms < eff_min:
+        raise ValueError(
+            f"duração {duration_ms} ms abaixo do mínimo remoto {eff_min} ms")
     if duration_ms <= target_ms:
         return [(0, duration_ms)]
+
+    durations: list[int] = []
+    remaining = duration_ms
+    while remaining > target_ms:
+        durations.append(target_ms)
+        remaining -= target_ms
+    durations.append(remaining)
+
+    # Uma sobra menor que o mínimo não pode virar um chunk. Primeiro tenta
+    # incorporá-la ao anterior sem ultrapassar o teto. Se isso não couber,
+    # transfere duração dos chunks anteriores até a sobra alcançar o piso.
+    if len(durations) > 1 and durations[-1] < eff_min:
+        tail = durations.pop()
+        if durations[-1] + tail <= eff_max:
+            durations[-1] += tail
+        else:
+            needed = eff_min - tail
+            for index in range(len(durations) - 1, -1, -1):
+                transferable = max(0, durations[index] - eff_min)
+                moved = min(needed, transferable)
+                durations[index] -= moved
+                tail += moved
+                needed -= moved
+                if needed == 0:
+                    break
+            if needed:
+                raise ValueError(
+                    f"duração {duration_ms} ms não pode ser dividida em chunks "
+                    f"de {eff_min}–{eff_max} ms")
+            durations.append(tail)
+
+    if any(not eff_min <= dur <= eff_max for dur in durations):
+        raise ValueError(
+            f"plano fora dos limites remotos {eff_min}–{eff_max} ms: "
+            f"{durations}")
+
     plan: list[tuple[int, int]] = []
     start = 0
-    while start < duration_ms:
-        remaining = duration_ms - start
-        if remaining <= target_ms:
-            dur = remaining
-        else:
-            dur = target_ms
-            leftover = remaining - dur
-            if leftover < MIN_DUR_MS:
-                dur = remaining
+    for dur in durations:
         plan.append((start, dur))
         start += dur
     return plan
@@ -800,9 +855,9 @@ def _build_sidecar(item: dict[str, Any], session_id: str, log_id: str,
                    duration_ms: int | None = None) -> bytes:
     """Monta o sidecar .data.zip para uma identidade específica (por conta).
 
-    Usa o perfil do APARELHO da conta: calibração com jitter, clockOffsetNs e
-    GOP próprios + uptime do sistema DERIVADO do recorded_at (cada "iPhone"
-    tem boot próprio — nunca o relógio congelado).
+    Usa o perfil do APARELHO Samsung da conta: intrinsics Brown-Conrady com
+    jitter e GOP próprios + elapsedRealtimeNanos DERIVADO do recorded_at (cada
+    aparelho tem boot próprio — nunca o relógio congelado).
     """
     duration_ms = int(duration_ms if duration_ms is not None else item["duration_ms"])
     wall_ms = (device_profile.recorded_at_to_wall_ms(recorded_at)
@@ -813,7 +868,6 @@ def _build_sidecar(item: dict[str, Any], session_id: str, log_id: str,
         imu_csv=imu_csv, frames_csv=frames_csv,
         imu_sample_count=item.get("n_samples"),
         calib=profile.calib,
-        clock_offset_ns=profile.clock_offset_ns,
         uptime_ns=profile.uptime_ns_at(wall_ms),
         frames_gop=profile.frames_gop,
         device_meta=profile.sidecar_device_meta(),
@@ -821,8 +875,9 @@ def _build_sidecar(item: dict[str, Any], session_id: str, log_id: str,
     )
 
 
-# Invalida cache `_acc*.mp4` gerado sem Core Media / com B-frames.
-_ACCOUNT_VIDEO_ENCODE_VERSION = "3"
+# Invalida cache `_acc*.mp4` gerado antes do envelope Android (handler
+# VideoHandler, High@4.2, áudio estéreo 256k) / com B-frames.
+_ACCOUNT_VIDEO_ENCODE_VERSION = "4"
 
 _ACCOUNT_VIDEO_LOCKS = threading.Lock()
 _account_video_locks: dict[str, threading.Lock] = {}
@@ -1381,7 +1436,8 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             if session_cache is not None:
                 session_cache[account.email] = sess
         if not getattr(sess, "_live", False):
-            sess.ensure_auth()
+            # Gate de org (quality-screen/userState + disabled) + version gate.
+            sess.ensure_auth(org_key=account.org_key)
         else:
             sess.warmup()
         result["org_key"] = account.org_key
@@ -1412,13 +1468,22 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 item["imu_path"], tuple(item["window_s"]),
                 duration_ms=item["duration_ms"],
                 seed=f"{item['clip_uid']}|{account.email}")
+        if not imu_csv:
+            # Sem IMU real: gera a do APARELHO (sinal próprio por conta — nunca
+            # a mesma IMU sintética para N contas).
+            imu_csv = build_imu_csv(
+                int(item["duration_ms"]),
+                seed=f"moneymin.imu:{profile.device_id}")
         fps = video_probe.get("fps") or 30.0
-        frames_csv = item.get("frames_csv") or ""
-        if unique_video or not frames_csv:
-            frames_csv = build_frames_csv(
-                item["duration_ms"], fps=fps,
-                gop=profile.frames_gop, offset_ns=abs(profile.clock_offset_ns))
         start_wall = device_profile.recorded_at_to_wall_ms(recorded_at)
+        frames_offset = profile.uptime_ns_at(
+            start_wall or int(time.time() * 1000))
+        # frames.csv SEMPRE derivado do MP4 REAL (PTS/keyframes) + offset do
+        # uptime Android do 1º frame. Nunca reusar o CSV preparado com relógio
+        # em zero (desync: o metadata usa firstFrameSensorTimestampNs = uptime).
+        frames_csv = build_frames_csv_from_video(
+            video_path, duration_ms=int(item["duration_ms"]),
+            fps=fps, gop=profile.frames_gop, offset_ns=frames_offset)
         plan = _chunk_plan(int(item["duration_ms"]))
         chunk_paths: list[Path] = []
         chunk_zips: list[bytes] = []
@@ -1438,9 +1503,12 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 _cut_video_chunk(
                     video_path, part, start_ms / 1000.0, dur_ms / 1000.0)
                 part_imu, n_imu = _slice_imu_csv(imu_csv, start_ms, dur_ms)
-                part_frames = build_frames_csv(
-                    dur_ms, fps=fps, gop=profile.frames_gop,
-                    offset_ns=abs(profile.clock_offset_ns))
+                part_frames = build_frames_csv_from_video(
+                    part, duration_ms=dur_ms, fps=fps,
+                    gop=profile.frames_gop,
+                    offset_ns=profile.uptime_ns_at(
+                        device_profile.recorded_at_to_wall_ms(rec_at)
+                        or start_wall or int(time.time() * 1000)))
             part_probe = probe_video(part) if len(plan) > 1 else video_probe
             chunk_item = dict(item)
             if len(plan) > 1:
@@ -2567,9 +2635,9 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
     sess = session
     if sess is None:
         sess = Session.from_email(email)
-        sess.ensure_auth()
+        sess.ensure_auth(org_key=org_key)
     elif not getattr(sess, "_live", False):
-        sess.ensure_auth()
+        sess.ensure_auth(org_key=org_key)
     tasks = sess.all_tasks(org_key)
     duration_pools = None
     if (normalize_dataset_provider(dataset_provider) in ("all", "ego4d")

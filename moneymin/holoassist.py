@@ -400,12 +400,13 @@ def build_imu_csv(
     gyroscope: Path,
     *,
     duration_ms: int,
-    sample_rate_hz: int = 100,
+    sample_rate_hz: int = config.ANDROID_IMU_SAMPLE_RATE_HZ,
 ) -> str:
-    """Converte sensores sincronizados do HoloLens para o sidecar iOS.
+    """Converte sensores sincronizados do HoloLens para o sidecar ANDROID.
 
     A grade do giroscópio é a âncora. O vizinho de acelerômetro mais próximo é
-    associado a cada amostra e o sinal é reamostrado para 100 Hz.
+    associado a cada amostra e o sinal é reamostrado para 500 Hz
+    (EgoImu.SAMPLING_PERIOD_US = 2000).
     """
     accel = _sensor_rows(accelerometer)
     gyro = _sensor_rows(gyroscope)
@@ -442,7 +443,7 @@ def build_imu_csv(
                 index * step_ns,
                 f"{ax:.6f}",
                 f"{ay:.6f}",
-                f"{-az:.6f}",
+                f"{az:.6f}",
                 f"{gx:.6f}",
                 f"{gy:.6f}",
                 f"{gz:.6f}",

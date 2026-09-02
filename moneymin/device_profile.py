@@ -1,32 +1,42 @@
 """
 device_profile.py — Identidade de APARELHO por conta (anti-colusão).
 
-Antes, todas as contas reportavam o MESMO iPhone: uptime congelado em
-`224_584_000_000_000` ns no metadata.json, calibração de câmera idêntica,
-`clockOffsetNs` igual, `device={"model":"iPhone 13"}` em todo upload e nenhum
-`X-Device-Id` (o app 1.22.0 envia). N contas com o mesmo relógio congelado é
-a assinatura de colusão mais barata de detectar.
+A réplica replica o app ANDROID 1.22.0 (com.bakerdata.minute) em um Samsung
+Galaxy S21–S24. Antes, todas as contas reportavam o MESMO aparelho único:
+uptime congelado, calibração idêntica, `device={"model":"SM-S918B"}` em todo
+upload e nenhum `X-Device-Id`. N contas com o mesmo relógio congelado é a
+assinatura de colusão mais barata de detectar.
 
-Aqui cada conta ganha um perfil de aparelho PRÓPRIO e persistente:
+Aqui cada conta ganha um perfil de aparelho PRÓPRIO e persistente (Samsung):
 
-  - device_id       — UUID estável → header `X-Device-Id` (app 1.22.0+)
-  - boot_wall_ms    — último boot do aparelho; `ios_systemUptimeNs` é DERIVADO
-                      do momento real (recorded_at) via `uptime_ns_at()`, nunca
-                      uma constante. "Reboota" sozinho após 21 dias.
-  - calib           — calibração ultra-wide do iPhone 13 com jitter
-                      determinístico POR CONTA (celulares diferentes, mesmo chip)
-  - clock_offset_ns — offset sensor↔wall clock com jitter por conta
-  - frames_gop      — GOP do frames.csv (28-32; iPhone faz ~1 keyframe/s)
-  - video_bitrate_mbps — alvo ABR do re-encode POR CONTA (7.4-8.8 Mbps)
-  - os_version      — release point do iOS (26.5.x) usada no UA e no app/opened
+  - device_id       — `android.ssaid:{ANDROID_ID}` → header `X-Device-Id`
+                      exato do app (getAndroidId, 16 hex; fallback é
+                      `android_no_ssaid`).
+  - device_model    — Build.MODEL real do aparelho sorteado (im.',
+                      `SM-S918B` = Galaxy S23 Ultra).
+  - os_version      — release do Android (ex.: "14") e sdk_int (ex.: 34)
+                      usados no metadata.json, UA e /app/opened.
+  - boot_wall_ms    — último boot do aparelho; `uptime_ns_at()` devolve o
+                      `SystemClock.elapsedRealtimeNanos` DERIVADO do momento
+                      real (recorded_at), nunca uma constante. "Reboota"
+                      sozinho após 21 dias.
+  - calib           — intrinsics ultra-wide SAMSUNG preservados (fx/fy/cx/cy
+                      no sensor nativo 4032x3024 + Brown-Conrady k1 k2 k3
+                      p1 p2 + rolling shutter) com jitter determinístico POR
+                      CONTA (celulares diferentes, mesmo chip).
+  - frames_gop      — GOP do frames.csv (28-32; ~1 keyframe/s a 30 fps).
+  - video_bitrate_mbps — bitrate real lido do MP4 da conta (7.4-8.8 Mbps).
 
 Estado persistido em `data/device_state/<email>.json` (gitignored). O perfil é
 PURE FUNCTION do e-mail (sem relógio na criação): mesmo perdendo o arquivo de
 estado, a conta recria o MESMO aparelho — fixado, sem rotacionar. Somente o
-"reboot" de 21d é dinâmico (e é persistido). Somente stdlib.
+"reboot" de 21d é dinâmico (e é persistido). Perfis legados são migrados
+automaticamente para um Samsung novo na 1ª leitura.
+Somente stdlib.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -39,24 +49,28 @@ from typing import Any
 
 from . import config
 
-# Uptime plausível de um iPhone usado no dia a dia: mínimo 6h (logo após boot)
+# Uptime plausível de um Android usado no dia a dia: mínimo 6h (logo após boot)
 # e máximo 21 dias (todo celular reinicia de quando em quando).
 MIN_UPTIME_NS = 6 * 3600 * 1_000_000_000
 MAX_UPTIME_NS = 21 * 86_400 * 1_000_000_000
 
-_CALIB_PATH = Path(__file__).with_name("iphone_uw_calibration.json")
+_CALIB_PATH = Path(__file__).with_name("samsung_uw_calibration.json")
 
-# Aparelhos compatíveis com o app: iPhone 12 ou mais novo. (nome comercial,
-# código técnico, peso de sorteio). A calibração de referência é a ultra-wide
-# do iPhone 13 (iPhone14,5) — cada geração tem lente própria, então cada
-# modelo recebe um offset DETERMINÍSTICO de intrinsics (±4% em fx/fy) em cima
-# da referência, mais o jitter por conta.
-DEVICE_POOL: list[tuple[str, str, int]] = [
-    ("iPhone 12", "iPhone13,1", 12),
-    ("iPhone 13", "iPhone14,5", 30),
-    ("iPhone 14", "iPhone14,7", 28),
-    ("iPhone 15", "iPhone15,4", 20),
-    ("iPhone 16", "iPhone17,3", 10),
+# Pool de Samsung Galaxy S21–S24 aceitos (S21/S21+/S21 Ultra … S24/S24+/S24 Ultra).
+# (comercial, Build.MODEL, peso, opções (release, sdkInt)).
+DEVICE_POOL: list[tuple[str, str, int, tuple[tuple[str, int], ...]]] = [
+    ("Galaxy S21",        "SM-G991B", 9,  (("13", 33), ("14", 34))),
+    ("Galaxy S21+",       "SM-G996B", 6,  (("13", 33), ("14", 34))),
+    ("Galaxy S21 Ultra",  "SM-G998B", 5,  (("13", 33), ("14", 34))),
+    ("Galaxy S22",        "SM-S901B", 8,  (("14", 34), ("15", 35))),
+    ("Galaxy S22+",       "SM-S906B", 6,  (("14", 34), ("15", 35))),
+    ("Galaxy S22 Ultra",  "SM-S908B", 8,  (("14", 34), ("15", 35))),
+    ("Galaxy S23",        "SM-S911B", 12, (("14", 34), ("15", 35))),
+    ("Galaxy S23+",       "SM-S916B", 8,  (("14", 34), ("15", 35))),
+    ("Galaxy S23 Ultra",  "SM-S918B", 8,  (("14", 34), ("15", 35))),
+    ("Galaxy S24",        "SM-S921B", 12, (("14", 34), ("15", 35))),
+    ("Galaxy S24+",       "SM-S926B", 8,  (("14", 34), ("15", 35))),
+    ("Galaxy S24 Ultra",  "SM-S928B", 8,  (("14", 34), ("15", 35))),
 ]
 
 _cache: dict[str, DeviceProfile] = {}
@@ -78,12 +92,14 @@ def _profile_path(email: str) -> Path:
 
 
 def _load_calibration_base() -> dict[str, Any]:
-    """Calibração REAL da ultra-wide do iPhone 14,5 (chip de referência)."""
+    """Calibração ultra-wide Samsung por Build.MODEL (referência natural)."""
     try:
-        data = json.loads(_CALIB_PATH.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — sem arquivo, jitter sobre zeros
+        return json.loads(_CALIB_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — sem arquivo, jitter sobre defaults
         return {}
-    return data.get("calibration") or {}
+
+
+_CALIB_DB = _load_calibration_base()
 
 
 def _wall_ms_now() -> int:
@@ -93,6 +109,11 @@ def _wall_ms_now() -> int:
 # GET /devices/recording-config (captura 06/08): backlogCapMs = 14400000.
 BACKLOG_CAP_MS = 14_400_000
 _BACKLOG_SLACK_S = 60.0
+
+
+def effective_backlog_cap_ms() -> int:
+    """Backlog em vigor — o remote recording-config pode sobrescrever o default."""
+    return int(config.recording_limits().get("backlog_cap_ms") or BACKLOG_CAP_MS)
 
 
 def recorded_at_to_wall_ms(recorded_at: str) -> int | None:
@@ -110,8 +131,8 @@ def recorded_at_to_wall_ms(recorded_at: str) -> int | None:
 def format_recorded_at(epoch_s: float) -> str:
     """ISO-8601 como `Date.toISOString()` do React Native: `YYYY-MM-DDTHH:mm:ss.sssZ`.
 
-    O sidecar real (sessão 627d39d8) usa 3 dígitos (`.562Z`). Hardcode `.000Z`
-    ou 6 dígitos (`.609000Z`) não bate com o app.
+    O sidecar Android usa o mesmo formato do JS (3 dígitos de millis). Hardcode
+    `.000Z` ou 6 dígitos (`.609000Z`) não bate com o app.
     """
     ms_total = int(round(float(epoch_s) * 1000.0))
     sec, milli = divmod(ms_total, 1000)
@@ -125,11 +146,13 @@ def clamp_recording_start(
     duration_s: float = 0.0,
     *,
     now: float | None = None,
-    backlog_cap_ms: int = BACKLOG_CAP_MS,
+    backlog_cap_ms: int | None = None,
 ) -> float:
-    """Início da gravação já terminada e ainda dentro do backlog (4h)."""
+    """Início da gravação já terminada e ainda dentro do backlog."""
     now = time.time() if now is None else float(now)
     duration_s = max(0.0, float(duration_s))
+    if backlog_cap_ms is None:
+        backlog_cap_ms = effective_backlog_cap_ms()
     cap_s = max(1.0, float(backlog_cap_ms) / 1000.0)
     latest = now - duration_s
     earliest = now - cap_s + _BACKLOG_SLACK_S
@@ -148,10 +171,12 @@ def recording_start_epoch(
     *,
     now: float | None = None,
     gap_s: float = 0.0,
-    backlog_cap_ms: int = BACKLOG_CAP_MS,
+    backlog_cap_ms: int | None = None,
 ) -> float:
     """Epoch do início: `agora - duração - gap`, preso à janela de backlog."""
     now = time.time() if now is None else float(now)
+    if backlog_cap_ms is None:
+        backlog_cap_ms = effective_backlog_cap_ms()
     start = now - max(0.0, float(duration_s)) - max(0.0, float(gap_s))
     return clamp_recording_start(
         start, duration_s, now=now, backlog_cap_ms=backlog_cap_ms)
@@ -174,17 +199,18 @@ def normalize_recorded_at(
 
 @dataclass
 class DeviceProfile:
-    """Identidade de aparelho de uma conta (um celular "virtual" por conta)."""
+    """Identidade de aparelho de uma conta (um Samsung "virtual" por conta)."""
 
     email: str
     device_id: str
-    device_model: str = "iPhone 13"          # formato curto (POST /uploads, app/opened)
-    sidecar_model: str = "iPhone14,5"        # formato técnico (metadata.json)
-    os_version: str = "26.5.2"               # release point do iOS (UA, app/opened)
-    sidecar_system_version: str = "26.5"     # systemVersion do metadata.json real
-    boot_wall_ms: int = 0                    # último boot (epoch ms)
-    created_wall_ms: int = 0                 # 1ª vez que a conta usou a réplica
-    clock_offset_ns: int = -125
+    device_model: str = "SM-S918B"          # Build.MODEL (short e sidecar)
+    sidecar_model: str = "SM-S918B"         # Build.MODEL completo (metadata.json)
+    os_version: str = "14"                  # release do Android (UA, app/opened)
+    sdk_int: int = 34                       # Build.VERSION.SDK_INT (metadata.json)
+    sidecar_system_version: str = "14"      # systemVersion = Build.VERSION.RELEASE
+    logical_camera_id: str = "4"            # id da câmera (camera_logical_X)
+    boot_wall_ms: int = 0                   # último boot (epoch ms)
+    created_wall_ms: int = 0                # 1ª vez que a conta usou a réplica
     frames_gop: int = 30
     video_bitrate_mbps: float = 8.0
     calib: dict[str, Any] = field(default_factory=dict)
@@ -200,8 +226,9 @@ class DeviceProfile:
         # e só explodiria mais tarde em abs(), headers ou no ffmpeg.
         known = {f: data[f] for f in (
             "email", "device_id", "device_model", "sidecar_model", "os_version",
-            "sidecar_system_version", "boot_wall_ms", "created_wall_ms",
-            "clock_offset_ns", "frames_gop", "video_bitrate_mbps", "calib")
+            "sdk_int", "sidecar_system_version", "logical_camera_id",
+            "boot_wall_ms", "created_wall_ms", "frames_gop",
+            "video_bitrate_mbps", "calib")
                  if f in data and data[f] is not None}
         return cls(**known)
 
@@ -215,9 +242,9 @@ class DeviceProfile:
 
     # --- tempo --------------------------------------------------------------
     def uptime_ns_at(self, wall_ms: int) -> int:
-        """Uptime do sistema (ns) no instante `wall_ms` (epoch ms).
+        """Uptime do sistema (ns, base SystemClock.elapsedRealtimeNanos).
 
-        Regras de plausibilidade:
+        Regras de plausibilidade (mesmo domínio do app Android):
           - < 6h  → skew de relógio/localmente recém-bootado: empurra um boot
             24h antes (uptime mínimo plausível);
           - > 21d → o celular "rebootou": novo boot entre 6h e 3d atrás
@@ -239,12 +266,13 @@ class DeviceProfile:
 
     # --- saídas usadas pela réplica -----------------------------------------
     def user_agent(self) -> str:
-        """UA por conta: a forma é a da captura mitm, mas o iOS varia por conta."""
-        return (f"Minute/{config.APP_VERSION} (com.bakerdata.minute; "
-                f"build:1; iOS {self.os_version})")
+        """UA do HTTP Android: OkHttp default (`okhttp/4.12.0` no APK) — o app
+        não sobrescreve o header; é o MESMO para todos os aparelhos."""
+        return config.USER_AGENT
 
     def location_header_value(self) -> str | None:
-        """JSON do `toFix` nativo: latitude, longitude, accuracy, isMock."""
+        """Valor EXATO do `formatDeviceLocationHeader` do bundle:
+        `<lat 6 casas>,<lon 6 casas>,<accuracy arredondada>,<isMock>`."""
         lat = getattr(self, "latitude", None)
         lng = getattr(self, "longitude", None)
         if lat is None:
@@ -267,23 +295,26 @@ class DeviceProfile:
             return None
         if not math.isfinite(accuracy) or accuracy <= 0:
             accuracy = 12.0
-        return json.dumps({
-            "latitude": lat,
-            "longitude": lng,
-            "accuracy": accuracy,
-            "isMock": False,
-        }, separators=(",", ":"))
+        # isMock em JS (String(bool) → "true"/"false" minúsculo), mesmo formato
+        # do concat do formatDeviceLocationHeader do bundle.
+        return f"{lat:.6f},{lng:.6f},{round(accuracy)},false"
 
-    def headers(self) -> dict[str, str]:
-        """Headers de identidade que o app 1.22.0 envia em toda chamada."""
+    def headers(self, *, include_location: bool = True) -> dict[str, str]:
+        """Headers de identidade que o app Android 1.22.0 envia.
+
+        `include_location=False` é usado para rotas sem gate geográfico — o app
+        só envia `X-Device-Location` nas rotas de quota/elegibilidade geo
+        (DETALHAMENTO §2.1), nunca em TODA chamada.
+        """
         out = {
             "X-App-Version": config.APP_VERSION,
             "User-Agent": self.user_agent(),
             "X-Device-Id": self.device_id,
         }
-        location = self.location_header_value()
-        if location:
-            out["X-Device-Location"] = location
+        if include_location:
+            location = self.location_header_value()
+            if location:
+                out["X-Device-Location"] = location
         return out
 
     def opened_payload(self, auth_method: str = "SESSION_RESUMED",
@@ -293,29 +324,29 @@ class DeviceProfile:
             "auth_method": auth_method,
             "app_version": config.APP_VERSION,
             "device_model": self.device_model,
-            "os_version": f"ios {self.os_version}",
+            "os_version": f"android {self.os_version}",
         }
         if opened_at:
             body["opened_at"] = opened_at
         return body
 
     def sidecar_device_meta(self) -> dict[str, str]:
-        """device COMPLETO do metadata.json (modelo técnico + systemName/Version)."""
+        """device do metadata.json (Shape Android: model + systemName/Version)."""
         return {
             "model": self.sidecar_model,
             "systemName": config.NATIVE_SIDECAR_SYSTEM_NAME,
             "systemVersion": self.sidecar_system_version,
         }
 
-    def sidecar_platform_meta(self) -> dict[str, str]:
-        """platform do metadata.json (`os` + `version` = systemVersion)."""
+    def sidecar_platform_meta(self) -> dict[str, Any]:
+        """platform do metadata.json: `{type:'android', version:sdkInt}`."""
         return {
-            "os": config.NATIVE_PLATFORM_OS,
-            "version": self.sidecar_system_version,
+            "type": config.NATIVE_PLATFORM_OS,
+            "version": int(self.sdk_int),
         }
 
     def upload_device_meta(self) -> dict[str, str]:
-        """getDeviceUploadMeta curto do POST /uploads: só o nome comercial."""
+        """getDeviceUploadMeta curto do POST /uploads: Build.MODEL apenas."""
         return {"model": self.device_model}
 
     def upload_platform_meta(self) -> dict[str, str]:
@@ -329,6 +360,9 @@ def get_profile(email: str, first_use_ms: int | None = None) -> DeviceProfile:
     `first_use_ms` (epoch ms) fixa o 1º uso virtual do aparelho na criação —
     ex.: o instante de registro da conta (mtime do token). Sem ele, cai na
     referência do 1º lote (18/08).
+
+    Perfis legados são substituídos por um Samsung novo na 1ª leitura — a
+    identidade de aparelho rotaciona UMA vez na migração.
     """
     with _cache_lock:
         cached = _cache.get(email)
@@ -339,14 +373,18 @@ def get_profile(email: str, first_use_ms: int | None = None) -> DeviceProfile:
     profile: DeviceProfile | None = None
     if path.exists():
         try:
-            profile = DeviceProfile.from_dict(
+            candidate = DeviceProfile.from_dict(
                 json.loads(path.read_text(encoding="utf-8")))
-            if not profile.device_id or not isinstance(profile.calib, dict):
-                profile = None
+            if (not candidate.device_id
+                    or not candidate.device_id.startswith("android.ssaid:")
+                    or not isinstance(candidate.calib, dict)
+                    or not candidate.calib.get("distortion_model")):
+                profile = None  # perfil legado/inválido — recria como Android
             else:
                 # O nome do arquivo é a fonte de verdade. Um estado copiado de
                 # outra conta não pode continuar escrevendo no caminho alheio.
-                profile.email = email
+                candidate.email = email
+                profile = candidate
         except (json.JSONDecodeError, ValueError, TypeError):
             profile = None
 
@@ -366,82 +404,102 @@ def get_profile(email: str, first_use_ms: int | None = None) -> DeviceProfile:
 _FIRST_USE_REF_MS = 1_787_011_200_000  # 2026-08-18T00:00:00Z (epoch ms)
 
 
+def _model_ref(build_model: str) -> dict[str, Any]:
+    """Referência de calibração ultra-wide de um Build.MODEL Samsung."""
+    models = _CALIB_DB.get("models") or {}
+    ref = models.get(build_model) or {}
+    if not ref:
+        ref = {"fx": 1545.0, "fy": 1543.0, "k1": -0.24, "k2": 0.12,
+               "k3": -0.035, "p1": 0.001, "p2": -0.002, "readoutS": 0.0104,
+               "logicalCameraId": "4"}
+    # cx/cy por modelo (coletados do aparelho real) — fallback no centro
+    # compartilhado do arquivo, senão no centro do sensor nativo.
+    if not ref.get("cx"):
+        ref = dict(ref)
+        center = _CALIB_DB.get("reference") or {"cx": 2016.0, "cy": 1512.0}
+        ref["cx"] = float(center.get("cx") or 2016.0)
+        ref["cy"] = float(center.get("cy") or 1512.0)
+    return ref
+
+
 def _create_profile(email: str, first_use_ms: int | None = None) -> DeviceProfile:
     """Gera um perfil novo — PURE FUNCTION de (e-mail, 1º uso).
 
-    Todo campo é derivado da seed `moneymin.device:<email>` (+ o instante de
+    Todo campo é derivado da seed `moneymin.android:<email>` (+ o instante de
     1º uso, fixo por conta): mesmo perdendo o
     `data/device_state/<email>.json`, a recriação reproduz idêntico aparelho
     (mesmo modelo, calibração, boot e idade). O único estado dinâmico é o
     "reboot" automático de `uptime_ns_at()` após 21d (persistido por dia).
 
-    `first_use_ms`: instante real de registro da conta (ex.: mtime do token) —
-    o aparelho nasce QUANDO a conta nasceu. Contas sem essa referência caem no
-    1º lote (18/08).
+    `first_use_ms`: instante real de registro da conta — o aparelho nasce
+    QUANDO a conta nasceu. Contas sem essa referência caem no 1º lote (18/08).
     """
-    seed = f"moneymin.device:{email}"
+    seed = f"moneymin.android:{email}"
     rng = random.Random(seed)
-    base = _load_calibration_base()
+    center = _CALIB_DB.get("reference") or {"cx": 2016.0, "cy": 1512.0,
+                                            "sensorWidth": 4032,
+                                            "sensorHeight": 3024}
+    ref_w = int(center.get("sensorWidth") or 4032)
+    ref_h = int(center.get("sensorHeight") or 3024)
+    center_cx = float(center.get("cx") or ref_w / 2.0)
+    center_cy = float(center.get("cy") or ref_h / 2.0)
 
-    # Aparelho da conta: iPhone 12 ou mais novo (compatibilidade do app),
-    # sorteado com pesos — as contas NÃO são um enxame de iPhone 13 idênticos.
-    device_model, sidecar_model = rng.choices(
-        [(m[0], m[1]) for m in DEVICE_POOL],
+    # Aparelho da conta: Samsung Galaxy S21–S24 (pool aceito pelo app),
+    # sorteado com pesos — as contas NÃO são um enxame de SM-S918B idênticos.
+    commercial, build_model, _weight, os_pool = rng.choices(
+        [(m[0], m[1], m[2], m[3]) for m in DEVICE_POOL],
         weights=[m[2] for m in DEVICE_POOL])[0]
+    os_version, sdk_int = os_pool[rng.randrange(len(os_pool))]
+    ref = _model_ref(build_model)
 
-    # Calibração: referência real do iPhone 13 + offset DETERMINÍSTICO por
-    # MODELO (lente de geração diferente, ±4% em fx/fy) + jitter fino POR
-    # CONTA (mesmo chip, montagem diferente).
-    model_rng = random.Random(f"moneymin.model:{sidecar_model}")
-    model_fx = model_rng.uniform(-0.04, 0.04)
-    model_fy = model_rng.uniform(-0.04, 0.04)
-    model_c = model_rng.uniform(-0.003, 0.003)
-    fx = float(base.get("fx") or 1552.02)
-    fy = float(base.get("fy") or 1552.02)
-    cx = float(base.get("cx") or 2009.94)
-    cy = float(base.get("cy") or 1519.41)
-    center_x = float(base.get("centerX") or 2015.02)
-    center_y = float(base.get("centerY") or 1514.35)
+    # Calibração: referência do modelo + jitter DETERMINÍSTICO POR CONTA
+    # (mesmo chip, montagem/amostra do lote diferente). cx/cy do modelo real
+    # (coletado via scripts/collect_sidecar.py) quando disponíveis.
+    nx = float(ref.get("fx") or 1545.0)
+    ny = float(ref.get("fy") or 1543.0)
+    model_cx = float(ref.get("cx") or center_cx)
+    model_cy = float(ref.get("cy") or center_cy)
     calib = {
-        "fx": round(fx * (1.0 + model_fx) * (1.0 + rng.uniform(-0.0012, 0.0012)), 6),
-        "fy": round(fy * (1.0 + model_fy) * (1.0 + rng.uniform(-0.0012, 0.0012)), 6),
-        "cx": round(cx * (1.0 + model_c) + rng.uniform(-1.2, 1.2), 3),
-        "cy": round(cy * (1.0 + model_c) + rng.uniform(-1.2, 1.2), 3),
-        "centerX": round(center_x + rng.uniform(-0.4, 0.4), 2),
-        "centerY": round(center_y + rng.uniform(-0.4, 0.4), 2),
-        "referenceWidth": int(base.get("referenceWidth") or 4032),
-        "referenceHeight": int(base.get("referenceHeight") or 3024),
-        "lensDistortionLookupTable":
-            list(base.get("lensDistortionLookupTable") or []),
-        "inverseLensDistortionLookupTable":
-            list(base.get("inverseLensDistortionLookupTable") or []),
-        "pixelSizeMm": float(base.get("pixelSizeMm") or 0.001),
+        "distortion_model": "brown_conrady",
+        "fx": round(nx * (1.0 + rng.uniform(-0.004, 0.004)), 6),
+        "fy": round(ny * (1.0 + rng.uniform(-0.004, 0.004)), 6),
+        "cx": round(model_cx + rng.uniform(-2.0, 2.0), 3),
+        "cy": round(model_cy + rng.uniform(-2.0, 2.0), 3),
+        "referenceWidth": ref_w,
+        "referenceHeight": ref_h,
+        "k1": float(ref.get("k1") or 0.0) * (1.0 + rng.uniform(-0.02, 0.02)),
+        "k2": float(ref.get("k2") or 0.0) * (1.0 + rng.uniform(-0.02, 0.02)),
+        "k3": float(ref.get("k3") or 0.0) * (1.0 + rng.uniform(-0.02, 0.02)),
+        "p1": float(ref.get("p1") or 0.0) + rng.uniform(-0.0004, 0.0004),
+        "p2": float(ref.get("p2") or 0.0) + rng.uniform(-0.0004, 0.0004),
+        "readoutS": round(float(ref.get("readoutS") or 0.0105)
+                          * (1.0 + rng.uniform(-0.05, 0.05)), 6),
+        "logicalCameraId": str(ref.get("logicalCameraId") or "4"),
     }
+    # ANDROID_ID: 64 bits em hex (Settings.Secure.ANDROID_ID) derivado da conta.
+    digest = hashlib.sha256(f"moneymin.android.id:{email}".encode("utf-8"))
+    android_id = digest.hexdigest()[:16]
+    device_id = f"android.ssaid:{android_id}"
 
     # 1º uso virtual: QUANDO a conta nasceu (first_use_ms, ex.: registro/token).
-    # Não some jitter aqui: ao criar um perfil imediatamente após a conta, isso
-    # colocava o primeiro uso até 6h NO FUTURO. Contas do 1º lote (sem
-    # referência própria) usam o lote de 18/08 + jitter (0–3d) — idade
-    # plausível para quem já vem subindo gravações desde a semana 18/08.
     if first_use_ms is not None:
         created_wall_ms = min(int(first_use_ms), _wall_ms_now())
     else:
         created_wall_ms = _FIRST_USE_REF_MS + int(rng.uniform(0.0, 3 * 86_400 * 1_000))
-    # Último reboot: 6h–3d ANTES do 1º uso — o uptime é plausível em qualquer
-    # instante (o "reboot" automático de 21d cuida do resto).
+    # Último reboot: 6h–3d ANTES do 1º uso — uptime plausível em qualquer instante.
     boot_wall_ms = created_wall_ms - int(
         rng.uniform(MIN_UPTIME_NS / 1e6, 3 * 86_400 * 1_000))
     return DeviceProfile(
         email=email,
-        device_id=str(uuid.uuid5(uuid.NAMESPACE_URL, seed)),
-        device_model=device_model,
-        sidecar_model=sidecar_model,
-        os_version=rng.choices(("26.5.2", "26.5.1", "26.5"),
-                              weights=(70, 20, 10))[0],
-        sidecar_system_version="26.5",
+        device_id=device_id,
+        device_model=build_model,
+        sidecar_model=build_model,
+        os_version=os_version,
+        sdk_int=int(sdk_int),
+        sidecar_system_version=os_version,
+        logical_camera_id=str(ref.get("logicalCameraId") or "4"),
         boot_wall_ms=boot_wall_ms,
         created_wall_ms=created_wall_ms,
-        clock_offset_ns=rng.randint(-135, -115),  # real: -125/-126
         frames_gop=rng.randint(28, 32),
         video_bitrate_mbps=round(rng.uniform(7.4, 8.8), 1),
         calib=calib,
@@ -454,10 +512,9 @@ def repair_future_timestamps(
     first_use_ms: int | None = None,
     now_ms: int | None = None,
 ) -> bool:
-    """Migra perfis da versão que somava jitter ao primeiro uso conhecido.
+    """Migra perfis com relógio no futuro: preserva identidade, desloca boot.
 
-    Preserva toda a identidade do aparelho e o intervalo boot→primeiro uso;
-    apenas desloca os dois relógios para trás. Devolve True se houve reparo.
+    Devolve True se houve reparo.
     """
     now_ms = int(now_ms if now_ms is not None else _wall_ms_now())
     known_first_use = int(first_use_ms) if first_use_ms is not None else None

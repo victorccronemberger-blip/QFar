@@ -7,8 +7,8 @@ Separação de responsabilidades:
     baixados/cacheados em `data/ego4d/`.
   - Seleção: `list_clips()` / `find_clip()` com filtros (device, has_imu, duração,
     cenário).
-  - IMU: baixa o `.csv` real do vídeo e converte para o formato iOS do sidecar
-    (`t,ax,ay,az,wx,wy,wz` em 100Hz).
+  - IMU: baixa o `.csv` real do vídeo e reamostra para o formato Android do sidecar
+    (`t,ax,ay,az,wx,wy,wz` em 500 Hz).
 
 Requisitos:
   - Credenciais AWS do Ego4D em `~/.aws/credentials` (profile `default`) com
@@ -1338,17 +1338,18 @@ IMU_MAX_INTERPOLATION_GAP_MS = 50.0
 def build_imu_csv(
     imu_csv_path: str | Path,
     window_s: tuple[float, float],
-    sample_rate_hz: int = 100,
+    sample_rate_hz: int = config.ANDROID_IMU_SAMPLE_RATE_HZ,
     duration_ms: int | None = None,
     seed: str | None = None,
 ) -> str:
-    """Converte e valida a IMU oficial antes de gerar o sidecar iOS.
+    """Converte e valida a IMU oficial antes de gerar o sidecar ANDROID.
 
-    A documentação do Ego4D registra timestamps não monotônicos, valores
-    ausentes e componentes sem IMU. Por isso a entrada é lida por nome de
-    coluna, ordenada pelo timestamp canônico e só interpola lacunas curtas.
-    Uma janela sem cobertura confiável falha em vez de fabricar minutos com a
-    última amostra observada.
+    Reamostra para 500 Hz (EgoImu.SAMPLING_PERIOD_US = 2000). A documentação
+    do Ego4D registra timestamps não monotônicos, valores ausentes e
+    componentes sem IMU. Por isso a entrada é lida por nome de coluna,
+    ordenada pelo timestamp canônico e só interpola lacunas curtas. Uma janela
+    sem cobertura confiável falha em vez de fabricar minutos com a última
+    amostra observada.
     """
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz deve ser positivo")
@@ -1473,18 +1474,34 @@ def build_imu_csv(
                 a + (b - a) * ratio for a, b in zip(la, ra, strict=True))
             samples[idx] = (gyro, accel)
 
+    # Decorelação POR CONTA: o mesmo clipe injetado em N contas não pode sair
+    # byte-idêntico (antes só havia ±0.002 de ruído). Ganhos/offsets pequenos e
+    # determinísticos (via seed da conta) preservam a forma real do movimento.
+    if noise_rng is not None:
+        accel_gain = tuple(noise_rng.uniform(0.985, 1.015) for _ in range(3))
+        gyro_gain = tuple(noise_rng.uniform(0.98, 1.02) for _ in range(3))
+        accel_bias = tuple(noise_rng.uniform(-0.012, 0.012) for _ in range(3))
+        gyro_bias = tuple(noise_rng.uniform(-0.002, 0.002) for _ in range(3))
+    else:
+        accel_gain = gyro_gain = (1.0, 1.0, 1.0)
+        accel_bias = gyro_bias = (0.0, 0.0, 0.0)
+
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow(IMU_HDR)
     for idx, sample in enumerate(samples):
         assert sample is not None
         gyro, accel = sample
+        # Android: grava o sensor COMO LIDO (sem negar o eixo z — convenção
+        # de gravidade +z do Android; um aparelho real não inverte o sinal).
+        accel = tuple(v * g + b for v, g, b in zip(accel, accel_gain, accel_bias))
+        gyro = tuple(v * g + b for v, g, b in zip(gyro, gyro_gain, gyro_bias))
         if noise_rng is not None:
             accel = tuple(value + noise_rng.gauss(0, 0.002) for value in accel)
             gyro = tuple(value + noise_rng.gauss(0, 0.0002) for value in gyro)
         writer.writerow([
             idx * step_ns,
-            f"{accel[0]:.6f}", f"{accel[1]:.6f}", f"{-accel[2]:.6f}",
+            f"{accel[0]:.6f}", f"{accel[1]:.6f}", f"{accel[2]:.6f}",
             f"{gyro[0]:.6f}", f"{gyro[1]:.6f}", f"{gyro[2]:.6f}",
         ])
     return out.getvalue()

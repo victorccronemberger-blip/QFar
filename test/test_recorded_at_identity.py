@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-import re
+import io
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from moneymin import config, device_profile, minute_api, upload
-from moneymin import campaign
+from moneymin import campaign, sidecar
 from moneymin.campaign import _chunk_plan, _slice_imu_csv
 from moneymin.device_profile import DeviceProfile
 from moneymin.recording_timeline import RecordingSlot
@@ -95,14 +97,15 @@ class IdentityConsistencyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.profile = DeviceProfile(
             email="id-test@example.com",
-            device_id="11111111-2222-3333-4444-555555555555",
-            device_model="iPhone 15",
-            sidecar_model="iPhone15,4",
-            os_version="26.5.2",
-            sidecar_system_version="26.5",
+            device_id="android.ssaid:0123456789abcdef",
+            device_model="SM-S918B",
+            sidecar_model="SM-S918B",
+            os_version="14",
+            sdk_int=34,
+            sidecar_system_version="14",
+            logical_camera_id="4",
             boot_wall_ms=1_785_000_000_000,
             created_wall_ms=1_785_100_000_000,
-            clock_offset_ns=-126,
             frames_gop=30,
             video_bitrate_mbps=8.1,
         )
@@ -111,27 +114,25 @@ class IdentityConsistencyTests(unittest.TestCase):
         ua = self.profile.user_agent()
         headers = self.profile.headers()
         opened = self.profile.opened_payload()
-        self.assertEqual(
-            ua,
-            f"Minute/{config.APP_VERSION} "
-            "(com.bakerdata.minute; build:1; iOS 26.5.2)",
-        )
+        # UA OkHttp do APK (4.12.0) — constante em todos os aparelhos.
+        self.assertEqual(config.USER_AGENT, "okhttp/4.12.0")
+        self.assertEqual(ua, config.USER_AGENT)
         self.assertEqual(headers["X-App-Version"], config.APP_VERSION)
         self.assertEqual(headers["User-Agent"], ua)
-        self.assertEqual(headers["X-Device-Id"], self.profile.device_id)
+        self.assertEqual(headers["X-Device-Id"], "android.ssaid:0123456789abcdef")
         self.assertEqual(opened["app_version"], config.APP_VERSION)
-        self.assertEqual(opened["device_model"], "iPhone 15")
-        self.assertEqual(opened["os_version"], "ios 26.5.2")
+        self.assertEqual(opened["device_model"], "SM-S918B")
+        self.assertEqual(opened["os_version"], "android 14")
         self.assertEqual(
-            self.profile.upload_device_meta()["model"], "iPhone 15")
+            self.profile.upload_device_meta()["model"], "SM-S918B")
         self.assertEqual(
-            self.profile.sidecar_device_meta()["model"], "iPhone15,4")
+            self.profile.sidecar_device_meta()["model"], "SM-S918B")
         self.assertEqual(
-            self.profile.sidecar_device_meta()["systemVersion"], "26.5")
+            self.profile.sidecar_device_meta()["systemVersion"], "14")
         self.assertEqual(
-            self.profile.sidecar_platform_meta()["version"], "26.5")
+            self.profile.sidecar_platform_meta()["version"], 34)
         self.assertEqual(
-            self.profile.sidecar_platform_meta()["os"], "ios")
+            self.profile.sidecar_platform_meta()["type"], "android")
 
     def test_sidecar_timebase_uses_profile_uptime_and_app_version(self) -> None:
         recorded_at = "2026-07-27T20:42:54.562Z"
@@ -145,16 +146,16 @@ class IdentityConsistencyTests(unittest.TestCase):
             device_meta=self.profile.sidecar_device_meta(),
             platform_meta=self.profile.sidecar_platform_meta(),
             calib=self.profile.calib,
-            clock_offset_ns=self.profile.clock_offset_ns,
             uptime_ns=self.profile.uptime_ns_at(wall_ms),
         )
         self.assertEqual(meta["appVersion"], config.APP_VERSION)
         self.assertEqual(meta["createdAt"], recorded_at)
-        self.assertEqual(meta["device"]["model"], "iPhone15,4")
-        self.assertEqual(meta["device"]["systemVersion"], "26.5")
-        self.assertEqual(meta["platform"]["os"], "ios")
-        self.assertEqual(meta["platform"]["version"], "26.5")
-        self.assertEqual(meta["timebase"]["clockDomain"], "ios_systemUptimeNs")
+        self.assertEqual(meta["device"]["model"], "SM-S918B")
+        self.assertEqual(meta["device"]["systemVersion"], "14")
+        self.assertEqual(meta["platform"]["type"], "android")
+        self.assertEqual(meta["platform"]["version"], 34)
+        self.assertEqual(
+            meta["timebase"]["clockDomain"], "android_elapsedRealtimeNanos")
         start_ns = int(meta["timebase"]["startNs"])
         self.assertEqual(start_ns, self.profile.uptime_ns_at(wall_ms))
         self.assertNotEqual(start_ns, 224_584_000_000_000)
@@ -168,7 +169,8 @@ class IdentityConsistencyTests(unittest.TestCase):
         self.profile.location_accuracy = 10.0
         value = self.profile.location_header_value()
         self.assertIsNotNone(value)
-        self.assertIn("latitude", value or "")
+        # CSV exato do formatDeviceLocationHeader do bundle Android (isMock minúsculo).
+        self.assertEqual(value, "-23.550500,-46.633300,10,false")
         self.assertEqual(
             self.profile.headers()["X-Device-Location"], value)
 
@@ -208,6 +210,29 @@ class ChunkPlanTests(unittest.TestCase):
         self.assertEqual(plan, [(0, 480_000), (480_000, 480_000)])
         self.assertEqual(sum(dur for _, dur in plan), 960_000)
         self.assertTrue(all(dur >= 60_000 for _, dur in plan))
+
+    def test_remote_max_never_overflows_when_tail_is_small(self) -> None:
+        limits = {
+            "min_duration_ms": 60_000,
+            "max_duration_ms": 300_000,
+            "backlog_cap_ms": 14_400_000,
+        }
+        with mock.patch.dict(config._EFFECTIVE_LIMITS, limits, clear=True):
+            for total in (350_000, 610_000):
+                plan = _chunk_plan(total)
+                self.assertEqual(sum(dur for _, dur in plan), total)
+                self.assertTrue(all(
+                    60_000 <= dur <= 300_000 for _, dur in plan))
+
+    def test_duration_below_remote_minimum_is_rejected(self) -> None:
+        limits = {
+            "min_duration_ms": 120_000,
+            "max_duration_ms": 300_000,
+            "backlog_cap_ms": 14_400_000,
+        }
+        with mock.patch.dict(config._EFFECTIVE_LIMITS, limits, clear=True):
+            with self.assertRaises(ValueError):
+                _chunk_plan(90_000)
 
     def test_imu_slice_rebases_timestamps(self) -> None:
         csv = "t,ax,ay,az,wx,wy,wz\n0,1,0,0,0,0,0\n10000000,1,0,0,0,0,0\n"
@@ -270,6 +295,70 @@ class ChunkPlanTests(unittest.TestCase):
 
 
 class UploadContractTests(unittest.TestCase):
+    def test_session_complete_only_on_last_chunk(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.upload_bodies: list[dict] = []
+                self.complete_bodies: list[dict] = []
+
+            def request(self, method: str, path: str, body=None):
+                if path == "/api/v1/storage/sas/blobs":
+                    return 200, json.dumps({
+                        "signed_urls": [
+                            {
+                                "filename": item["filename"],
+                                "blob_url": f"https://blob.invalid/{item['filename']}",
+                            }
+                            for item in body["files"]
+                        ],
+                    })
+                if path.startswith("/api/v1/uploads?"):
+                    self.upload_bodies.append(body)
+                    return 201, json.dumps({"id": f"upload-{len(self.upload_bodies)}"})
+                if path.endswith("/complete"):
+                    self.complete_bodies.append(body)
+                    return 200, "{}"
+                if path.endswith("/finalize"):
+                    return 204, ""
+                raise AssertionError(f"chamada inesperada: {method} {path}")
+
+        with tempfile.TemporaryDirectory(prefix="qmoney-upload-contract-") as tmp:
+            root = Path(tmp)
+            paths = [root / "c0.mp4", root / "c1.mp4"]
+            for path in paths:
+                path.write_bytes(b"v")
+            now = time.time()
+            recorded = [
+                device_profile.format_recorded_at(now - 180),
+                device_profile.format_recorded_at(now - 120),
+            ]
+            session = FakeSession()
+            probe = {
+                "duration_ms": 60_000, "fps": 30.0, "width": 1440,
+                "height": 1080, "codec": "h264", "has_video": True,
+                "has_audio": True,
+            }
+            with (
+                mock.patch.object(upload, "_probe_duration_ms", return_value=60_000),
+                mock.patch.object(upload, "probe_video", return_value=probe),
+                mock.patch.object(upload, "_put_blob_file", return_value=201),
+                mock.patch.object(upload, "_put_blob", return_value=201),
+            ):
+                result = upload.upload_session(
+                    session, paths, "org", task_id="task",
+                    recorded_at=recorded, normalize=False, register_first=True,
+                    finalize=True, max_retries=1, sidecar=False,
+                    suppress_per_chunk_catbear=True,
+                )
+
+        self.assertTrue(result.finalized)
+        self.assertEqual(len(session.complete_bodies), 2)
+        # Só o PATCH complete do ÚLTIMO chunk carrega session_complete: true.
+        self.assertNotIn("session_complete", session.complete_bodies[0])
+        self.assertIs(session.complete_bodies[1]["session_complete"], True)
+        self.assertIs(
+            session.complete_bodies[1]["suppress_per_chunk_catbear"], True)
+
     def test_post_and_sidecar_keep_each_chunk_recorded_at(self) -> None:
         class FakeSession:
             def __init__(self) -> None:
@@ -335,6 +424,469 @@ class UploadContractTests(unittest.TestCase):
             [body["meta"]["createdAt"] for body in session.upload_bodies],
             recorded,
         )
+
+
+class SensorFidelityTests(unittest.TestCase):
+    def test_imu_csv_is_500hz_and_span_matches_duration(self) -> None:
+        text = sidecar.build_imu_csv(60_000, seed="sensor-t")
+        rows = text.strip().splitlines()
+        self.assertEqual(rows[0], "t,ax,ay,az,wx,wy,wz")
+        self.assertEqual(len(rows) - 1, 30_001)  # 500 Hz * 60 s + 1
+        t0 = int(rows[1].split(",")[0])
+        t1 = int(rows[2].split(",")[0])
+        self.assertEqual(t1 - t0, 2_000_000)  # 2 ms em ns
+        self.assertEqual(int(rows[-1].split(",")[0]), 60_000 * 1_000_000)
+
+    def test_imu_signal_differs_per_account(self) -> None:
+        a = sidecar.build_imu_csv(6_000, seed="conta-a")
+        b = sidecar.build_imu_csv(6_000, seed="conta-b")
+        self.assertNotEqual(a, b)
+
+    def test_imu_az_is_positive_gravity_android(self) -> None:
+        rows = sidecar.build_imu_csv(2_000, seed="g").strip().splitlines()[1:]
+        azs = [float(r.split(",")[3]) for r in rows[50:-50]]
+        self.assertGreater(sum(azs) / len(azs), 9.0)
+
+    def test_imu_gravity_magnitude_is_one_g(self) -> None:
+        # Regressão: o gerador não pode somar gravidade 2x (|g| ≈ 19.6 era bug).
+        import math as _math
+        rows = sidecar.build_imu_csv(4_000, seed="g2").strip().splitlines()[1:]
+        magnitudes = []
+        for raw in rows[50:-50]:
+            values = [float(v) for v in raw.split(",")]
+            ax, ay, az = values[1], values[2], values[3]
+            magnitudes.append(_math.sqrt(ax * ax + ay * ay + az * az))
+        mean_g = sum(magnitudes) / len(magnitudes)
+        self.assertGreater(mean_g, 9.3)
+        self.assertLess(mean_g, 10.3)
+
+    def test_frames_from_video_falls_back_to_synthetic(self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="qmoney-frames-video-") as tmp:
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"not a real mp4")
+            text = sidecar.build_frames_csv_from_video(
+                video, duration_ms=10_000, offset_ns=1_234_000_000)
+        rows = text.strip().splitlines()
+        self.assertEqual(rows[0], "i,ptsNs,dtNs,tNs,key")
+        self.assertEqual(len(rows) - 1, 301)  # 30 fps * 10 s + 1
+        pts = [int(r.split(",")[1]) for r in rows[1:]]
+        self.assertTrue(all(later >= earlier
+                            for earlier, later in zip(pts, pts[1:])))
+        self.assertEqual(int(rows[1].split(",")[3]), 1_234_000_000)
+
+    def test_frames_from_real_mp4_uses_actual_pts_and_keyframes(self) -> None:
+        ffmpeg = sidecar.ffmpeg_bin()
+        if not ffmpeg or ffmpeg == "ffmpeg":
+            self.skipTest("ffmpeg indisponível para gerar MP4 de teste")
+        import subprocess as _subprocess
+
+        raw: list[tuple[int, bool]] = []
+        with tempfile.TemporaryDirectory(prefix="qmoney-frames-real-") as tmp:
+            video = Path(tmp) / "real.mp4"
+            try:
+                proc = _subprocess.run([
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i",
+                    "testsrc=duration=2:size=160x120:rate=30",
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-g", "6", "-keyint_min", "6", "-pix_fmt", "yuv420p",
+                    "-r", "30", str(video),
+                ], capture_output=True, text=True, timeout=120)
+            except Exception:
+                proc = None
+            if proc is None or proc.returncode != 0 or not video.exists():
+                self.skipTest("ffmpeg não conseguiu gerar o MP4")
+            raw = sidecar._extract_frame_pts_mp4(video)
+        self.assertEqual(len(raw), 60)  # 2 s × 30 fps
+        keys = [i for i, (_pts, key) in enumerate(raw) if key]
+        self.assertEqual(keys[:3], [0, 6, 12])
+        self.assertEqual(raw[1][0], 33_333_333)
+
+    def test_sidecar_zip_members_have_logid_prefix(self) -> None:
+        data = sidecar.build_sidecar_zip(
+            session_id="zip-session", chunk_index=0, duration_ms=30_000,
+            recorded_at="2026-08-20T12:00:00.000Z",
+            calib={
+                "fx": 1545, "fy": 1543, "cx": 2016, "cy": 1512,
+                "referenceWidth": 4032, "referenceHeight": 3024,
+                "k1": -0.24, "k2": 0.12, "k3": -0.035,
+                "p1": 0.001, "p2": -0.002, "readoutS": 0.0104,
+                "logicalCameraId": "4",
+            },
+            uptime_ns=88_000_000_000_000,
+            device_meta={"model": "SM-S918B", "systemName": "Android",
+                         "systemVersion": "14"},
+            platform_meta={"type": "android", "version": 34},
+            imu_seed="android.ssaid:0123456789abcdef",
+        )
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            members = sorted(zf.namelist())
+        self.assertEqual(
+            members,
+            ["zip-session_0.frames.csv", "zip-session_0.imu.csv",
+             "zip-session_0.metadata.json"])
+
+
+class ValidatorTests(unittest.TestCase):
+    def _zip_bytes(self) -> bytes:
+        return sidecar.build_sidecar_zip(
+            session_id="val-session", chunk_index=0, duration_ms=60_000,
+            recorded_at="2026-08-20T12:00:00.000Z",
+            calib={
+                "fx": 1545, "fy": 1543, "cx": 2016, "cy": 1512,
+                "referenceWidth": 4032, "referenceHeight": 3024,
+                "k1": -0.24, "k2": 0.12, "k3": -0.035,
+                "p1": 0.001, "p2": -0.002, "readoutS": 0.0104,
+                "logicalCameraId": "4",
+            },
+            uptime_ns=88_000_000_000_000,
+            device_meta={"model": "SM-S918B", "systemName": "Android",
+                         "systemVersion": "14"},
+            platform_meta={"type": "android", "version": 34},
+            imu_seed="android.ssaid:aaaaaaaaaaaaaaaa",
+        )
+
+    def test_built_sidecar_passes_local_checklist(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        summary = summarize(validate_sidecar_zip(
+            self._zip_bytes(), log_id="val-session_0", duration_ms=60_000))
+        self.assertEqual(summary["counts"]["fail"], 0)
+
+    def test_corrupted_imu_header_is_caught(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        payload = bytearray(self._zip_bytes())
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            inner = {name: zf.read(name) for name in zf.namelist()}
+        inner["val-session_0.imu.csv"] = (
+            b"t,ax,ay,az\n" + inner["val-session_0.imu.csv"].split(b"\n", 1)[1])
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, content in inner.items():
+                zf.writestr(name, content)
+        summary = summarize(validate_sidecar_zip(
+            buf.getvalue(), log_id="val-session_0", duration_ms=60_000))
+        self.assertGreater(summary["counts"]["fail"], 0)
+
+
+class PropertyAuditTests(unittest.TestCase):
+    """Matriz reduzida do fuzz: bordas de duração × modelos × seeds, 0 fails."""
+
+    _MODELS = [
+        ("SM-G991B", "2", 1250.0),
+        ("SM-S908B", "3", 1522.0),
+        ("SM-S918B", "4", 1600.0),
+        ("SM-S928B", "5", 1605.0),
+    ]
+    _DURATIONS = [60_000, 61_000, 480_000]
+    _SEEDS = ["android.ssaid:0123456789abcdef"]
+
+    def test_all_edge_sidecars_pass_the_local_checklist(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        fails: list[str] = []
+        # 1800s (máximo) só 1 caso — a malha completa é o scripts/fuzz_sidecars.py.
+        for duration in self._DURATIONS + [1_800_000]:
+            for model, cam_id, fx in self._MODELS:
+                for seed in self._SEEDS:
+                    if duration == 1_800_000 and (model, seed) != (
+                            self._MODELS[0][0], self._SEEDS[0]):
+                        continue
+                    payload = sidecar.build_sidecar_zip(
+                        session_id="prop", chunk_index=0,
+                        duration_ms=duration,
+                        recorded_at="2026-08-20T12:00:00.000Z",
+                        calib={
+                            "fx": fx, "fy": fx, "cx": 2016, "cy": 1512,
+                            "referenceWidth": 4032, "referenceHeight": 3024,
+                            "k1": -0.24, "k2": 0.12, "k3": -0.035,
+                            "p1": 0.001, "p2": -0.002, "readoutS": 0.0105,
+                            "logicalCameraId": cam_id,
+                        },
+                        uptime_ns=88_000_000_000_000,
+                        device_meta={"model": model, "systemName": "Android",
+                                     "systemVersion": "14"},
+                        platform_meta={"type": "android", "version": 34},
+                        imu_seed=seed,
+                    )
+                    summary = summarize(validate_sidecar_zip(
+                        payload, log_id="prop_0", duration_ms=duration))
+                    if summary["counts"]["fail"]:
+                        fails.append(
+                            f"{model} {duration}ms {seed}: "
+                            + "; ".join(f"{f['id']}" for f in summary["failures"]))
+        self.assertEqual(fails, [])
+
+    def test_multi_chunk_slice_keeps_each_chunk_consistent(self) -> None:
+        from moneymin.campaign import _slice_imu_csv
+        from moneymin.validate import summarize, validate_sidecar_zip
+
+        full = sidecar.build_imu_csv(960_000, seed="android.ssaid:abcdef")
+        for index, (start_ms, dur_ms) in enumerate(((0, 480_000), (480_000, 480_000))):
+            part, n = _slice_imu_csv(full, start_ms, dur_ms)
+            payload = sidecar.build_sidecar_zip_custom(
+                session_id="prop-mc", chunk_index=index, duration_ms=dur_ms,
+                recorded_at="2026-08-20T12:00:00.000Z",
+                calib={
+                    "fx": 1600, "fy": 1600, "cx": 2016, "cy": 1512,
+                    "referenceWidth": 4032, "referenceHeight": 3024,
+                    "k1": -0.24, "k2": 0.12, "k3": -0.035,
+                    "p1": 0.001, "p2": -0.002, "readoutS": 0.0112,
+                    "logicalCameraId": "4",
+                },
+                uptime_ns=88_000_000_000_000,
+                device_meta={"model": "SM-S918B", "systemName": "Android",
+                             "systemVersion": "14"},
+                platform_meta={"type": "android", "version": 34},
+                imu_csv=part, frames_csv=sidecar.build_frames_csv(
+                    dur_ms, fps=30.0, gop=30, offset_ns=88_000_000_000_000),
+                imu_sample_count=n,
+            )
+            summary = summarize(validate_sidecar_zip(
+                payload, log_id=f"prop-mc_{index}", duration_ms=dur_ms))
+            self.assertEqual(summary["counts"]["fail"], 0,
+                             f"chunk {index}: {summary['failures']}")
+
+
+class ValidatorRegressionTests(unittest.TestCase):
+    """Regressões dos falsos positivos do validador (P2 identificados)."""
+
+    @staticmethod
+    def _zip() -> bytes:
+        return sidecar.build_sidecar_zip(
+            session_id="val-session", chunk_index=0, duration_ms=60_000,
+            recorded_at="2026-08-20T12:00:00.000Z",
+            calib={
+                "fx": 1545, "fy": 1543, "cx": 2016, "cy": 1512,
+                "referenceWidth": 4032, "referenceHeight": 3024,
+                "k1": -0.24, "k2": 0.12, "k3": -0.035,
+                "p1": 0.001, "p2": -0.002, "readoutS": 0.0104,
+                "logicalCameraId": "4",
+            },
+            uptime_ns=88_000_000_000_000,
+            device_meta={"model": "SM-S918B", "systemName": "Android",
+                         "systemVersion": "14"},
+            platform_meta={"type": "android", "version": 34},
+            imu_seed="android.ssaid:aaaaaaaaaaaaaaaa",
+        )
+
+    @staticmethod
+    def _repack(members: dict[str, bytes]) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, content in members.items():
+                zf.writestr(name, content)
+        return buf.getvalue()
+
+    @staticmethod
+    def _inner(payload: bytes) -> dict[str, bytes]:
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            return {name: zf.read(name) for name in zf.namelist()}
+
+    def test_sample_count_mismatch_is_a_fail(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        inner = self._inner(self._zip())
+        meta = json.loads(inner["val-session_0.metadata.json"])
+        meta["imuDiagnostics"]["sampleCount"] = 123  # falso positivo antigo
+        inner["val-session_0.metadata.json"] = json.dumps(meta).encode()
+        summary = summarize(validate_sidecar_zip(
+            self._repack(inner), log_id="val-session_0", duration_ms=60_000))
+        self.assertGreater(summary["counts"]["fail"], 0)
+        self.assertIn(
+            "imuDiagnostics.sampleCount",
+            [f["id"] for f in summary["failures"]])
+
+    def test_sample_count_off_by_one_is_a_fail(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        inner = self._inner(self._zip())
+        meta = json.loads(inner["val-session_0.metadata.json"])
+        meta["imuDiagnostics"]["sampleCount"] += 1
+        inner["val-session_0.metadata.json"] = json.dumps(meta).encode()
+        summary = summarize(validate_sidecar_zip(
+            self._repack(inner), log_id="val-session_0", duration_ms=60_000))
+        self.assertIn(
+            "imuDiagnostics.sampleCount",
+            [f["id"] for f in summary["failures"]])
+
+    def test_frame_clock_mismatch_is_a_fail(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        inner = self._inner(self._zip())
+        name = "val-session_0.frames.csv"
+        lines = inner[name].decode().splitlines()
+        first = lines[1].split(",")
+        first[3] = first[1]  # remove uptime: tNs volta ao relógio zero-based
+        lines[1] = ",".join(first)
+        inner[name] = ("\n".join(lines) + "\n").encode()
+        summary = summarize(validate_sidecar_zip(
+            self._repack(inner), log_id="val-session_0", duration_ms=60_000))
+        self.assertIn(
+            "xcheck.frames_timebase",
+            [f["id"] for f in summary["failures"]])
+
+    def test_invalid_distortion_layout_is_a_fail(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        inner = self._inner(self._zip())
+        meta = json.loads(inner["val-session_0.metadata.json"])
+        meta["cameras"][0]["intrinsics"][
+            "distortion_coefficients_layout"] = "invalid"
+        inner["val-session_0.metadata.json"] = json.dumps(meta).encode()
+        summary = summarize(validate_sidecar_zip(
+            self._repack(inner), log_id="val-session_0", duration_ms=60_000))
+        self.assertIn(
+            "artifact.cameras_schema",
+            [f["id"] for f in summary["failures"]])
+
+    def test_header_only_csv_reproves_not_crashes(self) -> None:
+        from moneymin.validate import summarize, validate_sidecar_zip
+        inner = self._inner(self._zip())
+        inner["val-session_0.imu.csv"] = b"t,ax,ay,az,wx,wy,wz\n"
+        summary = summarize(validate_sidecar_zip(
+            self._repack(inner), log_id="val-session_0", duration_ms=60_000))
+        self.assertGreater(summary["counts"]["fail"], 0)
+
+
+class GatesTests(unittest.TestCase):
+    def _session(self, responder) -> minute_api.Session:
+        sess = minute_api.Session({"idToken": "token"}, email="gate@example.com")
+        sess._live = True
+        sess.request = responder  # type: ignore[method-assign]
+        return sess
+
+    @staticmethod
+    def _me_body(disabled: bool = False) -> str:
+        # UserResponse do OpenAPI: resourceKey do próprio usuário + disabled topo
+        # + organizations[].disabled por-org.
+        return json.dumps({
+            "email": "gate@example.com",
+            "resourceKey": "gate-user-key",
+            "disabled": False,
+            "organizations": [
+                {"resourceKey": "org", "name": "Org", "disabled": disabled},
+            ],
+        })
+
+    @staticmethod
+    def _quality_route() -> str:
+        return "/api/v1/organizations/org/quality-screen"
+
+    def test_org_state_detects_on_hold(self) -> None:
+        def responder(method: str, path: str, body=None):
+            if path == "/api/v1/users/me":
+                return 200, self._me_body()
+            if path == self._quality_route():
+                return 200, json.dumps(
+                    {"userState": "on_hold", "overall": "needs_work",
+                     "scores": []})
+            raise AssertionError(f"rota inesperada: {path}")
+
+        state = self._session(responder).org_state("org")
+        self.assertTrue(state["blocked"])
+        self.assertEqual(state["userState"], "on_hold")
+
+    def test_org_state_detects_inactive_and_disabled(self) -> None:
+        def responder(method: str, path: str, body=None):
+            if path == "/api/v1/users/me":
+                return 200, self._me_body(disabled=True)
+            if path == self._quality_route():
+                return 200, json.dumps({"userState": "inactive"})
+            raise AssertionError(f"rota inesperada: {path}")
+
+        state = self._session(responder).org_state("org")
+        self.assertTrue(state["disabled"])
+        self.assertTrue(state["blocked"])
+
+    def test_disabled_other_org_does_not_block_target(self) -> None:
+        def responder(method: str, path: str, body=None):
+            if path == "/api/v1/users/me":
+                return 200, json.dumps({
+                    "email": "gate@example.com",
+                    "resourceKey": "gate-user-key",
+                    "disabled": False,
+                    "organizations": [
+                        {"resourceKey": "outra", "name": "Outra",
+                         "disabled": True},
+                        {"resourceKey": "org", "name": "Org",
+                         "disabled": False},
+                    ],
+                })
+            if path == self._quality_route():
+                return 200, json.dumps({"userState": "active"})
+            raise AssertionError(f"rota inesperada: {path}")
+
+        state = self._session(responder).org_state("org")
+        self.assertFalse(state["disabled"])
+        self.assertFalse(state["blocked"])
+
+    def test_version_gate_latches_on_403_and_blocks(self) -> None:
+        def responder(method: str, path: str, body=None):
+            if path == "/api/v1/users/me":
+                return 200, self._me_body()
+            if path == self._quality_route():
+                return 200, json.dumps({"userState": "active"})
+            raise AssertionError(f"rota inesperada: {path}")
+
+        sess = self._session(responder)
+        try:
+            minute_api._maybe_latch_version_gate(
+                '{"detail":{"code":"app_version_too_old",'
+                '"minVersion":"1.99.0"}}')
+            gate = sess.version_gate()
+            self.assertIsNotNone(gate)
+            self.assertEqual(gate["minVersion"], "1.99.0")
+            self.assertLess(
+                minute_api._semver_tuple(config.APP_VERSION),
+                minute_api._semver_tuple("1.99.0"))
+            with self.assertRaises(minute_api.AuthError):
+                sess.ensure_auth(org_key="org")
+        finally:
+            minute_api._maybe_latch_version_gate("", clear=True)
+
+    def test_403_latches_through_session_request(self) -> None:
+        def _jwt() -> str:
+            def enc(obj: dict) -> str:
+                import base64
+                return base64.urlsafe_b64encode(
+                    json.dumps(obj).encode()).rstrip(b"=").decode()
+            return enc({"alg": "none"}) + "." + enc(
+                {"exp": 4_000_000_000}) + ".sig"
+
+        sess = minute_api.Session({"idToken": _jwt()}, email="gate@example.com")
+        sess._live = True
+        try:
+            with mock.patch.object(
+                    minute_api, "_request",
+                    return_value=(
+                        403,
+                        '{"detail":{"code":"app_version_too_old",'
+                        '"minVersion":"2.0.0"}}')):
+                status, _ = sess.request("GET", "/api/v1/users/me")
+            self.assertEqual(status, 403)
+            gate = minute_api._version_gate_file()
+            self.assertTrue(gate.exists())
+            data = json.loads(gate.read_text(encoding="utf-8"))
+            self.assertEqual(data["minVersion"], "2.0.0")
+        finally:
+            minute_api._maybe_latch_version_gate("", clear=True)
+
+    def test_camera_policy_allow_and_deny(self) -> None:
+        policy = json.dumps({
+            "policyVersion": 1,
+            "androidAllowModels": ["SM-S918B"],
+            "androidDeniedModels": [],
+            "androidAllowModelPatterns": [],
+            "normalization": {
+                "trimWhitespace": True, "lowercase": True,
+                "collapseInternalWhitespace": True,
+            },
+        })
+
+        def responder(method: str, path: str, body=None):
+            if path == "/api/v1/devices/native-camera-policy":
+                return 200, policy
+            raise AssertionError(f"rota inesperada: {path}")
+
+        sess = self._session(responder)
+        self.assertIs(sess.camera_model_allowed("  sm-s918b  "), True)
+        self.assertIs(sess.camera_model_allowed("SM-G991B"), False)
 
 
 if __name__ == "__main__":

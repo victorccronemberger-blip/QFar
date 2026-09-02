@@ -63,7 +63,6 @@ from typing import Any
 from . import config, transport
 from .atomic_io import load_json, save_bytes, save_json
 from .device_profile import (
-    BACKLOG_CAP_MS,
     DeviceProfile,
     format_recorded_at,
     recorded_at_to_wall_ms,
@@ -119,9 +118,9 @@ UPLOAD_MAX_DURATION_MS = 1_800_000
 def default_device_meta(profile: DeviceProfile | None = None) -> dict[str, Any]:
     """Metadados de dispositivo que o app nativo envia em meta.device.
 
-    Capturado do app iOS real (req 072): envia APENAS {"model": "iPhone 13"}.
+    Formato curto Android (getDeviceUploadMeta): APENAS {"model": Build.MODEL}.
     NÃO envia systemName nem systemVersion no POST /uploads.
-    Com perfil: o nome comercial daquele aparelho, não o default global.
+    Com perfil: o Build.MODEL Samsung daquele aparelho, não o default global.
     """
     if profile is not None:
         return profile.upload_device_meta()
@@ -133,7 +132,7 @@ def default_device_meta(profile: DeviceProfile | None = None) -> dict[str, Any]:
 def default_platform_meta(profile: DeviceProfile | None = None) -> dict[str, Any]:
     """Metadados de plataforma que o app nativo envia em meta.platform.
 
-    Capturado do app iOS real (req 072): envia APENAS {"os": "ios"}.
+    Formato curto Android (getDeviceUploadMeta): APENAS {"os": "android"}.
     NÃO envia version no POST /uploads.
     """
     if profile is not None:
@@ -181,7 +180,7 @@ def _normalize_recorded_at_sequence(
             transient=False,
         )
     now_ms = int((time.time() if now is None else float(now)) * 1000)
-    if wall_ms[0] < now_ms - BACKLOG_CAP_MS:
+    if wall_ms[0] < now_ms - config.recording_limits()["backlog_cap_ms"]:
         raise UploadError(
             "recorded_at está fora do backlog de gravação do Minute",
             transient=False,
@@ -220,7 +219,7 @@ def _recorded_at_sequence_from_base(
 def default_video_meta() -> dict[str, Any]:
     """Metadados de vídeo que o app nativo envia em meta.video.
 
-    Shape nativo iOS: {height, path, rotationDeg, width} (path = {logId}.mp4).
+    Shape Android: {height, path, rotationDeg, width} (path = {logId}.mp4).
     """
     return {
         "height": 1080,
@@ -245,10 +244,9 @@ def _put_blob(blob_url: str, file_bytes: bytes, content_type: str = "video/mp4",
     """Faz PUT dos bytes no Azure Blob Storage. Devolve o status HTTP.
 
     O transporte (e o fingerprint de rede) é do `transport.py`: com curl_cffi
-    o MP4 usa o upload resumável do NSURLSession (Put Block 4MB + Put Block
-    List — captura 06/08); o sidecar `.data.zip` vai com `resumable=False`
-    (PUT BlockBlob único, como o app). Sem curl_cffi, PUT BlockBlob. Sucesso
-    é 201 Created, não 200.
+    o MP4 e o sidecar sobem em blocos de 4MB + Put Block List, como o
+    AzureBlockUploader/OkHttp do app Android. Sem curl_cffi, PUT BlockBlob
+    único. Sucesso é 201 Created (o OkHttp do app aceita qualquer 2xx).
 
     Levanta UploadError se o Azure recusar (status != 201) ou em erro de rede.
     """
@@ -310,7 +308,7 @@ def _video_pix_fmt(video_path: str | Path) -> tuple[str | None, str | None]:
 
 
 def _video_handler(video_path: str | Path) -> str | None:
-    """handler_name do stream de vídeo (ex.: 'Core Media Video')."""
+    """handler_name do stream de vídeo (ex.: 'VideoHandler')."""
     return probe_video(video_path).get("handler_name")
 
 
@@ -328,12 +326,13 @@ def _run_ffmpeg(cmd: list[str], timeout: int = 3600):
 
 def normalize_video(video_path: str | Path, out_dir: str | Path | None = None,
                     preset: str = "veryfast") -> Path:
-    """Reencoda o vídeo para o formato EGO nativo do app (1440x1080 4:3).
+    """Reencoda o vídeo para o formato EGO nativo do app Android (1440x1080 4:3).
 
-    O iPhone grava a ultra-wide em 1440x1080 (4:3); datasets/YouTube vêm em
+    O app grava a ultra-wide em 1440x1080 (4:3); datasets/YouTube vêm em
     16:9 (1920x1080). O Catbear pontua melhor (clarity=great) o que replica a
-    gravação iPhone: proporção 4:3, yuv420p limited-range, handler
-    "Core Media Video" e sem tags de dataset.
+    gravação Android: proporção 4:3, yuv420p limited-range, H.264 High@4.2
+    (MediaRecorder setVideoEncodingProfileLevel(8, 8192)), handler
+    VideoHandler/SoundHandler e áudio AAC 48 kHz estéreo 256 kbps.
 
     Conversão: escala para cobrir 1440x1080 (force_original_aspect_ratio=increase)
     e corta o excesso (crop) para 4:3 — conteúdo central preservado.
@@ -347,7 +346,7 @@ def normalize_video(video_path: str | Path, out_dir: str | Path | None = None,
     handler = _video_handler(video_path) or ""
     w, h = _video_dims(video_path)
     native_43 = abs((w / h) - (4.0 / 3.0)) < 0.02
-    needs = (pix_fmt == "yuvj420p" or "core media" not in handler.lower()
+    needs = (pix_fmt == "yuvj420p" or "videohandler" not in handler.lower()
              or not native_43 or w != 1440)
     if not needs:
         return video_path
@@ -362,7 +361,8 @@ def normalize_video(video_path: str | Path, out_dir: str | Path | None = None,
         "-i", str(video_path),
         "-c:v", "libx264", "-preset", preset,
         "-b:v", "8000k", "-maxrate", "8000k", "-bufsize", "16000k",
-        "-profile:v", "high", "-level", "4.0",
+        "-profile:v", "high", "-level:v", "4.2",
+        "-g", "30", "-keyint_min", "30",
         "-vf", ("scale=1440:1080:force_original_aspect_ratio=increase,"
                 "crop=1440:1080,"
                 "scale=in_range=full:out_range=tv,format=yuv420p"),
@@ -370,20 +370,21 @@ def normalize_video(video_path: str | Path, out_dir: str | Path | None = None,
         "-color_range", "tv", "-colorspace", "bt709",
         "-color_primaries", "bt709", "-color_trc", "bt709",
         "-map_metadata", "-1", "-map_chapters", "-1",
-        "-metadata:s:v:0", "handler_name=Core Media Video",
-        "-c:a", "aac", "-ac", "1", "-ar", "48000",
+        "-metadata:s:v:0", "handler_name=VideoHandler",
+        "-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "256k",
+        "-metadata:s:a:0", "handler_name=SoundHandler",
         "-movflags", "+faststart", "-f", "mp4", str(out),
     ]
     try:
         res = _run_ffmpeg(cmd)
     except FileNotFoundError as exc:
         raise UploadError(
-            "vídeo precisa de reencode para formato iPhone (1440x1080 yuv420p), "
+            "vídeo precisa de reencode para formato Android (1440x1080 yuv420p), "
             "mas o FFmpeg do QMoney não está disponível; use Reparar instalação "
             "na aba Integrações") from exc
     if res.returncode != 0:
         raise UploadError(
-            f"falha ao normalizar vídeo para formato iPhone: {res.stderr.strip()[:300]}")
+            f"falha ao normalizar vídeo para formato Android: {res.stderr.strip()[:300]}")
     return out
 
 
@@ -439,7 +440,8 @@ def trim_video(
         "-t", str(end - start),
         "-c:v", "libx264", "-preset", "veryfast",
         "-b:v", "8000k", "-maxrate", "8000k", "-bufsize", "16000k",
-        "-profile:v", "high", "-level", "4.0",
+        "-profile:v", "high", "-level:v", "4.2",
+        "-g", "30", "-keyint_min", "30",
         "-vf", ("scale=1440:1080:force_original_aspect_ratio=increase,"
                 "crop=1440:1080,"
                 "scale=in_range=full:out_range=tv,format=yuv420p"),
@@ -447,8 +449,9 @@ def trim_video(
         "-color_range", "tv", "-colorspace", "bt709",
         "-color_primaries", "bt709", "-color_trc", "bt709",
         "-map_metadata", "-1", "-map_chapters", "-1",
-        "-metadata:s:v:0", "handler_name=Core Media Video",
-        "-c:a", "aac", "-ac", "1", "-ar", "48000",
+        "-metadata:s:v:0", "handler_name=VideoHandler",
+        "-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "256k",
+        "-metadata:s:a:0", "handler_name=SoundHandler",
         "-movflags", "+faststart", "-f", "mp4",
         str(out),
     ]
@@ -650,11 +653,19 @@ def complete_upload(
     size_bytes: int,
     *,
     suppress_per_chunk_catbear: bool = False,
+    session_complete: bool = False,
 ) -> dict[str, Any]:
-    """Confirma um blob já enviado; operação reutilizável após reinício."""
+    """Confirma um blob já enviado; operação reutilizável após reinício.
+
+    `session_complete=True` no ÚLTIMO chunk da sessão — o app nativo
+    (_completeUpload, bundle) adiciona `session_complete: true` ao corpo nesse
+    caso; o QMoney agora replica.
+    """
     body: dict[str, Any] = {"size_bytes": int(size_bytes)}
     if suppress_per_chunk_catbear:
         body["suppress_per_chunk_catbear"] = True
+    if session_complete:
+        body["session_complete"] = True
     status, text, response_headers = _session_request(
         session, "PATCH", f"/api/v1/uploads/{upload_id}/complete", body)
     if status == 409:
@@ -843,6 +854,19 @@ def _validate_sidecar_zip(
                 f"({actual / 1e9:.3f}s vs {duration_ms / 1000:.3f}s)",
                 transient=False,
             )
+    # Checklist local equivalente ao evaluate (monotonicidade, keyframes,
+    # schema do metadata, duração) — QA antes da rede.
+    from .validate import summarize, validate_sidecar_zip
+    _summary = summarize(
+        validate_sidecar_zip(payload, log_id=log_id, duration_ms=duration_ms))
+    if _summary["counts"].get("fail", 0):
+        details = "; ".join(
+            f"{item['id']}: {item['detail']}"
+            for item in _summary["failures"])
+        raise UploadError(
+            f"sidecar reprovado no checklist local: {details}",
+            transient=False,
+        )
     return metadata
 
 
@@ -893,7 +917,11 @@ def _conflict_upload(text: str) -> dict[str, Any]:
         if upload_id:
             break
     normalized = json.dumps(body, ensure_ascii=False).casefold()
-    if "session-deleted" in normalized or "session_deleted" in normalized:
+    # O app compara detail === SESSION_DELETED_DETAIL = 'Session has been
+    # deleted' (bundle:999140). A substring exata é a única confiável.
+    if ("session has been deleted" in normalized
+            or "session-deleted" in normalized
+            or "session_deleted" in normalized):
         raise UploadError(
             "POST /uploads: a sessão foi removida pelo servidor",
             status_code=409, transient=False, phase="create",
@@ -934,6 +962,7 @@ def _upload_single_chunk(
     max_retries: int = 3,
     retry_backoff: float = 1.5,
     suppress_per_chunk_catbear: bool = False,
+    session_complete: bool = False,
     fail_on_error: bool = True,
     sidecar: bool = True,
     sidecar_data: bytes | None = None,
@@ -951,7 +980,8 @@ def _upload_single_chunk(
 
     Espelha o app nativo:
       - auto-retry com backoff nas etapas transientes (create/sas, transport);
-      - PATCH complete com `suppress_per_chunk_catbear`;
+      - PATCH complete com `suppress_per_chunk_catbear` e `session_complete`
+        (este último no último chunk da sessão — replica `_completeUpload`);
       - se o registro foi criado e a confirmação falhar, marca `PATCH /fail`
         (fail_on_error) — comportamento `_failUpload` do app;
       - se o arquivo local sumir, devolve um ChunkResult em estado `loss`
@@ -962,6 +992,7 @@ def _upload_single_chunk(
 
     Retorna o ChunkResult com os IDs e metadados.
     """
+    _limits = config.recording_limits()
     file_size = video_path.stat().st_size if video_path.exists() else -1
     # Padrão nativo: logId = "{sessionId}_{chunk_index}".
     log_id = f"{session_id}_{chunk_index}"
@@ -991,14 +1022,14 @@ def _upload_single_chunk(
             error="arquivo local ausente antes do preflight",
         )
     if (file_size <= 0
-            or not UPLOAD_MIN_DURATION_MS <= duration_ms <= UPLOAD_MAX_DURATION_MS):
+            or not _limits["min_duration_ms"] <= duration_ms <= _limits["max_duration_ms"]):
         return ChunkResult(
             upload_id="", chunk_index=chunk_index, log_id=log_id, blob_path="",
             size_bytes=file_size, duration_ms=duration_ms, state=STATE_FAILED,
             error=(
                 "preflight recusou vídeo vazio ou fora da duração permitida "
-                f"({duration_ms} ms; esperado {UPLOAD_MIN_DURATION_MS}–"
-                f"{UPLOAD_MAX_DURATION_MS} ms)"),
+                f"({duration_ms} ms; esperado {_limits['min_duration_ms']}–"
+                f"{_limits['max_duration_ms']} ms)"),
         )
 
     # --- 0. sidecar .data.zip (nativo) ------------------------------------
@@ -1010,23 +1041,24 @@ def _upload_single_chunk(
                 sidecar_bytes = sidecar_data
             else:
                 probe = probe_video(video_path)
-                # Sem device_meta/platform_meta: o metadata.json do sidecar usa o
-                # device COMPLETO do iPhone real (iPhone14,5 + systemName +
-                # systemVersion; platform com version) — o que o catbear espera.
-                # Com `profile` (anti-colusão): calibração, clockOffset e
-                # uptime DO APARELHO DA CONTA — cada upload tem identidade
-                # de sensor própria.
+                # Sem device_meta/platform_meta: o metadata.json do sidecar usa
+                # o device COMPLETO Android (Build.MODEL + systemName +
+                # systemVersion; platform {type,version}) — o que o catbear espera.
+                # Com `profile` (anti-colusão): intrinsics Brown-Conrady e
+                # elapsedRealtimeNanos DO APARELHO DA CONTA — cada upload tem
+                # identidade de sensor própria.
                 sidecar_kwargs: dict[str, Any] = {}
                 if profile is not None:
                     wall_ms = recorded_at_to_wall_ms(recorded_at)
                     sidecar_kwargs = {
                         "calib": profile.calib,
-                        "clock_offset_ns": profile.clock_offset_ns,
                         "frames_gop": profile.frames_gop,
                         "uptime_ns": (profile.uptime_ns_at(wall_ms)
                                       if wall_ms else None),
+                        # IMU própria por conta (sem ela todas sobem a MESMA IMU)
+                        "imu_seed": profile.device_id,
                     }
-                    # device COMPLETO do perfil (modelo técnico da conta)
+                    # device COMPLETO do perfil (Build.MODEL Samsung da conta)
                     sidecar_kwargs["device_meta"] = profile.sidecar_device_meta()
                     sidecar_kwargs["platform_meta"] = profile.sidecar_platform_meta()
                 sidecar_bytes = build_sidecar_zip(
@@ -1035,6 +1067,9 @@ def _upload_single_chunk(
                     duration_ms=duration_ms,
                     recorded_at=recorded_at,
                     video_probe=probe,
+                    # frames.csv derivado do MP4 real (PTS/keyframes) como o
+                    # EgoSidecar lê com MediaExtractor — em QUALQUER upload.
+                    video_path=video_path,
                     **sidecar_kwargs,
                 )
             sidecar_metadata = _validate_sidecar_zip(
@@ -1185,11 +1220,12 @@ def _upload_single_chunk(
         if sidecar_bytes is not None:
             zip_url = urls_by_filename.get(sidecar_file_name, "")
             if zip_url:
-                # mitm 06/08: sidecar é PUT BlockBlob único, não Put Block.
+                # O nativeUploadTransport (AzureBlockUploader) sobe QUALQUER
+                # arquivo em blocos (mp4 e .data.zip) via OkHttp.
                 zip_status = _put_blob(zip_url, sidecar_bytes,
                                        content_type="application/zip",
                                        timeout=timeout_blob,
-                                       resumable=False)
+                                       resumable=None)
                 if zip_status != 201:
                     raise _http_upload_error(
                         "PUT sidecar", int(zip_status), "status inesperado")
@@ -1249,21 +1285,33 @@ def _upload_single_chunk(
         meta["chunk_index"] = chunk_index
         meta["size_bytes"] = file_size
         # O app nativo espalha o metadata.json do sidecar e DEPOIS sobrescreve
-        # device/platform/appVersion com getDeviceUploadMeta() — formato
-        # simplificado verificado na captura iOS real (sessão 44df642a, 06/08):
-        #   device   = {"model": "iPhone 13"}            (só model)
-        #   platform = {"os": "ios"}                     (só os)
+        # device/platform/appVersion com getDeviceUploadMeta() — formato curto
+        # Android (DETALHAMENTO §2.2):
+        #   device   = {"model": "SM-S918B"}   (só Build.MODEL)
+        #   platform = {"os": "android"}       (só os)
         #   appVersion = binaryAppVersion
-        # O metadata.json DENTRO do sidecar permanece COMPLETO (iPhone14,5 +
-        # systemName/systemVersion) — é o sidecar que alimenta os checks de
-        # integridade (artifact.metadata_json.*); o POST usa o formato curto.
-        # Formato curto do getDeviceUploadMeta (captura 072): só model/os.
-        # Com perfil: o MODELO DO APARELHO DA CONTA (iPhone 12+, não todos 13).
+        # O metadata.json DENTRO do sidecar permanece COMPLETO (model +
+        # systemName/systemVersion; platform {type,version}) — é o sidecar que
+        # alimenta os checks de integridade (artifact.metadata_json.*); o POST
+        # usa o formato curto.
+        # Com perfil: o MODELO SAMSUNG DO APARELHO DA CONTA (S21–S24).
         meta["device"] = default_device_meta(profile)
         meta["platform"] = default_platform_meta(profile)
         meta["appVersion"] = config.APP_VERSION
-        # O app real envia camera_source no meta (captura 072: "built-in").
-        meta["camera_source"] = config.NATIVE_CAMERA_SOURCE
+
+        # QA local: o backend compara o meta do POST com o sidecar
+        # (xcheck.metadata_json_matches_upload) — qualquer drift cai aqui.
+        from .validate import summarize as _summarize
+        from .validate import validate_upload_meta as _check_upload_meta
+        _meta_check = _summarize(_check_upload_meta(
+            meta, log_id=log_id, duration_ms=duration_ms))
+        if _meta_check["counts"].get("fail", 0):
+            details = "; ".join(f"{item['id']}: {item['detail']}"
+                                for item in _meta_check["failures"])
+            raise UploadError(
+                f"meta do POST /uploads reprovado no checklist local: {details}",
+                transient=False,
+            )
 
         upload_body: dict[str, Any] = {
             "session_id": session_id,
@@ -1391,6 +1439,7 @@ def _upload_single_chunk(
         return complete_upload(
             session, upload_id, file_size,
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
+            session_complete=session_complete,
         )
 
     complete_attempts = 1
@@ -1617,9 +1666,9 @@ def upload_session(
                       upload + a sessão no backend (DELETE /uploads/{id} e
                       DELETE /sessions/{sid}). Só finaliza a sessão se perfeita.
         profile       — perfil de APARELHO da conta (device_profile). Com ele,
-                      o sidecar usa calibração/clockOffset/uptime próprios e o
-                      meta usa o modelo daquele aparelho (anti-colusão). Sem
-                      ele, mantém os valores reais do iPhone do operador.
+                      o sidecar usa calibração/uptime próprios e o meta usa o
+                      modelo daquele aparelho (anti-colusão). Sem ele, usa o
+                      Samsung padrão de referência (config.NATIVE_*).
         chunk_index_start — índice inicial do chunk; usado pela retomada para
                       manter a identidade original e evitar registros duplicados.
         on_progress   — callback(phase, state, attempt) por etapa.
@@ -1778,6 +1827,10 @@ def upload_session(
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
+            # O app marca session_complete no PATCH complete do ITER ÚLTIMO chunk
+            # (quando a sessão será finalizada em seguida).
+            session_complete=(bool(finalize)
+                              and offset == len(paths) - 1),
             fail_on_error=fail_on_error,
             sidecar=sidecar,
             sidecar_data=chunk_sidecar_data,

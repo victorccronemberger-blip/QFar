@@ -127,15 +127,19 @@ HOSTINGER_MAIL_BASE = "https://api.mail.hostinger.com"
 CROWTADO_REF = "288TVN3C"
 CROWTADO_SIGNUP_URL = f"https://www.crowtado.com/sign-up?ref={CROWTADO_REF}"
 
-# Versão do app usada nos headers (bate com a captura mitm).
-# Backend exige min 1.21.0 (erro app_version_too_old em 08/08);
-# App Store já está em 1.22.0 (release 13/08/2026) — version-check do
-# backend ainda reporta latest 1.21.0, mas 1.21.0 segue aceita.
+# Versão do app usada nos headers (bate com o APK Android v1.22.0 / APKPure).
+# versionCode 1004023 (targetSdk 36). Backend exige min 1.21.0; 1.22.0 é a release atual.
 APP_VERSION = os.environ.get("MINUTE_APP_VERSION", "1.22.0")
-USER_AGENT = f"Minute/{APP_VERSION} (com.bakerdata.minute; build:1; iOS 26.5.2)"
-# iOS no Brasil (todas as contas operam daqui).
+ANDROID_VERSION_CODE = os.environ.get("MINUTE_ANDROID_VERSION_CODE", "1004023")
+# UA Android: TODO o HTTP passa pelo OkHttp (RN fetch + AzureBlockUploader) com
+# o header default `okhttp/<versão>` — o bundle não contém nenhum literal de UA
+# custom, e o APK declara okhttp/4.12.0. O OkHttp manda o MESMO header para
+# todos os aparelhos (a identidade fica em X-Device-Id/X-App-Version).
+USER_AGENT = os.environ.get("MINUTE_USER_AGENT", "okhttp/4.12.0")
+# Android no Brasil (todas as contas operam daqui).
 ACCEPT_LANGUAGE = os.environ.get("MINUTE_ACCEPT_LANGUAGE", "pt-BR,pt;q=0.9")
-# Header X-Device-Location (app 1.22.0): JSON {latitude, longitude, accuracy, isMock}.
+# Header X-Device-Location (app Android 1.22.0): CSV lat,lon,accuracy,isMock
+# (formatDeviceLocationHeader no bundle: lat.toFixed(6),lon.toFixed(6),round(acc),isMock).
 # Só envia se LAT/LNG estiverem no ambiente — não inventa GPS.
 try:
     DEVICE_LAT = float(os.environ["MINUTE_DEVICE_LAT"]) if os.environ.get("MINUTE_DEVICE_LAT") else None
@@ -166,25 +170,71 @@ EGO4D_AWS_PROFILE = (
 EGO4D_AWS_REGION = os.environ.get("EGO4D_AWS_REGION", "").strip()
 
 
-# --- Perfil nativo do app iOS (réplica do upload) ----------------------------
-# Valores que o app nativo REAL envia. Extraídos da captura iOS (req 072):
-# o meta do POST /uploads usa o formato CURTO getDeviceUploadMeta, enquanto o
-# metadata.json DENTRO do sidecar usa o formato COMPLETO (iPhone14,5 etc.).
-# Centralizados aqui para não ter valores mágicos espalhados no código.
+# --- Perfil nativo do app ANDROID (réplica do upload) ------------------------
+# Valores extraídos do APK Android v1.22.0 (jadx_out/sources/app/useminute):
+# o meta do POST /uploads usa o formato CURTO getDeviceUploadMeta
+# (platform={os}, device={model}), enquanto o metadata.json DENTRO do sidecar
+# usa o formato COMPLETO (platform={type,version:sdk} + device com
+# systemName/systemVersion). O aparelho de cada conta vem do device_profile
+# (pool Samsung Galaxy S21–S24); estes são apenas os fallbacks de uploads
+# avulsos sem perfil.
 
-# Formato curto do POST /uploads (captura 072): só "model".
-NATIVE_DEVICE_MODEL = os.environ.get("MINUTE_NATIVE_DEVICE_MODEL", "iPhone 13")
-# Formato curto do POST /uploads (captura 072): só "os".
-NATIVE_PLATFORM_OS = os.environ.get("MINUTE_NATIVE_PLATFORM_OS", "ios")
-# Foto/código da câmera usada no upload ("built-in" ou "external").
-NATIVE_CAMERA_SOURCE = os.environ.get("MINUTE_NATIVE_CAMERA_SOURCE", "built-in")
-# Formato COMPLETO do device dentro do sidecar (iPhone14,5 = iPhone 13 técnico).
-# Usado pelo metadata.json do .data.zip (o que alimenta os checks de integridade).
-NATIVE_SIDECAR_MODEL = os.environ.get("MINUTE_NATIVE_SIDECAR_MODEL", "iPhone14,5")
-NATIVE_SIDECAR_SYSTEM_NAME = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_NAME", "iOS")
-NATIVE_SIDECAR_SYSTEM_VERSION = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_VERSION", "26.5")
-# clockOffsetNs real observado na gravação d9f4fa6f (26.5.2) — usado no metadata.
-NATIVE_CLOCK_OFFSET_NS = os.environ.get("MINUTE_NATIVE_CLOCK_OFFSET_NS", "-125")
+# Formato curto do POST /uploads: só "model" (Build.MODEL de um Samsung comum).
+NATIVE_DEVICE_MODEL = os.environ.get("MINUTE_NATIVE_DEVICE_MODEL", "SM-S918B")
+# Formato curto do POST /uploads: só "os".
+NATIVE_PLATFORM_OS = os.environ.get("MINUTE_NATIVE_PLATFORM_OS", "android")
+# Formato COMPLETO do device dentro do sidecar (Build.MODEL + Android release).
+NATIVE_SIDECAR_MODEL = os.environ.get("MINUTE_NATIVE_SIDECAR_MODEL", "SM-S918B")
+NATIVE_SIDECAR_SYSTEM_NAME = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_NAME", "Android")
+NATIVE_SIDECAR_SYSTEM_VERSION = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_VERSION", "14")
+
+# IMU do pipeline "ego" do app (EgoImu.SAMPLING_PERIOD_US = 2000 -> 500 Hz).
+# A câmera Trinet externa roda a 562 Hz (TrinetImuCsv.IMU_SAMPLE_RATE_HZ).
+ANDROID_IMU_SAMPLE_RATE_HZ = 500
+
+# O fingerprint OkHttp/Android exige curl_cffi; o fallback urllib é Python puro
+# (JA3 próprio) e é o elo mais fraco. Em produção é recomendado exigir curl.
+REQUIRE_CURL = os.environ.get("MINUTE_REQUIRE_CURL", "").strip() == "1"
+
+
+# --- Limites efetivos de gravação (default = recording-config real 06/08) ----
+# Aplicados pelo warmup quando o GET /devices/recording-config responde; o
+# servidor pode mudar min/max/backlog e o app APLICA — a réplica acompanha.
+_EFFECTIVE_LIMITS: dict[str, int] = {
+    "min_duration_ms": 60_000,
+    "max_duration_ms": 1_800_000,
+    "backlog_cap_ms": 14_400_000,
+}
+
+
+def recording_limits() -> dict[str, int]:
+    """Limites de gravação em vigor (min/max duração + backlog)."""
+    return dict(_EFFECTIVE_LIMITS)
+
+
+def apply_recording_config(payload: dict) -> None:
+    """Funde a `nativeCameraPolicy`/recording-config remota nos limites locais.
+
+    Sanidade: min em [1s, 1h], max em [min, 6h], backlog em [1min, 24h].
+    Campos ausentes preservam o valor atual.
+    """
+    if not isinstance(payload, dict):
+        return
+    try:
+        min_ms = int(payload.get("minDurationMs") or _EFFECTIVE_LIMITS["min_duration_ms"])
+        min_ms = max(1_000, min(3_600_000, min_ms))
+        max_ms = int(payload.get("maxDurationMs") or _EFFECTIVE_LIMITS["max_duration_ms"])
+        max_ms = max(min_ms, min(21_600_000, max_ms))
+        backlog = int(payload.get("backlogCapMs") or _EFFECTIVE_LIMITS["backlog_cap_ms"])
+        backlog = max(60_000, min(86_400_000, backlog))
+        _EFFECTIVE_LIMITS["min_duration_ms"] = min_ms
+        _EFFECTIVE_LIMITS["max_duration_ms"] = max_ms
+        _EFFECTIVE_LIMITS["backlog_cap_ms"] = backlog
+    except (TypeError, ValueError):
+        pass
+
+# clockDomain exato do telefone no metadata (EgoCameraController.clockDomain).
+ANDROID_CLOCK_DOMAIN = os.environ.get("MINUTE_ANDROID_CLOCK_DOMAIN", "android_elapsedRealtimeNanos")
 
 
 def tokens_dir() -> Path:

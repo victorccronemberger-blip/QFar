@@ -2,19 +2,21 @@
 transport.py — Transporte HTTP da réplica (fingerprint de rede).
 
 O urllib do Python tem TLS (JA3/JA4) e headers visivelmente diferentes dos do
-NSURLSession do app nativo — uma assinatura de "não é o app" independente do
+OkHttp do app Android nativo — uma assinatura de "não é o app" independente do
 corpo das requisições. Este módulo centraliza o transporte com dois backends:
 
   - `curl` (preferido) — `curl_cffi` (pip install curl_cffi), que impersona o
-    TLS/HTTP2 do iOS Safari. Para o PUT no blob usa o transporte REAL do app
-    (captura mitm 06/08): Put Block em blocos de 4MB + Put Block List, com os
-    headers de upload resumável do NSURLSession (`Upload-Draft-Interop-Version:
-    6`, `Upload-Complete: ?1`, `x-ms-blob-content-type` no blocklist).
-  - `urllib` (fallback) — stdlib puro: PUT BlockBlob único (o que já passava
-    23/23). Usado quando o curl_cffi não está instalado.
+    TLS/HTTP2 de um Chrome Android (o mesmo perfil do OkHttp do app). Para o
+    PUT no blob replica o `AzureBlockUploader` do expo-background-upload
+    (jadx `expo/modules/backgroundupload`): Put Block em blocos de 4 MB
+    (`?comp=block&blockid=base64('%08d')`) + Put Block List com o XML
+    `<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>...</Latest></BlockList>`
+    e os headers `Content-Type: application/xml` + `x-ms-blob-content-type`.
+  - `urllib` (fallback) — stdlib puro: PUT BlockBlob único. Usado quando o
+    curl_cffi não está instalado.
 
 Seleção: env `MINUTE_TRANSPORT` = auto (default) | curl | urllib;
-`MINUTE_IMPERSONATE` força o alvo de impersonate (ex.: safari260_ios).
+`MINUTE_IMPERSONATE` força o alvo de impersonate (ex.: chrome131_android).
 O backend é resolvido uma vez e reportado por `kind()`.
 Somente stdlib no caminho fallback; curl_cffi é opcional (como o boto3).
 """
@@ -31,7 +33,7 @@ from typing import Any
 
 from . import config, tls
 
-BLOCK_SIZE = 4 * 1024 * 1024  # 4MB — bloco do NSURLSession (captura 06/08)
+BLOCK_SIZE = 4 * 1024 * 1024  # 4MB — bloco do AzureBlockUploader (Android)
 BLOCK_MAX_ATTEMPTS = 3
 
 _kind: str | None = None
@@ -40,11 +42,11 @@ _impersonate: str | None = None
 
 
 def _resolve() -> None:
-    """Escolhe o backend (uma vez). curl_cffi + impersonate iOS se disponível."""
+    """Escolhe o backend (uma vez). curl_cffi + impersonate Chrome/Android."""
     global _kind, _cffi, _impersonate
     if _kind is not None:
         return
-    # auto: curl_cffi impersonate iOS + Put Block 4MB (app nativo, mitm 06/08).
+    # auto: curl_cffi impersonate Chrome Android + Put Block 4MB (OkHttp nativo).
     forced = os.environ.get("MINUTE_TRANSPORT", "auto").strip().lower()
     forced_imp = os.environ.get("MINUTE_IMPERSONATE", "").strip()
     _cffi = None
@@ -57,15 +59,16 @@ def _resolve() -> None:
             except Exception:  # noqa: BLE001
                 BrowserType = None  # type: ignore[assignment]
             if BrowserType is not None:
-                # Alvos iOS em ordem de preferência (nomes variam por versão
-                # do curl_cffi — usa o primeiro que existir no enum). Prioriza
-                # o iOS 26 (contas rodam 26.5) e cai para iOS 18/17/15.
+                # Alvos Chrome/Android em ordem de preferência (nomes variam por
+                # versão do curl_cffi — usa o primeiro que existir no enum).
+                # O OkHttp de apps Android tem fingerprint TLS de Chrome.
                 candidates = [forced_imp] if forced_imp else [
-                    "ios26", "ios26_0", "safari260_ios",
-                    "ios18_4", "safari18_4_ios", "ios18_0",
-                    "safari18_0_ios", "ios17_2", "safari17_2_ios",
-                    "ios16_4", "safari17_0_ios",
-                    "safari15_5_ios", "safari15_5",
+                    "chrome131_android", "chrome130_android",
+                    "chrome124_android", "chrome120_android",
+                    "chrome116_android", "chrome110_android",
+                    "chrome131", "chrome124", "chrome120",
+                    "chrome110", "chrome116", "chrome116_android",
+                    "chrome99_android",
                 ]
                 for candidate in candidates:
                     if candidate and hasattr(BrowserType, candidate):
@@ -83,14 +86,14 @@ def _resolve() -> None:
 
 
 def kind() -> str:
-    """Backend ativo: 'curl' (curl_cffi/impersonate iOS) ou 'urllib' (stdlib)."""
+    """Backend ativo: 'curl' (curl_cffi/impersonate Android) ou 'urllib'."""
     _resolve()
     assert _kind is not None
     return _kind
 
 
 def _headers_for(headers: dict[str, str] | None) -> dict[str, str]:
-    """Headers base em forma de app iOS (urllib manda 'Accept-Encoding:
+    """Headers base em forma de app Android (urllib manda 'Accept-Encoding:
     identity' e 'Accept: */*' ausente — o app manda os dois)."""
     out = dict(headers or {})
     out.setdefault("Accept", "*/*")
@@ -146,13 +149,12 @@ def put_blob(blob_url: str, file_bytes: bytes,
              content_type: str = "video/mp4",
              timeout: int = 300,
              resumable: bool | None = None) -> int:
-    """Sobe os bytes no Azure Blob e devolve o status HTTP (201 = ok).
+    """Sobe os bytes no Azure Blob e devolve o status HTTP (2xx/201 = ok).
 
-    - vídeo (`resumable` True/None + curl): Put Block 4MB + Put Block List
-      (NSURLSession, captura mitm 06/08, sessão d05dde0a).
-    - sidecar (`resumable=False`): PUT BlockBlob único com
-      `x-ms-blob-type: BlockBlob` — o app nativo sobe o `.data.zip` assim.
-    - urllib: sempre BlockBlob único.
+    - qualquer arquivo (`resumable` não-False + curl): Put Block 4 MB + Put
+      Block List — protocolo do AzureBlockUploader do app Android (OkHttp).
+    - `resumable=False` explícito ou urllib: PUT BlockBlob único com
+      `x-ms-blob-type: BlockBlob` (legado de quando o sidecar ia single-PUT).
     """
     _resolve()
     use_blocks = (
@@ -160,7 +162,7 @@ def put_blob(blob_url: str, file_bytes: bytes,
         and _kind == "curl" and _cffi is not None
     )
     if use_blocks:
-        return _put_blob_ios(blob_url, file_bytes, content_type, timeout)
+        return _put_blob_android(blob_url, file_bytes, content_type, timeout)
     return _put_blob_blockblob(blob_url, file_bytes, content_type, timeout)
 
 
@@ -170,14 +172,14 @@ def put_blob_file(blob_url: str, file_path: str | Path,
                   on_progress: Callable[[int, int, float], None] | None = None) -> int:
     """Sobe um arquivo sem carregá-lo inteiro na memória.
 
-    O caminho curl mantém o protocolo iOS de blocos de 4 MB. O fallback urllib
-    entrega um stream com Content-Length, evitando picos de vários gigabytes
-    quando a campanha envia vídeos longos para contas em paralelo.
+    O caminho curl mantém o protocolo Android de blocos de 4 MB. O fallback
+    urllib entrega um stream com Content-Length, evitando picos de vários
+    gigabytes quando a campanha envia vídeos longos para contas em paralelo.
     """
     _resolve()
     path = Path(file_path)
     if _kind == "curl" and _cffi is not None:
-        return _put_blob_file_ios(
+        return _put_blob_file_android(
             blob_url, path, content_type, timeout, on_progress=on_progress)
     started = time.monotonic()
     with path.open("rb") as stream:
@@ -192,10 +194,18 @@ def put_blob_file(blob_url: str, file_path: str | Path,
             return resp.status
 
 
-def _put_blob_file_ios(blob_url: str, file_path: Path,
-                       content_type: str, timeout: int,
-                       on_progress: Callable[[int, int, float], None] | None = None) -> int:
-    """Envia blocos em uma conexão persistente e repete só o bloco que falhou."""
+def _put_blob_file_android(blob_url: str, file_path: Path,
+                           content_type: str, timeout: int,
+                           on_progress: Callable[[int, int, float], None] | None = None) -> int:
+    """Put Block 4MB + Put Block List — protocolo OkHttp/AzureBlockUploader.
+
+    Réplica do `AzureBlockUploader` do expo-background-upload (jadx):
+      - block id = base64("%08d" % índice)
+      - PUT ?comp=block     com header Content-Type (nada de Upload-Draft)
+      - PUT ?comp=blocklist com XML declarado + headers Content-Type e
+        x-ms-blob-content-type.
+    Qualquer resposta 2xx é sucesso (o OkHttp do app aceita 2xx).
+    """
     block_ids: list[str] = []
     total = file_path.stat().st_size
     started = time.monotonic()
@@ -207,6 +217,9 @@ def _put_blob_file_ios(blob_url: str, file_path: Path,
         if not owns_client:
             kwargs["impersonate"] = _impersonate
         return client.put(url, **kwargs)
+
+    def _ok(code: int) -> bool:
+        return 200 <= int(code) < 300
 
     try:
         with file_path.open("rb") as stream:
@@ -222,13 +235,13 @@ def _put_blob_file_ios(blob_url: str, file_path: Path,
                     try:
                         resp = _put(
                             block_url, data=chunk,
-                            headers={"Upload-Draft-Interop-Version": "6"},
+                            headers={"Content-Type": content_type},
                             timeout=timeout,
                         )
                     except Exception as exc:  # noqa: BLE001 — rede/TLS transitórios
                         last_error = exc
                     else:
-                        if resp.status_code == 201:
+                        if _ok(resp.status_code):
                             last_error = None
                             break
                         error = RuntimeError(
@@ -248,8 +261,9 @@ def _put_blob_file_ios(blob_url: str, file_path: Path,
                 if on_progress:
                     on_progress(sent, total, time.monotonic() - started)
 
-        xml = "<BlockList>" + "".join(f"<Latest>{bid}</Latest>" for bid in block_ids) \
-            + "</BlockList>"
+        xml = ('<?xml version="1.0" encoding="utf-8"?><BlockList>'
+               + "".join(f"<Latest>{bid}</Latest>" for bid in block_ids)
+               + "</BlockList>")
         sep = "&" if "?" in blob_url else "?"
         commit_url = f"{blob_url}{sep}comp=blocklist"
         commit_error: Exception | None = None
@@ -261,15 +275,13 @@ def _put_blob_file_ios(blob_url: str, file_path: Path,
                     headers={
                         "Content-Type": "application/xml",
                         "x-ms-blob-content-type": content_type,
-                        "Upload-Draft-Interop-Version": "6",
-                        "Upload-Complete": "?1",
                     },
                     timeout=timeout,
                 )
             except Exception as exc:  # noqa: BLE001 — rede/TLS transitórios
                 commit_error = exc
             else:
-                if resp.status_code == 201:
+                if _ok(resp.status_code):
                     return resp.status_code
                 commit_error = RuntimeError(
                     f"Put Block List falhou ({resp.status_code}): {resp.text[:300]}")
@@ -307,9 +319,12 @@ def _put_blob_blockblob(blob_url: str, file_bytes: bytes,
         return resp.status
 
 
-def _put_blob_ios(blob_url: str, file_bytes: bytes,
-                  content_type: str, timeout: int) -> int:
-    """Upload resumável do NSURLSession: blocos de 4MB + blocklist final."""
+def _put_blob_android(blob_url: str, file_bytes: bytes,
+                      content_type: str, timeout: int) -> int:
+    """Put Block 4MB + Put Block List — OkHttp/AzureBlockUploader (bytes)."""
+    def _ok(code: int) -> bool:
+        return 200 <= int(code) < 300
+
     block_ids: list[str] = []
     n = len(file_bytes)
     for off in range(0, n, BLOCK_SIZE):
@@ -320,18 +335,19 @@ def _put_blob_ios(blob_url: str, file_bytes: bytes,
         resp = _cffi.put(
             f"{blob_url}{sep}comp=block&blockid={block_id}",
             data=chunk,
-            headers={"Upload-Draft-Interop-Version": "6"},
+            headers={"Content-Type": content_type},
             timeout=timeout, impersonate=_impersonate,
         )
-        if resp.status_code != 201:
+        if not _ok(resp.status_code):
             raise RuntimeError(
                 f"Put Block {off // BLOCK_SIZE} falhou ({resp.status_code}): "
                 f"{resp.text[:300]}")
         block_ids.append(block_id)
 
     # Block list: <Latest> preserva a ordem dos blocos (não <Uncommitted>).
-    xml = "<BlockList>" + "".join(f"<Latest>{bid}</Latest>" for bid in block_ids) \
-        + "</BlockList>"
+    xml = ('<?xml version="1.0" encoding="utf-8"?><BlockList>'
+           + "".join(f"<Latest>{bid}</Latest>" for bid in block_ids)
+           + "</BlockList>")
     sep = "&" if "?" in blob_url else "?"
     resp = _cffi.put(
         f"{blob_url}{sep}comp=blocklist",
@@ -339,12 +355,10 @@ def _put_blob_ios(blob_url: str, file_bytes: bytes,
         headers={
             "Content-Type": "application/xml",
             "x-ms-blob-content-type": content_type,
-            "Upload-Draft-Interop-Version": "6",
-            "Upload-Complete": "?1",
         },
         timeout=timeout, impersonate=_impersonate,
     )
-    if resp.status_code != 201:
+    if not _ok(resp.status_code):
         raise RuntimeError(
             f"Put Block List falhou ({resp.status_code}): {resp.text[:300]}")
     return resp.status_code

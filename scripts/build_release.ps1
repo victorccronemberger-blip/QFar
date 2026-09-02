@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.14",
+    [string]$Version = "1.0.15",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64"
 )
 
@@ -37,8 +37,7 @@ New-Item -ItemType Directory -Force "$WorkDir\spec" | Out-Null
     --specpath "$WorkDir\spec" `
     --collect-data moneymin --collect-all curl_cffi `
     --collect-submodules playwright --collect-submodules boto3 --collect-submodules ego4d `
-    --add-data "$ProjectRoot\moneymin\iphone_uw_calibration.json;moneymin" `
-    --add-data "$ProjectRoot\moneymin\native_metadata_reference.json;moneymin" `
+    --add-data "$ProjectRoot\moneymin\samsung_uw_calibration.json;moneymin" `
     --add-data "$ProjectRoot\moneymin\resources;moneymin/resources" `
     --add-data "$ProjectRoot\reference;reference" `
     "$ProjectRoot\packaging\qmoney_service.py"
@@ -96,7 +95,9 @@ Get-ChildItem $BrowserSource -Directory | Where-Object Name -Match "^(ffmpeg|win
     ForEach-Object { Copy-Item $_.Group[0].FullName $BrowserTarget -Recurse -Force }
 
 $Zip = Join-Path $OutputDir "QMoney-windows-x64.zip"
-Remove-Item $Zip -Force -ErrorAction SilentlyContinue
+foreach ($OldArtifact in @($Zip, "$Zip.sha256", "$Zip.sig")) {
+    Remove-Item -LiteralPath $OldArtifact -Force -ErrorAction SilentlyContinue
+}
 Compress-Archive -Path "$Package\*" -DestinationPath $Zip -CompressionLevel Optimal
 $Hash = (Get-FileHash $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
 "$Hash  QMoney-windows-x64.zip" | Set-Content "$Zip.sha256" -Encoding ascii
@@ -110,11 +111,38 @@ if (-not (Test-Path -LiteralPath $SigningKey)) {
 }
 $Rsa = [System.Security.Cryptography.RSA]::Create()
 try {
-    $Rsa.ImportFromPem([System.IO.File]::ReadAllText($SigningKey))
-    $Signature = $Rsa.SignHash(
-        [Convert]::FromHexString($Hash),
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    if ($Rsa | Get-Member -Name ImportFromPem -MemberType Method) {
+        # PowerShell 7 / .NET moderno.
+        $Rsa.ImportFromPem([System.IO.File]::ReadAllText($SigningKey))
+        $HashBytes = [byte[]]::new($Hash.Length / 2)
+        for ($Index = 0; $Index -lt $HashBytes.Length; $Index++) {
+            $HashBytes[$Index] = [Convert]::ToByte($Hash.Substring($Index * 2, 2), 16)
+        }
+        $Signature = $Rsa.SignHash(
+            $HashBytes,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    } else {
+        # Windows PowerShell 5.1 não expõe ImportFromPem. O OpenSSL distribuído
+        # com o Git for Windows produz a mesma assinatura RSA/SHA-256 PKCS#1.
+        $OpenSsl = @(
+            (Get-Command openssl.exe -ErrorAction SilentlyContinue).Source,
+            "$env:ProgramFiles\Git\usr\bin\openssl.exe",
+            "$env:ProgramFiles\Git\mingw64\bin\openssl.exe"
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+            Select-Object -First 1
+        if (-not $OpenSsl) {
+            throw "PowerShell 7 ou OpenSSL não encontrado para assinar a atualização."
+        }
+        $SignaturePath = "$Zip.sig.bin"
+        & $OpenSsl dgst -sha256 -sign $SigningKey -out $SignaturePath $Zip
+        if ($LASTEXITCODE -ne 0) { throw "OpenSSL falhou ao assinar a atualização." }
+        try {
+            $Signature = [System.IO.File]::ReadAllBytes($SignaturePath)
+        } finally {
+            Remove-Item -LiteralPath $SignaturePath -Force -ErrorAction SilentlyContinue
+        }
+    }
     [System.IO.File]::WriteAllText(
         "$Zip.sig", [Convert]::ToBase64String($Signature),
         [System.Text.Encoding]::ASCII)
