@@ -127,6 +127,7 @@ private:
   QPushButton* _readinessRefresh{};
   QPushButton* _libraryChoose{};
   QPushButton* _diagnosticsExport{};
+  QPushButton* _repairInstall{};
   QString _currentLibraryRoot;
 
   QLabel* _integrationsHeadline{};

@@ -366,8 +366,8 @@ class Session:
         path = config.token_path(email)
         if not path.exists():
             raise AuthError(
-                f"nenhum token para {email} em {path.name} (pasta secrets/) — rode primeiro: "
-                f"python3 scripts/minute_cli.py login {email} <senha>"
+                f"nenhum acesso salvo para {email}; adicione ou reautentique "
+                "a conta pela aba Contas do QMoney"
             )
         sess = cls.from_file(path, live=False).with_email(email)
         if live:
@@ -397,7 +397,7 @@ class Session:
         if not token:
             raise AuthError(
                 f"token vazio para {self._who()} — refaça o login "
-                "(python3 scripts/minute_cli.py login <email> <senha>)."
+                "pela aba Contas do QMoney."
             )
         return token
 
@@ -618,7 +618,7 @@ class Session:
             return profile
         raise AuthError(
             f"{email}: sessão inválida ({status}) — o token pode ter expirado. "
-            f"Refaça o login: python3 scripts/minute_cli.py login {email} <senha>. "
+            "Refaça o login pela aba Contas do QMoney. "
             f"Detalhe: {body[:200]}"
         )
 

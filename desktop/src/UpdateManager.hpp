@@ -16,8 +16,10 @@ public:
   static bool verifyHashSignature(const QByteArray& hash,
                                   const QByteArray& signature);
   void check(bool interactive = false);
+  void repair();
   void downloadAndInstall();
   bool isBusy() const { return _busy; }
+  bool isRepair() const { return _repair; }
 
 signals:
   void statusChanged(const QString& text);
@@ -45,4 +47,5 @@ private:
   QFile* _output{};
   bool _busy{};
   bool _interactive{};
+  bool _repair{};
 };

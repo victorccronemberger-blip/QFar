@@ -41,12 +41,13 @@ jobs:
         shell: pwsh
         run: |
           $root = (Get-Location).Path
+          New-Item -ItemType Directory -Force dist/work/spec | Out-Null
           playwright install chromium
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name QMoneyService --paths $root `
             --icon "$root/desktop/resources/qmoney.ico" `
-            --distpath release/pyinstaller --workpath release/pyinstaller-work `
-            --specpath packaging --collect-data moneymin --collect-all curl_cffi `
+            --distpath dist/work/pyinstaller --workpath dist/work/pyinstaller-build `
+            --specpath dist/work/spec --collect-data moneymin --collect-all curl_cffi `
             --collect-submodules playwright --collect-submodules boto3 `
             --collect-submodules ego4d `
             --add-data "$root/moneymin/iphone_uw_calibration.json;moneymin" `
@@ -58,29 +59,36 @@ jobs:
       - name: Compilar interface nativa com motor incorporado
         shell: pwsh
         run: |
-          $env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path release/pyinstaller/QMoneyService.exe).Path
-          cmake -S desktop -B build-ci -G "Visual Studio 17 2022" -A x64
-          cmake --build build-ci --config Release --parallel
+          $env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path dist/work/pyinstaller/QMoneyService.exe).Path
+          cmake -S desktop -B dist/work/cmake -G "Visual Studio 17 2022" -A x64
+          cmake --build dist/work/cmake --config Release --parallel
 
       - name: Montar distribuição
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force release/QMoney/runtime | Out-Null
-          Copy-Item build-ci/Release/QMoney.exe release/QMoney/
-          Copy-Item build-ci/Release/QMoneyUpdater.exe release/QMoney/
-          Copy-Item release/pyinstaller/QMoneyService.exe release/QMoney/runtime/
-          windeployqt --release --no-translations --compiler-runtime release/QMoney/QMoney.exe
+          New-Item -ItemType Directory -Force dist/QMoney/runtime | Out-Null
+          Copy-Item dist/work/cmake/Release/QMoney.exe dist/QMoney/
+          Copy-Item dist/work/cmake/Release/QMoneyUpdater.exe dist/QMoney/
+          Copy-Item dist/work/pyinstaller/QMoneyService.exe dist/QMoney/runtime/
+          windeployqt --release --no-translations --compiler-runtime dist/QMoney/QMoney.exe
 
-          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile release/ffmpeg.zip
-          Expand-Archive release/ffmpeg.zip release/ffmpeg
-          New-Item -ItemType Directory -Force release/QMoney/runtime/tools/ffmpeg/bin | Out-Null
-          Copy-Item (Get-ChildItem release/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName release/QMoney/runtime/tools/ffmpeg/bin/
-          Copy-Item (Get-ChildItem release/ffmpeg -Recurse -Filter ffprobe.exe | Select-Object -First 1).FullName release/QMoney/runtime/tools/ffmpeg/bin/
-          Copy-Item "$env:LOCALAPPDATA/ms-playwright" release/QMoney/runtime/ms-playwright -Recurse
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile dist/work/ffmpeg.zip
+          Expand-Archive dist/work/ffmpeg.zip dist/work/ffmpeg
+          New-Item -ItemType Directory -Force dist/QMoney/runtime/tools/ffmpeg/bin | Out-Null
+          Copy-Item (Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName dist/QMoney/runtime/tools/ffmpeg/bin/
+          Copy-Item (Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffprobe.exe | Select-Object -First 1).FullName dist/QMoney/runtime/tools/ffmpeg/bin/
 
-          Compress-Archive -Path release/QMoney/* -DestinationPath release/QMoney-windows-x64.zip -CompressionLevel Optimal
-          $hash = (Get-FileHash release/QMoney-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  QMoney-windows-x64.zip" | Set-Content release/QMoney-windows-x64.zip.sha256 -Encoding ascii
+          $ucrt = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/Redist" -Recurse -File -Filter ucrtbase.dll |
+            Where-Object FullName -Match "\\ucrt\\DLLs\\x64\\ucrtbase\.dll$" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $ucrt) { throw "UCRT x64 não encontrado no Windows SDK." }
+          Copy-Item (Join-Path $ucrt.Directory.FullName "*.dll") dist/QMoney/runtime/tools/ffmpeg/bin/
+
+          Copy-Item "$env:LOCALAPPDATA/ms-playwright" dist/QMoney/runtime/ms-playwright -Recurse
+
+          Compress-Archive -Path dist/QMoney/* -DestinationPath dist/QMoney-windows-x64.zip -CompressionLevel Optimal
+          $hash = (Get-FileHash dist/QMoney-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  QMoney-windows-x64.zip" | Set-Content dist/QMoney-windows-x64.zip.sha256 -Encoding ascii
           if (-not $env:QMONEY_UPDATE_PRIVATE_KEY) {
             throw "Configure o secret QMONEY_UPDATE_PRIVATE_KEY com a chave RSA privada."
           }
@@ -92,7 +100,7 @@ jobs:
               [System.Security.Cryptography.HashAlgorithmName]::SHA256,
               [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
             [System.IO.File]::WriteAllText(
-              "release/QMoney-windows-x64.zip.sig",
+              "dist/QMoney-windows-x64.zip.sig",
               [Convert]::ToBase64String($signature),
               [System.Text.Encoding]::ASCII)
           } finally {
@@ -105,17 +113,15 @@ jobs:
         with:
           name: QMoney-windows-x64
           path: |
-            release/QMoney/QMoney.exe
-            release/QMoney-windows-x64.zip
-            release/QMoney-windows-x64.zip.sha256
-            release/QMoney-windows-x64.zip.sig
+            dist/QMoney-windows-x64.zip
+            dist/QMoney-windows-x64.zip.sha256
+            dist/QMoney-windows-x64.zip.sig
 
       - name: Anexar arquivos à release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/QMoney/QMoney.exe
-            release/QMoney-windows-x64.zip
-            release/QMoney-windows-x64.zip.sha256
-            release/QMoney-windows-x64.zip.sig
+            dist/QMoney-windows-x64.zip
+            dist/QMoney-windows-x64.zip.sha256
+            dist/QMoney-windows-x64.zip.sig

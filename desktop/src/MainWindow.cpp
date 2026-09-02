@@ -286,11 +286,22 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
           [this](const QString& message, bool interactive) {
             _updateButton->setEnabled(true);
             _updateButton->setText(QStringLiteral("↻  Verificar atualização"));
-            if (interactive) QMessageBox::warning(this, QStringLiteral("Atualizações"), message);
+            if (_repairInstall) {
+              _repairInstall->setEnabled(true);
+              _repairInstall->setText(QStringLiteral("Reparar instalação"));
+            }
+            if (interactive) QMessageBox::warning(
+                this, _updates.isRepair() ? QStringLiteral("Reparo da instalação")
+                                          : QStringLiteral("Atualizações"),
+                message);
           });
   connect(&_updates, &UpdateManager::checkFinished, this,
           [this](bool available, bool interactive) {
-            _updateButton->setEnabled(true);
+            if (!_updates.isBusy()) _updateButton->setEnabled(true);
+            if (_repairInstall && !_updates.isBusy()) {
+              _repairInstall->setEnabled(true);
+              _repairInstall->setText(QStringLiteral("Reparar instalação"));
+            }
             if (!available) {
               _updateButton->setText(QStringLiteral("✓  QMoney %1").arg(QCoreApplication::applicationVersion()));
               if (interactive)
@@ -300,25 +311,45 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
           });
   connect(&_updates, &UpdateManager::updateAvailable, this,
           [this](const QString& version, const QString& notes) {
+            const bool repair = _updates.isRepair();
             _updateButton->setEnabled(true);
-            _updateButton->setText(QStringLiteral("⬇  Instalar QMoney %1").arg(version));
+            _updateButton->setText(repair
+                ? QStringLiteral("Reparando componentes…")
+                : QStringLiteral("⬇  Instalar QMoney %1").arg(version));
             const QString safeNotes = notes.trimmed().isEmpty()
                                           ? QStringLiteral("Esta versão não possui notas adicionais.")
                                           : notes.trimmed();
             const auto answer = QMessageBox::question(
-                this, QStringLiteral("QMoney %1 disponível").arg(version),
-                QStringLiteral("Uma nova versão está pronta para baixar.\n\n%1\n\nInstalar agora?")
-                    .arg(safeNotes));
+                this, repair ? QStringLiteral("Reparar QMoney")
+                             : QStringLiteral("QMoney %1 disponível").arg(version),
+                repair
+                    ? QStringLiteral(
+                          "O QMoney baixará novamente o pacote oficial assinado e "
+                          "restaurará FFmpeg, FFprobe, navegador privado e o motor local.\n\n"
+                          "Suas contas, credenciais e campanhas serão preservadas. Continuar?")
+                    : QStringLiteral("Uma nova versão está pronta para baixar.\n\n%1\n\nInstalar agora?")
+                          .arg(safeNotes));
             if (answer == QMessageBox::Yes) {
               _updateButton->setEnabled(false);
-              _updateButton->setText(QStringLiteral("Baixando atualização…"));
+              if (_repairInstall) _repairInstall->setEnabled(false);
+              _updateButton->setText(repair ? QStringLiteral("Baixando reparo…")
+                                            : QStringLiteral("Baixando atualização…"));
               _updates.downloadAndInstall();
+            } else if (repair) {
+              _updateButton->setText(
+                  QStringLiteral("✓  QMoney %1").arg(QCoreApplication::applicationVersion()));
+              if (_repairInstall) {
+                _repairInstall->setEnabled(true);
+                _repairInstall->setText(QStringLiteral("Reparar instalação"));
+              }
             }
           });
   connect(&_updates, &UpdateManager::progress, this,
           [this](qint64 received, qint64 total) {
             if (total > 0)
               _updateButton->setText(QStringLiteral("Baixando… %1%").arg(received * 100 / total));
+            if (total > 0 && _repairInstall && _updates.isRepair())
+              _repairInstall->setText(QStringLiteral("Baixando… %1%").arg(received * 100 / total));
           });
   connect(&_updates, &UpdateManager::installReady, this, &MainWindow::installUpdate);
   QTimer::singleShot(1800, this, [this] { checkForUpdates(false); });
@@ -863,7 +894,8 @@ QWidget* MainWindow::buildIntegrationsPage() {
   _hostingerStatus->setObjectName(QStringLiteral("integrationStatus"));
   hostLayout->addWidget(_hostingerStatus);
   auto* hostHelp = quietLabel(QStringLiteral(
-      "A Hostinger é usada somente para ler códigos de verificação ao registrar novas contas. Campanhas com contas existentes não dependem dela."));
+      "A Hostinger lê os códigos de verificação usados em novos cadastros. "
+      "Para trocar a API, digite o novo token e salve; o valor protegido nunca é exibido."));
   hostHelp->setWordWrap(true);
   hostLayout->addWidget(hostHelp);
   auto* hostFormBody = new QWidget;
@@ -879,7 +911,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
       _hostingerTest->setEnabled(true);
   });
   _hostingerMailbox = new QLineEdit;
-  _hostingerMailbox->setPlaceholderText(QStringLiteral("Opcional; a primeira caixa será usada"));
+  _hostingerMailbox->setPlaceholderText(QStringLiteral("Em branco usa automaticamente a primeira caixa"));
   hostForm->addRow(QStringLiteral("ID da caixa"), _hostingerMailbox);
   hostLayout->addWidget(hostFormBody);
   auto* hostActions = new QHBoxLayout;
@@ -919,6 +951,16 @@ QWidget* MainWindow::buildIntegrationsPage() {
   connect(readinessButton, &QPushButton::clicked, this,
           [this] { _navigation->setCurrentRow(1); });
   localLayout->addWidget(readinessButton);
+  _repairInstall = new QPushButton(QStringLiteral("Reparar instalação"));
+  _repairInstall->setToolTip(QStringLiteral(
+      "Baixa novamente o pacote oficial assinado sem apagar contas ou configurações."));
+  connect(_repairInstall, &QPushButton::clicked, this, [this] {
+    if (_updates.isBusy()) return;
+    _repairInstall->setEnabled(false);
+    _repairInstall->setText(QStringLiteral("Localizando pacote…"));
+    _updates.repair();
+  });
+  localLayout->addWidget(_repairInstall);
   layout->addWidget(card(QStringLiteral("Componentes incluídos no QMoney"), local));
   layout->addStretch();
 
@@ -1848,7 +1890,8 @@ void MainWindow::loadIntegrations() {
     const bool holoReady = holo.value(QStringLiteral("catalog_ready")).toBool()
                         && holo.value(QStringLiteral("indexes_ready")).toBool();
     const bool runtimeReady = runtime.value(QStringLiteral("ffmpeg_ready")).toBool()
-                           && runtime.value(QStringLiteral("ffprobe_ready")).toBool();
+                           && runtime.value(QStringLiteral("ffprobe_ready")).toBool()
+                           && runtime.value(QStringLiteral("browser_ready")).toBool();
     const int readyCount = int(egoConfigured) + int(egoCatalog)
                          + int(hostConfigured) + int(holoReady) + int(runtimeReady);
     _integrationsHeadline->setText(readyCount == 5
@@ -1887,23 +1930,29 @@ void MainWindow::loadIntegrations() {
     if (egoConfigured && !egoCatalog && !_ego4dCatalogPreparing)
       prepareEgo4dCatalog();
 
+    const QString hostHint = host.value(QStringLiteral("token_hint")).toString();
+    const QString mailboxHint = host.value(QStringLiteral("mailbox_hint")).toString();
     _hostingerStatus->setText(hostConfigured
-        ? QStringLiteral("● Token protegido e disponível")
+        ? QStringLiteral("● Token protegido %1 · caixa %2")
+              .arg(hostHint, mailboxHint.isEmpty() ? QStringLiteral("automática") : mailboxHint)
         : QStringLiteral("● Token ainda não configurado"));
     _hostingerStatus->setProperty("integrationState", hostConfigured ? "ok" : "missing");
     _hostingerStatus->style()->unpolish(_hostingerStatus);
     _hostingerStatus->style()->polish(_hostingerStatus);
     _hostingerToken->setPlaceholderText(hostConfigured
-        ? QStringLiteral("Protegido — digite somente para substituir")
+        ? QStringLiteral("Protegido %1 — digite somente para substituir").arg(hostHint)
         : QStringLiteral("Token da API Mail da Hostinger"));
     _hostingerTest->setEnabled(hostConfigured);
+    _hostingerSave->setText(hostConfigured
+        ? QStringLiteral("Salvar alterações")
+        : QStringLiteral("Validar e salvar"));
 
     _holoIntegrationStatus->setText(holoReady
         ? QStringLiteral("✓ Catálogo e índices instalados. Nenhuma credencial necessária.")
-        : QStringLiteral("! Catálogo ou índices ausentes na biblioteca selecionada."));
+        : QStringLiteral("○ Será preparado automaticamente quando HoloAssist for usado."));
     _runtimeIntegrationStatus->setText(runtimeReady
-        ? QStringLiteral("✓ FFmpeg e FFprobe acompanham o aplicativo.")
-        : QStringLiteral("! Ferramentas de vídeo ausentes; reinstale o pacote completo."));
+        ? QStringLiteral("✓ Motor, FFmpeg, FFprobe e navegador acompanham o aplicativo.")
+        : QStringLiteral("! Componente ausente; use Reparar instalação nesta tela."));
     setStatus(QStringLiteral("Estado das integrações atualizado."));
   });
 }
@@ -1981,18 +2030,18 @@ void MainWindow::saveHostingerIntegration() {
   QJsonObject body;
   if (!_hostingerToken->text().trimmed().isEmpty())
     body.insert(QStringLiteral("token"), _hostingerToken->text().trimmed());
-  if (!_hostingerMailbox->text().trimmed().isEmpty())
-    body.insert(QStringLiteral("mailbox_id"), _hostingerMailbox->text().trimmed());
+  // O campo sempre vai no PUT: vazio significa voltar para a primeira caixa
+  // automática; omitir preservaria para sempre um ID antigo.
+  body.insert(QStringLiteral("mailbox_id"), _hostingerMailbox->text().trimmed());
   _hostingerSave->setEnabled(false);
   _hostingerSave->setText(QStringLiteral("Validando…"));
   _api.put(QStringLiteral("/api/integrations/hostinger"), body,
            [this](bool ok, const QJsonDocument&, const QString& error) {
     _hostingerSave->setEnabled(true);
-    _hostingerSave->setText(QStringLiteral("Validar e salvar"));
     if (!ok) return showError(QStringLiteral("Hostinger não configurada"), error);
     _hostingerToken->clear();
     _hostingerMailbox->clear();
-    setStatus(QStringLiteral("Token Hostinger validado e protegido pelo Windows."));
+    setStatus(QStringLiteral("Configuração da Hostinger validada e protegida pelo Windows."));
     loadIntegrations();
     loadReadiness();
   });

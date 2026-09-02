@@ -312,6 +312,8 @@ def _integration_snapshot() -> dict[str, Any]:
     )
     storage = _storage_snapshot(include_path=True)
     access = str(ego.get("access_key_id") or "")
+    host_token = str(host.get("token") or config.HOSTINGER_MAIL_TOKEN or "")
+    host_mailbox = str(host.get("mailbox_id") or config.HOSTINGER_MAILBOX_ID or "")
     return {
         "security": {
             "provider": "Windows DPAPI",
@@ -325,9 +327,12 @@ def _integration_snapshot() -> dict[str, Any]:
                               and (ego_dir / "clips.csv").is_file()),
         },
         "hostinger": {
-            "configured": bool(host.get("token") or config.HOSTINGER_MAIL_TOKEN),
-            "mailbox_configured": bool(host.get("mailbox_id")
-                                       or config.HOSTINGER_MAILBOX_ID),
+            "configured": bool(host_token),
+            "token_hint": f"••••{host_token[-4:]}" if len(host_token) >= 4 else "",
+            "mailbox_configured": bool(host_mailbox),
+            "mailbox_hint": (
+                f"••••{host_mailbox[-4:]}" if len(host_mailbox) >= 4 else ""
+            ),
         },
         "holoassist": {
             "catalog_ready": holo_catalog,
@@ -336,6 +341,7 @@ def _integration_snapshot() -> dict[str, Any]:
         "runtime": {
             "ffmpeg_ready": readiness._binary_works(readiness.ffmpeg_bin()),
             "ffprobe_ready": readiness._binary_works(readiness.ffprobe_bin()),
+            "browser_ready": readiness._private_browser_present(),
         },
         "library": storage,
     }

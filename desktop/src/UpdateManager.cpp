@@ -95,6 +95,7 @@ void UpdateManager::check(bool interactive) {
   if (_busy) return;
   _busy = true;
   _interactive = interactive;
+  _repair = false;
   emit statusChanged(QStringLiteral("Verificando atualizações…"));
   auto* reply = _network.get(requestFor(QUrl(QString::fromLatin1(kLatestRelease))));
   connect(reply, &QNetworkReply::finished, this, [this, reply] {
@@ -147,6 +148,50 @@ void UpdateManager::check(bool interactive) {
     emit statusChanged(QStringLiteral("Atualização %1 disponível.").arg(_version));
     emit updateAvailable(_version, _notes);
     emit checkFinished(true, _interactive);
+  });
+}
+
+void UpdateManager::repair() {
+  if (_busy) return;
+  _busy = true;
+  _interactive = true;
+  _repair = true;
+  emit statusChanged(QStringLiteral("Localizando o pacote completo do QMoney…"));
+  auto* reply = _network.get(requestFor(QUrl(QString::fromLatin1(kLatestRelease))));
+  connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    const QByteArray payload = reply->readAll();
+    const QString networkError = reply->errorString();
+    const bool failed = reply->error() != QNetworkReply::NoError;
+    reply->deleteLater();
+    if (failed)
+      return fail(QStringLiteral("Não foi possível localizar o pacote de reparo: %1")
+                      .arg(networkError));
+
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(payload, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject())
+      return fail(QStringLiteral("O GitHub retornou um pacote de reparo inválido."));
+
+    const QJsonObject release = document.object();
+    _version = normalizedVersion(release.value(QStringLiteral("tag_name")).toString());
+    _notes.clear();
+    _packageUrl = QUrl();
+    _checksumUrl = QUrl();
+    _signatureUrl = QUrl();
+    for (const QJsonValue& value : release.value(QStringLiteral("assets")).toArray()) {
+      const QJsonObject asset = value.toObject();
+      const QString name = asset.value(QStringLiteral("name")).toString();
+      const QUrl url(asset.value(QStringLiteral("browser_download_url")).toString());
+      if (name == QString::fromLatin1(kPackageName)) _packageUrl = url;
+      if (name == QString::fromLatin1(kChecksumName)) _checksumUrl = url;
+      if (name == QString::fromLatin1(kSignatureName)) _signatureUrl = url;
+    }
+    if (!_packageUrl.isValid() || !_checksumUrl.isValid() || !_signatureUrl.isValid())
+      return fail(QStringLiteral("A versão publicada não contém todos os componentes de reparo."));
+    _busy = false;
+    emit statusChanged(QStringLiteral("Pacote completo pronto para reparar a instalação."));
+    emit updateAvailable(_version, QString());
+    emit checkFinished(true, true);
   });
 }
 

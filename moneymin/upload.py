@@ -379,7 +379,8 @@ def normalize_video(video_path: str | Path, out_dir: str | Path | None = None,
     except FileNotFoundError as exc:
         raise UploadError(
             "vídeo precisa de reencode para formato iPhone (1440x1080 yuv420p), "
-            "mas ffmpeg não está instalado — instale ffmpeg") from exc
+            "mas o FFmpeg do QMoney não está disponível; use Reparar instalação "
+            "na aba Integrações") from exc
     if res.returncode != 0:
         raise UploadError(
             f"falha ao normalizar vídeo para formato iPhone: {res.stderr.strip()[:300]}")

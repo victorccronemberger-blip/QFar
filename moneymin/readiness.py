@@ -42,6 +42,24 @@ def _binary_works(command: str) -> bool:
     return result.returncode == 0
 
 
+def _private_browser_present() -> bool:
+    """Confirma o Chromium privado distribuído com o pacote Release."""
+    roots = [
+        Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")),
+        config.RUNTIME_ROOT / "ms-playwright",
+    ]
+    for root in roots:
+        if not str(root) or not root.is_dir():
+            continue
+        patterns = (
+            "chromium-*/chrome-win*/chrome.exe",
+            "chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe",
+        )
+        if any(any(root.glob(pattern)) for pattern in patterns):
+            return True
+    return False
+
+
 def _valid_account_tokens() -> tuple[int, int]:
     valid = total = 0
     if not config.SECRETS_DIR.exists():
@@ -94,7 +112,15 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
         "FFmpeg/FFprobe",
         "ok" if media_ok else "error",
         "disponíveis para preparar vídeo" if media_ok
-        else "reinstale o pacote completo do QMoney",
+        else "use Reparar instalação na aba Integrações",
+    ))
+
+    browser_ok = _private_browser_present()
+    checks.append(_check(
+        "Navegador privado",
+        "ok" if browser_ok else "warning",
+        "Chromium incluído para cadastros e verificações" if browser_ok
+        else "componente incluído no pacote; use Reparar instalação no QMoney",
     ))
 
     valid_tokens, total_tokens = _valid_account_tokens()
@@ -123,9 +149,9 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
         indexes_ok = all((holoassist._INDEX_SEED_DIR / name).exists() for name in seed_names)
         checks.append(_check(
             "Catálogo HoloAssist",
-            "ok" if metadata_ok else "error",
+            "ok" if metadata_ok else "warning",
             "metadados instalados" if metadata_ok
-            else "reinstale o pacote completo ou selecione outra biblioteca",
+            else "será preparado automaticamente ao selecionar HoloAssist",
         ))
         checks.append(_check(
             "Índices HoloAssist",

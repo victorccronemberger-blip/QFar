@@ -72,7 +72,7 @@ _FFPROBE_CACHE: str | None = None
 
 
 def _local_tools_bin(name: str) -> str | None:
-    """Binário instalado localmente em ``ROOT/tools/<nome>/`` (INSTALAR_TUDO.bat).
+    """Binário distribuído no runtime privado do QMoney.
 
     Aceita ``tools/<nome>/bin/<nome>.exe`` e a estrutura do zip do gyan.dev
     (``tools/ffmpeg/ffmpeg-<vers>-essentials_build/bin/ffmpeg.exe``).

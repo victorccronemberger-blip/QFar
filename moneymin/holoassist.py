@@ -12,6 +12,7 @@ import gzip
 import io
 import json
 import shutil
+import threading
 import urllib.request
 from collections import Counter
 from collections.abc import Callable
@@ -58,6 +59,7 @@ MINUTE_TASK_TYPES: dict[str, frozenset[str]] = {
 }
 MIN_CORRECT_ACTION_RATIO = 0.95
 _INDEX_SEED_DIR = Path(__file__).with_name("resources") / "holoassist"
+_METADATA_LOCK = threading.Lock()
 
 
 def data_dir() -> Path:
@@ -117,10 +119,11 @@ def download_metadata(
     progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[Path, Path]:
     """Baixa somente anotações e splits (aprox. 117 MB), nunca os TARs pesados."""
-    return (
-        _download(ANNOTATIONS_URL, annotations_path(), progress),
-        _download(SPLITS_URL, data_dir() / "data-splits-v1_2.zip", progress),
-    )
+    with _METADATA_LOCK:
+        return (
+            _download(ANNOTATIONS_URL, annotations_path(), progress),
+            _download(SPLITS_URL, data_dir() / "data-splits-v1_2.zip", progress),
+        )
 
 
 @lru_cache(maxsize=4)
@@ -135,8 +138,10 @@ def _load_annotations(path: str, modified_ns: int) -> tuple[dict[str, Any], ...]
 def annotations() -> tuple[dict[str, Any], ...]:
     path = annotations_path()
     if not path.exists():
+        download_metadata()
+    if not path.exists():
         raise FileNotFoundError(
-            "índice HoloAssist ausente; execute scripts/holoassist.py metadata"
+            "o QMoney não conseguiu preparar os metadados HoloAssist"
         )
     return _load_annotations(str(path), path.stat().st_mtime_ns)
 
