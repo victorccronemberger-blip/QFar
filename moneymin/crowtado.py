@@ -531,13 +531,27 @@ def _chrome_exe() -> str:
 
 
 def _playwright_chrome() -> str | None:
-    """Chromium instalado por `playwright install chromium` (fallback ao Chrome)."""
+    """Chromium privado do QMoney ou cache Playwright de desenvolvimento."""
     import glob
     import os
     import sys
     if sys.platform == "win32":
-        base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
-        pat = os.path.join(base, "chromium-*", "chrome-win", "chrome.exe")
+        roots = [
+            os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
+            str(config.RUNTIME_ROOT / "ms-playwright"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright"),
+        ]
+        # Playwright mudou o diretório de chrome-win para chrome-win64 em
+        # revisões recentes. O curinga mantém o pacote portátil compatível com
+        # ambas sem depender de Chrome instalado no computador.
+        for base in roots:
+            if not base:
+                continue
+            matches = sorted(glob.glob(os.path.join(
+                base, "chromium-*", "chrome-win*", "chrome.exe")), reverse=True)
+            if matches:
+                return matches[0]
+        return None
     elif sys.platform == "darwin":
         pat = os.path.expanduser(
             "~/Library/Caches/ms-playwright/chromium-*/chrome-mac/"
