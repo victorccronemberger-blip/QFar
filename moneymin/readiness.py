@@ -93,7 +93,8 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
     checks.append(_check(
         "FFmpeg/FFprobe",
         "ok" if media_ok else "error",
-        "disponíveis para preparar vídeo" if media_ok else "execute INSTALAR_TUDO.bat",
+        "disponíveis para preparar vídeo" if media_ok
+        else "reinstale o pacote completo do QMoney",
     ))
 
     valid_tokens, total_tokens = _valid_account_tokens()
@@ -124,7 +125,7 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
             "Catálogo HoloAssist",
             "ok" if metadata_ok else "error",
             "metadados instalados" if metadata_ok
-            else "execute scripts\\holoassist.py metadata",
+            else "reinstale o pacote completo ou selecione outra biblioteca",
         ))
         checks.append(_check(
             "Índices HoloAssist",
@@ -159,8 +160,12 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
         aws_ok = _aws_credentials_present()
         checks.append(_check(
             "Catálogo Ego4D",
-            "ok" if catalog_ok else "error",
-            "catálogo instalado" if catalog_ok else "execute scripts\\ego4d_full.py diagnostics",
+            "ok" if catalog_ok else ("warning" if aws_ok else "error"),
+            "catálogo instalado" if catalog_ok else (
+                "será preparado automaticamente com as credenciais salvas"
+                if aws_ok else
+                "configure as credenciais na aba Integrações"
+            ),
         ))
         checks.append(_check(
             "Credenciais Ego4D",

@@ -140,6 +140,7 @@ private:
   QPushButton* _ego4dSave{};
   QPushButton* _ego4dTest{};
   QPushButton* _ego4dPrepare{};
+  bool _ego4dCatalogPreparing{};
   QLabel* _hostingerStatus{};
   class QLineEdit* _hostingerToken{};
   class QLineEdit* _hostingerMailbox{};

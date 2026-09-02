@@ -1683,6 +1683,10 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
                                      : QStringLiteral("color:#e66c76"));
   if (ready) {
     setStatus(QStringLiteral("Serviço local pronto."));
+    // O pacote Release não distribui scripts de manutenção. Assim que o
+    // motor sobe, a própria interface verifica e prepara o catálogo Ego4D
+    // quando já existem credenciais protegidas neste computador.
+    loadIntegrations();
     const QString healthPath = qApp->property("updateHealthPath").toString();
     if (!healthPath.isEmpty()) {
       QSaveFile marker(healthPath);
@@ -1880,6 +1884,8 @@ void MainWindow::loadIntegrations() {
       _ego4dRegion->setPlaceholderText(region);
     _ego4dTest->setEnabled(egoConfigured);
     _ego4dPrepare->setEnabled(egoConfigured && !egoCatalog);
+    if (egoConfigured && !egoCatalog && !_ego4dCatalogPreparing)
+      prepareEgo4dCatalog();
 
     _hostingerStatus->setText(hostConfigured
         ? QStringLiteral("● Token protegido e disponível")
@@ -1922,7 +1928,7 @@ void MainWindow::saveEgo4dIntegration() {
     _ego4dAccessKey->clear();
     _ego4dSecretKey->clear();
     _ego4dSessionToken->clear();
-    setStatus(QStringLiteral("Credencial Ego4D validada e protegida pelo Windows."));
+    setStatus(QStringLiteral("Credencial validada. Preparando o catálogo Ego4D…"));
     loadIntegrations();
     loadReadiness();
   });
@@ -1952,10 +1958,13 @@ void MainWindow::testEgo4dIntegration() {
 }
 
 void MainWindow::prepareEgo4dCatalog() {
+  if (_ego4dCatalogPreparing) return;
+  _ego4dCatalogPreparing = true;
   _ego4dPrepare->setEnabled(false);
   _ego4dPrepare->setText(QStringLiteral("Preparando…"));
   _api.post(QStringLiteral("/api/integrations/ego4d/catalog"), {},
             [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _ego4dCatalogPreparing = false;
     _ego4dPrepare->setText(QStringLiteral("Preparar catálogo"));
     if (!ok) {
       _ego4dPrepare->setEnabled(true);
