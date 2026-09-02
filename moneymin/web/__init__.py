@@ -7,6 +7,7 @@ import sys
 import threading
 
 from .server import create_app
+from .. import tls
 
 
 class _SafeStream:
@@ -88,6 +89,7 @@ def run_webui(host: str = "127.0.0.1", port: int = 8876,
               open_browser: bool = False, parent_pid: int | None = None) -> None:
     """Sobe o servico local. ``open_browser`` e mantido apenas por compatibilidade."""
     _harden_stdio()
+    tls.configure_environment()
     _watch_parent(parent_pid)
     print(f"QMoney service em http://{host}:{port}  (Ctrl+C para sair)")
     _serve(create_app(), host, port, False)

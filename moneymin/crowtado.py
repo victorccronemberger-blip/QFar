@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from . import config
+from . import config, tls
 
 CLERK_BASE = "https://clerk.crowtado.com"
 SITE_BASE = "https://www.crowtado.com"
@@ -81,6 +81,16 @@ class CrowtadoSession:
                 return exc.code, json.loads(text)
             except (json.JSONDecodeError, ValueError):
                 return exc.code, text
+        except urllib.error.URLError as exc:
+            detail = str(getattr(exc, "reason", exc))
+            if "CERTIFICATE_VERIFY_FAILED" in detail.upper():
+                raise CrowtadoError(
+                    "a conexão segura não pôde ser validada; use Reparar "
+                    "instalação na aba Integrações e tente novamente"
+                ) from exc
+            raise CrowtadoError(
+                "não foi possível conectar ao Crowtado; confira a internet e tente novamente"
+            ) from exc
 
     def session_jwt(self) -> str:
         """JWT de sessão fresco (lido do last_active_token do client, ~60s de vida)."""
@@ -136,7 +146,7 @@ def login(email: str, password: str) -> CrowtadoSession:
     caixa catch-all da Hostinger (moneymin.hostinger_mail) e confirma.
     """
     jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener = tls.build_opener(urllib.request.HTTPCookieProcessor(jar))
     sess = CrowtadoSession(opener, "")
 
     status, body = sess._fapi("/v1/client", {})

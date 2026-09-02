@@ -29,7 +29,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, tls
 
 BLOCK_SIZE = 4 * 1024 * 1024  # 4MB — bloco do NSURLSession (captura 06/08)
 BLOCK_MAX_ATTEMPTS = 3
@@ -134,7 +134,7 @@ def http_request_detailed(
     for key, value in headers.items():
         req.add_header(key, value)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with tls.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read(), dict(resp.headers.items())
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read(), dict((exc.headers or {}).items())
@@ -185,7 +185,7 @@ def put_blob_file(blob_url: str, file_path: str | Path,
         req.add_header("x-ms-blob-type", "BlockBlob")
         req.add_header("Content-Type", content_type)
         req.add_header("Content-Length", str(path.stat().st_size))
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with tls.urlopen(req, timeout=timeout) as resp:
             if on_progress:
                 size = path.stat().st_size
                 on_progress(size, size, time.monotonic() - started)
@@ -303,7 +303,7 @@ def _put_blob_blockblob(blob_url: str, file_bytes: bytes,
     req = urllib.request.Request(blob_url, method="PUT", data=file_bytes)
     for key, value in headers.items():
         req.add_header(key, value)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with tls.urlopen(req, timeout=timeout) as resp:
         return resp.status
 
 

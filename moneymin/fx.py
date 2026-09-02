@@ -9,7 +9,7 @@ import time
 import urllib.request
 from typing import Any, Callable
 
-from . import config
+from . import config, tls
 from .atomic_io import load_json, save_json
 
 BCB_USD_BRL_URL = (
@@ -69,7 +69,7 @@ def usd_brl_quote(
                 BCB_USD_BRL_URL,
                 headers={"Accept": "application/json", "User-Agent": "QMoney/1"},
             )
-            open_url = opener or urllib.request.urlopen
+            open_url = opener or tls.urlopen
             with open_url(request, timeout=5) as response:
                 payload = json.loads(response.read().decode("utf-8-sig"))
             quote = _parse_bcb(payload, current)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import urllib.error
 from unittest import mock
 
+from moneymin import crowtado
 from moneymin.web import server
 
 
@@ -45,6 +47,15 @@ class CrowtadoCredentialTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         save.assert_not_called()
+
+    def test_certificate_failure_is_translated_to_repair_action(self):
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.URLError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate")
+        session = crowtado.CrowtadoSession(opener, "")
+
+        with self.assertRaisesRegex(crowtado.CrowtadoError, "Reparar instalação"):
+            session._fapi("/v1/client", {})
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
+from . import tls
 from .atomic_io import load_json, save_json
 
 # A leitura salta o conteúdo dos membros grandes usando HTTP Range. Um bloco
@@ -73,7 +74,8 @@ class HttpRangeReader:
 
     def _connect(self) -> http.client.HTTPSConnection:
         if self._connection is None:
-            self._connection = http.client.HTTPSConnection(self._host, timeout=self._timeout)
+            self._connection = http.client.HTTPSConnection(
+                self._host, timeout=self._timeout, context=tls.context())
         return self._connection
 
     def _head(self) -> tuple[int, str]:

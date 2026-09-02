@@ -15,7 +15,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config
+from . import config, tls
 
 
 @dataclass(frozen=True)
@@ -131,7 +131,7 @@ def download_file(url: str, dest: str | Path | None = None, chunk: int = 1 << 20
         config.VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
         dest = config.VIDEOS_DIR / Path(urllib.parse.urlparse(url).path).name
     dest = Path(dest)
-    with urllib.request.urlopen(url) as resp, open(dest, "wb") as out:
+    with tls.urlopen(url) as resp, open(dest, "wb") as out:
         while True:
             block = resp.read(chunk)
             if not block:

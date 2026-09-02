@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, tls
 from .remote_tar import RemoteTar
 
 ANNOTATIONS_URL = (
@@ -103,7 +103,7 @@ def _download(
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".tmp")
     request = urllib.request.Request(url, headers={"User-Agent": "MoneyMin/0.3"})
-    with urllib.request.urlopen(request, timeout=120) as response, temporary.open("wb") as output:
+    with tls.urlopen(request, timeout=120) as response, temporary.open("wb") as output:
         total = int(response.headers.get("Content-Length") or 0)
         downloaded = 0
         while block := response.read(4 * 1024 * 1024):

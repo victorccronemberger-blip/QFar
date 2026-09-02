@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import quote
 
-from . import config
+from . import config, tls
 
 EGO4D_DIR = config.MEDIA_DATA_DIR / "ego4d"
 MANIFEST_BUCKET = "ego4d-consortium-sharing"
@@ -212,7 +212,7 @@ def _s3_get_stdlib(bucket: str, key: str, dest: Path,
     req = urllib.request.Request(f"https://{host}{uri}", headers=headers)
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with urllib.request.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
+        with tls.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
             shutil.copyfileobj(resp, f)
     except urllib.error.HTTPError as exc:
         new_region = exc.headers.get("x-amz-bucket-region") if exc.headers else None

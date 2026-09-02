@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from . import config
+from . import config, tls
 
 
 class MailError(RuntimeError):
@@ -43,7 +43,7 @@ def _request(path: str, method: str = "GET", body: Any = None,
     if data:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with tls.urlopen(req, timeout=30) as resp:
             text = resp.read().decode("utf-8", "replace")
             return resp.status, _parse(text)
     except urllib.error.HTTPError as exc:
