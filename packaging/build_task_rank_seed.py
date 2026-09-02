@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import gzip
 import json
-import pickle
 from pathlib import Path
+
+from moneymin import ego4d
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "data" / "task_rank_cache.pkl"
 OUTPUT = ROOT / "moneymin" / "resources" / "ego4d_task_rank_seed.json.gz"
 FIELDS = (
     "clip_uid",
@@ -36,13 +36,24 @@ FIELDS = (
 
 
 def main() -> None:
-    _stamp, buckets = pickle.loads(SOURCE.read_bytes())
+    buckets = ego4d.rank_all_task_spans()
+    long_buckets = ego4d.rank_all_task_spans(
+        min_dur_s=600, max_dur_s=1800)
+    for name, items in long_buckets.items():
+        buckets.setdefault(name, []).extend(items)
     tasks: dict[str, list[dict]] = {}
-    for name, items in buckets.items():
-        tasks[str(name)] = [
-            {field: item[field] for field in FIELDS if field in item}
-            for item in items
-        ]
+    for name, items in sorted(buckets.items()):
+        portable: list[dict] = []
+        seen: set[str] = set()
+        for item in items:
+            identity = str(item.get("clip_uid") or "")
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            portable.append({
+                field: item[field] for field in FIELDS if field in item
+            })
+        tasks[str(name)] = portable
     payload = {
         "schema": 1,
         "source": "Ego4D v2 licensed metadata; media is not embedded",
@@ -54,9 +65,14 @@ def main() -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_bytes(gzip.compress(encoded, compresslevel=9, mtime=0))
     clips = sum(len(items) for items in tasks.values())
+    long_clips = sum(
+        float(item.get("dur_s") or 0) >= 600
+        for items in tasks.values()
+        for item in items
+    )
     print(
         f"{OUTPUT}: {len(tasks)} tarefas, {clips} trechos, "
-        f"{OUTPUT.stat().st_size} bytes"
+        f"{long_clips} longos, {OUTPUT.stat().st_size} bytes"
     )
 
 

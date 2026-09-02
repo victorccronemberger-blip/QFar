@@ -48,6 +48,26 @@ class PortableTaskCatalogTests(unittest.TestCase):
             for clip in items
         ))
 
+    def test_seed_contains_long_content_outside_gardening(self) -> None:
+        seed = campaign._load_rank_seed()
+        assert seed is not None
+
+        long_clips = [
+            clip
+            for name, clips in seed.items()
+            if name != "Gardening"
+            for clip in clips
+            if float(clip.get("dur_s") or 0) >= 600
+        ]
+
+        self.assertGreaterEqual(len(long_clips), 10)
+        self.assertGreaterEqual(len({
+            name
+            for name, clips in seed.items()
+            if name != "Gardening"
+            if any(float(clip.get("dur_s") or 0) >= 600 for clip in clips)
+        }), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

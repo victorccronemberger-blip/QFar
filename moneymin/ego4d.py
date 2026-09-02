@@ -899,6 +899,7 @@ def list_task_spans(
         return []
     videos = _cat().videos
     out: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for uid, events in index.items():
         video = videos.get(uid) or {}
         if require_imu and video.get("has_imu") is not True:
@@ -908,7 +909,12 @@ def list_task_spans(
             continue
         duration = float(video.get("duration_sec") or 0)
         search_text = task_matching.span_search_text(events)
-        if not task_matching.span_evidence_possible(rule, search_text):
+        has_evidence = task_matching.span_evidence_possible(rule, search_text)
+        exact_long_scenario = (
+            min_dur_s >= task_matching.LONG_ACTIVITY_MIN_S
+            and task_matching.scenario_is_sufficient(rule, scenarios)
+        )
+        if not has_evidence and not exact_long_scenario:
             continue
         activity_rules = [
             (name, candidate) for name, candidate in task_matching.TASK_RULES.items()
@@ -918,23 +924,56 @@ def list_task_spans(
         prepared = task_matching.prepare_span_events(events)
         event_labels = task_matching.label_span_events(prepared, activity_rules)
         rivals = task_matching.competing_span_names(task_name, activity_rules)
-        for span in task_matching.extract_spans(
-                rule, events,
-                min_s=max(min_dur_s, rule.min_span_s or 0.0),
-                max_s=max_dur_s,
-                pad_s=0.0,
-                video_duration_s=duration or None,
-                prepared_events=prepared,
-                activity_mode=True,
-                task_name=task_name,
-                event_task_names=event_labels,
-                competing_task_names=rivals):
-            rec = _span_record(video, span)
-            rec["match_confidence"] = rule.confidence
-            if (min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
-                    and (not require_imu or imu_window_is_covered(
-                        video, tuple(rec["window_s"])))):
-                out.append(rec)
+        if exact_long_scenario:
+            for span in task_matching.scenario_activity_spans(
+                    [
+                        (*row[:3], task_name in event_labels[index],
+                         row[3] or bool(event_labels[index] & rivals))
+                        for index, row in enumerate(prepared)
+                    ],
+                    min_s=min_dur_s,
+                    max_s=max_dur_s,
+                    video_duration_s=duration,
+                    allowed_intervals=(
+                        imu_coverage_intervals(video) if require_imu else None
+                    )):
+                rec = _span_record(video, span)
+                rec["match_confidence"] = "scenario"
+                identity = str(rec.get("clip_uid") or "")
+                if (identity and identity not in seen
+                        and (not require_imu or imu_window_is_covered(
+                            video, tuple(rec["window_s"])))):
+                    seen.add(identity)
+                    out.append(rec)
+        base_min = max(min_dur_s, rule.min_span_s or 0.0)
+        span_minimums = [base_min] if has_evidence else []
+        if (has_evidence
+                and base_min < task_matching.LONG_ACTIVITY_MIN_S <= max_dur_s):
+            span_minimums.append(task_matching.LONG_ACTIVITY_MIN_S)
+        for span_minimum in span_minimums:
+            for span in task_matching.extract_spans(
+                    rule, events,
+                    min_s=span_minimum,
+                    max_s=max_dur_s,
+                    pad_s=0.0,
+                    video_duration_s=duration or None,
+                    prepared_events=prepared,
+                    activity_mode=True,
+                    task_name=task_name,
+                    event_task_names=event_labels,
+                    competing_task_names=rivals,
+                    allowed_intervals=(
+                        imu_coverage_intervals(video) if require_imu else None
+                    )):
+                rec = _span_record(video, span)
+                rec["match_confidence"] = rule.confidence
+                identity = str(rec.get("clip_uid") or "")
+                if (identity and identity not in seen
+                        and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
+                        and (not require_imu or imu_window_is_covered(
+                            video, tuple(rec["window_s"])))):
+                    seen.add(identity)
+                    out.append(rec)
     out.sort(key=lambda r: (-(r.get("match_score") or 0), -(r.get("dur_s") or 0),
                             str(r.get("clip_uid") or "")))
     return out
@@ -955,6 +994,7 @@ def rank_all_task_spans(
         return buckets
     videos = _cat().videos
     named_rules = list(task_matching.TASK_RULES.items())
+    seen_by_task: dict[str, set[str]] = defaultdict(set)
     for uid, events in index.items():
         video = videos.get(uid) or {}
         if require_imu and video.get("has_imu") is not True:
@@ -974,30 +1014,71 @@ def rank_all_task_spans(
             (name, rule) for name, rule in candidate_rules
             if task_matching.span_evidence_possible(rule, search_text)
         ]
-        if not possible_rules:
+        exact_long_rules = [
+            (name, rule) for name, rule in candidate_rules
+            if (min_dur_s >= task_matching.LONG_ACTIVITY_MIN_S
+                and task_matching.scenario_is_sufficient(rule, scenarios))
+        ]
+        eligible_rules = list(dict(possible_rules + exact_long_rules).items())
+        if not eligible_rules:
             continue
         activity_rules = possible_rules
         prepared = task_matching.prepare_span_events(events)
         event_labels = task_matching.label_span_events(prepared, activity_rules)
-        for name, rule in possible_rules:
+        possible_names = {name for name, _rule in possible_rules}
+        exact_long_names = {name for name, _rule in exact_long_rules}
+        for name, rule in eligible_rules:
             rivals = task_matching.competing_span_names(name, activity_rules)
-            for span in task_matching.extract_spans(
-                    rule, events,
-                    min_s=max(min_dur_s, rule.min_span_s or 0.0),
-                    max_s=max_dur_s,
-                    pad_s=0.0,
-                    video_duration_s=duration or None,
-                    prepared_events=prepared,
-                    activity_mode=True,
-                    task_name=name,
-                    event_task_names=event_labels,
-                    competing_task_names=rivals):
-                rec = _span_record(video, span)
-                rec["match_confidence"] = rule.confidence
-                if (min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
-                        and (not require_imu or imu_window_is_covered(
-                            video, tuple(rec["window_s"])))):
-                    buckets[name].append(rec)
+            if name in exact_long_names:
+                for span in task_matching.scenario_activity_spans(
+                        [
+                            (*row[:3], name in event_labels[index],
+                             row[3] or bool(event_labels[index] & rivals))
+                            for index, row in enumerate(prepared)
+                        ],
+                        min_s=min_dur_s,
+                        max_s=max_dur_s,
+                        video_duration_s=duration,
+                        allowed_intervals=(
+                            imu_coverage_intervals(video) if require_imu else None
+                        )):
+                    rec = _span_record(video, span)
+                    rec["match_confidence"] = "scenario"
+                    identity = str(rec.get("clip_uid") or "")
+                    if (identity and identity not in seen_by_task[name]
+                            and (not require_imu or imu_window_is_covered(
+                                video, tuple(rec["window_s"])))):
+                        seen_by_task[name].add(identity)
+                        buckets[name].append(rec)
+            base_min = max(min_dur_s, rule.min_span_s or 0.0)
+            span_minimums = [base_min] if name in possible_names else []
+            if (name in possible_names
+                    and base_min < task_matching.LONG_ACTIVITY_MIN_S <= max_dur_s):
+                span_minimums.append(task_matching.LONG_ACTIVITY_MIN_S)
+            for span_minimum in span_minimums:
+                for span in task_matching.extract_spans(
+                        rule, events,
+                        min_s=span_minimum,
+                        max_s=max_dur_s,
+                        pad_s=0.0,
+                        video_duration_s=duration or None,
+                        prepared_events=prepared,
+                        activity_mode=True,
+                        task_name=name,
+                        event_task_names=event_labels,
+                        competing_task_names=rivals,
+                        allowed_intervals=(
+                            imu_coverage_intervals(video) if require_imu else None
+                        )):
+                    rec = _span_record(video, span)
+                    rec["match_confidence"] = rule.confidence
+                    identity = str(rec.get("clip_uid") or "")
+                    if (identity and identity not in seen_by_task[name]
+                            and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
+                            and (not require_imu or imu_window_is_covered(
+                                video, tuple(rec["window_s"])))):
+                        seen_by_task[name].add(identity)
+                        buckets[name].append(rec)
     for _name, items in buckets.items():
         items.sort(key=lambda r: (
             -(r.get("match_score") or 0), -(r.get("dur_s") or 0),

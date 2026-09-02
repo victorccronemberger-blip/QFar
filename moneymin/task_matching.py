@@ -95,11 +95,13 @@ TASK_RULES: dict[str, TaskRule] = {
         "Car/scooter washing",
         ("wash", "scrub", "rinse", "soap", "sponge", "wipe", "clean"),
         ("car", "vehicle", "windshield", "wheel", "tire", "dashboard"),
+        scenario_sufficient=("Car/scooter washing",),
     ),
     "Gardening": _r(
         "Gardening",
         ("plant", "water", "weed", "prun", "harvest", "garden", "soil", "flower", "seed", "pot",
          "dig", "fertiliz", "compost", "cultivat", "mow", "lawn", "grass cutter"),
+        scenario_sufficient=("Gardening",),
     ),
     "Full Yard Maintenance": _r(
         ("Doing yardwork / shoveling snow", "Gardening"),
@@ -179,8 +181,9 @@ TASK_RULES: dict[str, TaskRule] = {
          "structure", "panel", "frame", "rack", "desk", "bed"),
         ("screw", "bolt", "piece", "part", "attach", "fit", "install", "assembl",
          "tighten", "join", "connect", "build", "construct"),
-        # Sem scenario_sufficient: montar móvel sentado no chão é o ban
-        # clássico. Exige evidência da ação; higiene recusa "sits/sitting".
+        scenario_sufficient=("Assembling furniture",),
+        # O cenário comprova a montagem, mas a higiene continua removendo
+        # qualquer janela em que a pessoa apareça sentada.
     ),
     "Pet Care Routine": _r(
         ("Washing the dog / pet", "Playing with pets"),
@@ -193,6 +196,7 @@ TASK_RULES: dict[str, TaskRule] = {
         ("dog", "pet", "leash"),
         ("walk", "walking", "leash", "street", "road", "path"),
         action_excluded=("stroller", "baby"),
+        scenario_sufficient=("Walking the dog / pet",),
     ),
     "Water Houseplants": _r(
         "Potting plants (indoor)",
@@ -418,6 +422,7 @@ TASK_RULES: dict[str, TaskRule] = {
         "Washing the dog / pet",
         ("wash", "bath", "bathe", "brush", "groom"),
         ("dog", "pet", "cat", "horse", "animal"),
+        scenario_sufficient=("Washing the dog / pet",),
     ),
 }
 
@@ -634,6 +639,11 @@ SPAN_MIN_RATIO = 0.75
 SPAN_MAX_GAP_S = 15.0
 SPAN_PAD_S = 2.0
 ACTIVITY_TARGET_MAX_GAP_S = 30.0
+LONG_ACTIVITY_MIN_S = 600.0
+LONG_ACTIVITY_ROW_MAX_GAP_S = 120.0
+LONG_ACTIVITY_TARGET_MAX_GAP_S = 180.0
+LONG_ACTIVITY_CONTEXT_S = 300.0
+SCENARIO_BOUNDARY_BUFFER_S = 60.0
 
 
 # Relações pai/filho: uma evidência da tarefa ampla não é concorrência para a
@@ -693,8 +703,37 @@ def _activity_spans(
     max_s: float,
     max_gap_s: float,
     video_duration_s: float | None,
+    allowed_intervals: Iterable[tuple[float, float]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Isola sessões contínuas entre evidências recorrentes da mesma tarefa."""
+    """Isola sessões contínuas entre evidências recorrentes da mesma tarefa.
+
+    Narrações Ego4D não têm cadência fixa. Para pedidos de dez minutos ou
+    mais, uma pausa sem anotação não pode ser confundida automaticamente com
+    troca de atividade. O modo longo tolera lacunas neutras maiores, mas os
+    limites de higiene e qualquer tarefa concorrente continuam encerrando o
+    trecho imediatamente.
+    """
+    long_mode = min_s >= LONG_ACTIVITY_MIN_S
+    strict_cores: list[dict[str, Any]] = []
+    if long_mode:
+        # Primeiro encontra uma ação realmente contínua com os limites
+        # conservadores. Ela será a prova semântica para qualquer extensão.
+        strict_cores = _activity_spans(
+            rule,
+            flagged,
+            min_s=60.0,
+            max_s=max_s,
+            max_gap_s=max_gap_s,
+            video_duration_s=video_duration_s,
+            allowed_intervals=None,
+        )
+
+    row_gap_limit = max_gap_s
+    target_gap_limit = ACTIVITY_TARGET_MAX_GAP_S
+    if long_mode:
+        row_gap_limit = max(row_gap_limit, LONG_ACTIVITY_ROW_MAX_GAP_S)
+        target_gap_limit = max(
+            target_gap_limit, LONG_ACTIVITY_TARGET_MAX_GAP_S)
     target_runs: list[list[int]] = []
     current: list[int] = []
     previous_row: int | None = None
@@ -704,7 +743,7 @@ def _activity_spans(
         row_gap = (
             t - flagged[previous_row][0] if previous_row is not None else 0.0
         )
-        if boundary or (previous_row is not None and row_gap > max_gap_s):
+        if boundary or (previous_row is not None and row_gap > row_gap_limit):
             if current:
                 target_runs.append(current)
             current = []
@@ -717,7 +756,7 @@ def _activity_spans(
                 if previous_target is not None else 0.0
             )
             if (previous_target is not None
-                    and target_gap > ACTIVITY_TARGET_MAX_GAP_S):
+                    and target_gap > target_gap_limit):
                 if current:
                     target_runs.append(current)
                 current = []
@@ -765,6 +804,143 @@ def _activity_spans(
                     "n_events": b - a + 1,
                 })
             cursor = best_pos + 1
+
+    if long_mode:
+        # Um núcleo verificado de alguns minutos pode estar dentro de uma
+        # tomada longa da mesma atividade. Expanda no máximo cinco minutos de
+        # cada lado e jamais atravesse uma anotação insegura/concorrente.
+        for core in strict_cores:
+            core_start = float(core["start"])
+            core_end = float(core["end"])
+            corridor_start = max(0.0, core_start - LONG_ACTIVITY_CONTEXT_S)
+            corridor_end = core_end + LONG_ACTIVITY_CONTEXT_S
+            if video_duration_s:
+                corridor_end = min(corridor_end, float(video_duration_s))
+            if allowed_intervals is not None:
+                containing = [
+                    (start, end) for start, end in allowed_intervals
+                    if float(start) <= core_start + 1e-6
+                    and float(end) >= core_end - 1e-6
+                ]
+                if not containing:
+                    continue
+                covered_start, covered_end = max(
+                    containing, key=lambda interval: interval[1] - interval[0])
+                corridor_start = max(corridor_start, float(covered_start))
+                corridor_end = min(corridor_end, float(covered_end))
+            for t, _text, _normed, _on_task, boundary in flagged:
+                if not boundary:
+                    continue
+                if t <= core_start:
+                    corridor_start = max(corridor_start, t + 0.001)
+                elif t >= core_end:
+                    corridor_end = min(corridor_end, t - 0.001)
+                    break
+            available = corridor_end - corridor_start
+            if available < min_s:
+                continue
+            duration = min(max_s, available)
+            midpoint = (core_start + core_end) / 2.0
+            start = max(corridor_start, midpoint - duration / 2.0)
+            end = start + duration
+            if end > corridor_end:
+                end = corridor_end
+                start = end - duration
+            window_rows = [
+                row for row in flagged
+                if start <= row[0] <= end and not row[4]
+            ]
+            units = [row[2] for row in window_rows if row[2]]
+            expanded = {
+                "start": start,
+                "end": end,
+                "action_text": " ".join(units),
+                "action_units": units,
+                "match_score": core["match_score"],
+                "n_events": len(window_rows),
+                "expanded_from_verified_core": True,
+            }
+            if not any(
+                    abs(float(existing["start"]) - start) < 1e-6
+                    and abs(float(existing["end"]) - end) < 1e-6
+                    for existing in spans):
+                spans.append(expanded)
+    return spans
+
+
+def scenario_activity_spans(
+    flagged: list[tuple[float, str, str, bool, bool]],
+    *,
+    min_s: float,
+    max_s: float,
+    video_duration_s: float,
+    allowed_intervals: Iterable[tuple[float, float]] | None = None,
+) -> list[dict[str, Any]]:
+    """Cria janelas longas quando o cenário Ego4D equivale à tarefa.
+
+    Um cenário suficiente é uma anotação humana do vídeo inteiro, não uma
+    inferência por palavra. Ainda assim, cada evento inseguro ou concorrente
+    remove um minuto dos dois lados antes de as janelas serem formadas.
+    """
+    duration = max(0.0, float(video_duration_s or 0.0))
+    if duration < min_s:
+        return []
+    blocked: list[tuple[float, float]] = []
+    for t, _text, _normed, _on_task, boundary in flagged:
+        if boundary:
+            blocked.append((
+                max(0.0, t - SCENARIO_BOUNDARY_BUFFER_S),
+                min(duration, t + SCENARIO_BOUNDARY_BUFFER_S),
+            ))
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(blocked):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    sources = list(allowed_intervals or [(0.0, duration)])
+    safe: list[tuple[float, float]] = []
+    for source_start, source_end in sources:
+        source_start = max(0.0, float(source_start))
+        source_end = min(duration, float(source_end))
+        if source_end - source_start < min_s:
+            continue
+        cursor = source_start
+        for start, end in merged:
+            if end <= source_start or start >= source_end:
+                continue
+            clipped_start = max(source_start, start)
+            clipped_end = min(source_end, end)
+            if clipped_start - cursor >= min_s:
+                safe.append((cursor, clipped_start))
+            cursor = max(cursor, clipped_end)
+        if source_end - cursor >= min_s:
+            safe.append((cursor, source_end))
+
+    spans: list[dict[str, Any]] = []
+    for safe_start, safe_end in safe:
+        safe_duration = safe_end - safe_start
+        # Produza a maior quantidade de vídeos independentes, sem sobrepor
+        # frames. Um corredor seguro de 24 min vira dois takes de ~12 min, em
+        # vez de apenas um take monolítico.
+        count = max(1, int(safe_duration // min_s))
+        window_duration = min(max_s, safe_duration / count)
+        for index in range(count):
+            start = safe_start + index * window_duration
+            end = start + window_duration
+            if not min_s <= end - start <= max_s + 1e-6:
+                continue
+            rows = [row for row in flagged if start <= row[0] <= end]
+            units = [row[2] for row in rows if row[2]]
+            spans.append({
+                "start": start,
+                "end": end,
+                "action_text": " ".join(units),
+                "action_units": units,
+                "match_score": 100,
+                "n_events": len(rows),
+                "scenario_verified": True,
+            })
     return spans
 
 
@@ -873,10 +1049,13 @@ def prepare_span_events(
         text = str(raw_text or "").strip()
         if not text:
             continue
-        wearer_text = " ".join(_camera_wearer_segments(text))
         uncertain = bool(re.search(r"#\s*unsure\b", text, re.I))
-        rows.append((t, text, wearer_text,
-                     _narration_is_dirty(text) or uncertain))
+        # `#unsure` significa apenas que o anotador não reconheceu um objeto.
+        # Não serve como evidência semântica, mas também não representa por si
+        # só celular, pessoa sentada ou troca de tarefa.
+        wearer_text = "" if uncertain else " ".join(
+            _camera_wearer_segments(text))
+        rows.append((t, text, wearer_text, _narration_is_dirty(text)))
     rows.sort(key=lambda row: row[0])
     return tuple(rows)
 
@@ -917,6 +1096,7 @@ def extract_spans(
     task_name: str | None = None,
     event_task_names: tuple[frozenset[str], ...] | None = None,
     competing_task_names: frozenset[str] = frozenset(),
+    allowed_intervals: Iterable[tuple[float, float]] | None = None,
 ) -> list[dict[str, Any]]:
     """Corta trechos contínuos da tarefa a partir de narrações temporizadas.
 
@@ -954,7 +1134,8 @@ def extract_spans(
     if activity_mode:
         return _activity_spans(
             rule, flagged, min_s=min_s, max_s=max_s,
-            max_gap_s=max_gap_s, video_duration_s=video_duration_s)
+            max_gap_s=max_gap_s, video_duration_s=video_duration_s,
+            allowed_intervals=allowed_intervals)
 
     spans: list[dict[str, Any]] = []
     i = 0
