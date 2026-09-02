@@ -71,7 +71,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 
 from .. import (
-    campaign, config, crowtado, ego4d, holo_accelerator, holoassist,
+    campaign, config, crowtado, ego4d, fx, holo_accelerator, holoassist,
     hostinger_mail, readiness, sent_registry,
 )
 from ..atomic_io import load_json, save_json
@@ -1479,6 +1479,7 @@ def create_app() -> Flask:
             "accounts": configured,
             "with_password": sorted(_crowtado_creds()),
             "runner": BALANCES_RUNNER.snapshot(),
+            "exchange": fx.usd_brl_quote(),
         })
 
     @app.post("/api/balances/refresh")

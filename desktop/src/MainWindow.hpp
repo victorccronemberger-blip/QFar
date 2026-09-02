@@ -86,7 +86,8 @@ private:
   void loadBalances();
   void loadHistory();
 
-  QString money(qint64 cents) const;
+  QString usdMoney(qint64 cents) const;
+  QString brlMoney(qint64 usdCents, double usdBrlRate) const;
   QString friendlyDate(const QString& iso) const;
   QString encoded(const QString& value) const;
   oclero::qlementine::QlementineStyle* _style{};
@@ -188,6 +189,11 @@ private:
   QTableWidget* _balancesTable{};
   QLabel* _balancesState{};
   QPushButton* _balancesRefresh{};
+  QLabel* _balancesApprovedUsd{};
+  QLabel* _balancesApprovedBrl{};
+  QLabel* _balancesPendingUsd{};
+  QLabel* _balancesPendingBrl{};
+  QLabel* _balancesExchange{};
 
   QTableWidget* _historyTable{};
   QPlainTextEdit* _historyDetail{};

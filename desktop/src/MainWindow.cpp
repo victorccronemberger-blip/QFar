@@ -1282,10 +1282,48 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesTable->setColumnWidth(3, 176);
   _balancesTable->setColumnWidth(4, 176);
   _balancesTable->horizontalHeaderItem(1)->setToolTip(
-      QStringLiteral("Valor liberado para solicitar saque."));
+      QStringLiteral("Valor em dólar liberado para solicitar saque."));
   _balancesTable->horizontalHeaderItem(2)->setToolTip(
-      QStringLiteral("Valor registrado pelo Crowtado que ainda não foi liberado para saque."));
+      QStringLiteral("Valor em dólar registrado pelo Crowtado que ainda não foi liberado para saque."));
   layout->addWidget(card(QStringLiteral("Saldos no Crowtado"), _balancesTable), 1);
+
+  auto* summaryBody = new QWidget;
+  auto* summaryLayout = new QVBoxLayout(summaryBody);
+  summaryLayout->setContentsMargins(0, 0, 0, 0);
+  summaryLayout->setSpacing(10);
+  auto* totals = new QWidget;
+  auto* totalsLayout = new QHBoxLayout(totals);
+  totalsLayout->setContentsMargins(0, 0, 0, 0);
+  totalsLayout->setSpacing(28);
+  const auto totalBlock = [](const QString& title, QLabel** usd, QLabel** brl) {
+    auto* block = new QWidget;
+    auto* blockLayout = new QVBoxLayout(block);
+    blockLayout->setContentsMargins(0, 0, 0, 0);
+    blockLayout->setSpacing(3);
+    auto* caption = new QLabel(title.toUpper());
+    caption->setObjectName(QStringLiteral("balanceTotalCaption"));
+    blockLayout->addWidget(caption);
+    *usd = new QLabel(QStringLiteral("US$ 0,00"));
+    (*usd)->setObjectName(QStringLiteral("balanceTotalUsd"));
+    blockLayout->addWidget(*usd);
+    *brl = new QLabel(QStringLiteral("≈ R$ —"));
+    (*brl)->setObjectName(QStringLiteral("balanceTotalBrl"));
+    blockLayout->addWidget(*brl);
+    return block;
+  };
+  totalsLayout->addWidget(totalBlock(
+      QStringLiteral("Total aprovado"), &_balancesApprovedUsd, &_balancesApprovedBrl), 1);
+  auto* divider = new QFrame;
+  divider->setFrameShape(QFrame::VLine);
+  divider->setObjectName(QStringLiteral("balanceDivider"));
+  totalsLayout->addWidget(divider);
+  totalsLayout->addWidget(totalBlock(
+      QStringLiteral("Total pendente"), &_balancesPendingUsd, &_balancesPendingBrl), 1);
+  summaryLayout->addWidget(totals);
+  _balancesExchange = quietLabel(QStringLiteral("Carregando cotação USD/BRL…"));
+  _balancesExchange->setObjectName(QStringLiteral("balanceExchange"));
+  summaryLayout->addWidget(_balancesExchange);
+  layout->addWidget(card(QStringLiteral("Resumo em dólar"), summaryBody));
 
   return pageShell(QStringLiteral("Saldos"),
                    QStringLiteral("Acompanhe valores disponíveis e pendentes e solicite o link de saque."), body);
@@ -1416,6 +1454,11 @@ void MainWindow::applyStructuralStyle(bool dark) {
     #metricCaption { color: %5; font-size: 9px; font-weight: 800; letter-spacing: 1.1px; }
     #metricValue { color: %4; font-family: "Cascadia Mono", Consolas; font-size: 32px; font-weight: 700; }
     #metricTiming { color: %5; font-size: 8px; font-weight: 700; letter-spacing: 0.9px; }
+    #balanceTotalCaption { color: %5; font-size: 9px; font-weight: 800; letter-spacing: 1.05px; }
+    #balanceTotalUsd { color: %4; font-family: "Cascadia Mono", Consolas; font-size: 23px; font-weight: 720; }
+    #balanceTotalBrl { color: #ff7a36; font-family: "Cascadia Mono", Consolas; font-size: 12px; font-weight: 680; }
+    #balanceExchange { color: %5; font-size: 10px; border-top: 1px solid %6; padding-top: 8px; }
+    #balanceDivider { color: %6; }
     #pulseTitle { color: %4; font-size: 21px; font-weight: 735; letter-spacing: -0.2px; }
     #securityBadge { color: #61c694; background: %9; border: 1px solid %6; border-radius: 13px; padding: 8px 13px; font-size: 10px; font-weight: 700; }
     #integrationStatus { color: %4; font-size: 13px; font-weight: 700; }
@@ -2385,19 +2428,30 @@ void MainWindow::loadBalances() {
     const auto balances = root.value(QStringLiteral("balances")).toObject();
     const auto withPassword = root.value(QStringLiteral("with_password")).toArray();
     const auto runner = root.value(QStringLiteral("runner")).toObject();
+    const auto exchange = root.value(QStringLiteral("exchange")).toObject();
     QStringList passwordAccounts;
     for (const auto value : withPassword) passwordAccounts << value.toString();
     _balancesTable->setRowCount(accounts.size());
+    qint64 approvedTotal = 0;
+    qint64 pendingTotal = 0;
     int row = 0;
     for (const auto value : accounts) {
       const QString email = value.toString();
       const auto balance = balances.value(email).toObject();
       _balancesTable->setItem(row, 0, cell(email));
-      QString available = balance.contains(QStringLiteral("availableCents"))
-          ? money(static_cast<qint64>(balance.value(QStringLiteral("availableCents")).toDouble()))
+      const bool hasAvailable = balance.value(QStringLiteral("availableCents")).isDouble();
+      const bool hasPending = balance.value(QStringLiteral("pendingCents")).isDouble();
+      const qint64 availableCents = hasAvailable
+          ? static_cast<qint64>(balance.value(QStringLiteral("availableCents")).toDouble()) : 0;
+      const qint64 pendingCents = hasPending
+          ? static_cast<qint64>(balance.value(QStringLiteral("pendingCents")).toDouble()) : 0;
+      if (hasAvailable) approvedTotal += availableCents;
+      if (hasPending) pendingTotal += pendingCents;
+      QString available = hasAvailable
+          ? usdMoney(availableCents)
           : QStringLiteral("—");
-      QString pending = balance.contains(QStringLiteral("pendingCents"))
-          ? money(static_cast<qint64>(balance.value(QStringLiteral("pendingCents")).toDouble()))
+      QString pending = hasPending
+          ? usdMoney(pendingCents)
           : QStringLiteral("—");
       if (!balance.value(QStringLiteral("error")).toString().isEmpty()) {
         available = QStringLiteral("erro");
@@ -2425,6 +2479,29 @@ void MainWindow::loadBalances() {
       });
       _balancesTable->setCellWidget(row, 4, withdraw);
       ++row;
+    }
+    _balancesApprovedUsd->setText(usdMoney(approvedTotal));
+    _balancesPendingUsd->setText(usdMoney(pendingTotal));
+    const bool exchangeAvailable = exchange.value(QStringLiteral("available")).toBool();
+    const double usdBrlRate = exchange.value(QStringLiteral("rate")).toDouble();
+    if (exchangeAvailable && usdBrlRate > 0.0) {
+      _balancesApprovedBrl->setText(QStringLiteral("≈ %1").arg(brlMoney(approvedTotal, usdBrlRate)));
+      _balancesPendingBrl->setText(QStringLiteral("≈ %1").arg(brlMoney(pendingTotal, usdBrlRate)));
+      const QDate quoteDate = QDate::fromString(
+          exchange.value(QStringLiteral("quote_date")).toString(), Qt::ISODate);
+      const QString dateText = quoteDate.isValid()
+          ? QLocale(QStringLiteral("pt_BR")).toString(quoteDate, QStringLiteral("dd/MM/yyyy"))
+          : QStringLiteral("data indisponível");
+      _balancesExchange->setText(QStringLiteral("%1Cotação BCB de venda · US$ 1 = R$ %2 · %3")
+          .arg(exchange.value(QStringLiteral("stale")).toBool()
+                   ? QStringLiteral("Última cotação salva · ") : QString())
+          .arg(QLocale(QStringLiteral("pt_BR")).toString(usdBrlRate, 'f', 4))
+          .arg(dateText));
+    } else {
+      _balancesApprovedBrl->setText(QStringLiteral("≈ R$ —"));
+      _balancesPendingBrl->setText(QStringLiteral("≈ R$ —"));
+      _balancesExchange->setText(
+          QStringLiteral("Conversão para BRL indisponível · os totais em USD permanecem válidos."));
     }
     const bool running = runner.value(QStringLiteral("state")).toString() == QStringLiteral("running");
     _balancesRefresh->setEnabled(!running);
@@ -2460,8 +2537,13 @@ void MainWindow::loadHistory() {
   });
 }
 
-QString MainWindow::money(qint64 cents) const {
-  return QLocale(QStringLiteral("pt_BR")).toCurrencyString(cents / 100.0, QStringLiteral("R$"));
+QString MainWindow::usdMoney(qint64 cents) const {
+  return QLocale(QStringLiteral("pt_BR")).toCurrencyString(cents / 100.0, QStringLiteral("US$"));
+}
+
+QString MainWindow::brlMoney(qint64 usdCents, double usdBrlRate) const {
+  return QLocale(QStringLiteral("pt_BR")).toCurrencyString(
+      (usdCents / 100.0) * usdBrlRate, QStringLiteral("R$"));
 }
 
 QString MainWindow::friendlyDate(const QString& iso) const {
