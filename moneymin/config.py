@@ -135,6 +135,20 @@ APP_VERSION = os.environ.get("MINUTE_APP_VERSION", "1.22.0")
 USER_AGENT = f"Minute/{APP_VERSION} (com.bakerdata.minute; build:1; iOS 26.5.2)"
 # iOS no Brasil (todas as contas operam daqui).
 ACCEPT_LANGUAGE = os.environ.get("MINUTE_ACCEPT_LANGUAGE", "pt-BR,pt;q=0.9")
+# Header X-Device-Location (app 1.22.0): JSON {latitude, longitude, accuracy, isMock}.
+# Só envia se LAT/LNG estiverem no ambiente — não inventa GPS.
+try:
+    DEVICE_LAT = float(os.environ["MINUTE_DEVICE_LAT"]) if os.environ.get("MINUTE_DEVICE_LAT") else None
+except ValueError:
+    DEVICE_LAT = None
+try:
+    DEVICE_LNG = float(os.environ["MINUTE_DEVICE_LNG"]) if os.environ.get("MINUTE_DEVICE_LNG") else None
+except ValueError:
+    DEVICE_LNG = None
+try:
+    DEVICE_LOCATION_ACCURACY = float(os.environ.get("MINUTE_DEVICE_ACCURACY", "12"))
+except ValueError:
+    DEVICE_LOCATION_ACCURACY = 12.0
 # Teto do cache de MP4 por aparelho (`*_native_acc*.mp4` em data/ego4d/).
 # O `_native.mp4` não conta — é a fonte do re-encode rápido. 0 = sem teto.
 VIDEO_CACHE_GB = float(os.environ.get("MINUTE_VIDEO_CACHE_GB", "40"))

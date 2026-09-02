@@ -136,6 +136,9 @@ def _is_disabled_error(error: str | None) -> bool:
     return "desativad" in text or "disabled" in text or "conta desativada" in text
 # Janela de duração aceita (recording-config: min 60s / max 1800s).
 MIN_DUR_MS, MAX_DUR_MS = 60000, 1800000
+# O app sobe a sessão em pedaços (`{session}_{i}`). Gravação contínua curta
+# fica num único `_0`; acima disto parte em janelas ≥ 60s.
+NATIVE_CHUNK_TARGET_MS = 480_000
 DATASET_PROVIDERS = frozenset({"all", "ego4d", "holoassist"})
 
 
@@ -152,8 +155,7 @@ def _frames_csv(duration_ms: int, fps: float = 30.0) -> str:
 
 
 def _recorded_at_now() -> str:
-    micros = int(time.time() * 1000) % 1_000_000
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{micros:06d}Z"
+    return device_profile.format_recorded_at(time.time())
 
 
 def _ffmpeg_head(ff: str) -> list[str]:
@@ -196,22 +198,50 @@ def _use_nvenc(ff: str) -> bool:
     return _ffmpeg_encoder_available(ff, "h264_nvenc")
 
 
-def _native_video_codec_args(*, nvenc: bool) -> list[str]:
+def _native_video_codec_args(
+    *,
+    nvenc: bool,
+    bitrate: str | None = None,
+    gop: int | None = None,
+) -> list[str]:
+    """H.264 High@4.0 sem B-frames — o sidecar nativo manda hasBFrames: null."""
+    br = bitrate or NATIVE_BITRATE
+    # GOP explícito só no re-encode por aparelho; o `_native.mp4` fica no
+    # intervalo padrão do encoder (~1 s a 30 fps), como o iPhone.
+    gop_args: list[str] = []
+    if gop is not None:
+        gop_args = ["-g", str(int(gop)), "-keyint_min", str(int(gop))]
     if nvenc:
-        # p4 entrega boa qualidade e usa a RTX para a parte cara do encode.
         return [
             "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
-            "-rc", "vbr", "-b:v", NATIVE_BITRATE,
-            "-maxrate", NATIVE_BITRATE, "-bufsize", "16000k",
+            "-rc", "vbr", "-b:v", br, "-maxrate", br, "-bufsize", "16000k",
             "-profile:v", "high", "-level:v", "4.0",
             "-spatial_aq", "1", "-temporal_aq", "1",
-            "-rc-lookahead", "20", "-bf", "2",
+            "-rc-lookahead", "20", "-bf", "0",
+            *gop_args,
         ]
     return [
         "-c:v", "libx264", "-preset", "veryfast",
         "-threads", str(_heavy_encode_threads()),
-        "-b:v", NATIVE_BITRATE, "-maxrate", NATIVE_BITRATE,
-        "-bufsize", "16000k", "-profile:v", "high", "-level", "4.0",
+        "-b:v", br, "-maxrate", br, "-bufsize", "16000k",
+        "-profile:v", "high", "-level", "4.0",
+        "-bf", "0",
+        *gop_args,
+    ]
+
+
+def _native_container_args(tmp: Path) -> list[str]:
+    """Mesmo envelope do app iOS: 1440x1080 yuv420p TV, Core Media, AAC 48 kHz."""
+    return [
+        "-vf", ("scale=1440:1080:force_original_aspect_ratio=increase,"
+                "crop=1440:1080,scale=in_range=full:out_range=tv,format=yuv420p"),
+        "-r", "30",
+        "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-map_metadata", "-1", "-map_chapters", "-1",
+        "-metadata:s:v:0", "handler_name=Core Media Video",
+        "-c:a", "aac", "-ac", "1", "-ar", "48000",
+        "-movflags", "+faststart", "-f", "mp4", str(tmp),
     ]
 
 
@@ -244,7 +274,7 @@ def _normalize_video(src: Path, out_dir: Path, *,
     try:
         source_stat = src.stat()
         cache_key = {
-            "version": 2,
+            "version": 3,
             "source_size": source_stat.st_size,
             "source_mtime_ns": source_stat.st_mtime_ns,
             "start_s": None if start_s is None else round(float(start_s), 6),
@@ -292,17 +322,7 @@ def _normalize_video(src: Path, out_dir: Path, *,
     if tmp.exists():
         tmp.unlink()
     input_args = cmd
-    common_args = [
-        "-vf", ("scale=1440:1080:force_original_aspect_ratio=increase,"
-                "crop=1440:1080,scale=in_range=full:out_range=tv,format=yuv420p"),
-        "-r", "30",
-        "-color_range", "tv", "-colorspace", "bt709",
-        "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-map_metadata", "-1", "-map_chapters", "-1",
-        "-metadata:s:v:0", "handler_name=Core Media Video",
-        "-c:a", "aac", "-ac", "1", "-ar", "48000",
-        "-movflags", "+faststart", "-f", "mp4", str(tmp),
-    ]
+    common_args = _native_container_args(tmp)
 
     use_nvenc = _use_nvenc(ff)
     cmd = [*input_args, *_native_video_codec_args(nvenc=use_nvenc), *common_args]
@@ -633,46 +653,176 @@ def _new_identity(duration_s: float, email: str,
                   recorded_at: str | None = None) -> tuple[str, str, str]:
     """Gera session_id/log_id/recorded_at NOVOS (identidade única por conta).
 
-    Anti-colusão: `recorded_at` NO PASSADO — a gravação terminou `gap` (1.5min
-    a 1.5h) ANTES do upload, nunca "agora": um vídeo de 60s "gravado" que
-    aparece completo no servidor segundos depois é comportamento impossível de
-    app real. O gap é sorteado por (conta, sessão) — as contas da mesma
-    campanha também têm recorded_at desincronizados entre si.
+    `recorded_at` é o INÍCIO da gravação, no formato nativo (3 dígitos, UTC)
+    e dentro do backlog de 4h. Sem valor pré-agendado, a gravação termina
+    `gap` (1.5min–1.5h) antes do upload — nunca "agora".
     """
     session_id = str(uuid.uuid4())
     if recorded_at:
+        recorded_at = device_profile.normalize_recorded_at(
+            recorded_at, duration_s=duration_s)
         return session_id, f"{session_id}_0", recorded_at
     rng = random.Random(f"{email}|{session_id}")
     gap_s = rng.uniform(90.0, 5400.0)
-    ts = time.time() - duration_s - gap_s
-    micros = int(round(ts * 1_000_000)) % 1_000_000
-    recorded_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)) \
-        + f".{micros:06d}Z"
+    start = device_profile.recording_start_epoch(duration_s, gap_s=gap_s)
+    recorded_at = device_profile.format_recorded_at(start)
     return session_id, f"{session_id}_0", recorded_at
+
+
+def _chunk_plan(duration_ms: int, target_ms: int = NATIVE_CHUNK_TARGET_MS
+                ) -> list[tuple[int, int]]:
+    """Janelas (start_ms, dur_ms). Uma só se couber no alvo; senão N ≥ 60s."""
+    duration_ms = max(1, int(duration_ms))
+    target_ms = max(MIN_DUR_MS, int(target_ms))
+    if duration_ms <= target_ms:
+        return [(0, duration_ms)]
+    plan: list[tuple[int, int]] = []
+    start = 0
+    while start < duration_ms:
+        remaining = duration_ms - start
+        if remaining <= target_ms:
+            dur = remaining
+        else:
+            dur = target_ms
+            leftover = remaining - dur
+            if leftover < MIN_DUR_MS:
+                dur = remaining
+        plan.append((start, dur))
+        start += dur
+    return plan
+
+
+def _slice_imu_csv(imu_csv: str, start_ms: int, duration_ms: int) -> tuple[str, int]:
+    """Recorta o imu.csv no intervalo do chunk e zera o relógio do pedaço."""
+    start_ns = int(start_ms) * 1_000_000
+    end_ns = start_ns + int(duration_ms) * 1_000_000
+    lines = (imu_csv or "").splitlines()
+    if not lines:
+        return "", 0
+    header = lines[0]
+    out = [header]
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        first, _, rest = line.partition(",")
+        try:
+            t_ns = int(float(first))
+        except ValueError:
+            continue
+        if t_ns < start_ns or t_ns >= end_ns:
+            continue
+        out.append(f"{t_ns - start_ns},{rest}" if rest else str(t_ns - start_ns))
+    return "\n".join(out) + ("\n" if len(out) > 1 else ""), max(0, len(out) - 1)
+
+
+_CHUNK_VIDEO_LOCKS_GUARD = threading.Lock()
+_chunk_video_locks: dict[str, threading.Lock] = {}
+
+
+def _chunk_video_signature(src: Path, start_s: float, dur_s: float) -> str:
+    stat = src.stat()
+    value = (
+        f"v1|{src.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
+        f"{float(start_s):.3f}|{float(dur_s):.3f}"
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _chunk_video_path(
+    src: Path,
+    chunk_index: int,
+    start_ms: int,
+    duration_ms: int,
+) -> Path:
+    """Nome imutável: contas paralelas compartilham o mesmo corte pronto."""
+    signature = _chunk_video_signature(
+        src, start_ms / 1000.0, duration_ms / 1000.0)
+    return src.with_name(
+        f"{src.stem}_ch{int(chunk_index)}_{signature[:12]}{src.suffix}")
+
+
+def _chunk_video_lock(dest: Path) -> threading.Lock:
+    key = os.path.normcase(str(dest.resolve(strict=False)))
+    with _CHUNK_VIDEO_LOCKS_GUARD:
+        return _chunk_video_locks.setdefault(key, threading.Lock())
+
+
+def _cut_video_chunk(src: Path, dest: Path, start_s: float, dur_s: float) -> Path:
+    """Corta uma vez e publica atomicamente para todas as contas do lote."""
+    expected = _chunk_video_signature(src, start_s, dur_s)
+    ready = dest.with_name(dest.name + ".chunk.ok")
+    with _chunk_video_lock(dest):
+        try:
+            if (dest.is_file() and dest.stat().st_size > 0 and ready.is_file()
+                    and ready.read_text(encoding="utf-8").strip() == expected):
+                return dest
+        except OSError:
+            pass
+        ff = _ffmpeg_bin()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.stem + ".tmp.mp4")
+        if tmp.exists():
+            tmp.unlink()
+        cmd = [
+            *_ffmpeg_head(ff),
+            "-ss", f"{max(0.0, float(start_s)):.3f}",
+            "-i", str(src),
+            "-t", f"{max(0.1, float(dur_s)):.3f}",
+            "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(tmp),
+        ]
+        res = _ffmpeg_run(cmd)
+        if res.returncode != 0 or not probe_video(tmp).get("duration_ms"):
+            if tmp.exists():
+                tmp.unlink()
+            cmd = [
+                *_ffmpeg_head(ff),
+                "-ss", f"{max(0.0, float(start_s)):.3f}",
+                "-i", str(src),
+                "-t", f"{max(0.1, float(dur_s)):.3f}",
+                *_native_video_codec_args(nvenc=_use_nvenc(ff)),
+                *_native_container_args(tmp),
+            ]
+            res = _ffmpeg_run(cmd)
+        if res.returncode != 0:
+            if tmp.exists():
+                tmp.unlink()
+            raise UploadError(
+                f"corte de chunk falhou: {(res.stderr or '')[:400]}")
+        tmp.replace(dest)
+        ready.write_text(expected, encoding="utf-8")
+        return dest
 
 
 def _build_sidecar(item: dict[str, Any], session_id: str, log_id: str,
                    recorded_at: str, profile: DeviceProfile,
                    video_probe: dict[str, Any], imu_csv: str,
-                   frames_csv: str) -> bytes:
+                   frames_csv: str, *, chunk_index: int = 0,
+                   duration_ms: int | None = None) -> bytes:
     """Monta o sidecar .data.zip para uma identidade específica (por conta).
 
     Usa o perfil do APARELHO da conta: calibração com jitter, clockOffsetNs e
     GOP próprios + uptime do sistema DERIVADO do recorded_at (cada "iPhone"
     tem boot próprio — nunca o relógio congelado).
     """
-    wall_ms = device_profile.recorded_at_to_wall_ms(recorded_at)
+    duration_ms = int(duration_ms if duration_ms is not None else item["duration_ms"])
+    wall_ms = (device_profile.recorded_at_to_wall_ms(recorded_at)
+               or int(time.time() * 1000))
     return build_sidecar_zip_custom(
-        session_id=session_id, chunk_index=0, duration_ms=item["duration_ms"],
+        session_id=session_id, chunk_index=chunk_index, duration_ms=duration_ms,
         recorded_at=recorded_at, video_probe=video_probe, log_id=log_id,
         imu_csv=imu_csv, frames_csv=frames_csv,
-        imu_sample_count=item["n_samples"],
+        imu_sample_count=item.get("n_samples"),
         calib=profile.calib,
         clock_offset_ns=profile.clock_offset_ns,
-        uptime_ns=profile.uptime_ns_at(wall_ms) if wall_ms else None,
+        uptime_ns=profile.uptime_ns_at(wall_ms),
         frames_gop=profile.frames_gop,
+        device_meta=profile.sidecar_device_meta(),
+        platform_meta=profile.sidecar_platform_meta(),
     )
 
+
+# Invalida cache `_acc*.mp4` gerado sem Core Media / com B-frames.
+_ACCOUNT_VIDEO_ENCODE_VERSION = "3"
 
 _ACCOUNT_VIDEO_LOCKS = threading.Lock()
 _account_video_locks: dict[str, threading.Lock] = {}
@@ -720,12 +870,11 @@ def _valid_account_video(out: Path, base: Path) -> bool:
         if st.st_size <= 0 or st.st_mtime < base.stat().st_mtime:
             return False
         ok = _account_video_ok_path(out)
-        if ok.exists() and ok.stat().st_mtime >= st.st_mtime:
-            return True
-        if probe_video(out).get("duration_ms"):
-            ok.write_text("ok", encoding="utf-8")
-            return True
-        return False
+        if (not ok.exists() or ok.stat().st_mtime < st.st_mtime
+                or ok.read_text(encoding="utf-8").strip()
+                != _ACCOUNT_VIDEO_ENCODE_VERSION):
+            return False
+        return bool(probe_video(out).get("duration_ms"))
     except Exception:  # noqa: BLE001 — probe/stat falhou: trata como miss
         return False
 
@@ -753,42 +902,37 @@ def _per_account_video(base: Path, profile: DeviceProfile) -> Path:
                 return out
             ff = _ffmpeg_bin()
             mb = profile.video_bitrate_mbps
+            br = f"{mb:.1f}M"
             tmp = _account_video_tmp_path(out)
             stale = out.with_name(out.name + ".tmp")  # legado .mp4.tmp
             for leftover in (tmp, stale):
                 if leftover.exists():
                     leftover.unlink()
+            input_args = [*_ffmpeg_head(ff), "-i", str(base)]
+            common_args = _native_container_args(tmp)
+            use_nvenc = _use_nvenc(ff)
             cmd = [
-                *_ffmpeg_head(ff), "-i", str(base),
-                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
-                "-b:v", f"{mb:.1f}M", "-maxrate", f"{mb * 1.15:.1f}M",
-                "-bufsize", f"{mb * 2:.0f}M",
-                "-profile:v", "high", "-level", "4.0",
-                "-g", str(profile.frames_gop),
-                "-c:a", "copy",
-                "-movflags", "+faststart", "-f", "mp4", str(tmp),
+                *input_args,
+                *_native_video_codec_args(
+                    nvenc=use_nvenc, bitrate=br, gop=profile.frames_gop),
+                *common_args,
             ]
             try:
                 res = _ffmpeg_run(cmd)
             except FileNotFoundError as exc:
                 raise UploadError(
                     "re-encode por conta precisa de ffmpeg") from exc
-            probed = probe_video(tmp) if res.returncode == 0 else {}
-            if res.returncode != 0 or not probed.get("duration_ms"):
-                # Native sem áudio, ou copy gerou container sem duração:
-                # refaz com aac em vez de copy.
-                cmd_aac = [
-                    *_ffmpeg_head(ff), "-i", str(base),
-                    "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
-                    "-b:v", f"{mb:.1f}M", "-maxrate", f"{mb * 1.15:.1f}M",
-                    "-bufsize", f"{mb * 2:.0f}M",
-                    "-profile:v", "high", "-level", "4.0",
-                    "-g", str(profile.frames_gop),
-                    "-c:a", "aac", "-ac", "1", "-ar", "48000",
-                    "-movflags", "+faststart", "-f", "mp4", str(tmp),
+            if res.returncode != 0 and use_nvenc:
+                if tmp.exists():
+                    tmp.unlink()
+                cmd = [
+                    *input_args,
+                    *_native_video_codec_args(
+                        nvenc=False, bitrate=br, gop=profile.frames_gop),
+                    *common_args,
                 ]
-                res = _ffmpeg_run(cmd_aac)
-                probed = probe_video(tmp) if res.returncode == 0 else {}
+                res = _ffmpeg_run(cmd)
+            probed = probe_video(tmp) if res.returncode == 0 else {}
             if res.returncode != 0:
                 if tmp.exists():
                     tmp.unlink()
@@ -801,7 +945,8 @@ def _per_account_video(base: Path, profile: DeviceProfile) -> Path:
                         "re-encode por conta gerou vídeo sem duração "
                         f"(size={size})")
                 tmp.replace(out)
-                _account_video_ok_path(out).write_text("ok", encoding="utf-8")
+                _account_video_ok_path(out).write_text(
+                    _ACCOUNT_VIDEO_ENCODE_VERSION, encoding="utf-8")
             finally:
                 if tmp.exists():
                     try:
@@ -1063,6 +1208,7 @@ def _media_companions(path: Path) -> list[Path]:
         path.with_name(f"{path.stem}.tmp.mp4"),
         path.with_name(path.name + ".tmp"),
         path.with_name(path.name + ".part"),
+        path.with_name(path.name + ".chunk.ok"),
     ]
 
 
@@ -1128,9 +1274,15 @@ def _cleanup_uploaded_item(
                 path for path in base.parent.glob("*_acc*.mp4")
                 if path.name.startswith(base.stem + "_acc")
             ]
+            chunk_variants = [
+                *base.parent.glob(f"{base.stem}_ch*{base.suffix}"),
+                *base.parent.glob(f"{base.stem}_acc*_ch*{base.suffix}"),
+            ]
         except OSError:
             variants = []
+            chunk_variants = []
         candidates.extend(variants)
+        candidates.extend(chunk_variants)
     for path in list(candidates):
         candidates.extend(_media_companions(path))
     protected_keys: set[str] = set()
@@ -1228,10 +1380,10 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             sess = Session.from_email(account.email)
             if session_cache is not None:
                 session_cache[account.email] = sess
-            else:
-                sess.ensure_auth()
-        elif not getattr(sess, "_live", False):
+        if not getattr(sess, "_live", False):
             sess.ensure_auth()
+        else:
+            sess.warmup()
         result["org_key"] = account.org_key
         profile = device_profile.get_profile(account.email)
         if not getattr(sess, "_moneymin_pending_pumped", False):
@@ -1260,24 +1412,59 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 item["imu_path"], tuple(item["window_s"]),
                 duration_ms=item["duration_ms"],
                 seed=f"{item['clip_uid']}|{account.email}")
+        fps = video_probe.get("fps") or 30.0
         frames_csv = item.get("frames_csv") or ""
         if unique_video or not frames_csv:
             frames_csv = build_frames_csv(
-                item["duration_ms"], fps=(video_probe.get("fps") or 30.0),
+                item["duration_ms"], fps=fps,
                 gop=profile.frames_gop, offset_ns=abs(profile.clock_offset_ns))
-        zip_bytes = _build_sidecar(item, session_id, log_id, recorded_at,
-                                   profile=profile, video_probe=video_probe,
-                                   imu_csv=imu_csv, frames_csv=frames_csv)
+        start_wall = device_profile.recorded_at_to_wall_ms(recorded_at)
+        plan = _chunk_plan(int(item["duration_ms"]))
+        chunk_paths: list[Path] = []
+        chunk_zips: list[bytes] = []
+        chunk_recorded: list[str] = []
+        for index, (start_ms, dur_ms) in enumerate(plan):
+            log_id = f"{session_id}_{index}"
+            rec_at = recorded_at
+            if start_wall is not None:
+                rec_at = device_profile.format_recorded_at(
+                    start_wall / 1000.0 + start_ms / 1000.0)
+            if len(plan) == 1:
+                part = video_path
+                part_imu, n_imu = imu_csv, int(item.get("n_samples") or 0)
+                part_frames = frames_csv
+            else:
+                part = _chunk_video_path(video_path, index, start_ms, dur_ms)
+                _cut_video_chunk(
+                    video_path, part, start_ms / 1000.0, dur_ms / 1000.0)
+                part_imu, n_imu = _slice_imu_csv(imu_csv, start_ms, dur_ms)
+                part_frames = build_frames_csv(
+                    dur_ms, fps=fps, gop=profile.frames_gop,
+                    offset_ns=abs(profile.clock_offset_ns))
+            part_probe = probe_video(part) if len(plan) > 1 else video_probe
+            chunk_item = dict(item)
+            if len(plan) > 1:
+                chunk_item["n_samples"] = n_imu
+            chunk_zips.append(_build_sidecar(
+                chunk_item, session_id, log_id, rec_at, profile=profile,
+                video_probe=part_probe, imu_csv=part_imu,
+                frames_csv=part_frames, chunk_index=index,
+                duration_ms=dur_ms))
+            chunk_paths.append(part)
+            chunk_recorded.append(rec_at)
         res = upload_session(
-            sess, video_path, account.org_key,
+            sess, chunk_paths if len(chunk_paths) > 1 else chunk_paths[0],
+            account.org_key,
             task_id=task_id, session_id=session_id,
-            recorded_at=recorded_at,
-            sidecar=True, sidecar_data=zip_bytes,
+            recorded_at=chunk_recorded if len(chunk_recorded) > 1 else recorded_at,
+            sidecar=True,
+            sidecar_data=chunk_zips if len(chunk_zips) > 1 else chunk_zips[0],
             normalize=False, register_first=True,
             persist_sidecar=True,
             evaluate=evaluate, finalize=finalize,
             timeout_blob=timeout_blob,
             profile=profile,
+            suppress_per_chunk_catbear=len(chunk_paths) > 1,
             on_progress=on_progress,
         )
         result["session_id"] = res.session_id

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import config
 from .atomic_io import load_json, save_json
+from .device_profile import format_recorded_at
 
 _LOCK = threading.Lock()
 
@@ -20,10 +21,7 @@ class RecordingSlot:
 
     @property
     def recorded_at(self) -> str:
-        seconds = int(self.start_epoch)
-        micros = int(round((self.start_epoch - seconds) * 1_000_000)) % 1_000_000
-        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) \
-            + f".{micros:06d}Z"
+        return format_recorded_at(self.start_epoch)
 
 
 def timeline_path() -> Path:

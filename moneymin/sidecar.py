@@ -443,14 +443,9 @@ def build_metadata_json(
     if clock_offset_ns is None:
         clock_offset_ns = int(config.NATIVE_CLOCK_OFFSET_NS)  # real (d9f4fa6f)
     clock_offset_ns = int(clock_offset_ns)
-    try:
-        import datetime
-        start_wall_ms = int(
-            datetime.datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
-            .timestamp() * 1000
-        )
-    except Exception:  # noqa: BLE001
-        start_wall_ms = int(time.time() * 1000)
+    from .device_profile import normalize_recorded_at, recorded_at_to_wall_ms
+    recorded_at = normalize_recorded_at(recorded_at)
+    start_wall_ms = recorded_at_to_wall_ms(recorded_at) or int(time.time() * 1000)
     end_wall_ms = start_wall_ms + duration_ms
     # clockDomain == "ios_systemUptimeNs": os timestamps de sensor são SYSTEM
     # UPTIME (desde o boot), ~2.2e14 ns para ~2,5 dias. O app real usa uptime

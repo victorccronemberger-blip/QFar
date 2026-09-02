@@ -34,6 +34,8 @@ from .atomic_io import save_json
 _REFRESH_SKEW_S = 10 * 60
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
+_WARMED_IDENTITIES: set[str] = set()
+_WARMED_IDENTITIES_GUARD = threading.Lock()
 
 # --- Endpoints Firebase / Google Identity Toolkit ---------------------------
 _SIGNIN_URL = (
@@ -612,6 +614,7 @@ class Session:
                     f"conta desativada no HUB: {who}. "
                     "A plataforma precisa reativá-la antes de novos envios."
                 )
+            self.warmup()
             return profile
         raise AuthError(
             f"{email}: sessão inválida ({status}) — o token pode ter expirado. "
@@ -654,3 +657,33 @@ class Session:
         não afeta o upload.
         """
         return self.get("/api/v1/devices/recording-config")
+
+    def warmup(self) -> None:
+        """Replica a abertura do app: telemetria + limites de gravação.
+
+        Best-effort: falha de rede não derruba o upload. Roda uma vez por
+        conta durante esta execução do motor, mesmo que a interface crie
+        várias instâncias de Session ao recarregar telas.
+        """
+        if getattr(self, "_warmed", False):
+            return
+        identity = str(self.email or self.data.get("email") or "").casefold()
+        if identity:
+            with _WARMED_IDENTITIES_GUARD:
+                if identity in _WARMED_IDENTITIES:
+                    self._warmed = True
+                    return
+                _WARMED_IDENTITIES.add(identity)
+        self._warmed = True
+        try:
+            self.app_opened("SESSION_RESUMED")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            status, body = self.fetch_recording_config()
+            if status == 200:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    self.recording_config = parsed
+        except Exception:  # noqa: BLE001
+            pass

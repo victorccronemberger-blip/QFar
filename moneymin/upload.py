@@ -62,7 +62,13 @@ from typing import Any
 
 from . import config, transport
 from .atomic_io import load_json, save_bytes, save_json
-from .device_profile import DeviceProfile, recorded_at_to_wall_ms
+from .device_profile import (
+    BACKLOG_CAP_MS,
+    DeviceProfile,
+    format_recorded_at,
+    recorded_at_to_wall_ms,
+    recording_start_epoch,
+)
 from .sidecar import (
     build_metadata_json,
     build_sidecar_zip,
@@ -110,26 +116,105 @@ UPLOAD_MAX_DURATION_MS = 1_800_000
 
 # --- Metadados de dispositivo/plataforma/video/rede (mimica app nativo) ---------
 
-def default_device_meta() -> dict[str, Any]:
+def default_device_meta(profile: DeviceProfile | None = None) -> dict[str, Any]:
     """Metadados de dispositivo que o app nativo envia em meta.device.
 
     Capturado do app iOS real (req 072): envia APENAS {"model": "iPhone 13"}.
     NÃO envia systemName nem systemVersion no POST /uploads.
+    Com perfil: o nome comercial daquele aparelho, não o default global.
     """
+    if profile is not None:
+        return profile.upload_device_meta()
     return {
         "model": config.NATIVE_DEVICE_MODEL,
     }
 
 
-def default_platform_meta() -> dict[str, Any]:
+def default_platform_meta(profile: DeviceProfile | None = None) -> dict[str, Any]:
     """Metadados de plataforma que o app nativo envia em meta.platform.
 
     Capturado do app iOS real (req 072): envia APENAS {"os": "ios"}.
     NÃO envia version no POST /uploads.
     """
+    if profile is not None:
+        return profile.upload_platform_meta()
     return {
         "os": config.NATIVE_PLATFORM_OS,
     }
+
+
+def _iso_now() -> str:
+    return format_recorded_at(time.time())
+
+
+def _normalize_recorded_at_sequence(
+    values: list[str],
+    durations_ms: list[int],
+    *,
+    now: float | None = None,
+) -> list[str]:
+    """Canoniza horários explícitos sem destruir a distância entre chunks.
+
+    O chamador já usou esses mesmos horários para montar os sidecars. Portanto
+    não podemos prender cada chunk à duração total da sessão: isso colapsa os
+    últimos horários e faz o POST divergir de ``metadata.createdAt``. Valores
+    explícitos são validados como uma sequência e apenas reformatados.
+    """
+    if len(values) != len(durations_ms):
+        raise UploadError(
+            "recorded_at precisa ter exatamente um horário por chunk",
+            transient=False,
+        )
+    if not values:
+        return []
+    wall_ms: list[int] = []
+    for value in values:
+        parsed = recorded_at_to_wall_ms(str(value))
+        if parsed is None:
+            raise UploadError(
+                f"recorded_at inválido: {value!r}", transient=False)
+        wall_ms.append(parsed)
+    if any(current <= previous
+           for previous, current in zip(wall_ms, wall_ms[1:], strict=False)):
+        raise UploadError(
+            "recorded_at dos chunks precisa ser estritamente crescente",
+            transient=False,
+        )
+    now_ms = int((time.time() if now is None else float(now)) * 1000)
+    if wall_ms[0] < now_ms - BACKLOG_CAP_MS:
+        raise UploadError(
+            "recorded_at está fora do backlog de gravação do Minute",
+            transient=False,
+        )
+    last_end_ms = max(
+        started + max(0, int(duration))
+        for started, duration in zip(wall_ms, durations_ms, strict=True)
+    )
+    # Pequena tolerância só para diferença de relógio entre captura e chamada.
+    if last_end_ms > now_ms + 5_000:
+        raise UploadError(
+            "recorded_at indica chunk que ainda não terminou",
+            transient=False,
+        )
+    return [format_recorded_at(value / 1000.0) for value in wall_ms]
+
+
+def _recorded_at_sequence_from_base(
+    base: str,
+    durations_ms: list[int],
+    *,
+    now: float | None = None,
+) -> list[str]:
+    """Expande o início da sessão em inícios contínuos de cada chunk."""
+    base_ms = recorded_at_to_wall_ms(base)
+    if base_ms is None:
+        raise UploadError(f"recorded_at inválido: {base!r}", transient=False)
+    cursor = base_ms
+    values: list[str] = []
+    for duration in durations_ms:
+        values.append(format_recorded_at(cursor / 1000.0))
+        cursor += max(0, int(duration))
+    return _normalize_recorded_at_sequence(values, durations_ms, now=now)
 
 
 def default_video_meta() -> dict[str, Any]:
@@ -779,7 +864,7 @@ def _chunk_sidecar(chunk: ChunkResult, session_id: str, org_key: str,
         "state": state,
         "attempts": attempts,
         "error": error,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "updated_at": _iso_now(),
     }
 
 
@@ -941,15 +1026,8 @@ def _upload_single_chunk(
                                       if wall_ms else None),
                     }
                     # device COMPLETO do perfil (modelo técnico da conta)
-                    sidecar_kwargs["device_meta"] = {
-                        "model": profile.sidecar_model,
-                        "systemName": config.NATIVE_SIDECAR_SYSTEM_NAME,
-                        "systemVersion": profile.sidecar_system_version,
-                    }
-                    sidecar_kwargs["platform_meta"] = {
-                        "os": config.NATIVE_PLATFORM_OS,
-                        "version": profile.sidecar_system_version,
-                    }
+                    sidecar_kwargs["device_meta"] = profile.sidecar_device_meta()
+                    sidecar_kwargs["platform_meta"] = profile.sidecar_platform_meta()
                 sidecar_bytes = build_sidecar_zip(
                     session_id=session_id,
                     chunk_index=chunk_index,
@@ -1180,11 +1258,8 @@ def _upload_single_chunk(
         # integridade (artifact.metadata_json.*); o POST usa o formato curto.
         # Formato curto do getDeviceUploadMeta (captura 072): só model/os.
         # Com perfil: o MODELO DO APARELHO DA CONTA (iPhone 12+, não todos 13).
-        meta["device"] = {
-            "model": (profile.device_model if profile
-                      else config.NATIVE_DEVICE_MODEL),
-        }
-        meta["platform"] = {"os": config.NATIVE_PLATFORM_OS}
+        meta["device"] = default_device_meta(profile)
+        meta["platform"] = default_platform_meta(profile)
         meta["appVersion"] = config.APP_VERSION
         # O app real envia camera_source no meta (captura 072: "built-in").
         meta["camera_source"] = config.NATIVE_CAMERA_SOURCE
@@ -1483,7 +1558,7 @@ def upload_session(
     org_key: str,
     task_id: str | None = None,
     session_id: str | None = None,
-    recorded_at: str | None = None,
+    recorded_at: str | list[str] | None = None,
     content_type: str = "video/mp4",
     timeout_blob: int = 300,
     finalize: bool = True,
@@ -1498,7 +1573,7 @@ def upload_session(
     fail_on_error: bool = True,
     persist_sidecar: bool = False,
     sidecar: bool = True,
-    sidecar_data: bytes | None = None,
+    sidecar_data: bytes | list[bytes] | None = None,
     ego_meta: dict[str, Any] | None = None,
     require_perfect: bool = False,
     normalize: bool = True,
@@ -1576,23 +1651,37 @@ def upload_session(
 
     # Defaults de meta (mimica app nativo) se não fornecidos.
     if device_meta is None:
-        device_meta = default_device_meta()
+        device_meta = default_device_meta(profile)
     if platform_meta is None:
-        platform_meta = default_platform_meta()
+        platform_meta = default_platform_meta(profile)
     if video_meta is None:
         video_meta = default_video_meta()
     if network_meta is None:
         network_meta = default_network_meta()
 
     session_id = session_id or str(uuid.uuid4())
-    # O app iOS real envia recordedAt com microssegundos (ex: .609000Z).
-    # Usar .000Z faz o backend rejeitar como "não autêntico".
-    if not recorded_at:
-        import random
-        now = time.time()
-        # Microssegundos realistas (0-999999) em vez de .000000
-        micros = random.randint(0, 999999)
-        recorded_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{micros:06d}Z"
+    # recorded_at = início da gravação, formato JS toISOString (3 dígitos).
+    # Sem valor: a gravação acabou de terminar (agora - duração), dentro do
+    # backlog de 4h. Nunca o literal `.000Z` nem 6 dígitos.
+    durations_ms = [_probe_duration_ms(p) for p in paths]
+    total_ms = sum(durations_ms)
+    recorded_at_list: list[str] | None = None
+    if isinstance(recorded_at, list):
+        recorded_at_list = _normalize_recorded_at_sequence(
+            [str(value) for value in recorded_at], durations_ms)
+        recorded_at = recorded_at_list[0] if recorded_at_list else ""
+    if recorded_at_list is None:
+        base_recorded_at = (
+            str(recorded_at) if recorded_at else format_recorded_at(
+                recording_start_epoch(total_ms / 1000.0))
+        )
+        sequence = _recorded_at_sequence_from_base(
+            base_recorded_at, durations_ms)
+        recorded_at = sequence[0]
+        if len(sequence) > 1:
+            recorded_at_list = sequence
+    if len(paths) > 1 and not suppress_per_chunk_catbear:
+        suppress_per_chunk_catbear = True
 
     chunks: list[ChunkResult] = []
     total_size = 0
@@ -1607,12 +1696,22 @@ def upload_session(
             if not stored:
                 continue
             stored.update(updates)
-            stored["updated_at"] = time.strftime(
-                "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+            stored["updated_at"] = _iso_now()
             save_sidecar(stored)
 
     for offset, vpath in enumerate(paths):
         idx = int(chunk_index_start) + offset
+        chunk_recorded_at = (
+            recorded_at_list[offset]
+            if recorded_at_list and offset < len(recorded_at_list)
+            else recorded_at
+        )
+        chunk_sidecar_data: bytes | None = None
+        if isinstance(sidecar_data, list):
+            if offset < len(sidecar_data):
+                chunk_sidecar_data = sidecar_data[offset]
+        else:
+            chunk_sidecar_data = sidecar_data
         journal: dict[str, Any] | None = None
         checkpoint_callback: Callable[..., None] | None = None
         if persist_sidecar:
@@ -1627,7 +1726,7 @@ def upload_session(
                 "filename": f"{session_id}_{idx}.mp4",
                 "local_video_path": str(vpath.resolve()),
                 "size_bytes": vpath.stat().st_size,
-                "recorded_at": recorded_at,
+                "recorded_at": chunk_recorded_at,
                 "state": STATE_CREATING,
                 "phase": "queued",
                 "attempts": int(existing.get("attempts") or 0),
@@ -1643,12 +1742,11 @@ def upload_session(
                     existing.get("expected_chunk_count") or len(paths)),
                 "suppress_per_chunk_catbear": bool(existing.get(
                     "suppress_per_chunk_catbear", suppress_per_chunk_catbear)),
-                "updated_at": time.strftime(
-                    "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                "updated_at": _iso_now(),
             }
-            if sidecar_data is not None:
+            if chunk_sidecar_data is not None:
                 archive_path = _sidecar_archive_path(session_id, idx)
-                save_bytes(archive_path, sidecar_data)
+                save_bytes(archive_path, chunk_sidecar_data)
                 journal["sidecar_data_path"] = str(archive_path.resolve())
             save_sidecar(journal)
 
@@ -1657,8 +1755,7 @@ def upload_session(
                 **updates: Any,
             ) -> None:
                 _journal.update(updates)
-                _journal["updated_at"] = time.strftime(
-                    "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+                _journal["updated_at"] = _iso_now()
                 save_sidecar(_journal)
 
             checkpoint_callback = _save_checkpoint
@@ -1672,7 +1769,7 @@ def upload_session(
             task_id=task_id,
             content_type=content_type,
             timeout_blob=timeout_blob,
-            recorded_at=recorded_at,
+            recorded_at=chunk_recorded_at,
             device_meta=device_meta,
             platform_meta=platform_meta,
             video_meta=video_meta,
@@ -1682,7 +1779,7 @@ def upload_session(
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
             fail_on_error=fail_on_error,
             sidecar=sidecar,
-            sidecar_data=sidecar_data,
+            sidecar_data=chunk_sidecar_data,
             ego_meta=ego_meta,
             register_first=register_first,
             on_progress=on_progress,
@@ -1695,7 +1792,7 @@ def upload_session(
 
         if persist_sidecar:
             final_journal = _chunk_sidecar(
-                chunk, session_id, org_key, task_id, recorded_at,
+                chunk, session_id, org_key, task_id, chunk_recorded_at,
                 f"{chunk.log_id}.mp4", chunk.state, chunk.attempts, chunk.error,
             )
             if journal is not None:

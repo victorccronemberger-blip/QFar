@@ -28,6 +28,7 @@ estado, a conta recria o MESMO aparelho — fixado, sem rotacionar. Somente o
 from __future__ import annotations
 
 import json
+import math
 import random
 import threading
 import time
@@ -89,6 +90,11 @@ def _wall_ms_now() -> int:
     return int(time.time() * 1000)
 
 
+# GET /devices/recording-config (captura 06/08): backlogCapMs = 14400000.
+BACKLOG_CAP_MS = 14_400_000
+_BACKLOG_SLACK_S = 60.0
+
+
 def recorded_at_to_wall_ms(recorded_at: str) -> int | None:
     """Converte `recorded_at` (ISO-8601 com Z) em epoch ms. None se inválido."""
     import datetime
@@ -99,6 +105,71 @@ def recorded_at_to_wall_ms(recorded_at: str) -> int | None:
         )
     except Exception:  # noqa: BLE001
         return None
+
+
+def format_recorded_at(epoch_s: float) -> str:
+    """ISO-8601 como `Date.toISOString()` do React Native: `YYYY-MM-DDTHH:mm:ss.sssZ`.
+
+    O sidecar real (sessão 627d39d8) usa 3 dígitos (`.562Z`). Hardcode `.000Z`
+    ou 6 dígitos (`.609000Z`) não bate com o app.
+    """
+    ms_total = int(round(float(epoch_s) * 1000.0))
+    sec, milli = divmod(ms_total, 1000)
+    if sec < 0:
+        sec, milli = 0, 0
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(sec)) + f".{milli:03d}Z"
+
+
+def clamp_recording_start(
+    start_epoch_s: float,
+    duration_s: float = 0.0,
+    *,
+    now: float | None = None,
+    backlog_cap_ms: int = BACKLOG_CAP_MS,
+) -> float:
+    """Início da gravação já terminada e ainda dentro do backlog (4h)."""
+    now = time.time() if now is None else float(now)
+    duration_s = max(0.0, float(duration_s))
+    cap_s = max(1.0, float(backlog_cap_ms) / 1000.0)
+    latest = now - duration_s
+    earliest = now - cap_s + _BACKLOG_SLACK_S
+    if earliest > latest:
+        return latest
+    start = float(start_epoch_s)
+    if start < earliest:
+        return earliest
+    if start > latest:
+        return latest
+    return start
+
+
+def recording_start_epoch(
+    duration_s: float,
+    *,
+    now: float | None = None,
+    gap_s: float = 0.0,
+    backlog_cap_ms: int = BACKLOG_CAP_MS,
+) -> float:
+    """Epoch do início: `agora - duração - gap`, preso à janela de backlog."""
+    now = time.time() if now is None else float(now)
+    start = now - max(0.0, float(duration_s)) - max(0.0, float(gap_s))
+    return clamp_recording_start(
+        start, duration_s, now=now, backlog_cap_ms=backlog_cap_ms)
+
+
+def normalize_recorded_at(
+    value: str,
+    *,
+    duration_s: float | None = None,
+    now: float | None = None,
+) -> str:
+    """Reemite `recorded_at` no formato nativo; opcionalmente prende ao backlog."""
+    wall_ms = recorded_at_to_wall_ms(value)
+    epoch = (wall_ms / 1000.0) if wall_ms is not None else (
+        time.time() if now is None else float(now))
+    if duration_s is not None:
+        epoch = clamp_recording_start(epoch, duration_s, now=now)
+    return format_recorded_at(epoch)
 
 
 @dataclass
@@ -172,13 +243,48 @@ class DeviceProfile:
         return (f"Minute/{config.APP_VERSION} (com.bakerdata.minute; "
                 f"build:1; iOS {self.os_version})")
 
+    def location_header_value(self) -> str | None:
+        """JSON do `toFix` nativo: latitude, longitude, accuracy, isMock."""
+        lat = getattr(self, "latitude", None)
+        lng = getattr(self, "longitude", None)
+        if lat is None:
+            lat = config.DEVICE_LAT
+        if lng is None:
+            lng = config.DEVICE_LNG
+        if lat is None or lng is None:
+            return None
+        try:
+            lat = float(lat)
+            lng = float(lng)
+            accuracy = float(
+                getattr(self, "location_accuracy", None)
+                or config.DEVICE_LOCATION_ACCURACY
+            )
+        except (TypeError, ValueError):
+            return None
+        if (not math.isfinite(lat) or not -90.0 <= lat <= 90.0
+                or not math.isfinite(lng) or not -180.0 <= lng <= 180.0):
+            return None
+        if not math.isfinite(accuracy) or accuracy <= 0:
+            accuracy = 12.0
+        return json.dumps({
+            "latitude": lat,
+            "longitude": lng,
+            "accuracy": accuracy,
+            "isMock": False,
+        }, separators=(",", ":"))
+
     def headers(self) -> dict[str, str]:
         """Headers de identidade que o app 1.22.0 envia em toda chamada."""
-        return {
+        out = {
             "X-App-Version": config.APP_VERSION,
             "User-Agent": self.user_agent(),
             "X-Device-Id": self.device_id,
         }
+        location = self.location_header_value()
+        if location:
+            out["X-Device-Location"] = location
+        return out
 
     def opened_payload(self, auth_method: str = "SESSION_RESUMED",
                        opened_at: str | None = None) -> dict[str, Any]:
@@ -192,6 +298,29 @@ class DeviceProfile:
         if opened_at:
             body["opened_at"] = opened_at
         return body
+
+    def sidecar_device_meta(self) -> dict[str, str]:
+        """device COMPLETO do metadata.json (modelo técnico + systemName/Version)."""
+        return {
+            "model": self.sidecar_model,
+            "systemName": config.NATIVE_SIDECAR_SYSTEM_NAME,
+            "systemVersion": self.sidecar_system_version,
+        }
+
+    def sidecar_platform_meta(self) -> dict[str, str]:
+        """platform do metadata.json (`os` + `version` = systemVersion)."""
+        return {
+            "os": config.NATIVE_PLATFORM_OS,
+            "version": self.sidecar_system_version,
+        }
+
+    def upload_device_meta(self) -> dict[str, str]:
+        """getDeviceUploadMeta curto do POST /uploads: só o nome comercial."""
+        return {"model": self.device_model}
+
+    def upload_platform_meta(self) -> dict[str, str]:
+        """getDeviceUploadMeta curto do POST /uploads: só `os`."""
+        return {"os": config.NATIVE_PLATFORM_OS}
 
 
 def get_profile(email: str, first_use_ms: int | None = None) -> DeviceProfile:
