@@ -22,7 +22,8 @@ Endpoints JSON consumidos exclusivamente pelo aplicativo desktop:
   Campanha (uma por vez — ver web.runner)
     POST   /api/campaigns                inicia; 400 body inválido; se ocupado,
                                          devolve a campanha existente (idempotente)
-                                         body: {accounts, tasks, count, max_dur_s,
+                                         body: {accounts, tasks, count,
+                                         min_dur_s, max_dur_s,
                                          delay_mode (off|clip|fixed), delay_s,
                                          paralelismo automático entre contas,
                                          active_hours: [7, 18] | null}
@@ -573,7 +574,7 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
 # --- app -----------------------------------------------------------------------
 
 def _parse_duration_range(values) -> tuple[float, float]:
-    """Valida o teto da UI e o mínimo legado de clientes anteriores."""
+    """Valida o intervalo de duração solicitado pela interface."""
     bounds = []
     for name, default in (("min_dur_s", 60), ("max_dur_s", MAX_DUR_S)):
         try:

@@ -156,6 +156,7 @@ private:
   QListWidget* _campaignAccounts{};
   QListWidget* _campaignTasks{};
   QDoubleSpinBox* _targetHours{};
+  QSpinBox* _minDuration{};
   QSpinBox* _maxDuration{};
   QComboBox* _delayMode{};
   QSpinBox* _delaySeconds{};

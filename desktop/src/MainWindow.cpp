@@ -1065,11 +1065,29 @@ QWidget* MainWindow::buildCampaignPage() {
   _targetHours->setValue(8.0);
   _targetHours->setSuffix(QStringLiteral(" h / conta"));
   form->addRow(QStringLiteral("Meta de gravação"), _targetHours);
+  _minDuration = new QSpinBox;
+  _minDuration->setRange(1, 30);
+  _minDuration->setValue(1);
+  _minDuration->setSuffix(QStringLiteral(" min"));
+  _minDuration->setToolTip(
+      QStringLiteral("O QMoney selecionará somente vídeos com pelo menos esta duração."));
   _maxDuration = new QSpinBox;
   _maxDuration->setRange(1, 30);
   _maxDuration->setValue(30);
   _maxDuration->setSuffix(QStringLiteral(" min"));
-  connect(_maxDuration, &QSpinBox::valueChanged, this, [this] { loadTasks(); });
+  _maxDuration->setToolTip(
+      QStringLiteral("O QMoney selecionará somente vídeos até esta duração."));
+  connect(_minDuration, &QSpinBox::valueChanged, this, [this](int minimum) {
+    const QSignalBlocker blocker(_maxDuration);
+    _maxDuration->setMinimum(minimum);
+    loadTasks();
+  });
+  connect(_maxDuration, &QSpinBox::valueChanged, this, [this](int maximum) {
+    const QSignalBlocker blocker(_minDuration);
+    _minDuration->setMaximum(maximum);
+    loadTasks();
+  });
+  form->addRow(QStringLiteral("Duração mínima"), _minDuration);
   form->addRow(QStringLiteral("Duração máxima"), _maxDuration);
   _delayMode = new QComboBox;
   configureCombo(_delayMode, 420);
@@ -2166,8 +2184,10 @@ void MainWindow::loadTasks() {
   }
   _campaignTasks->clear();
   _campaignTasks->addItem(QStringLiteral("Carregando categorias…"));
-  const QString path = QStringLiteral("/api/tasks?email=%1&max_dur_s=%2&dataset=%3")
-      .arg(encoded(account)).arg(_maxDuration->value() * 60)
+  const QString path = QStringLiteral(
+      "/api/tasks?email=%1&min_dur_s=%2&max_dur_s=%3&dataset=%4")
+      .arg(encoded(account)).arg(_minDuration->value() * 60)
+      .arg(_maxDuration->value() * 60)
       .arg(encoded(_dataset->currentData().toString()));
   _api.get(path, [this](bool ok, const QJsonDocument& doc, const QString& error) {
     _campaignTasks->clear();
@@ -2229,6 +2249,7 @@ void MainWindow::startCampaign() {
       {QStringLiteral("tasks"), tasks},
       {QStringLiteral("count"), 1},
       {QStringLiteral("target_hours"), _targetHours->value()},
+      {QStringLiteral("min_dur_s"), _minDuration->value() * 60},
       {QStringLiteral("max_dur_s"), _maxDuration->value() * 60},
       {QStringLiteral("delay_mode"), _delayMode->currentData().toString()},
       {QStringLiteral("delay_s"), _delaySeconds->value()},
