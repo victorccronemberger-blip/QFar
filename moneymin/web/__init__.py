@@ -39,6 +39,17 @@ class _SafeStream:
 
 
 def _harden_stdio() -> None:
+    # Impede que falhas de inicialização de ferramentas auxiliares (por
+    # exemplo, DLL ausente no ffprobe) abram uma caixa modal do Windows e
+    # bloqueiem o motor. O subprocesso ainda devolve erro normalmente.
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            current = int(kernel32.GetErrorMode())
+            kernel32.SetErrorMode(current | 0x0001 | 0x0002 | 0x8000)
+        except (AttributeError, OSError, ValueError):
+            pass
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name)
         if stream is not None and not isinstance(stream, _SafeStream):

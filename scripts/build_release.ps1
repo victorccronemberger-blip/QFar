@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.6",
+    [string]$Version = "1.0.7",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64"
 )
 
@@ -62,6 +62,20 @@ $MediaBin = "$Package\runtime\tools\ffmpeg\bin"
 New-Item -ItemType Directory -Force $MediaBin | Out-Null
 Copy-Item $Ffmpeg.FullName $MediaBin -Force
 Copy-Item $Ffprobe.FullName $MediaBin -Force
+
+# FFmpeg/FFprobe usam o Universal C Runtime. Em instalações limpas ou Windows
+# sem o UCRT atualizado, o loader encerrava o processo com 0xc0000142 antes
+# de o motor conseguir registrar o erro. O app-local deployment é suportado
+# pela Microsoft e mantém o QMoney portátil, sem instalador adicional.
+$WindowsKitsRedist = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Redist"
+$UcrtBase = Get-ChildItem $WindowsKitsRedist -Recurse -File -Filter ucrtbase.dll `
+    -ErrorAction SilentlyContinue |
+    Where-Object FullName -Match "\\ucrt\\DLLs\\x64\\ucrtbase\.dll$" |
+    Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $UcrtBase) {
+    throw "UCRT x64 de redistribuição não encontrado no Windows SDK."
+}
+Copy-Item (Join-Path $UcrtBase.Directory.FullName "*.dll") $MediaBin -Force
 
 # O navegador é privado ao runtime do QMoney; o usuário não precisa instalar
 # Playwright ou Chrome. Copiamos apenas a revisão atual esperada pelo pacote.
