@@ -1,22 +1,40 @@
 param(
     [string]$Version = "1.0.6",
-    [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
-    [string]$BuildDir = "$PSScriptRoot\..\build-release",
-    [string]$OutputDir = "$PSScriptRoot\..\release"
+    [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64"
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path "$PSScriptRoot\..").Path
+$OutputDir = Join-Path $ProjectRoot "dist"
+$WorkDir = Join-Path $OutputDir "work"
+$BuildDir = Join-Path $WorkDir "cmake"
 $QtRoot = (Resolve-Path $QtRoot).Path
 $MingwBin = (Resolve-Path "$ProjectRoot\.qt\Tools\mingw1310_64\bin").Path
 $env:PATH = "$MingwBin;$QtRoot\bin;$env:PATH"
 $env:QMONEY_VERSION = $Version
 
+# Todos os artefatos, inclusive os temporários, ficam dentro de dist/.
+# Remover o pacote anterior evita misturar DLLs/runtime de versões diferentes.
+$Package = Join-Path $OutputDir "QMoney"
+$OutputPrefix = $OutputDir.TrimEnd('\') + '\'
+foreach ($GeneratedDir in @($WorkDir, $Package)) {
+    $FullGeneratedDir = [System.IO.Path]::GetFullPath($GeneratedDir)
+    if (-not $FullGeneratedDir.StartsWith(
+            $OutputPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Diretório de build fora de dist: $FullGeneratedDir"
+    }
+    if (Test-Path -LiteralPath $FullGeneratedDir) {
+        Remove-Item -LiteralPath $FullGeneratedDir -Recurse -Force
+    }
+}
+New-Item -ItemType Directory -Force $OutputDir | Out-Null
+New-Item -ItemType Directory -Force "$WorkDir\spec" | Out-Null
+
 & "$ProjectRoot\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed `
     --name QMoneyService `
     --paths $ProjectRoot --icon "$ProjectRoot\desktop\resources\qmoney.ico" `
-    --distpath "$OutputDir\pyinstaller" --workpath "$OutputDir\pyinstaller-work" `
-    --specpath "$ProjectRoot\packaging" `
+    --distpath "$WorkDir\pyinstaller" --workpath "$WorkDir\pyinstaller-build" `
+    --specpath "$WorkDir\spec" `
     --collect-data moneymin --collect-all curl_cffi `
     --collect-submodules playwright --collect-submodules boto3 --collect-submodules ego4d `
     --add-data "$ProjectRoot\moneymin\iphone_uw_calibration.json;moneymin" `
@@ -24,19 +42,18 @@ $env:QMONEY_VERSION = $Version
     --add-data "$ProjectRoot\moneymin\resources;moneymin/resources" `
     --add-data "$ProjectRoot\reference;reference" `
     "$ProjectRoot\packaging\qmoney_service.py"
-$env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path "$OutputDir\pyinstaller\QMoneyService.exe").Path
+$env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path "$WorkDir\pyinstaller\QMoneyService.exe").Path
 cmake -S "$ProjectRoot\desktop" -B $BuildDir -G Ninja `
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$QtRoot
 cmake --build $BuildDir --config Release --parallel
 
-$Package = Join-Path $OutputDir "QMoney"
 New-Item -ItemType Directory -Force $Package | Out-Null
 New-Item -ItemType Directory -Force "$Package\runtime" | Out-Null
 Copy-Item "$BuildDir\QMoney.exe" $Package -Force
 Copy-Item "$BuildDir\QMoneyUpdater.exe" $Package -Force
 & "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler `
     --no-opengl-sw "$Package\QMoney.exe"
-Copy-Item "$OutputDir\pyinstaller\QMoneyService.exe" "$Package\runtime" -Force
+Copy-Item "$WorkDir\pyinstaller\QMoneyService.exe" "$Package\runtime" -Force
 
 $Ffmpeg = Get-ChildItem "$ProjectRoot\tools\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
 $Ffprobe = Get-ChildItem "$ProjectRoot\tools\ffmpeg" -Recurse -Filter ffprobe.exe | Select-Object -First 1
@@ -89,5 +106,8 @@ try {
         [System.Text.Encoding]::ASCII)
 } finally {
     $Rsa.Dispose()
+}
+if (Test-Path -LiteralPath $WorkDir) {
+    Remove-Item -LiteralPath $WorkDir -Recurse -Force
 }
 Write-Host "Pacote pronto: $Zip"
