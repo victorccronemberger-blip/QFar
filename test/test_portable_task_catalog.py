@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from moneymin import campaign
+from moneymin import ego4d
 
 
 class PortableTaskCatalogTests(unittest.TestCase):
@@ -67,6 +68,19 @@ class PortableTaskCatalogTests(unittest.TestCase):
             if name != "Gardening"
             if any(float(clip.get("dur_s") or 0) >= 600 for clip in clips)
         }), 5)
+
+    def test_known_incomplete_sensor_sources_are_never_selected(self) -> None:
+        seed = campaign._load_rank_seed()
+        assert seed is not None
+
+        recovered = campaign._merge_rank_seed(seed)
+
+        self.assertFalse(any(
+            str(clip.get("parent_video_uid") or "")
+            in ego4d.KNOWN_INCOMPLETE_IMU_VIDEO_UIDS
+            for clips in recovered.values()
+            for clip in clips
+        ))
 
 
 if __name__ == "__main__":

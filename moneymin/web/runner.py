@@ -41,6 +41,20 @@ def friendly_campaign_error(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return "O QMoney não conseguiu concluir esta etapa. Tente novamente."
+    if "memoryerror" in text or "cannot allocate memory" in text or "not enough memory" in text:
+        return "Este computador ficou sem memória durante a preparação. O QMoney liberou a etapa e seguirá com outro vídeo."
+    if "cobertura imu insuficiente" in text or "sem amostras válidas de imu" in text:
+        sensor = "acelerômetro" if "acelerômetro" in text else (
+            "giroscópio" if "giroscópio" in text else "sensor")
+        return f"O vídeo tem uma lacuna real no {sensor} do Ego4D e foi descartado antes do envio."
+    if "sem imu real" in text or "sem cobertura contínua de imu" in text:
+        return "O vídeo não possui sensores contínuos suficientes e foi descartado antes do envio."
+    if any(term in text for term in (
+            "invalidaccesskeyid", "signaturedoesnotmatch", "expiredtoken",
+            "credenciais ego4d inválidas", "credenciais aws ausentes")):
+        return "As credenciais do Ego4D não foram aceitas. Atualize-as na aba Integrações."
+    if "acesso negado ao ego4d" in text or "accessdenied" in text:
+        return "A licença Ego4D não autorizou este arquivo. O QMoney seguirá com outro vídeo."
     if any(term in text for term in ("disabled", "desativad", "blocked account")):
         return "A conta foi desativada no Minute. Valide-a antes de continuar."
     if any(term in text for term in (
@@ -57,13 +71,14 @@ def friendly_campaign_error(value: Any) -> str:
         return "A conexão foi interrompida. Confira a internet e tente novamente."
     if any(term in text for term in ("no space", "disk full", "espaço insuficiente")):
         return "Não há espaço livre suficiente na biblioteca de mídia."
-    if any(term in text for term in (
-            "clip", "video", "vídeo", "manifest", "duração", "duration")):
-        return "Não foi possível preparar um vídeo compatível. O QMoney seguirá para o próximo."
     if any(term in text for term in ("http 500", "http 502", "http 503", "http 504")):
         return "O serviço do Minute está instável. Aguarde e tente novamente."
     if "http 400" in text or "bad request" in text:
         return "O serviço recusou este envio. Revise a conta e a categoria selecionada."
+    if any(term in text for term in (
+            "clip", "video", "vídeo", "manifest", "duração", "duration",
+            "ffmpeg", "ffprobe")):
+        return "Não foi possível preparar este vídeo. O QMoney o preservou e seguirá para o próximo."
     return "O envio não foi concluído após as tentativas automáticas. Valide a conta e tente novamente."
 
 
@@ -331,12 +346,13 @@ class CampaignRunner:
             elif kind == "clip_prepare_progress":
                 phase = str(payload.get("phase") or "")
                 labels = {
-                    "video_lookup": "localizando vídeo no índice HoloAssist",
+                    "video_lookup": "localizando vídeo licenciado",
                     "video_index": "catalogando offsets do HoloAssist",
                     "video_download": "baixando somente o vídeo selecionado",
                     "video_cached": "vídeo HoloAssist encontrado no cache",
                     "video_ready": "vídeo-fonte pronto",
-                    "imu_lookup": "localizando sensores no índice HoloAssist",
+                    "imu_lookup": "localizando sensores licenciados",
+                    "imu_preflight": "validando continuidade dos sensores",
                     "imu_index": "catalogando offsets dos sensores",
                     "imu_download": "baixando somente os sensores selecionados",
                     "imu_cached": "sensores encontrados no cache",

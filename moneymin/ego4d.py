@@ -34,6 +34,7 @@ import shutil
 import urllib.error
 import urllib.request
 import uuid
+from array import array
 from collections import defaultdict
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -53,6 +54,13 @@ def timed_narrations_path() -> Path:
 # Header do csv que o sidecar espera (ver sidecar.build_imu_csv).
 IMU_HDR = ["t", "ax", "ay", "az", "wx", "wy", "wz"]
 FRAMES_HDR = ["i", "ptsNs", "dtNs", "tNs", "key"]
+
+# Fontes verificadas cujo metadata declara IMU contínua, mas o CSV real tem
+# lacunas longas em um dos sensores. Mantê-las no catálogo faz um computador
+# novo baixar/codificar centenas de MB antes de descobrir que são inutilizáveis.
+KNOWN_INCOMPLETE_IMU_VIDEO_UIDS = frozenset({
+    "ce2cf2f6-24aa-4195-93a6-f82b283815e6",
+})
 
 
 @lru_cache(maxsize=2)
@@ -517,6 +525,8 @@ def imu_window_is_covered(
     *, tolerance_s: float = 0.050,
 ) -> bool:
     """Recusa janelas que atravessam componentes sem IMU."""
+    if str(video.get("video_uid") or "") in KNOWN_INCOMPLETE_IMU_VIDEO_UIDS:
+        return False
     if video.get("has_imu") is not True:
         return False
     metadata = video.get("imu_metadata") or {}
@@ -1412,8 +1422,11 @@ def download_imu(video: dict[str, Any], dest: Path) -> Path | None:
 
 # --- Conversão da IMU para o sidecar ------------------------------------------
 
-IMU_MIN_BUCKET_COVERAGE = 0.70
-IMU_MAX_INTERPOLATION_GAP_MS = 50.0
+# O arquivo canônico reúne sensores de frequências diferentes. Uma câmera pode
+# ter giroscópio a 100/200 Hz e acelerômetro a 50/200 Hz; exigir ocupação de
+# 70% da grade Android de 500 Hz reprova até uma captura perfeita. O critério
+# correto é a continuidade temporal de CADA sensor antes da reamostragem.
+IMU_MAX_INTERPOLATION_GAP_MS = 75.0
 
 
 def build_imu_csv(
@@ -1422,6 +1435,7 @@ def build_imu_csv(
     sample_rate_hz: int = config.ANDROID_IMU_SAMPLE_RATE_HZ,
     duration_ms: int | None = None,
     seed: str | None = None,
+    validate_only: bool = False,
 ) -> str:
     """Converte e valida a IMU oficial antes de gerar o sidecar ANDROID.
 
@@ -1456,8 +1470,16 @@ def build_imu_csv(
         noise_rng = random.Random(seed)
         phase_ms = noise_rng.uniform(0.0, min(8.0, step_ms * 0.8))
 
-    rows: list[tuple[float, tuple[float, float, float],
-                     tuple[float, float, float]]] = []
+    # Não guarde cada linha como tuplas/objetos Python. Em um vídeo de 30 min
+    # isso ultrapassava facilmente centenas de MB e fazia PCs com pouca RAM
+    # morrerem com ``MemoryError`` justamente depois do encode terminar. A
+    # soma por bucket independe da ordem dos timestamps, então acumulamos
+    # diretamente em arrays compactos (aprox. 50 MB no pior caso de 30 min).
+    sums = [array("d", [0.0]) * n for _ in range(6)]
+    # Giroscópio e acelerômetro não necessariamente aparecem na mesma linha.
+    # Contadores separados preservam os dois sinais reais em vez de jogar fora
+    # uma amostra válida só porque o outro sensor está vazio naquele instante.
+    counts = [array("I", [0]) * n for _ in range(2)]
     required = (
         "canonical_timestamp_ms", "gyro_x", "gyro_y", "gyro_z",
         "accl_x", "accl_y", "accl_z",
@@ -1471,89 +1493,66 @@ def build_imu_csv(
         for row in reader:
             try:
                 cms = float(row["canonical_timestamp_ms"])
-                gyro = tuple(float(row[name]) for name in ("gyro_x", "gyro_y", "gyro_z"))
-                accel = tuple(float(row[name]) for name in ("accl_x", "accl_y", "accl_z"))
             except (TypeError, ValueError):
                 continue
-            values = (cms, *gyro, *accel)
-            if not all(math.isfinite(value) for value in values):
+            if not math.isfinite(cms):
                 continue
             # Não usamos `break`: o Ego4D documenta timestamps fora de ordem.
-            if start_ms - step_ms <= cms <= sensor_end_ms + step_ms:
-                rows.append((cms, gyro, accel))
-    rows.sort(key=lambda item: item[0])
-    if not rows:
-        raise RuntimeError("janela do clipe sem amostras válidas de IMU")
+            if not start_ms - step_ms <= cms <= sensor_end_ms + step_ms:
+                continue
+            idx = math.floor((cms - start_ms - phase_ms) / step_ms)
+            if not 0 <= idx < n:
+                continue
+            for component, (offset, names) in enumerate((
+                (0, ("gyro_x", "gyro_y", "gyro_z")),
+                (3, ("accl_x", "accl_y", "accl_z")),
+            )):
+                try:
+                    values = tuple(float(row[name]) for name in names)
+                except (TypeError, ValueError):
+                    continue
+                if not all(math.isfinite(value) for value in values):
+                    continue
+                for col, value in enumerate(values, start=offset):
+                    sums[col][idx] += value
+                counts[component][idx] += 1
 
-    sums = [[0.0] * 6 for _ in range(n)]
-    counts = [0] * n
-    for cms, gyro, accel in rows:
-        idx = math.floor((cms - start_ms - phase_ms) / step_ms)
-        if not 0 <= idx < n:
-            continue
-        values = (*gyro, *accel)
-        for col, value in enumerate(values):
-            sums[idx][col] += value
-        counts[idx] += 1
+    def _continuity(component_counts: array) -> tuple[int, int, int, int]:
+        first: int | None = None
+        last: int | None = None
+        valid_count = 0
+        internal_gap = 0
+        for idx, count in enumerate(component_counts):
+            if not count:
+                continue
+            valid_count += 1
+            if first is None:
+                first = idx
+            if last is not None:
+                internal_gap = max(internal_gap, idx - last - 1)
+            last = idx
+        if first is None or last is None:
+            raise RuntimeError("janela do clipe sem amostras válidas de IMU")
+        return first, last, valid_count, internal_gap
 
-    valid = [idx for idx, count in enumerate(counts) if count]
-    if not valid:
-        raise RuntimeError("janela do clipe sem buckets válidos de IMU")
+    continuity = [_continuity(component) for component in counts]
     max_gap_samples = max(
         1, int(math.ceil(IMU_MAX_INTERPOLATION_GAP_MS / step_ms)))
-    leading_gap = valid[0]
-    trailing_gap = (n - 1) - valid[-1]
-    internal_gap = max(
-        (right - left - 1 for left, right in zip(valid, valid[1:], strict=False)),
-        default=0,
-    )
-    coverage = len(valid) / n
-    minimum_coverage = (IMU_MIN_BUCKET_COVERAGE if duration_ms >= 1000 else 0.0)
-    if (coverage < minimum_coverage
-            or leading_gap > max_gap_samples
-            or trailing_gap > max_gap_samples
-            or internal_gap > max_gap_samples):
-        raise RuntimeError(
-            "cobertura IMU insuficiente para a janela "
-            f"(buckets={coverage:.1%}, lacuna máxima="
-            f"{max(leading_gap, trailing_gap, internal_gap) * step_ms:.0f}ms)")
+    labels = ("giroscópio", "acelerômetro")
+    for label, (first, last, valid_count, internal_gap) in zip(
+            labels, continuity, strict=True):
+        leading_gap = first
+        trailing_gap = (n - 1) - last
+        largest_gap = max(leading_gap, trailing_gap, internal_gap)
+        if largest_gap > max_gap_samples:
+            source_rate = valid_count / max(0.001, duration_ms / 1000.0)
+            raise RuntimeError(
+                f"cobertura IMU insuficiente no {label} "
+                f"(taxa efetiva={source_rate:.1f}Hz, lacuna máxima="
+                f"{largest_gap * step_ms:.0f}ms)")
 
-    samples: list[tuple[tuple[float, float, float],
-                        tuple[float, float, float]] | None] = [None] * n
-    for idx in valid:
-        values = [value / counts[idx] for value in sums[idx]]
-        samples[idx] = ((values[0], values[1], values[2]),
-                        (values[3], values[4], values[5]))
-
-    previous: list[int | None] = [None] * n
-    following: list[int | None] = [None] * n
-    last: int | None = None
-    for idx in range(n):
-        if samples[idx] is not None:
-            last = idx
-        previous[idx] = last
-    last = None
-    for idx in range(n - 1, -1, -1):
-        if samples[idx] is not None:
-            last = idx
-        following[idx] = last
-    for idx, sample in enumerate(samples):
-        if sample is not None:
-            continue
-        left, right = previous[idx], following[idx]
-        if left is None:
-            samples[idx] = samples[right]  # type: ignore[index]
-        elif right is None:
-            samples[idx] = samples[left]
-        else:
-            ratio = (idx - left) / (right - left)
-            lg, la = samples[left]  # type: ignore[misc]
-            rg, ra = samples[right]  # type: ignore[misc]
-            gyro = tuple(
-                a + (b - a) * ratio for a, b in zip(lg, rg, strict=True))
-            accel = tuple(
-                a + (b - a) * ratio for a, b in zip(la, ra, strict=True))
-            samples[idx] = (gyro, accel)
+    if validate_only:
+        return ""
 
     # Decorelação POR CONTA: o mesmo clipe injetado em N contas não pode sair
     # byte-idêntico (antes só havia ±0.002 de ruído). Ganhos/offsets pequenos e
@@ -1570,9 +1569,46 @@ def build_imu_csv(
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow(IMU_HDR)
-    for idx, sample in enumerate(samples):
-        assert sample is not None
-        gyro, accel = sample
+    left: list[int | None] = [None, None]
+    right: list[int | None] = [continuity[0][0], continuity[1][0]]
+
+    def _component_values(component: int, idx: int) -> tuple[float, ...]:
+        component_counts = counts[component]
+        offset = component * 3
+
+        def _bucket(bucket: int) -> tuple[float, ...]:
+            count = component_counts[bucket]
+            return tuple(
+                sums[col][bucket] / count
+                for col in range(offset, offset + 3)
+            )
+
+        if component_counts[idx]:
+            left[component] = idx
+            if right[component] is not None and right[component] <= idx:
+                candidate = idx + 1
+                while candidate < n and not component_counts[candidate]:
+                    candidate += 1
+                right[component] = candidate if candidate < n else None
+            return _bucket(idx)
+        previous = left[component]
+        following = right[component]
+        if previous is None:
+            assert following is not None
+            return _bucket(following)
+        if following is None:
+            return _bucket(previous)
+        before = _bucket(previous)
+        after = _bucket(following)
+        ratio = (idx - previous) / (following - previous)
+        return tuple(
+            a + (b - a) * ratio
+            for a, b in zip(before, after, strict=True)
+        )
+
+    for idx in range(n):
+        gyro = _component_values(0, idx)
+        accel = _component_values(1, idx)
         # Android: grava o sensor COMO LIDO (sem negar o eixo z — convenção
         # de gravidade +z do Android; um aparelho real não inverte o sinal).
         accel = tuple(v * g + b for v, g, b in zip(accel, accel_gain, accel_bias))

@@ -466,7 +466,13 @@ def _ego_clip_inputs(
     return ego4d.find_clip(str(clip_info.get("clip_uid") or ""))
 
 
-def prepare_clip(clip: dict[str, Any], video: dict[str, Any], work_dir: Path) -> dict[str, Any]:
+def prepare_clip(
+    clip: dict[str, Any],
+    video: dict[str, Any],
+    work_dir: Path,
+    *,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Baixa clipe + IMU real, normaliza o vídeo e monta o sidecar. (sem upload)"""
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -483,6 +489,27 @@ def prepare_clip(clip: dict[str, Any], video: dict[str, Any], work_dir: Path) ->
             f"clipe {clip_uid} atravessa trecho sem cobertura contínua de IMU")
 
     parent_uid = str(clip.get("parent_video_uid") or clip_uid)
+
+    def _progress(phase: str, **payload: Any) -> None:
+        if progress:
+            progress(phase, payload)
+
+    # Valide o sensor ANTES de baixar/codificar gigabytes de vídeo. O catálogo
+    # informa a cobertura geral, mas alguns aparelhos têm lacunas finas (por
+    # exemplo, acelerômetro ausente por ~1 s) visíveis somente no CSV. Antes a
+    # campanha gastava vários minutos no encode e só então descartava o clipe.
+    _progress("imu_lookup")
+    imu_path = ego4d.download_imu(video, work_dir / f"{parent_uid}_imu.csv")
+    if imu_path is None:
+        raise RuntimeError(
+            f"clipe {clip_uid} sem IMU real — não enviar (coerência sensor falharia)."
+            f" Escolha um clipe com has_imu=true.")
+    _progress("imu_preflight")
+    ego4d.build_imu_csv(
+        imu_path, window_s, duration_ms=dur_ms, validate_only=True)
+    _progress("imu_ready")
+
+    _progress("video_lookup")
     if clip.get("needs_cut"):
         # Prefere o clip oficial CRF 18 quando ele contém a janela; o IMU
         # continua no relógio absoluto do vídeo canônico.
@@ -494,6 +521,7 @@ def prepare_clip(clip: dict[str, Any], video: dict[str, Any], work_dir: Path) ->
             source["needs_cut"] = False
             ego4d.download_clip(source, parent_path)
         source_video_path = parent_path
+        _progress("encode")
         native = _normalize_video(
             parent_path, work_dir,
             start_s=start_s - media_offset, dur_s=dur_s, stem=clip_uid)
@@ -503,26 +531,21 @@ def prepare_clip(clip: dict[str, Any], video: dict[str, Any], work_dir: Path) ->
         source_video_path = clip_path
         # O mp4 oficial começa em orig_start; o corte humano é relativo a ele.
         rel = start_s - orig_start
+        _progress("encode")
         native = _normalize_video(
             clip_path, work_dir,
             start_s=rel if rel > 0.02 else None,
             dur_s=dur_s, stem=clip_uid)
-    # IMU real (cache por vídeo-pai — janelas longas compartilham o mesmo csv)
-    imu_path = ego4d.download_imu(video, work_dir / f"{parent_uid}_imu.csv")
+    _progress("video_ready", bytes=native.stat().st_size)
     probe = probe_video(native)
     if not probe.get("duration_ms"):
         raise RuntimeError(
             f"clipe {clip_uid}: native sem duração após normalize "
             f"({native})")
 
-    # IMU: real (preferido) ou cai p/ não usar e lança erro — melhor falhar com
-    # mensagem clara do que enviar sem IMU (coerência sensor<->vídeo é a chave).
-    if imu_path is None:
-        raise RuntimeError(
-            f"clipe {clip_uid} sem IMU real — não enviar (coerência sensor falharia)."
-            f" Escolha um clipe com has_imu=true.")
     # Duração do ARQUIVO (probe) — o encoder nunca entrega N.000 s.
     dur_ms = int(probe["duration_ms"])
+    _progress("sidecar")
     imu_csv = ego4d.build_imu_csv(imu_path, window_s, duration_ms=dur_ms)
     # 500 Hz (EgoImu.SAMPLING_PERIOD_US=2000) — o n_samples alimenta o
     # imuDiagnostics.sampleCount e precisa bater com as linhas do CSV.
@@ -1890,8 +1913,8 @@ def run_campaign(
                   task=tsk.scenario, dur_s=clip_info["dur_s"])
             try:
                 item = prefetch.take(clip_info["clip_uid"])
-                if item is None and clip_info.get("source") == "holoassist":
-                    def _holo_progress(
+                if item is None:
+                    def _prepare_progress(
                         phase: str,
                         payload: dict[str, Any],
                         _clip_uid: str = str(clip_info["clip_uid"]),
@@ -1903,14 +1926,16 @@ def run_campaign(
                             **payload,
                         )
 
+                if item is None and clip_info.get("source") == "holoassist":
                     item = prepare_holoassist_clip(
-                        clip_info, work_dir, progress=_holo_progress
+                        clip_info, work_dir, progress=_prepare_progress
                     )
                 if item is None:
                     clip, video = _ego_clip_inputs(clip_info)
                     if clip is None or video is None:
                         raise RuntimeError("clipe ou vídeo pai ausente no manifest")
-                    item = prepare_clip(clip, video, work_dir)
+                    item = prepare_clip(
+                        clip, video, work_dir, progress=_prepare_progress)
                 # A duração real pode diferir das anotações ou de um cache antigo.
                 # Nunca envie um MP4 que ultrapasse o teto escolhido.
                 if float(item["duration_ms"]) > tsk.max_dur_s * 1000:
@@ -2429,6 +2454,9 @@ def _load_rank_seed() -> dict[str, tuple[dict[str, Any], ...]] | None:
         for item in items:
             if not isinstance(item, dict):
                 return None
+            if (str(item.get("parent_video_uid") or "")
+                    in ego4d.KNOWN_INCOMPLETE_IMU_VIDEO_UIDS):
+                continue
             try:
                 duration = float(item.get("dur_s") or 0)
             except (TypeError, ValueError):
@@ -2493,6 +2521,9 @@ def _merge_rank_seed(
         merged: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in (*buckets.get(name, ()), *seed.get(name, ())):
+            if (str(item.get("parent_video_uid") or "")
+                    in ego4d.KNOWN_INCOMPLETE_IMU_VIDEO_UIDS):
+                continue
             try:
                 duration = float(item.get("dur_s") or 0)
             except (TypeError, ValueError):
