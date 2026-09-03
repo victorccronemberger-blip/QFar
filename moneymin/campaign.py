@@ -2415,13 +2415,19 @@ def session_result(
         raise RuntimeError("Minute devolveu um estado de sessão ilegível")
     files = d.get("files") or []
     uf = d.get("unprocessedFiles") or []
+    if not isinstance(files, list) or not isinstance(uf, list):
+        raise RuntimeError("Minute devolveu uma lista de arquivos ilegível")
     status = "processing"
     quality = None
     if files and not uf:
-        quality = files[0].get("quality")
+        quality = files[0].get("quality") if isinstance(files[0], dict) else None
         status = "preview_ready"
     elif uf:
-        states = [str(item.get("previewStatus") or "pending") for item in uf]
+        states = [
+            str(item.get("previewStatus") or "pending").strip().lower()
+            if isinstance(item, dict) else "pending"
+            for item in uf
+        ]
         if any(value == "unavailable" for value in states):
             status = "unprocessed:unavailable"
         elif any(value not in {"pending", "processing"} for value in states):
@@ -2430,7 +2436,11 @@ def session_result(
                 if value not in {"pending", "processing"})
         else:
             status = "processing"
-    preview_states = [str(item.get("previewStatus") or "pending") for item in uf]
+    preview_states = [
+        str(item.get("previewStatus") or "pending").strip().lower()
+        if isinstance(item, dict) else "pending"
+        for item in uf
+    ]
     return {
         "session_id": session_id, "email": email, "status": status,
         "quality": quality, "task": d.get("taskName"),

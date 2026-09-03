@@ -280,11 +280,14 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
   _backendProbe.setInterval(650);
   _campaignPoll.setInterval(1100);
   _previewPoll.setInterval(15000);
+  _taskReload.setInterval(350);
+  _taskReload.setSingleShot(true);
   _balancePoll.setInterval(1500);
   _cachePoll.setInterval(1300);
   connect(&_backendProbe, &QTimer::timeout, this, &MainWindow::probeBackend);
   connect(&_campaignPoll, &QTimer::timeout, this, &MainWindow::pollCampaign);
   connect(&_previewPoll, &QTimer::timeout, this, &MainWindow::pollCampaignPreviews);
+  connect(&_taskReload, &QTimer::timeout, this, &MainWindow::loadTasks);
   connect(&_balancePoll, &QTimer::timeout, this, &MainWindow::loadBalances);
   connect(&_cachePoll, &QTimer::timeout, this, &MainWindow::loadAccelerator);
 
@@ -1016,7 +1019,8 @@ QWidget* MainWindow::buildCampaignPage() {
   _dataset->addItem(QStringLiteral("Somente HoloAssist"), QStringLiteral("holoassist"));
   _dataset->setCurrentIndex(0);
   fitComboPopup(_dataset);
-  connect(_dataset, &QComboBox::currentIndexChanged, this, [this] { loadTasks(); });
+  connect(_dataset, &QComboBox::currentIndexChanged, this,
+          [this] { _taskReload.start(); });
   sourceLayout->addWidget(new QLabel(QStringLiteral("Origem")));
   sourceLayout->addWidget(_dataset, 1);
   auto* reloadTasks = new QPushButton(QStringLiteral("Recarregar categorias"));
@@ -1033,7 +1037,8 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignAccounts->setMinimumHeight(190);
   _campaignAccounts->setSpacing(2);
   _campaignAccounts->setUniformItemSizes(true);
-  connect(_campaignAccounts, &QListWidget::itemChanged, this, [this] { loadTasks(); });
+  connect(_campaignAccounts, &QListWidget::itemChanged, this,
+          [this] { _taskReload.start(); });
   accountCol->addWidget(_campaignAccounts);
   auto* taskCol = new QVBoxLayout;
   auto* taskHead = new QHBoxLayout;
@@ -1083,12 +1088,12 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_minDuration, &QSpinBox::valueChanged, this, [this](int minimum) {
     const QSignalBlocker blocker(_maxDuration);
     _maxDuration->setMinimum(minimum);
-    loadTasks();
+    _taskReload.start();
   });
   connect(_maxDuration, &QSpinBox::valueChanged, this, [this](int maximum) {
     const QSignalBlocker blocker(_minDuration);
     _minDuration->setMaximum(maximum);
-    loadTasks();
+    _taskReload.start();
   });
   form->addRow(QStringLiteral("Duração mínima"), _minDuration);
   form->addRow(QStringLiteral("Duração máxima"), _maxDuration);
@@ -1428,7 +1433,7 @@ QWidget* MainWindow::buildHistoryPage() {
   _historyTable = new QTableWidget(0, 4);
   configureTable(_historyTable);
   _historyTable->setHorizontalHeaderLabels(
-      {QStringLiteral("Início"), QStringLiteral("Contas"), QStringLiteral("Clipes"), QStringLiteral("Sucesso")});
+      {QStringLiteral("Início"), QStringLiteral("Contas"), QStringLiteral("Vídeos"), QStringLiteral("Envios OK")});
   _historyTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
   _historyTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
   _historyTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
@@ -1458,25 +1463,21 @@ QWidget* MainWindow::buildHistoryPage() {
       verifyPreviews->setEnabled(true);
       verifyPreviews->setText(QStringLiteral("Verificar prévias no Minute"));
       if (!ok) return showError(QStringLiteral("Falha ao verificar prévias"), error);
-      int ready = 0;
-      int pending = 0;
-      int unavailable = 0;
-      int errors = 0;
+      const auto summary = doc.object().value(QStringLiteral("summary")).toObject();
+      const int ready = summary.value(QStringLiteral("ready")).toInt();
+      const int pending = summary.value(QStringLiteral("pending")).toInt();
+      const int unavailable = summary.value(QStringLiteral("unavailable")).toInt();
+      const int errors = summary.value(QStringLiteral("errors")).toInt();
       QStringList attention;
       for (const auto value : doc.object().value(QStringLiteral("results")).toArray()) {
         const auto result = value.toObject();
         const QString status = result.value(QStringLiteral("status")).toString();
         const QString email = result.value(QStringLiteral("email")).toString();
-        if (status == QStringLiteral("preview_ready")) {
-          ++ready;
-        } else if (status == QStringLiteral("unprocessed:pending") ||
-                   status == QStringLiteral("processing")) {
-          ++pending;
-        } else if (status.startsWith(QStringLiteral("unprocessed:unavailable"))) {
-          ++unavailable;
+        if (status.startsWith(QStringLiteral("unprocessed:unavailable"))) {
           attention << QStringLiteral("× %1 — prévia indisponível").arg(email);
-        } else {
-          ++errors;
+        } else if (status != QStringLiteral("preview_ready")
+                   && status != QStringLiteral("unprocessed:pending")
+                   && status != QStringLiteral("processing")) {
           attention << QStringLiteral("× %1 — %2").arg(email, status);
         }
       }
@@ -1484,13 +1485,13 @@ QWidget* MainWindow::buildHistoryPage() {
       lines << _historyDetail->toPlainText()
             << QString()
             << QStringLiteral("PROCESSAMENTO NO MINUTE")
-            << QStringLiteral("✓ %1 pronta(s)  ·  %2 processando  ·  %3 indisponível(is)  ·  %4 erro(s)")
+            << QStringLiteral("✓ %1 arquivo(s) pronto(s)  ·  %2 processando  ·  %3 indisponível(is)  ·  %4 erro(s)")
                    .arg(ready).arg(pending).arg(unavailable).arg(errors);
       if (pending > 0)
         lines << QStringLiteral("Os arquivos foram recebidos; o Minute ainda não publicou essas prévias.");
       lines << attention;
       _historyDetail->setPlainText(lines.join(QLatin1Char('\n')));
-      setStatus(QStringLiteral("Prévias: %1 prontas, %2 processando, %3 indisponíveis.")
+      setStatus(QStringLiteral("Arquivos de prévia: %1 prontos, %2 processando, %3 indisponíveis.")
                     .arg(ready).arg(pending).arg(unavailable));
     });
   });
@@ -1507,7 +1508,7 @@ QWidget* MainWindow::buildHistoryPage() {
             << friendlyDate(root.value(QStringLiteral("started_at")).toString())
             << QString()
             << QStringLiteral("VISÃO GERAL")
-            << QStringLiteral("%1 vídeo(s) · %2 concluído(s) · %3 ignorado(s) · %4 falha(s)")
+            << QStringLiteral("%1 vídeo(s) · %2 envio(s) concluído(s) · %3 ignorado(s) · %4 falha(s)")
                    .arg(summary.value(QStringLiteral("videos")).toInt())
                    .arg(summary.value(QStringLiteral("success")).toInt())
                    .arg(summary.value(QStringLiteral("skipped")).toInt())
@@ -1522,7 +1523,7 @@ QWidget* MainWindow::buildHistoryPage() {
         const QString marker = failed > 0 ? QStringLiteral("×")
                              : success > 0 ? QStringLiteral("✓") : QStringLiteral("•");
         lines << QStringLiteral("%1  %2").arg(marker, account.value(QStringLiteral("email")).toString())
-              << QStringLiteral("    %1 concluído(s) · %2 ignorado(s) · %3 falha(s)")
+              << QStringLiteral("    %1 envio(s) concluído(s) · %2 ignorado(s) · %3 falha(s)")
                      .arg(success).arg(skipped).arg(failed);
       }
       lines << QString() << QStringLiteral("CONTEÚDO PROCESSADO");
@@ -1538,7 +1539,7 @@ QWidget* MainWindow::buildHistoryPage() {
         const QString marker = failed > 0 ? QStringLiteral("×") : QStringLiteral("✓");
         lines << QStringLiteral("%1  %2 · %3")
                      .arg(marker, item.value(QStringLiteral("task")).toString(), durationText)
-              << QStringLiteral("    %1 concluído(s) · %2 ignorado(s) · %3 falha(s)")
+              << QStringLiteral("    %1 envio(s) concluído(s) · %2 ignorado(s) · %3 falha(s)")
                      .arg(item.value(QStringLiteral("success")).toInt())
                      .arg(item.value(QStringLiteral("skipped")).toInt())
                      .arg(failed);
@@ -1845,6 +1846,13 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
         marker.commit();
       }
       qApp->setProperty("updateHealthPath", QString());
+    }
+    const QString savedPreview =
+        QSettings().value(QStringLiteral("previewLogName")).toString();
+    if (_previewLogName.isEmpty() && !savedPreview.isEmpty()) {
+      _previewLogName = QFileInfo(savedPreview).fileName();
+      _previewPoll.start();
+      QTimer::singleShot(0, this, &MainWindow::pollCampaignPreviews);
     }
   }
 }
@@ -2233,6 +2241,8 @@ void MainWindow::loadCampaignData() {
 }
 
 void MainWindow::loadTasks() {
+  _taskReload.stop();
+  const int generation = ++_taskLoadGeneration;
   QString account;
   for (int i = 0; i < _campaignAccounts->count(); ++i) {
     if (_campaignAccounts->item(i)->checkState() == Qt::Checked) {
@@ -2242,16 +2252,20 @@ void MainWindow::loadTasks() {
   }
   if (account.isEmpty()) {
     _campaignTasks->clear();
+    _campaignStart->setEnabled(false);
     return;
   }
   _campaignTasks->clear();
   _campaignTasks->addItem(QStringLiteral("Carregando categorias…"));
+  _campaignStart->setEnabled(false);
   const QString path = QStringLiteral(
       "/api/tasks?email=%1&min_dur_s=%2&max_dur_s=%3&dataset=%4")
       .arg(encoded(account)).arg(_minDuration->value() * 60)
       .arg(_maxDuration->value() * 60)
       .arg(encoded(_dataset->currentData().toString()));
-  _api.get(path, [this](bool ok, const QJsonDocument& doc, const QString& error) {
+  _api.get(path, [this, generation](bool ok, const QJsonDocument& doc,
+                                   const QString& error) {
+    if (generation != _taskLoadGeneration) return;
     _campaignTasks->clear();
     if (!ok) {
       _campaignTasks->addItem(QStringLiteral("Falha: ") + error);
@@ -2375,6 +2389,7 @@ void MainWindow::startCampaign() {
       _previewPoll.stop();
       _previewLogName.clear();
       _previewCheckActive = false;
+      QSettings().remove(QStringLiteral("previewLogName"));
       _campaignFeed->clear();
       _campaignPoll.start();
       pollCampaign();
@@ -2450,6 +2465,7 @@ void MainWindow::pollCampaign() {
       if (state == QStringLiteral("done") && !logName.isEmpty()
           && _previewLogName.isEmpty()) {
         _previewLogName = logName;
+        QSettings().setValue(QStringLiteral("previewLogName"), logName);
         _previewPoll.start();
         pollCampaignPreviews();
       }
@@ -2465,6 +2481,16 @@ void MainWindow::pollCampaignPreviews() {
             [this](bool ok, const QJsonDocument& doc, const QString& error) {
     _previewCheckActive = false;
     if (!ok) {
+      if (error.contains(QStringLiteral("log não encontrado"), Qt::CaseInsensitive)) {
+        _previewPoll.stop();
+        _previewLogName.clear();
+        QSettings().remove(QStringLiteral("previewLogName"));
+        _campaignStage->setText(QStringLiteral("Atenção no histórico"));
+        _campaignCurrent->setText(QStringLiteral(
+            "O registro salvo para acompanhar as prévias não foi encontrado."));
+        setStatus(error);
+        return;
+      }
       _campaignStage->setText(QStringLiteral("Aguardando o Minute"));
       _campaignCurrent->setText(QStringLiteral(
           "Os vídeos foram enviados. A consulta das prévias será repetida automaticamente."));
@@ -2477,7 +2503,9 @@ void MainWindow::pollCampaignPreviews() {
     const int pending = summary.value(QStringLiteral("pending")).toInt();
     const int unavailable = summary.value(QStringLiteral("unavailable")).toInt();
     const int errors = summary.value(QStringLiteral("errors")).toInt();
-    const int finished = ready + unavailable + errors;
+    const int transientErrors = summary.value(QStringLiteral("transient_errors")).toInt();
+    const int terminalErrors = qMax(0, errors - transientErrors);
+    const int finished = ready + unavailable + terminalErrors;
     const int percent = total > 0 ? qBound(0, finished * 100 / total, 100) : 100;
     _campaignProgress->setValue(percent);
     _campaignProgress->setFormat(total > 0
@@ -2487,18 +2515,36 @@ void MainWindow::pollCampaignPreviews() {
         "%1 prontas · %2 processando · %3 falhas")
         .arg(ready).arg(pending).arg(unavailable + errors));
 
-    if (pending > 0) {
-      _campaignStage->setText(QStringLiteral("Processamento no Minute"));
+    if (total <= 0) {
+      _previewPoll.stop();
+      _previewLogName.clear();
+      QSettings().remove(QStringLiteral("previewLogName"));
+      _campaignStage->setText(QStringLiteral("Nenhum envio confirmado"));
       _campaignCurrent->setText(QStringLiteral(
-          "%1 de %2 prévias publicadas. Os vídeos já foram recebidos; o Minute está processando o restante.")
-          .arg(ready).arg(total));
-      setStatus(QStringLiteral("Prévias no Minute: %1 prontas, %2 processando.")
-                    .arg(ready).arg(pending));
+          "A campanha terminou sem uma sessão remota para acompanhar. Veja o Histórico para identificar o motivo."));
+      setStatus(QStringLiteral("A campanha não possui arquivos enviados ao Minute."));
+      return;
+    }
+
+    if (pending > 0 || transientErrors > 0) {
+      _campaignStage->setText(transientErrors > 0
+          ? QStringLiteral("Confirmando no Minute")
+          : QStringLiteral("Processamento no Minute"));
+      _campaignCurrent->setText(transientErrors > 0
+          ? QStringLiteral(
+                "%1 de %2 arquivos publicados. %3 consulta(s) falharam temporariamente e serão repetidas automaticamente.")
+                .arg(ready).arg(total).arg(transientErrors)
+          : QStringLiteral(
+                "%1 de %2 arquivos publicados. Os vídeos já foram recebidos; o Minute está processando o restante.")
+                .arg(ready).arg(total));
+      setStatus(QStringLiteral("Prévias no Minute: %1 prontas, %2 processando, %3 consultas pendentes.")
+                    .arg(ready).arg(pending).arg(transientErrors));
       return;
     }
 
     _previewPoll.stop();
     _previewLogName.clear();
+    QSettings().remove(QStringLiteral("previewLogName"));
     if (unavailable > 0 || errors > 0) {
       _campaignStage->setText(QStringLiteral("Atenção nas prévias"));
       _campaignCurrent->setText(QStringLiteral(

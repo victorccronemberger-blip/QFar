@@ -125,23 +125,30 @@ def _aws_creds() -> tuple[str, str, str | None]:
         raise RuntimeError(
             "credenciais AWS ausentes no ambiente; configure "
             "EGO4D_AWS_PROFILE ou AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY")
-    cred_path = Path.home() / ".aws" / "credentials"
-    parser = configparser.RawConfigParser()
-    try:
-        with cred_path.open(encoding="utf-8") as stream:
-            parser.read_file(stream)
-    except (OSError, configparser.Error) as exc:
-        raise RuntimeError(f"~/.aws/credentials inacessível: {exc}") from exc
-    if not parser.has_section(profile):
-        raise RuntimeError(
-            f"perfil AWS [{profile}] ausente em ~/.aws/credentials")
-    ak = parser.get(profile, "aws_access_key_id", fallback="").strip()
-    sk = parser.get(profile, "aws_secret_access_key", fallback="").strip()
-    token = parser.get(profile, "aws_session_token", fallback="").strip() or None
-    if not ak or not sk:
-        raise RuntimeError(
-            f"credenciais AWS incompletas em ~/.aws/credentials [{profile}]")
-    return ak, sk, token
+    configured = os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "").strip()
+    candidates = ([Path(configured)] if configured else [
+        config.EGO4D_LOCAL_AWS_CREDENTIALS,
+        Path.home() / ".aws" / "credentials",
+    ])
+    for cred_path in candidates:
+        if not cred_path.is_file():
+            continue
+        parser = configparser.RawConfigParser()
+        try:
+            with cred_path.open(encoding="utf-8") as stream:
+                parser.read_file(stream)
+        except (OSError, configparser.Error):
+            continue
+        if not parser.has_section(profile):
+            continue
+        ak = parser.get(profile, "aws_access_key_id", fallback="").strip()
+        sk = parser.get(profile, "aws_secret_access_key", fallback="").strip()
+        token = parser.get(
+            profile, "aws_session_token", fallback="").strip() or None
+        if ak and sk:
+            return ak, sk, token
+    raise RuntimeError(
+        f"perfil AWS [{profile}] ausente ou incompleto nos arquivos configurados")
 
 
 def _aws_region() -> str:
@@ -152,15 +159,25 @@ def _aws_region() -> str:
     if not profile:
         return (os.environ.get("AWS_REGION")
                 or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1")
-    cfg_path = Path.home() / ".aws" / "config"
-    parser = configparser.RawConfigParser()
-    try:
-        with cfg_path.open(encoding="utf-8") as stream:
-            parser.read_file(stream)
-    except (OSError, configparser.Error):
-        return "us-east-1"
     section = "default" if profile == "default" else f"profile {profile}"
-    return parser.get(section, "region", fallback="us-east-1").strip()
+    configured = os.environ.get("AWS_CONFIG_FILE", "").strip()
+    candidates = ([Path(configured)] if configured else [
+        config.EGO4D_LOCAL_AWS_CONFIG,
+        Path.home() / ".aws" / "config",
+    ])
+    for cfg_path in candidates:
+        if not cfg_path.is_file():
+            continue
+        parser = configparser.RawConfigParser()
+        try:
+            with cfg_path.open(encoding="utf-8") as stream:
+                parser.read_file(stream)
+        except (OSError, configparser.Error):
+            continue
+        region = parser.get(section, "region", fallback="").strip()
+        if region:
+            return region
+    return "us-east-1"
 
 
 def _s3_get_stdlib(bucket: str, key: str, dest: Path,

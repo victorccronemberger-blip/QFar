@@ -99,6 +99,7 @@ private:
   QTimer _backendProbe;
   QTimer _campaignPoll;
   QTimer _previewPoll;
+  QTimer _taskReload;
   QTimer _balancePoll;
   QTimer _cachePoll;
   int _probeAttempts{};
@@ -174,6 +175,7 @@ private:
   QLabel* _campaignStats{};
   QPlainTextEdit* _campaignFeed{};
   QJsonArray _taskRecords;
+  int _taskLoadGeneration{};
   int _lastCampaignSeq{};
   QString _previewLogName;
   bool _previewCheckActive{};

@@ -48,6 +48,21 @@ class CrowtadoCredentialTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         save.assert_not_called()
 
+    def test_balances_ignore_credentials_from_removed_identities(self):
+        accounts = [{"email": "ativa@example.com"}]
+        saved = {
+            "ativa@example.com": "senha-atual",
+            "removida@example.com": "senha-antiga",
+        }
+        with mock.patch.object(server, "_list_accounts", return_value=accounts), \
+             mock.patch.object(server, "_crowtado_creds", return_value=saved), \
+             mock.patch.object(server, "_load_balances", return_value={}), \
+             mock.patch.object(server.fx, "usd_brl_quote", return_value={}):
+            response = self.client.get("/api/balances")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["with_password"], ["ativa@example.com"])
+
     def test_certificate_failure_is_translated_to_repair_action(self):
         opener = mock.Mock()
         opener.open.side_effect = urllib.error.URLError(

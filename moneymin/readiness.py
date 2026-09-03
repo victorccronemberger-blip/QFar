@@ -86,16 +86,24 @@ def _aws_credentials_present() -> bool:
     if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
         return True
     profile = config.EGO4D_AWS_PROFILE or "default"
-    parser = configparser.RawConfigParser()
-    try:
-        parser.read(Path.home() / ".aws" / "credentials", encoding="utf-8")
-    except (OSError, configparser.Error):
-        return False
-    return bool(
-        parser.has_section(profile)
-        and parser.get(profile, "aws_access_key_id", fallback="").strip()
-        and parser.get(profile, "aws_secret_access_key", fallback="").strip()
-    )
+    configured = os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "").strip()
+    candidates = ([Path(configured)] if configured else [
+        config.EGO4D_LOCAL_AWS_CREDENTIALS,
+        Path.home() / ".aws" / "credentials",
+    ])
+    for path in candidates:
+        if not path.is_file():
+            continue
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read(path, encoding="utf-8")
+        except (OSError, configparser.Error):
+            continue
+        if (parser.has_section(profile)
+                and parser.get(profile, "aws_access_key_id", fallback="").strip()
+                and parser.get(profile, "aws_secret_access_key", fallback="").strip()):
+            return True
+    return False
 
 
 def campaign_readiness(provider: str | None = None) -> dict[str, Any]:

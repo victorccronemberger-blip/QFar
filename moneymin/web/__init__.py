@@ -7,7 +7,7 @@ import sys
 import threading
 
 from .server import create_app
-from .. import tls
+from .. import campaign, tls
 
 
 class _SafeStream:
@@ -92,7 +92,20 @@ def run_webui(host: str = "127.0.0.1", port: int = 8876,
     tls.configure_environment()
     _watch_parent(parent_pid)
     print(f"QMoney service em http://{host}:{port}  (Ctrl+C para sair)")
-    _serve(create_app(), host, port, False)
+    app = create_app()
+
+    def warm_catalog() -> None:
+        try:
+            campaign.warm_task_catalog()
+            print("Catálogo de vídeos pronto.")
+        except Exception:  # aquecimento é otimização; a API tenta de novo
+            print("Catálogo será carregado ao abrir a campanha.")
+
+    # O catálogo é pesado na primeira leitura. Prepará-lo enquanto o usuário vê
+    # a tela inicial evita que a página Nova campanha pareça travada.
+    threading.Thread(target=warm_catalog, daemon=True,
+                     name="qmoney-catalog-warmup").start()
+    _serve(app, host, port, False)
 
 
 def _serve(app, host: str, port: int, open_browser: bool) -> None:

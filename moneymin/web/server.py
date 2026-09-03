@@ -1162,6 +1162,16 @@ def create_app() -> Flask:
             ready = readiness.campaign_readiness(provider)
         except Exception as exc:  # noqa: BLE001 — ainda devolve os outros checks
             ready = {"ready": False, "checks": [], "error": str(exc)}
+        readiness_errors = [
+            item for item in ready.get("checks", [])
+            if item.get("status") == "error"
+        ]
+        for item in readiness_errors:
+            message = f"{item.get('name')}: {item.get('detail')}"
+            if message not in blockers:
+                blockers.append(message)
+        if not ready.get("ready") and not readiness_errors and ready.get("error"):
+            blockers.append(f"prontidão indisponível: {ready['error']}")
         storage = _storage_snapshot(include_path=False)
         if storage.get("free_bytes", 0) < 10 * 1024 ** 3:
             warnings.append("há menos de 10 GiB livres na unidade da biblioteca")
@@ -1240,6 +1250,24 @@ def create_app() -> Flask:
         missing = [e for e in emails if e not in known]
         if missing:
             return jsonify({"error": "conta(s) sem token: " + ", ".join(missing)}), 400
+
+        # O POST público continua seguro mesmo se um cliente antigo pular o
+        # preflight. Sem ferramentas, índices ou credenciais da origem, iniciar
+        # uma thread apenas produziria uma falha tardia depois do download.
+        try:
+            environment = readiness.campaign_readiness(dataset_provider)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return jsonify({"error": f"não foi possível validar a prontidão: {exc}"}), 400
+        environment_errors = [
+            item for item in environment.get("checks", [])
+            if item.get("status") == "error"
+        ]
+        if environment_errors:
+            details = "; ".join(
+                f"{item.get('name')}: {item.get('detail')}"
+                for item in environment_errors
+            )
+            return jsonify({"error": "ambiente não está pronto: " + details}), 400
 
         resolved: list[AccountSpec | None] = [None] * len(emails)
         skipped: list[str] = []
@@ -1462,36 +1490,46 @@ def create_app() -> Flask:
         path = _log_path(name)
         if path is None:
             return jsonify({"error": "log não encontrado"}), 404
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        entries: list[tuple[str, str, str]] = []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return jsonify({"error": "log ilegível (JSON vazio/corrompido)"}), 400
+        entries: list[tuple[str, str, str, int]] = []
         for it in data.get("items", []):
             for acc in it.get("accounts", []):
                 sid = acc.get("session_id")
                 if not sid:
                     continue
+                uploads = acc.get("uploads")
+                expected_files = len(uploads) if isinstance(uploads, list) else 1
+                expected_files = max(1, expected_files)
                 org = acc.get("org_key") or _safe_org(acc.get("email", ""))
                 if not org:
-                    entries.append((str(acc.get("email") or ""), "", str(sid)))
+                    entries.append((str(acc.get("email") or ""), "", str(sid),
+                                    expected_files))
                     continue
-                entries.append((str(acc.get("email") or ""), str(org), str(sid)))
+                entries.append((str(acc.get("email") or ""), str(org), str(sid),
+                                expected_files))
 
         # Uma sessão autenticada por conta evita renovar o mesmo refresh token
         # para cada vídeo. Contas diferentes são consultadas em paralelo; as
         # sessões da mesma conta continuam seriais para não disputar tokens.
-        grouped: dict[str, list[tuple[str, str]]] = {}
-        for email, org, sid in entries:
-            grouped.setdefault(email, []).append((org, sid))
+        grouped: dict[str, list[tuple[str, str, int]]] = {}
+        for email, org, sid, expected_files in entries:
+            grouped.setdefault(email, []).append((org, sid, expected_files))
 
         def _check_account(
-            group: tuple[str, list[tuple[str, str]]],
+            group: tuple[str, list[tuple[str, str, int]]],
         ) -> list[dict[str, Any]]:
             email, account_entries = group
             output: list[dict[str, Any]] = []
-            valid = [(org, sid) for org, sid in account_entries if org]
-            invalid = [(org, sid) for org, sid in account_entries if not org]
+            valid = [(org, sid, expected) for org, sid, expected in account_entries
+                     if org]
+            invalid = [(org, sid, expected) for org, sid, expected in account_entries
+                       if not org]
             output.extend({"session_id": sid, "email": email,
-                           "status": "sem org_key"}
-                          for _, sid in invalid)
+                           "status": "sem org_key", "expected_files": expected}
+                          for _, sid, expected in invalid)
             if not valid:
                 return output
             try:
@@ -1499,14 +1537,18 @@ def create_app() -> Flask:
             except (AuthError, RuntimeError, OSError) as exc:
                 return output + [
                     {"session_id": sid, "email": email,
-                     "status": f"erro: {exc}"} for _, sid in valid]
-            for org, sid in valid:
+                     "status": f"erro: {exc}", "expected_files": expected}
+                    for _, sid, expected in valid]
+            for org, sid, expected in valid:
                 try:
-                    output.append(campaign.session_result(
-                        email, org, sid, session=sess))
+                    result = campaign.session_result(
+                        email, org, sid, session=sess)
+                    result["expected_files"] = expected
+                    output.append(result)
                 except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
                     output.append({"session_id": sid, "email": email,
-                                   "status": f"erro: {exc}"})
+                                   "status": f"erro: {exc}",
+                                   "expected_files": expected})
             return output
 
         results: list[dict[str, Any]] = []
@@ -1516,17 +1558,56 @@ def create_app() -> Flask:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 for account_results in pool.map(_check_account, groups):
                     results.extend(account_results)
-        ready = sum(item.get("status") == "preview_ready" for item in results)
-        pending = sum(item.get("status") == "processing" for item in results)
-        unavailable = sum(
+        session_ready = sum(item.get("status") == "preview_ready" for item in results)
+        session_pending = sum(item.get("status") == "processing" for item in results)
+        session_unavailable = sum(
             str(item.get("status") or "").startswith("unprocessed:unavailable")
             for item in results)
-        errors = len(results) - ready - pending - unavailable
+        session_errors = (len(results) - session_ready - session_pending
+                          - session_unavailable)
+
+        # A interface fala em prévias, portanto o progresso precisa contar os
+        # arquivos/chunks reais, não apenas as sessões. Uma sessão longa pode
+        # conter vários MP4s e pode estar parcialmente processada.
+        ready = pending = unavailable = total = errors = transient_errors = 0
+        for item in results:
+            expected = max(1, int(item.get("expected_files") or 1))
+            reported = max(0, int(item.get("total_files") or 0))
+            status = str(item.get("status") or "")
+            if status.startswith("erro:"):
+                total += expected
+                errors += expected
+                transient_errors += expected
+            elif status == "sem org_key":
+                total += expected
+                errors += expected
+            else:
+                item_total = max(expected, reported)
+                item_ready = max(0, int(item.get("ready_files") or 0))
+                item_pending = max(0, int(item.get("pending_files") or 0))
+                item_unavailable = max(
+                    0, int(item.get("unavailable_files") or 0))
+                missing = max(
+                    0, item_total - item_ready - item_pending - item_unavailable)
+                total += item_total
+                ready += item_ready
+                pending += item_pending
+                unavailable += item_unavailable
+                if status == "processing":
+                    pending += missing
+                else:
+                    errors += missing
         return jsonify({
             "results": results,
             "summary": {
-                "total": len(results), "ready": ready, "pending": pending,
+                "total": total, "ready": ready, "pending": pending,
                 "unavailable": unavailable, "errors": errors,
+                "transient_errors": transient_errors,
+            },
+            "sessions": {
+                "total": len(results), "ready": session_ready,
+                "pending": session_pending, "unavailable": session_unavailable,
+                "errors": session_errors,
             },
         })
 
@@ -1534,10 +1615,17 @@ def create_app() -> Flask:
     @app.get("/api/balances")
     def get_balances():
         configured = sorted(a["email"] for a in _list_accounts())
+        configured_set = set(configured)
+        # O cofre pode conservar credenciais de identidades removidas. Elas não
+        # pertencem mais à operação atual e não devem inflar a contagem exibida
+        # nem aparecer como contas conectadas no desktop.
+        with_password = sorted(
+            email for email in _crowtado_creds() if email in configured_set
+        )
         return jsonify({
             "balances": _load_balances(),
             "accounts": configured,
-            "with_password": sorted(_crowtado_creds()),
+            "with_password": with_password,
             "runner": BALANCES_RUNNER.snapshot(),
             "exchange": fx.usd_brl_quote(),
         })

@@ -12,18 +12,32 @@ namespace fs = std::filesystem;
 namespace {
 std::wstring quote(const std::wstring& value) { return L"\"" + value + L"\""; }
 
+std::string utf8(const std::wstring& value) {
+  if (value.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                                       static_cast<int>(value.size()),
+                                       nullptr, 0, nullptr, nullptr);
+  if (size <= 0) return {};
+  std::string output(static_cast<std::size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                      output.data(), size, nullptr, nullptr);
+  return output;
+}
+
 void logLine(const fs::path& target, const std::wstring& line) {
   wchar_t local[MAX_PATH]{};
   const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
   const fs::path root = length > 0 ? fs::path(local) / L"QMoney" : target;
   std::error_code ec;
   fs::create_directories(root, ec);
-  std::wofstream log(root / L"update.log", std::ios::app);
+  // O locale padrão de std::wofstream no Windows corrompe acentos. O arquivo
+  // de diagnóstico é UTF-8 explícito para permanecer legível em qualquer PC.
+  std::ofstream log(root / L"update.log", std::ios::app | std::ios::binary);
   SYSTEMTIME time{};
   GetLocalTime(&time);
-  log << L"[" << time.wYear << L"-" << time.wMonth << L"-" << time.wDay << L" "
-      << time.wHour << L":" << time.wMinute << L":" << time.wSecond << L"] "
-      << line << L"\n";
+  log << "[" << time.wYear << "-" << time.wMonth << "-" << time.wDay << " "
+      << time.wHour << ":" << time.wMinute << ":" << time.wSecond << "] "
+      << utf8(line) << "\n";
 }
 
 bool runProcess(const std::wstring& command, DWORD timeout = 300000) {
