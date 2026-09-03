@@ -1463,7 +1463,7 @@ def create_app() -> Flask:
         if path is None:
             return jsonify({"error": "log não encontrado"}), 404
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-        results: list[dict[str, Any]] = []
+        entries: list[tuple[str, str, str]] = []
         for it in data.get("items", []):
             for acc in it.get("accounts", []):
                 sid = acc.get("session_id")
@@ -1471,15 +1471,64 @@ def create_app() -> Flask:
                     continue
                 org = acc.get("org_key") or _safe_org(acc.get("email", ""))
                 if not org:
-                    results.append({"session_id": sid, "email": acc.get("email"),
-                                    "status": "sem org_key"})
+                    entries.append((str(acc.get("email") or ""), "", str(sid)))
                     continue
+                entries.append((str(acc.get("email") or ""), str(org), str(sid)))
+
+        # Uma sessão autenticada por conta evita renovar o mesmo refresh token
+        # para cada vídeo. Contas diferentes são consultadas em paralelo; as
+        # sessões da mesma conta continuam seriais para não disputar tokens.
+        grouped: dict[str, list[tuple[str, str]]] = {}
+        for email, org, sid in entries:
+            grouped.setdefault(email, []).append((org, sid))
+
+        def _check_account(
+            group: tuple[str, list[tuple[str, str]]],
+        ) -> list[dict[str, Any]]:
+            email, account_entries = group
+            output: list[dict[str, Any]] = []
+            valid = [(org, sid) for org, sid in account_entries if org]
+            invalid = [(org, sid) for org, sid in account_entries if not org]
+            output.extend({"session_id": sid, "email": email,
+                           "status": "sem org_key"}
+                          for _, sid in invalid)
+            if not valid:
+                return output
+            try:
+                sess = Session.from_email(email)
+            except (AuthError, RuntimeError, OSError) as exc:
+                return output + [
+                    {"session_id": sid, "email": email,
+                     "status": f"erro: {exc}"} for _, sid in valid]
+            for org, sid in valid:
                 try:
-                    results.append(campaign.session_result(acc["email"], org, sid))
-                except (AuthError, RuntimeError, OSError) as exc:
-                    results.append({"session_id": sid, "email": acc.get("email"),
-                                    "status": f"erro: {exc}"})
-        return jsonify({"results": results})
+                    output.append(campaign.session_result(
+                        email, org, sid, session=sess))
+                except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+                    output.append({"session_id": sid, "email": email,
+                                   "status": f"erro: {exc}"})
+            return output
+
+        results: list[dict[str, Any]] = []
+        groups = list(grouped.items())
+        if groups:
+            workers = min(6, len(groups))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for account_results in pool.map(_check_account, groups):
+                    results.extend(account_results)
+        ready = sum(item.get("status") == "preview_ready" for item in results)
+        pending = sum(item.get("status") == "processing" for item in results)
+        unavailable = sum(
+            str(item.get("status") or "").startswith("unprocessed:unavailable")
+            for item in results)
+        errors = len(results) - ready - pending - unavailable
+        return jsonify({
+            "results": results,
+            "summary": {
+                "total": len(results), "ready": ready, "pending": pending,
+                "unavailable": unavailable, "errors": errors,
+            },
+        })
 
     # -- saldos (crowtado) -----------------------------------------------------
     @app.get("/api/balances")

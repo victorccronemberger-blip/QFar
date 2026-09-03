@@ -279,10 +279,12 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
 
   _backendProbe.setInterval(650);
   _campaignPoll.setInterval(1100);
+  _previewPoll.setInterval(15000);
   _balancePoll.setInterval(1500);
   _cachePoll.setInterval(1300);
   connect(&_backendProbe, &QTimer::timeout, this, &MainWindow::probeBackend);
   connect(&_campaignPoll, &QTimer::timeout, this, &MainWindow::pollCampaign);
+  connect(&_previewPoll, &QTimer::timeout, this, &MainWindow::pollCampaignPreviews);
   connect(&_balancePoll, &QTimer::timeout, this, &MainWindow::loadBalances);
   connect(&_cachePoll, &QTimer::timeout, this, &MainWindow::loadAccelerator);
 
@@ -381,6 +383,7 @@ MainWindow::~MainWindow() {
 void MainWindow::closeEvent(QCloseEvent* event) {
   _closing = true;
   _campaignPoll.stop();
+  _previewPoll.stop();
   _cachePoll.stop();
   _balancePoll.stop();
   _backendProbe.stop();
@@ -2369,6 +2372,9 @@ void MainWindow::startCampaign() {
         return showError(QStringLiteral("Campanha não iniciada"), startError);
       }
       _lastCampaignSeq = 0;
+      _previewPoll.stop();
+      _previewLogName.clear();
+      _previewCheckActive = false;
       _campaignFeed->clear();
       _campaignPoll.start();
       pollCampaign();
@@ -2437,7 +2443,78 @@ void MainWindow::pollCampaign() {
       if (!detail.isEmpty()) line += QStringLiteral("\n             %1").arg(detail);
       _campaignFeed->appendPlainText(line);
     }
-    if (!running) _campaignPoll.stop();
+    if (!running) {
+      _campaignPoll.stop();
+      const QString logName = QFileInfo(
+          snap.value(QStringLiteral("log_path")).toString()).fileName();
+      if (state == QStringLiteral("done") && !logName.isEmpty()
+          && _previewLogName.isEmpty()) {
+        _previewLogName = logName;
+        _previewPoll.start();
+        pollCampaignPreviews();
+      }
+    }
+  });
+}
+
+void MainWindow::pollCampaignPreviews() {
+  if (_previewLogName.isEmpty() || _previewCheckActive) return;
+  _previewCheckActive = true;
+  _api.post(QStringLiteral("/api/logs/") + encoded(_previewLogName)
+                + QStringLiteral("/status"), {},
+            [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _previewCheckActive = false;
+    if (!ok) {
+      _campaignStage->setText(QStringLiteral("Aguardando o Minute"));
+      _campaignCurrent->setText(QStringLiteral(
+          "Os vídeos foram enviados. A consulta das prévias será repetida automaticamente."));
+      setStatus(QStringLiteral("Minute ainda não respondeu sobre as prévias: %1").arg(error));
+      return;
+    }
+    const auto summary = doc.object().value(QStringLiteral("summary")).toObject();
+    const int total = summary.value(QStringLiteral("total")).toInt();
+    const int ready = summary.value(QStringLiteral("ready")).toInt();
+    const int pending = summary.value(QStringLiteral("pending")).toInt();
+    const int unavailable = summary.value(QStringLiteral("unavailable")).toInt();
+    const int errors = summary.value(QStringLiteral("errors")).toInt();
+    const int finished = ready + unavailable + errors;
+    const int percent = total > 0 ? qBound(0, finished * 100 / total, 100) : 100;
+    _campaignProgress->setValue(percent);
+    _campaignProgress->setFormat(total > 0
+        ? QStringLiteral("%1 de %2 prévias prontas · %p%").arg(ready).arg(total)
+        : QStringLiteral("Nenhuma sessão enviada"));
+    _campaignStats->setText(QStringLiteral(
+        "%1 prontas · %2 processando · %3 falhas")
+        .arg(ready).arg(pending).arg(unavailable + errors));
+
+    if (pending > 0) {
+      _campaignStage->setText(QStringLiteral("Processamento no Minute"));
+      _campaignCurrent->setText(QStringLiteral(
+          "%1 de %2 prévias publicadas. Os vídeos já foram recebidos; o Minute está processando o restante.")
+          .arg(ready).arg(total));
+      setStatus(QStringLiteral("Prévias no Minute: %1 prontas, %2 processando.")
+                    .arg(ready).arg(pending));
+      return;
+    }
+
+    _previewPoll.stop();
+    _previewLogName.clear();
+    if (unavailable > 0 || errors > 0) {
+      _campaignStage->setText(QStringLiteral("Atenção nas prévias"));
+      _campaignCurrent->setText(QStringLiteral(
+          "%1 prévia(s) pronta(s); %2 precisam de atenção. Veja os detalhes no Histórico.")
+          .arg(ready).arg(unavailable + errors));
+      _campaignFeed->appendPlainText(QStringLiteral(
+          "!   Minute concluiu a fila com %1 prévia(s) que precisam de atenção.")
+          .arg(unavailable + errors));
+    } else {
+      _campaignStage->setText(QStringLiteral("Concluída"));
+      _campaignCurrent->setText(QStringLiteral(
+          "Todas as %1 prévias foram publicadas no Minute.").arg(ready));
+      _campaignFeed->appendPlainText(QStringLiteral(
+          "✓   Minute publicou todas as %1 prévias.").arg(ready));
+      setStatus(QStringLiteral("Campanha concluída: todas as prévias estão prontas no Minute."));
+    }
   });
 }
 

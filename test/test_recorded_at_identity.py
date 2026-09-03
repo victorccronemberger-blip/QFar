@@ -295,6 +295,39 @@ class ChunkPlanTests(unittest.TestCase):
 
 
 class UploadContractTests(unittest.TestCase):
+    def test_partial_preview_is_still_processing(self) -> None:
+        class FakeSession:
+            def get(self, path: str):
+                return 200, json.dumps({
+                    "taskName": "Gardening",
+                    "files": [{"quality": {"overall": "great"}}],
+                    "unprocessedFiles": [{"previewStatus": "pending"}],
+                })
+
+        result = campaign.session_result(
+            "user@example.com", "org", "session", session=FakeSession())
+
+        self.assertEqual(result["status"], "processing")
+        self.assertEqual(result["ready_files"], 1)
+        self.assertEqual(result["pending_files"], 1)
+        self.assertEqual(result["total_files"], 2)
+
+    def test_preview_ready_requires_no_unprocessed_files(self) -> None:
+        class FakeSession:
+            def get(self, path: str):
+                return 200, json.dumps({
+                    "taskName": "Gardening",
+                    "files": [{"quality": {"overall": "great"}}],
+                    "unprocessedFiles": [],
+                })
+
+        result = campaign.session_result(
+            "user@example.com", "org", "session", session=FakeSession())
+
+        self.assertEqual(result["status"], "preview_ready")
+        self.assertEqual(result["ready_files"], 1)
+        self.assertEqual(result["pending_files"], 0)
+
     def test_session_complete_always_suppresses_per_chunk_catbear(self) -> None:
         class FakeSession:
             def __init__(self) -> None:
@@ -373,9 +406,8 @@ class UploadContractTests(unittest.TestCase):
 
         self.assertTrue(result.finalized)
         self.assertEqual(len(session.complete_bodies), 2)
-        # O QMoney usa o endpoint explícito /finalize. O sinal migratório do
-        # Android não pode ser combinado com ele: essa combinação prende a
-        # geração de previews no backend atual.
+        # O QMoney usa o endpoint explícito /finalize e não mistura nele o
+        # sinal migratório redundante do Android.
         self.assertNotIn("session_complete", session.complete_bodies[0])
         self.assertNotIn("session_complete", session.complete_bodies[1])
         self.assertIs(

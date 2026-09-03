@@ -78,6 +78,7 @@ private:
   void loadTasks();
   void startCampaign();
   void pollCampaign();
+  void pollCampaignPreviews();
   void loadAccelerator();
   void startAccelerator();
   void loadAccounts();
@@ -97,6 +98,7 @@ private:
   QProcess _backend;
   QTimer _backendProbe;
   QTimer _campaignPoll;
+  QTimer _previewPoll;
   QTimer _balancePoll;
   QTimer _cachePoll;
   int _probeAttempts{};
@@ -173,6 +175,8 @@ private:
   QPlainTextEdit* _campaignFeed{};
   QJsonArray _taskRecords;
   int _lastCampaignSeq{};
+  QString _previewLogName;
+  bool _previewCheckActive{};
 
   QComboBox* _cacheTask{};
   QSpinBox* _cacheLimit{};

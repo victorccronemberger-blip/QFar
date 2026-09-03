@@ -2395,24 +2395,51 @@ def run_campaign(
     return log
 
 
-def session_result(email: str, org_key: str, session_id: str) -> dict[str, Any]:
+def session_result(
+    email: str,
+    org_key: str,
+    session_id: str,
+    *,
+    session: Session | None = None,
+) -> dict[str, Any]:
     """Consulta o estado de uma sessão (preview + quality scores) numa conta."""
-    sess = Session.from_email(email)
-    _, body = sess.get(f"/api/v1/organizations/{org_key}/sessions/{session_id}")
+    sess = session or Session.from_email(email)
+    http_status, body = sess.get(
+        f"/api/v1/organizations/{org_key}/sessions/{session_id}")
     import json as _json
-    d = _json.loads(body)
+    if http_status != 200:
+        raise RuntimeError(
+            f"Minute devolveu HTTP {http_status} ao consultar a sessão")
+    d = _json.loads(body) if isinstance(body, str) else body
+    if not isinstance(d, dict):
+        raise RuntimeError("Minute devolveu um estado de sessão ilegível")
     files = d.get("files") or []
     uf = d.get("unprocessedFiles") or []
     status = "processing"
     quality = None
-    if files:
+    if files and not uf:
         quality = files[0].get("quality")
         status = "preview_ready"
     elif uf:
-        status = "unprocessed:" + str(uf[0].get("previewStatus"))
+        states = [str(item.get("previewStatus") or "pending") for item in uf]
+        if any(value == "unavailable" for value in states):
+            status = "unprocessed:unavailable"
+        elif any(value not in {"pending", "processing"} for value in states):
+            status = "unprocessed:" + next(
+                value for value in states
+                if value not in {"pending", "processing"})
+        else:
+            status = "processing"
+    preview_states = [str(item.get("previewStatus") or "pending") for item in uf]
     return {
         "session_id": session_id, "email": email, "status": status,
         "quality": quality, "task": d.get("taskName"),
+        "ready_files": len(files),
+        "pending_files": sum(
+            value in {"pending", "processing"} for value in preview_states),
+        "unavailable_files": sum(
+            value == "unavailable" for value in preview_states),
+        "total_files": len(files) + len(uf),
     }
 
 

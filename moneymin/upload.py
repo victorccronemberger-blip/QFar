@@ -1831,10 +1831,9 @@ def upload_session(
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
-            # Enquanto /sessions/{id}/finalize existir, ele é a única fonte de
-            # conclusão da sessão. Misturar o sinal migratório
-            # `session_complete` com esse endpoint deixa previews presos em
-            # `pending` no backend atual.
+            # Enquanto /sessions/{id}/finalize existir, ele continua sendo a
+            # fonte explícita de conclusão usada pelo QMoney. Não combinamos o
+            # contrato estável com o sinal migratório redundante.
             session_complete=False,
             fail_on_error=fail_on_error,
             sidecar=sidecar,
