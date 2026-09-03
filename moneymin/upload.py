@@ -664,7 +664,10 @@ def complete_upload(
     prévia no backend.
     """
     body: dict[str, Any] = {"size_bytes": int(size_bytes)}
-    if suppress_per_chunk_catbear:
+    # O backend atual exige os dois sinais juntos enquanto o endpoint de
+    # finalize ainda existe. O Android sempre envia a supressão, inclusive em
+    # sessões de um único chunk.
+    if suppress_per_chunk_catbear or session_complete:
         body["suppress_per_chunk_catbear"] = True
     if session_complete:
         body["session_complete"] = True

@@ -295,6 +295,26 @@ class ChunkPlanTests(unittest.TestCase):
 
 
 class UploadContractTests(unittest.TestCase):
+    def test_session_complete_always_suppresses_per_chunk_catbear(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.body: dict | None = None
+
+            def request(self, method: str, path: str, body=None):
+                self.body = body
+                return 200, "{}"
+
+        session = FakeSession()
+        upload.complete_upload(
+            session, "upload-1", 1234,
+            suppress_per_chunk_catbear=False,
+            session_complete=True,
+        )
+
+        self.assertIsNotNone(session.body)
+        self.assertIs(session.body["session_complete"], True)
+        self.assertIs(session.body["suppress_per_chunk_catbear"], True)
+
     def test_session_complete_on_every_chunk_of_accepted_session(self) -> None:
         class FakeSession:
             def __init__(self) -> None:
