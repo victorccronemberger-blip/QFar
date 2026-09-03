@@ -138,9 +138,11 @@ def _is_disabled_error(error: str | None) -> bool:
     return "desativad" in text or "disabled" in text or "conta desativada" in text
 # Janela de duração aceita (recording-config: min 60s / max 1800s).
 MIN_DUR_MS, MAX_DUR_MS = 60000, 1800000
-# O app sobe a sessão em pedaços (`{session}_{i}`). Gravação contínua curta
-# fica num único `_0`; acima disto parte em janelas ≥ 60s.
-NATIVE_CHUNK_TARGET_MS = 480_000
+# Cada vídeo selecionado deve permanecer um único envio sempre que couber no
+# limite devolvido pelo recording-config. Dividir nominalmente a cada 8 min
+# fazia uma gravação humana de 15 min aparecer no parceiro como dois envios.
+# O sufixo `{session}_{i}` continua existindo apenas para gravações que
+# realmente excedam o teto remoto.
 DATASET_PROVIDERS = frozenset({"all", "ego4d", "holoassist"})
 
 
@@ -712,13 +714,15 @@ def _chunk_plan(duration_ms: int, target_ms: int | None = None
     recording-config remoto (min/max duração) — sem gerar chunk que o preflight
     viria a recusar se o servidor apertar o teto.
 
-    Alvo = menor(8min nominal, max remoto); piso = min remoto.
+    Por padrão, o alvo é o próprio máximo remoto. Assim, um vídeo dentro do
+    intervalo aceito vira exatamente um upload; só há particionamento quando a
+    duração total ultrapassa o teto imposto pelo backend.
     """
     limits = config.recording_limits()
     eff_min = max(1_000, int(limits.get("min_duration_ms") or MIN_DUR_MS))
     eff_max = max(eff_min, int(limits.get("max_duration_ms") or MAX_DUR_MS))
     if target_ms is None:
-        target_ms = min(NATIVE_CHUNK_TARGET_MS, eff_max)
+        target_ms = eff_max
     target_ms = min(eff_max, max(eff_min, int(target_ms)))
     duration_ms = max(1, int(duration_ms))
     if duration_ms < eff_min:

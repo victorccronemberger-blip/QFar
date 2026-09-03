@@ -205,11 +205,16 @@ class ChunkPlanTests(unittest.TestCase):
     def test_short_recording_is_one_chunk(self) -> None:
         self.assertEqual(_chunk_plan(96_100), [(0, 96_100)])
 
-    def test_long_recording_splits_without_tiny_tail(self) -> None:
-        plan = _chunk_plan(960_000)
-        self.assertEqual(plan, [(0, 480_000), (480_000, 480_000)])
-        self.assertEqual(sum(dur for _, dur in plan), 960_000)
-        self.assertTrue(all(dur >= 60_000 for _, dur in plan))
+    def test_recordings_from_ten_to_thirty_minutes_are_one_upload(self) -> None:
+        for duration_ms in (600_000, 900_000, 1_800_000):
+            with self.subTest(duration_ms=duration_ms):
+                plan = _chunk_plan(duration_ms)
+                self.assertEqual(plan, [(0, duration_ms)])
+
+    def test_recording_above_remote_max_is_split(self) -> None:
+        plan = _chunk_plan(2_400_000)
+        self.assertEqual(plan, [(0, 1_800_000), (1_800_000, 600_000)])
+        self.assertEqual(sum(dur for _, dur in plan), 2_400_000)
 
     def test_remote_max_never_overflows_when_tail_is_small(self) -> None:
         limits = {
