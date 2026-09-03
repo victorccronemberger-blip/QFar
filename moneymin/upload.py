@@ -657,9 +657,11 @@ def complete_upload(
 ) -> dict[str, Any]:
     """Confirma um blob já enviado; operação reutilizável após reinício.
 
-    `session_complete=True` no ÚLTIMO chunk da sessão — o app nativo
-    (_completeUpload, bundle) adiciona `session_complete: true` ao corpo nesse
-    caso; o QMoney agora replica.
+    `session_complete=True` em cada chunk de uma sessão que o usuário já
+    aceitou. No app Android, ``isSessionAccepted(sessionId)`` é repassado a
+    ``_completeUpload`` em toda confirmação; não é um marcador exclusivo do
+    último chunk. Esse sinal também dispara o processamento assíncrono da
+    prévia no backend.
     """
     body: dict[str, Any] = {"size_bytes": int(size_bytes)}
     if suppress_per_chunk_catbear:
@@ -981,7 +983,7 @@ def _upload_single_chunk(
     Espelha o app nativo:
       - auto-retry com backoff nas etapas transientes (create/sas, transport);
       - PATCH complete com `suppress_per_chunk_catbear` e `session_complete`
-        (este último no último chunk da sessão — replica `_completeUpload`);
+        em todo chunk de uma sessão aceita (replica `_completeUpload`);
       - se o registro foi criado e a confirmação falhar, marca `PATCH /fail`
         (fail_on_error) — comportamento `_failUpload` do app;
       - se o arquivo local sumir, devolve um ChunkResult em estado `loss`
@@ -1827,10 +1829,9 @@ def upload_session(
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
-            # O app marca session_complete no PATCH complete do ITER ÚLTIMO chunk
-            # (quando a sessão será finalizada em seguida).
-            session_complete=(bool(finalize)
-                              and offset == len(paths) - 1),
+            # O Android passa isSessionAccepted(sessionId) em CADA complete.
+            # `finalize=True` significa que esta sessão já foi aceita.
+            session_complete=bool(finalize),
             fail_on_error=fail_on_error,
             sidecar=sidecar,
             sidecar_data=chunk_sidecar_data,
@@ -2099,10 +2100,13 @@ def pump_pending(
                     current_size: int = int(sidecar.get("size_bytes") or 0),
                     suppress: bool = bool(
                         sidecar.get("suppress_per_chunk_catbear")),
+                    session_complete: bool = bool(
+                        sidecar.get("finalize_requested")),
                 ) -> dict[str, Any]:
                     return complete_upload(
                         session, current_upload_id, current_size,
                         suppress_per_chunk_catbear=suppress,
+                        session_complete=session_complete,
                     )
 
                 complete_data, attempts = _with_retry(

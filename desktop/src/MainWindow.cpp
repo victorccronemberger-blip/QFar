@@ -1438,6 +1438,59 @@ QWidget* MainWindow::buildHistoryPage() {
   _historyDetail = new QPlainTextEdit;
   _historyDetail->setReadOnly(true);
   _historyDetail->setPlaceholderText(QStringLiteral("Selecione uma campanha para ver o registro completo."));
+  auto* verifyPreviews = new QPushButton(QStringLiteral("Verificar prévias no Minute"));
+  connect(verifyPreviews, &QPushButton::clicked, this, [this, verifyPreviews] {
+    const int row = _historyTable->currentRow();
+    if (row < 0 || !_historyTable->item(row, 0)) {
+      return showError(QStringLiteral("Selecione uma campanha"),
+                       QStringLiteral("Escolha uma linha do histórico antes de verificar as prévias."));
+    }
+    const QString name = _historyTable->item(row, 0)->data(Qt::UserRole).toString();
+    if (name.isEmpty()) return;
+    verifyPreviews->setEnabled(false);
+    verifyPreviews->setText(QStringLiteral("Consultando o Minute…"));
+    setStatus(QStringLiteral("Consultando o processamento real das prévias no Minute…"));
+    _api.post(QStringLiteral("/api/logs/") + encoded(name) + QStringLiteral("/status"), {},
+              [this, verifyPreviews](bool ok, const QJsonDocument& doc, const QString& error) {
+      verifyPreviews->setEnabled(true);
+      verifyPreviews->setText(QStringLiteral("Verificar prévias no Minute"));
+      if (!ok) return showError(QStringLiteral("Falha ao verificar prévias"), error);
+      int ready = 0;
+      int pending = 0;
+      int unavailable = 0;
+      int errors = 0;
+      QStringList attention;
+      for (const auto value : doc.object().value(QStringLiteral("results")).toArray()) {
+        const auto result = value.toObject();
+        const QString status = result.value(QStringLiteral("status")).toString();
+        const QString email = result.value(QStringLiteral("email")).toString();
+        if (status == QStringLiteral("preview_ready")) {
+          ++ready;
+        } else if (status == QStringLiteral("unprocessed:pending") ||
+                   status == QStringLiteral("processing")) {
+          ++pending;
+        } else if (status.startsWith(QStringLiteral("unprocessed:unavailable"))) {
+          ++unavailable;
+          attention << QStringLiteral("× %1 — prévia indisponível").arg(email);
+        } else {
+          ++errors;
+          attention << QStringLiteral("× %1 — %2").arg(email, status);
+        }
+      }
+      QStringList lines;
+      lines << _historyDetail->toPlainText()
+            << QString()
+            << QStringLiteral("PROCESSAMENTO NO MINUTE")
+            << QStringLiteral("✓ %1 pronta(s)  ·  %2 processando  ·  %3 indisponível(is)  ·  %4 erro(s)")
+                   .arg(ready).arg(pending).arg(unavailable).arg(errors);
+      if (pending > 0)
+        lines << QStringLiteral("Os arquivos foram recebidos; o Minute ainda não publicou essas prévias.");
+      lines << attention;
+      _historyDetail->setPlainText(lines.join(QLatin1Char('\n')));
+      setStatus(QStringLiteral("Prévias: %1 prontas, %2 processando, %3 indisponíveis.")
+                    .arg(ready).arg(pending).arg(unavailable));
+    });
+  });
   connect(_historyTable, &QTableWidget::cellClicked, this, [this](int row, int) {
     const QString name = _historyTable->item(row, 0)->data(Qt::UserRole).toString();
     if (name.isEmpty()) return;
@@ -1497,8 +1550,14 @@ QWidget* MainWindow::buildHistoryPage() {
       _historyDetail->setPlainText(lines.join(QLatin1Char('\n')));
     });
   });
+  auto* detailBody = new QWidget;
+  auto* detailLayout = new QVBoxLayout(detailBody);
+  detailLayout->setContentsMargins(0, 0, 0, 0);
+  detailLayout->setSpacing(10);
+  detailLayout->addWidget(verifyPreviews, 0, Qt::AlignRight);
+  detailLayout->addWidget(_historyDetail, 1);
   layout->addWidget(card(QStringLiteral("Campanhas"), _historyTable), 3);
-  layout->addWidget(card(QStringLiteral("Registro"), _historyDetail), 2);
+  layout->addWidget(card(QStringLiteral("Registro"), detailBody), 2);
   return pageShell(QStringLiteral("Histórico"),
                    QStringLiteral("Audite campanhas anteriores e seus resultados por conta."), body);
 }

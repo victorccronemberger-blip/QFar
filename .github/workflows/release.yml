@@ -50,8 +50,7 @@ jobs:
             --specpath dist/work/spec --collect-data moneymin --collect-all curl_cffi `
             --collect-submodules playwright --collect-submodules boto3 `
             --collect-submodules ego4d `
-            --add-data "$root/moneymin/iphone_uw_calibration.json;moneymin" `
-            --add-data "$root/moneymin/native_metadata_reference.json;moneymin" `
+            --add-data "$root/moneymin/samsung_uw_calibration.json;moneymin" `
             --add-data "$root/moneymin/resources;moneymin/resources" `
             --add-data "$root/reference;reference" `
             "$root/packaging/qmoney_service.py"

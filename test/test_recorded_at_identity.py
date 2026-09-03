@@ -295,7 +295,7 @@ class ChunkPlanTests(unittest.TestCase):
 
 
 class UploadContractTests(unittest.TestCase):
-    def test_session_complete_only_on_last_chunk(self) -> None:
+    def test_session_complete_on_every_chunk_of_accepted_session(self) -> None:
         class FakeSession:
             def __init__(self) -> None:
                 self.upload_bodies: list[dict] = []
@@ -353,9 +353,11 @@ class UploadContractTests(unittest.TestCase):
 
         self.assertTrue(result.finalized)
         self.assertEqual(len(session.complete_bodies), 2)
-        # Só o PATCH complete do ÚLTIMO chunk carrega session_complete: true.
-        self.assertNotIn("session_complete", session.complete_bodies[0])
+        # O Android passa isSessionAccepted(sessionId) em cada PATCH complete.
+        self.assertIs(session.complete_bodies[0]["session_complete"], True)
         self.assertIs(session.complete_bodies[1]["session_complete"], True)
+        self.assertIs(
+            session.complete_bodies[0]["suppress_per_chunk_catbear"], True)
         self.assertIs(
             session.complete_bodies[1]["suppress_per_chunk_catbear"], True)
 
