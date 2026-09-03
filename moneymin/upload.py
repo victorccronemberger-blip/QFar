@@ -657,11 +657,10 @@ def complete_upload(
 ) -> dict[str, Any]:
     """Confirma um blob já enviado; operação reutilizável após reinício.
 
-    `session_complete=True` em cada chunk de uma sessão que o usuário já
-    aceitou. No app Android, ``isSessionAccepted(sessionId)`` é repassado a
-    ``_completeUpload`` em toda confirmação; não é um marcador exclusivo do
-    último chunk. Esse sinal também dispara o processamento assíncrono da
-    prévia no backend.
+    ``session_complete`` existe no cliente Android para o fluxo que substituirá
+    o endpoint de ``finalize``. O QMoney usa o contrato público e comprovado
+    ``complete -> finalize``; portanto os dois mecanismos não devem ser
+    combinados pelo orquestrador.
     """
     body: dict[str, Any] = {"size_bytes": int(size_bytes)}
     # O backend atual exige os dois sinais juntos enquanto o endpoint de
@@ -1832,9 +1831,11 @@ def upload_session(
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
-            # O Android passa isSessionAccepted(sessionId) em CADA complete.
-            # `finalize=True` significa que esta sessão já foi aceita.
-            session_complete=bool(finalize),
+            # Enquanto /sessions/{id}/finalize existir, ele é a única fonte de
+            # conclusão da sessão. Misturar o sinal migratório
+            # `session_complete` com esse endpoint deixa previews presos em
+            # `pending` no backend atual.
+            session_complete=False,
             fail_on_error=fail_on_error,
             sidecar=sidecar,
             sidecar_data=chunk_sidecar_data,
@@ -2103,13 +2104,11 @@ def pump_pending(
                     current_size: int = int(sidecar.get("size_bytes") or 0),
                     suppress: bool = bool(
                         sidecar.get("suppress_per_chunk_catbear")),
-                    session_complete: bool = bool(
-                        sidecar.get("finalize_requested")),
                 ) -> dict[str, Any]:
                     return complete_upload(
                         session, current_upload_id, current_size,
                         suppress_per_chunk_catbear=suppress,
-                        session_complete=session_complete,
+                        session_complete=False,
                     )
 
                 complete_data, attempts = _with_retry(

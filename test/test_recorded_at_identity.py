@@ -315,7 +315,7 @@ class UploadContractTests(unittest.TestCase):
         self.assertIs(session.body["session_complete"], True)
         self.assertIs(session.body["suppress_per_chunk_catbear"], True)
 
-    def test_session_complete_on_every_chunk_of_accepted_session(self) -> None:
+    def test_finalize_flow_does_not_mix_session_complete(self) -> None:
         class FakeSession:
             def __init__(self) -> None:
                 self.upload_bodies: list[dict] = []
@@ -373,9 +373,11 @@ class UploadContractTests(unittest.TestCase):
 
         self.assertTrue(result.finalized)
         self.assertEqual(len(session.complete_bodies), 2)
-        # O Android passa isSessionAccepted(sessionId) em cada PATCH complete.
-        self.assertIs(session.complete_bodies[0]["session_complete"], True)
-        self.assertIs(session.complete_bodies[1]["session_complete"], True)
+        # O QMoney usa o endpoint explícito /finalize. O sinal migratório do
+        # Android não pode ser combinado com ele: essa combinação prende a
+        # geração de previews no backend atual.
+        self.assertNotIn("session_complete", session.complete_bodies[0])
+        self.assertNotIn("session_complete", session.complete_bodies[1])
         self.assertIs(
             session.complete_bodies[0]["suppress_per_chunk_catbear"], True)
         self.assertIs(
