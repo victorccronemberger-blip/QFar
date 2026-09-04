@@ -4,6 +4,7 @@
 #include "UpdateManager.hpp"
 
 #include <QJsonArray>
+#include <QHash>
 #include <QJsonObject>
 #include <QMainWindow>
 #include <QProcess>
@@ -62,6 +63,8 @@ private:
   void navigate(int index);
   void refreshCurrentPage();
   void showError(const QString& title, const QString& error);
+  void showAccountIssues(const QString& title, const QStringList& blockers,
+                         const QJsonArray& issues);
   void setStatus(const QString& text);
 
   void loadHome();
@@ -94,6 +97,7 @@ private:
   QString encoded(const QString& value) const;
   oclero::qlementine::QlementineStyle* _style{};
   ApiClient _api;
+  QHash<QString, QJsonObject> _accountChecks;
   UpdateManager _updates;
   QProcess _backend;
   QTimer _backendProbe;

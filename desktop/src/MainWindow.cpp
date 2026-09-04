@@ -2,6 +2,7 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QColor>
 #include <QComboBox>
@@ -39,6 +40,7 @@
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScreen>
 #include <QSaveFile>
 #include <QSettings>
 #include <QSizePolicy>
@@ -1299,13 +1301,13 @@ QWidget* MainWindow::buildAccountsPage() {
   _accountsTable = new QTableWidget(0, 4);
   configureTable(_accountsTable);
   _accountsTable->setHorizontalHeaderLabels(
-      {QStringLiteral("Conta"), QStringLiteral("Organização"), QStringLiteral("Token"), QStringLiteral("Ações")});
+      {QStringLiteral("Conta"), QStringLiteral("Organização"), QStringLiteral("Última verificação"), QStringLiteral("Ações")});
   _accountsTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   _accountsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
   _accountsTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
   _accountsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
   _accountsTable->setColumnWidth(1, 220);
-  _accountsTable->setColumnWidth(2, 175);
+  _accountsTable->setColumnWidth(2, 245);
   _accountsTable->setColumnWidth(3, 232);
   _accountsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
 
@@ -1887,6 +1889,71 @@ void MainWindow::showError(const QString& title, const QString& error) {
   setStatus(error);
 }
 
+void MainWindow::showAccountIssues(const QString& title, const QStringList& blockers,
+                                  const QJsonArray& issues) {
+  const QString checkedAt = QDateTime::currentDateTime().toString(QStringLiteral("dd/MM/yyyy HH:mm:ss"));
+  QStringList sections;
+  sections << QStringLiteral("Verificação em %1").arg(checkedAt);
+  if (!blockers.isEmpty()) sections << blockers.join(QLatin1Char('\n'));
+  for (const auto& value : issues) {
+    const auto issue = value.toObject();
+    const QString email = issue.value(QStringLiteral("email")).toString();
+    sections << QStringLiteral("Conta: %1\nEtapa: %2\nMotivo: %3\nComo resolver: %4\nDetalhe: %5")
+        .arg(email, issue.value(QStringLiteral("stage")).toString(),
+             issue.value(QStringLiteral("reason")).toString(),
+             issue.value(QStringLiteral("action")).toString(),
+             issue.value(QStringLiteral("detail")).toString());
+    if (!email.isEmpty()) {
+      _accountChecks.insert(email, QJsonObject{
+          {QStringLiteral("status"), QStringLiteral("error")},
+          {QStringLiteral("checked_at"), checkedAt},
+          {QStringLiteral("error"), issue.value(QStringLiteral("reason"))}});
+    }
+  }
+  const QString report = sections.join(QStringLiteral("\n\n"));
+  QDialog dialog(this);
+  dialog.setWindowTitle(title);
+  dialog.setSizeGripEnabled(true);
+  const QSize available = screen()->availableGeometry().size();
+  dialog.resize(qMin(820, available.width() - 40), qMin(540, available.height() - 80));
+  auto* layout = new QVBoxLayout(&dialog);
+  layout->setContentsMargins(22, 20, 22, 20);
+  layout->setSpacing(14);
+  auto* heading = new QLabel(title);
+  heading->setWordWrap(true);
+  auto titleFont = heading->font();
+  titleFont.setPointSize(16);
+  titleFont.setBold(true);
+  heading->setFont(titleFont);
+  layout->addWidget(heading);
+  auto* explanation = new QLabel(QStringLiteral(
+      "A verificação não foi concluída para os itens abaixo. "
+      "Um token no prazo não garante acesso ao serviço. "
+      "Falhas de rede não significam necessariamente senha incorreta."));
+  explanation->setWordWrap(true);
+  layout->addWidget(explanation);
+  auto* details = new QPlainTextEdit;
+  details->setReadOnly(true);
+  details->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+  details->setPlainText(report);
+  layout->addWidget(details, 1);
+  auto* buttons = new QDialogButtonBox;
+  auto* copy = buttons->addButton(QStringLiteral("Copiar diagnóstico"), QDialogButtonBox::ActionRole);
+  auto* accounts = buttons->addButton(QStringLiteral("Abrir Contas"), QDialogButtonBox::ActionRole);
+  auto* close = buttons->addButton(QStringLiteral("Fechar"), QDialogButtonBox::RejectRole);
+  close->setDefault(true);
+  connect(copy, &QPushButton::clicked, &dialog, [report] { QApplication::clipboard()->setText(report); });
+  connect(accounts, &QPushButton::clicked, &dialog, [this, &dialog] {
+    dialog.accept();
+    _navigation->setCurrentRow(5);
+    navigate(5);
+  });
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addWidget(buttons);
+  setStatus(title);
+  dialog.exec();
+}
+
 void MainWindow::setStatus(const QString& text) {
   const QString full = text.simplified();
   const QString compact = full.size() > 180 ? full.left(177) + QStringLiteral("…") : full;
@@ -2354,8 +2421,21 @@ void MainWindow::startCampaign() {
     if (!result.value(QStringLiteral("ok")).toBool() || !blockerLines.isEmpty()) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       _campaignStart->setEnabled(true);
-      return showError(QStringLiteral("Campanha bloqueada pelo preflight"),
-                       blockerLines.join(QLatin1Char('\n')));
+      const auto issues = result.value(QStringLiteral("account_issues")).toArray();
+      const auto errors = result.value(QStringLiteral("account_errors")).toArray();
+      if (!issues.isEmpty()) {
+        for (const auto& value : errors)
+          blockerLines.removeAll(QStringLiteral("• ") + value.toString());
+      } else {
+        // Compatível com motores anteriores que já retornavam o erro da conta,
+        // mas cuja interface mostrava somente a contagem de falhas.
+        for (const auto& value : errors) {
+          const QString line = QStringLiteral("• ") + value.toString();
+          if (!blockerLines.contains(line)) blockerLines << line;
+        }
+      }
+      return showAccountIssues(QStringLiteral("Campanha não iniciada — verificação pendente"),
+                               blockerLines, issues);
     }
 
     const auto accountInfo = result.value(QStringLiteral("accounts")).toObject();
@@ -2629,8 +2709,18 @@ void MainWindow::loadAccounts() {
       _accountsTable->setItem(row, 0, cell(email));
       _accountsTable->setItem(row, 1, cell(account.value(QStringLiteral("org_key")).toString(QStringLiteral("não verificada"))));
       const qint64 expiry = static_cast<qint64>(account.value(QStringLiteral("expires_at")).toDouble());
-      _accountsTable->setItem(row, 2, cell(expiry > QDateTime::currentSecsSinceEpoch()
-          ? QStringLiteral("válido") : QStringLiteral("renovação necessária")));
+      const auto lastCheck = _accountChecks.value(email);
+      QString state = expiry > QDateTime::currentSecsSinceEpoch()
+          ? QStringLiteral("Token no prazo · não verificada")
+          : QStringLiteral("Acesso precisa ser verificado");
+      if (!lastCheck.isEmpty()) {
+        state = (lastCheck.value(QStringLiteral("status")).toString() == QStringLiteral("active")
+                     ? QStringLiteral("Acesso verificado · ") : QStringLiteral("Falha na verificação · "))
+                + lastCheck.value(QStringLiteral("checked_at")).toString();
+      }
+      auto* statusCell = cell(state);
+      statusCell->setToolTip(state + QStringLiteral("\n") + lastCheck.value(QStringLiteral("error")).toString());
+      _accountsTable->setItem(row, 2, statusCell);
       auto* actions = new QWidget;
       auto* actionsLayout = new QHBoxLayout(actions);
       actionsLayout->setContentsMargins(5, 5, 5, 5);
@@ -2639,9 +2729,18 @@ void MainWindow::loadAccounts() {
       check->setMinimumSize(86, 32);
       connect(check, &QPushButton::clicked, this, [this, email] {
         _api.post(QStringLiteral("/api/accounts/") + encoded(email) + QStringLiteral("/check"), {},
-          [this](bool ok, const QJsonDocument&, const QString& error) {
-            if (!ok) showError(QStringLiteral("Conta não validada"), error);
-            else { setStatus(QStringLiteral("Conta validada.")); loadAccounts(); }
+          [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
+            auto check = doc.object();
+            check.insert(QStringLiteral("status"), ok ? QStringLiteral("active") : QStringLiteral("error"));
+            check.insert(QStringLiteral("checked_at"), QDateTime::currentDateTime().toString(QStringLiteral("dd/MM HH:mm:ss")));
+            _accountChecks.insert(email, check);
+            if (!ok) {
+              const auto issue = check.value(QStringLiteral("issue")).toObject();
+              showAccountIssues(QStringLiteral("Conta não verificada"),
+                  issue.isEmpty() ? QStringList{email + QStringLiteral(": ") + error} : QStringList{},
+                  issue.isEmpty() ? QJsonArray{} : QJsonArray{issue});
+            } else setStatus(QStringLiteral("Acesso de %1 verificado agora.").arg(email));
+            loadAccounts();
           });
       });
       auto* remove = new QPushButton(QStringLiteral("Remover"));
@@ -2681,9 +2780,24 @@ void MainWindow::checkAllAccounts() {
     const int active = result.value(QStringLiteral("active")).toInt();
     const int disabled = result.value(QStringLiteral("disabled")).toArray().size();
     const int errors = result.value(QStringLiteral("errors")).toArray().size();
+    QJsonArray issues;
+    QStringList legacyErrors;
+    for (const auto& value : result.value(QStringLiteral("results")).toArray()) {
+      auto check = value.toObject();
+      const QString email = check.value(QStringLiteral("email")).toString();
+      check.insert(QStringLiteral("checked_at"), QDateTime::currentDateTime().toString(QStringLiteral("dd/MM HH:mm:ss")));
+      _accountChecks.insert(email, check);
+      if (check.value(QStringLiteral("status")).toString() != QStringLiteral("active")) {
+        const auto issue = check.value(QStringLiteral("issue")).toObject();
+        if (!issue.isEmpty()) issues.append(issue);
+        else legacyErrors << email + QStringLiteral(": ") + check.value(QStringLiteral("error")).toString();
+      }
+    }
     setStatus(QStringLiteral("Verificação concluída: %1 ativas · %2 desativadas · %3 com erro · %4 no total.")
                   .arg(active).arg(disabled).arg(errors).arg(total));
     loadAccounts();
+    if (!issues.isEmpty() || !legacyErrors.isEmpty())
+      showAccountIssues(QStringLiteral("Verificação concluída com pendências"), legacyErrors, issues);
   });
 }
 
@@ -2698,10 +2812,11 @@ void MainWindow::addAccount(bool registerNew) {
   const QString endpoint = registerNew ? QStringLiteral("/api/accounts/register")
                                        : QStringLiteral("/api/accounts");
   _api.post(endpoint, {{QStringLiteral("email"), email}, {QStringLiteral("password"), password}},
-            [this](bool ok, const QJsonDocument&, const QString& error) {
+            [this, email](bool ok, const QJsonDocument&, const QString& error) {
     _accountAdd->setEnabled(true);
     _accountRegister->setEnabled(true);
     if (!ok) return showError(QStringLiteral("Conta não conectada"), error);
+    _accountChecks.remove(email);
     _accountEmail->clear();
     _accountPassword->clear();
     setStatus(QStringLiteral("Conta conectada."));

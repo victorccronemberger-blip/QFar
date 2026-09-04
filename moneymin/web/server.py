@@ -79,6 +79,7 @@ from ..atomic_io import load_json, save_json
 from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import load_secure_settings, save_secure_settings
+from .account_issues import account_issue, issue_text
 from .runner import (
     BALANCES_RUNNER, HOLO_CACHE_RUNNER, RUNNER, friendly_campaign_error,
 )
@@ -468,12 +469,12 @@ def _check_account_health(email: str) -> dict[str, Any]:
             "expires_at": session.data.get("expires_at", 0),
         }
     except (AuthError, RuntimeError, OSError) as exc:
-        error = str(exc)
-        disabled = "conta desativada no hub" in error.lower()
+        issue = account_issue(email, exc)
+        disabled = issue["code"] == "restricted"
         return {
             "email": email,
             "status": "disabled" if disabled else "error",
-            "error": error,
+            "error": issue_text(issue), "issue": issue,
         }
 
 
@@ -669,13 +670,9 @@ def create_app() -> Flask:
 
     @app.post("/api/accounts/<email>/check")
     def check_account(email: str):
-        try:
-            sess = Session.from_email(email)
-            org_key = _resolve_org(email, session=sess)
-        except (AuthError, RuntimeError, OSError) as exc:
-            return jsonify({"error": str(exc)}), 400
-        return jsonify({"ok": True, "email": email, "org_key": org_key,
-                        "expires_at": sess.data.get("expires_at", 0)})
+        result = _check_account_health(email)
+        ok = result["status"] == "active"
+        return jsonify({"ok": ok, **result}), 200 if ok else 400
 
     @app.post("/api/accounts/check-all")
     def check_all_accounts():
@@ -696,9 +693,10 @@ def create_app() -> Flask:
                     try:
                         results_by_email[email] = future.result()
                     except Exception as exc:  # noqa: BLE001 — uma conta não mata o lote
+                        issue = account_issue(email, exc)
                         results_by_email[email] = {
                             "email": email, "status": "error",
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": issue_text(issue), "issue": issue,
                         }
         results = [results_by_email[email] for email in emails]
         return jsonify({
@@ -1082,40 +1080,41 @@ def create_app() -> Flask:
             blockers.append("selecione ao menos uma categoria")
         known = {account["email"] for account in _list_accounts()}
         missing_accounts = [email for email in emails if email not in known]
-        if missing_accounts:
-            blockers.append("há contas sem token salvo")
-
         accounts: list[AccountSpec] = []
         account_errors: list[str] = []
-        if emails and not missing_accounts:
+        account_issues: list[dict[str, Any]] = []
+        for email in missing_accounts:
+            account_issues.append(account_issue(email, AuthError("sem token salvo")))
+        if emails:
             resolved: list[AccountSpec | None] = [None] * len(emails)
             with ThreadPoolExecutor(max_workers=max(1, min(6, len(emails)))) as pool:
                 futures = {pool.submit(_resolve_org, email): i
-                           for i, email in enumerate(emails)}
+                           for i, email in enumerate(emails) if email in known}
                 for future in as_completed(futures):
                     index = futures[future]
                     try:
                         resolved[index] = AccountSpec(emails[index], future.result())
                     except (AuthError, RuntimeError, OSError) as exc:
-                        account_errors.append(f"{emails[index]}: {exc}")
+                        account_issues.append(account_issue(emails[index], exc))
             accounts = [account for account in resolved if account is not None]
-            if account_errors:
-                blockers.append(f"{len(account_errors)} conta(s) não autenticaram")
 
         selected: list[dict[str, Any]] = []
         unavailable: list[str] = []
+        catalog_loaded = False
         if accounts and raw_tasks:
             try:
                 catalog = campaign.available_tasks(
                     accounts[0].email, accounts[0].org_key,
                     min_dur_s=min_dur_s, max_dur_s=max_dur_s,
                     include_unavailable=True, dataset_provider=provider)
+                catalog_loaded = True
             except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
-                blockers.append(f"catálogo indisponível: {exc}")
+                account_issues.append(account_issue(
+                    accounts[0].email, exc, stage="Carregamento das categorias"))
                 catalog = []
             by_id = {str(item.get("id")): item for item in catalog if item.get("id")}
             seen: set[str] = set()
-            for raw in raw_tasks:
+            for raw in raw_tasks if catalog_loaded else []:
                 task_id = str(raw.get("task_id", "")).strip() if isinstance(raw, dict) else ""
                 item = by_id.get(task_id)
                 if not task_id or item is None:
@@ -1140,7 +1139,8 @@ def create_app() -> Flask:
                         if item.get("id")
                     }
                 except (AuthError, RuntimeError, OSError) as exc:
-                    blockers.append(f"preflight falhou para {account.email}: {exc}")
+                    account_issues.append(account_issue(
+                        account.email, exc, stage="Consulta das categorias"))
                     continue
                 missing = selected_ids - account_ids
                 if missing:
@@ -1150,8 +1150,14 @@ def create_app() -> Flask:
 
         if unavailable:
             warnings.append(f"{len(unavailable)} categoria(s) sem clipe na duração escolhida")
-        if raw_tasks and not selected:
+        if raw_tasks and catalog_loaded and not selected:
             blockers.append("nenhuma categoria selecionada possui clipe compatível")
+
+        account_issues.sort(key=lambda item: (emails.index(item["email"]), item["stage"]))
+        account_errors = [issue_text(item) for item in account_issues]
+        # Compatibilidade: clientes antigos leem apenas blockers. Não esconder
+        # a conta nem classificar falhas de rede como credenciais inválidas.
+        blockers.extend(account_errors)
 
         clip_count = sum(int(item.get("clip_count") or 0) for item in selected)
         if target_hours > 0:
@@ -1187,6 +1193,7 @@ def create_app() -> Flask:
             "blockers": blockers,
             "warnings": warnings,
             "account_errors": account_errors,
+            "account_issues": account_issues,
             "readiness": ready,
             "storage": storage,
         }), 200
