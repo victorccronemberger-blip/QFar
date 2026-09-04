@@ -1,11 +1,14 @@
 param(
-    [string]$Version = "1.0.25",
-    [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64"
+    [string]$Version = "1.0.26",
+    [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
+    [switch]$Staging
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $OutputDir = Join-Path $ProjectRoot "dist"
+# Permite preparar uma atualização sem apagar o pacote que está em uso.
+if ($Staging) { $OutputDir = Join-Path $OutputDir "staging" }
 $WorkDir = Join-Path $OutputDir "work"
 $BuildDir = Join-Path $WorkDir "cmake"
 $QtRoot = (Resolve-Path $QtRoot).Path
@@ -17,6 +20,14 @@ $env:QMONEY_VERSION = $Version
 # Remover o pacote anterior evita misturar DLLs/runtime de versões diferentes.
 $Package = Join-Path $OutputDir "QMoney"
 $OutputPrefix = $OutputDir.TrimEnd('\') + '\'
+# Não remover parcialmente uma instalação que o usuário está executando.
+$PackagePrefix = [System.IO.Path]::GetFullPath($Package).TrimEnd('\') + '\'
+$ActivePackage = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and $_.Path.StartsWith($PackagePrefix, [System.StringComparison]::OrdinalIgnoreCase)
+} | Select-Object -First 1
+if ($ActivePackage) {
+    throw "O pacote de destino está em uso. Use -Staging ou feche o QMoney antes de compilar."
+}
 foreach ($GeneratedDir in @($WorkDir, $Package)) {
     $FullGeneratedDir = [System.IO.Path]::GetFullPath($GeneratedDir)
     if (-not $FullGeneratedDir.StartsWith(

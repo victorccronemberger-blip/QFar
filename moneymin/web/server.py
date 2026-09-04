@@ -915,6 +915,16 @@ def create_app() -> Flask:
     def get_storage_library():
         return jsonify(_storage_snapshot(include_path=True))
 
+    @app.get("/api/health")
+    def get_health():
+        """Handshake leve: nunca abrir ferramentas, ler contas ou percorrer mídia."""
+        return jsonify({
+            "ok": True,
+            "service": {
+                "app_version": os.environ.get("QMONEY_APP_VERSION", "unknown"),
+            },
+        })
+
     @app.get("/api/diagnostics")
     def get_diagnostics():
         """Relatório deliberadamente sem emails, tokens, senhas ou URLs privadas."""

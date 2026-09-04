@@ -33,6 +33,8 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   QNetworkRequest req(QUrl(_baseUrl + path));
   req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
   req.setRawHeader("Accept", "application/json");
+  // Limite apenas do handshake: operações longas mantêm seu comportamento.
+  if (path == QStringLiteral("/api/health")) req.setTransferTimeout(3000);
 
   QNetworkReply* reply = nullptr;
   const QByteArray payload = body ? QJsonDocument(*body).toJson(QJsonDocument::Compact) : QByteArray();
@@ -59,4 +61,3 @@ void ApiClient::request(const QByteArray& method, const QString& path,
     callback(ok && error.isEmpty(), doc, error);
   });
 }
-

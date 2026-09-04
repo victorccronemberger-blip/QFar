@@ -36,6 +36,9 @@ def _binary_works(command: str) -> bool:
             stderr=subprocess.DEVNULL,
             timeout=15,
             check=False,
+            # Redirecionar stdout não impede o Windows de abrir um console.
+            # run() também mata e aguarda este filho se o prazo expirar.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return False

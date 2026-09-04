@@ -107,6 +107,8 @@ private:
   QTimer _balancePoll;
   QTimer _cachePoll;
   int _probeAttempts{};
+  int _probeGeneration{};
+  bool _probeInFlight{};
   int _backendRestarts{};
   bool _backendReady{};
   bool _closing{};

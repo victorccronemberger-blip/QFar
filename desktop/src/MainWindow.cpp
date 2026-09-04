@@ -1701,6 +1701,8 @@ void MainWindow::installUpdate(const QString& packagePath) {
 }
 
 void MainWindow::startBackend() {
+  ++_probeGeneration;
+  _probeInFlight = false;
   const QString appDir = QCoreApplication::applicationDirPath();
   QString packagedService = provisionEmbeddedService();
   if (packagedService.isEmpty())
@@ -1755,6 +1757,11 @@ void MainWindow::startBackend() {
   _backend.setWorkingDirectory(workingDirectory);
   _backend.setProcessEnvironment(environment);
   _backend.setProcessChannelMode(QProcess::MergedChannels);
+#ifdef Q_OS_WIN
+  _backend.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
+    args->flags |= CREATE_NO_WINDOW;
+  });
+#endif
   disconnect(&_backend, nullptr, this, nullptr);
   connect(&_backend, &QProcess::readyReadStandardOutput, this, [this] {
     const QString output = QString::fromUtf8(_backend.readAllStandardOutput()).trimmed();
@@ -1784,6 +1791,8 @@ void MainWindow::startBackend() {
 
 void MainWindow::stopBackend() {
   _backendProbe.stop();
+  ++_probeGeneration;
+  _probeInFlight = false;
   if (_backend.state() != QProcess::NotRunning) {
     _backend.terminate();
     if (!_backend.waitForFinished(1800)) {
@@ -1805,9 +1814,14 @@ void MainWindow::restartBackend() {
 }
 
 void MainWindow::probeBackend() {
+  if (_closing || _restartingBackend || _backendReady || _probeInFlight) return;
+  _probeInFlight = true;
+  const int generation = _probeGeneration;
   ++_probeAttempts;
-  _api.get(QStringLiteral("/api/diagnostics"),
-           [this](bool ok, const QJsonDocument& document, const QString&) {
+  _api.get(QStringLiteral("/api/health"),
+           [this, generation](bool ok, const QJsonDocument& document, const QString&) {
+    if (generation != _probeGeneration || _closing) return;
+    _probeInFlight = false;
     const QString serviceVersion = document.object()
                                        .value(QStringLiteral("service"))
                                        .toObject()
@@ -1819,11 +1833,11 @@ void MainWindow::probeBackend() {
       _backendRestarts = 0;
       setBackendReady(true);
       refreshCurrentPage();
-    } else if (ok && !serviceVersion.isEmpty()) {
-      setBackendReady(false, QStringLiteral("Ajustando versão do motor…"));
     } else if (_probeAttempts > 22) {
       _backendProbe.stop();
       setBackendReady(false, QStringLiteral("Serviço indisponível"));
+    } else if (ok && !serviceVersion.isEmpty()) {
+      setBackendReady(false, QStringLiteral("Versão do motor incompatível"));
     }
   });
 }
