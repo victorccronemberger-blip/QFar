@@ -1028,6 +1028,32 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* reloadTasks = new QPushButton(QStringLiteral("Recarregar categorias"));
   connect(reloadTasks, &QPushButton::clicked, this, &MainWindow::loadTasks);
   sourceLayout->addWidget(reloadTasks);
+  _campaignReset = new QPushButton(QStringLiteral("Resetar lista"));
+  _campaignReset->setToolTip(QStringLiteral(
+      "Limpa a lista de vídeos já utilizados e permite que eles sejam selecionados novamente."));
+  connect(_campaignReset, &QPushButton::clicked, this, [this] {
+    const auto choice = QMessageBox::warning(
+        this, QStringLiteral("Resetar lista de vídeos usados"),
+        QStringLiteral("Os vídeos registrados como já utilizados poderão ser selecionados "
+                       "novamente nas próximas campanhas.\n\n"
+                       "O histórico das campanhas e os dados das contas serão preservados. "
+                       "Deseja continuar?"),
+        QMessageBox::Reset | QMessageBox::Cancel, QMessageBox::Cancel);
+    if (choice != QMessageBox::Reset) return;
+    _campaignReset->setEnabled(false);
+    _campaignReset->setText(QStringLiteral("Resetando…"));
+    _api.post(QStringLiteral("/api/sent/reset"), {},
+              [this](bool ok, const QJsonDocument&, const QString& error) {
+      _campaignReset->setText(QStringLiteral("Resetar lista"));
+      _campaignReset->setEnabled(!_campaignActive);
+      if (!ok)
+        return showError(QStringLiteral("Lista não resetada"), error);
+      setStatus(QStringLiteral(
+          "Lista de vídeos usados resetada. O histórico foi preservado."));
+      loadTasks();
+    });
+  });
+  sourceLayout->addWidget(_campaignReset);
   layout->addWidget(card(QStringLiteral("Conteúdo da campanha"), sourceBody));
 
   auto* selection = new QWidget;
@@ -2303,6 +2329,12 @@ void MainWindow::exportDiagnostics() {
 }
 
 void MainWindow::loadCampaignData() {
+  // Até o motor responder, mantenha ações destrutivas e uma nova partida
+  // bloqueadas. Isso evita uma janela curta em que a tela ainda não conhece
+  // uma campanha em execução ou encerramento.
+  _campaignActive = true;
+  _campaignStart->setEnabled(false);
+  _campaignReset->setEnabled(false);
   _api.get(QStringLiteral("/api/accounts"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
     if (!ok) return showError(QStringLiteral("Falha ao carregar contas"), error);
     const QSignalBlocker blocker(_campaignAccounts);
@@ -2373,7 +2405,7 @@ void MainWindow::loadTasks() {
       }
       _campaignTasks->addItem(item);
     }
-    _campaignStart->setEnabled(compatible > 0 && !_campaignStop->isEnabled());
+    _campaignStart->setEnabled(compatible > 0 && !_campaignActive);
     if (compatible == 0) {
       setStatus(QStringLiteral("Nenhuma categoria tem clipe compatível nesta origem e duração."));
     } else {
@@ -2448,6 +2480,9 @@ void MainWindow::startCampaign() {
           if (!blockerLines.contains(line)) blockerLines << line;
         }
       }
+      if (issues.isEmpty())
+        return showError(QStringLiteral("Campanha não iniciada"),
+                         blockerLines.join(QLatin1Char('\n')));
       return showAccountIssues(QStringLiteral("Campanha não iniciada — verificação pendente"),
                                blockerLines, issues);
     }
@@ -2473,12 +2508,24 @@ void MainWindow::startCampaign() {
 
     _campaignStart->setText(QStringLiteral("Iniciando…"));
     _api.post(QStringLiteral("/api/campaigns"), body,
-              [this](bool started, const QJsonDocument&, const QString& startError) {
+              [this](bool started, const QJsonDocument& startDoc, const QString& startError) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       if (!started) {
-        _campaignStart->setEnabled(true);
+        _campaignStart->setEnabled(!_campaignActive);
         return showError(QStringLiteral("Campanha não iniciada"), startError);
       }
+      if (startDoc.object().value(QStringLiteral("already_running")).toBool()) {
+        _campaignActive = true;
+        _campaignStart->setEnabled(false);
+        _campaignReset->setEnabled(false);
+        _campaignPoll.start();
+        pollCampaign();
+        return showError(QStringLiteral("Campanha já em andamento"),
+                         QStringLiteral("A campanha anterior ainda está executando ou encerrando. "
+                                        "Aguarde a conclusão antes de iniciar outra."));
+      }
+      _campaignActive = true;
+      _campaignReset->setEnabled(false);
       _lastCampaignSeq = 0;
       _previewPoll.stop();
       _previewLogName.clear();
@@ -2499,8 +2546,10 @@ void MainWindow::pollCampaign() {
     const auto snap = doc.object();
     const QString state = snap.value(QStringLiteral("state")).toString();
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
+    _campaignActive = running;
     _campaignStop->setEnabled(running && state != QStringLiteral("stopping"));
     _campaignStart->setEnabled(!running);
+    _campaignReset->setEnabled(!running);
     const QHash<QString, QString> stateLabels{
         {QStringLiteral("idle"), QStringLiteral("Aguardando")},
         {QStringLiteral("running"), QStringLiteral("Em andamento")},

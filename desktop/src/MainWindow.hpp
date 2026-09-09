@@ -175,6 +175,7 @@ private:
   QSpinBox* _hourEnd{};
   QPushButton* _campaignStart{};
   QPushButton* _campaignStop{};
+  QPushButton* _campaignReset{};
   QProgressBar* _campaignProgress{};
   QLabel* _campaignStage{};
   QLabel* _campaignCurrent{};
@@ -185,6 +186,7 @@ private:
   int _lastCampaignSeq{};
   QString _previewLogName;
   bool _previewCheckActive{};
+  bool _campaignActive{};
 
   QComboBox* _cacheTask{};
   QSpinBox* _cacheLimit{};

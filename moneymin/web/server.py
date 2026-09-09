@@ -1745,6 +1745,10 @@ def create_app() -> Flask:
 
     @app.post("/api/sent/reset")
     def reset_sent():
+        if RUNNER.running:
+            return jsonify({
+                "error": "aguarde a campanha terminar antes de resetar a lista de vídeos usados",
+            }), 409
         body = request.get_json(silent=True) or {}
         scenario = body.get("scenario")
         sent_registry.reset(str(scenario) if scenario else None)
