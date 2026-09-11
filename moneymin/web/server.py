@@ -158,6 +158,37 @@ def _save_prefs(prefs: dict[str, Any]) -> None:
         save_json(PREFS_PATH, prefs)
 
 
+def _removed_accounts_path() -> Path:
+    """Registro local que impede a migração de ressuscitar contas removidas."""
+    return config.DATA_DIR / "removed_accounts.json"
+
+
+def _removed_accounts() -> set[str]:
+    value = load_json(_removed_accounts_path(), {})
+    emails = value.get("emails", []) if isinstance(value, dict) else []
+    return {
+        str(email).strip().casefold()
+        for email in emails
+        if str(email).strip()
+    }
+
+
+def _set_account_removed(email: str, removed: bool) -> None:
+    normalized = email.strip().casefold()
+    if not normalized:
+        return
+    with _PERSISTENCE_LOCK:
+        emails = _removed_accounts()
+        if removed:
+            emails.add(normalized)
+        else:
+            emails.discard(normalized)
+        save_json(_removed_accounts_path(), {
+            "schema": 1,
+            "emails": sorted(emails),
+        })
+
+
 # --- integrações protegidas -------------------------------------------------
 
 def _legacy_aws_credentials() -> dict[str, str]:
@@ -419,6 +450,7 @@ def _list_accounts() -> list[dict[str, Any]]:
     """Contas = token_*.json em secrets/ (sem rede). org_key vem do cache de prefs."""
     prefs = _load_prefs()
     org_keys = prefs.get("org_keys", {})
+    removed = _removed_accounts()
     out: list[dict[str, Any]] = []
     for path in sorted(config.tokens_dir().glob("token_*.json")):
         try:
@@ -427,6 +459,8 @@ def _list_accounts() -> list[dict[str, Any]]:
             continue
         email = data.get("email")
         if not email:
+            continue
+        if str(email).strip().casefold() in removed:
             continue
         out.append({
             "email": email,
@@ -525,11 +559,23 @@ def _remove_account_data(email: str) -> None:
     with _PERSISTENCE_LOCK:
         stored = load_json(CROWTADO_PW_PATH, {})
         creds = stored if isinstance(stored, dict) else {}
-        if creds.pop(email, None) is not None:
+        matching_creds = [
+            key for key in creds
+            if str(key).casefold() == email.casefold()
+        ]
+        for key in matching_creds:
+            creds.pop(key, None)
+        if matching_creds:
             save_json(CROWTADO_PW_PATH, creds)
 
         balances = _load_balances()
-        if balances.pop(email, None) is not None:
+        matching_balances = [
+            key for key in balances
+            if str(key).casefold() == email.casefold()
+        ]
+        for key in matching_balances:
+            balances.pop(key, None)
+        if matching_balances:
             _save_balances(balances)
     crowtado.clear_cached_session(email)
 
@@ -616,6 +662,7 @@ def create_app() -> Flask:
             login(email, password)
         except (RuntimeError, OSError) as exc:
             return jsonify({"error": str(exc)}), 400
+        _set_account_removed(email, False)
         # A tela pede a senha da identidade Minute / Crowtado. Antes este
         # caminho salvava somente o token Minute, então a mesma conta aparecia
         # em Saldos como se não fosse uma conta Crowtado.
@@ -646,6 +693,7 @@ def create_app() -> Flask:
                 created = False
             except RuntimeError as exc:
                 return jsonify({"error": str(exc)}), 400
+        _set_account_removed(email, False)
         _save_crowtado_cred(email, password)
         return jsonify({"ok": True, "email": email, "created": created})
 
@@ -658,14 +706,31 @@ def create_app() -> Flask:
         path = config.token_path(email)
         if not path.exists():
             return jsonify({"error": f"conta não encontrada: {email}"}), 404
-        path.unlink()
-        prefs = _load_prefs()
-        prefs.get("org_keys", {}).pop(email, None)
-        selected = prefs.get("selected_accounts")
-        if isinstance(selected, list):
-            prefs["selected_accounts"] = [e for e in selected if e != email]
-        _save_prefs(prefs)
-        _remove_account_data(email)
+        # Grave primeiro a intenção. Mesmo se o Windows interromper a remoção
+        # física, a conta já não reaparece nem volta para uma campanha.
+        _set_account_removed(email, True)
+        try:
+            path.unlink(missing_ok=True)
+            prefs = _load_prefs()
+            normalized = email.casefold()
+            org_keys = prefs.get("org_keys", {})
+            if isinstance(org_keys, dict):
+                for key in list(org_keys):
+                    if str(key).casefold() == normalized:
+                        org_keys.pop(key, None)
+            selected = prefs.get("selected_accounts")
+            if isinstance(selected, list):
+                prefs["selected_accounts"] = [
+                    value for value in selected
+                    if str(value).casefold() != normalized
+                ]
+            _save_prefs(prefs)
+            _remove_account_data(email)
+        except OSError as exc:
+            return jsonify({
+                "ok": True,
+                "warning": f"a conta não voltará, mas alguns dados locais aguardam nova tentativa de limpeza: {exc}",
+            })
         return jsonify({"ok": True})
 
     @app.post("/api/accounts/<email>/check")

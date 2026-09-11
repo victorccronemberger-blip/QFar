@@ -27,6 +27,8 @@
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QJsonValue>
 #include <QLabel>
 #include <QLineEdit>
@@ -42,6 +44,7 @@
 #include <QScrollArea>
 #include <QScreen>
 #include <QSaveFile>
+#include <QSet>
 #include <QSettings>
 #include <QSizePolicy>
 #include <QSpinBox>
@@ -241,6 +244,32 @@ void copyIfNewer(const QString& source, const QString& destination) {
   QFile(destination).setFileTime(src.lastModified(), QFileDevice::FileModificationTime);
 }
 
+QSet<QString> removedAccounts(const QString& userRoot) {
+  QSet<QString> removed;
+  QFile file(userRoot + QStringLiteral("/data/removed_accounts.json"));
+  if (!file.open(QIODevice::ReadOnly)) return removed;
+  const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+  if (!document.isObject()) return removed;
+  for (const QJsonValue& value : document.object().value(QStringLiteral("emails")).toArray()) {
+    const QString email = value.toString().trimmed().toCaseFolded();
+    if (!email.isEmpty()) removed.insert(email);
+  }
+  return removed;
+}
+
+bool belongsToRemovedAccount(const QString& tokenPath, const QSet<QString>& removed) {
+  if (removed.isEmpty()) return false;
+  const QString name = QFileInfo(tokenPath).fileName();
+  if (!name.startsWith(QStringLiteral("token_")) ||
+      !name.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) return false;
+  QFile file(tokenPath);
+  if (!file.open(QIODevice::ReadOnly)) return false;
+  const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+  const QString email = document.object().value(QStringLiteral("email"))
+                            .toString().trimmed().toCaseFolded();
+  return !email.isEmpty() && removed.contains(email);
+}
+
 void migrateLegacyState(const QString& legacyRoot, const QString& userRoot) {
   if (QDir::cleanPath(legacyRoot) == QDir::cleanPath(userRoot)) return;
   const QDir legacyData(legacyRoot + QStringLiteral("/data"));
@@ -248,8 +277,13 @@ void migrateLegacyState(const QString& legacyRoot, const QString& userRoot) {
   const QStringList stateFiles = legacyData.entryList(
       {QStringLiteral("*.json"), QStringLiteral("*.jsonl"), QStringLiteral("*.pkl")},
       QDir::Files);
-  for (const QString& name : stateFiles)
+  for (const QString& name : stateFiles) {
+    // É uma decisão do usuário, não conteúdo da biblioteca. Nunca permita que
+    // um estado empacotado/legado mais novo substitua suas exclusões locais.
+    if (name.compare(QStringLiteral("removed_accounts.json"), Qt::CaseInsensitive) == 0)
+      continue;
     copyIfNewer(legacyData.filePath(name), userData.filePath(name));
+  }
 
   const QStringList stateDirectories = {QStringLiteral("device_state")};
   for (const QString& directory : stateDirectories) {
@@ -262,11 +296,13 @@ void migrateLegacyState(const QString& legacyRoot, const QString& userRoot) {
     }
   }
 
+  const QSet<QString> removed = removedAccounts(userRoot);
   const QDir legacySecrets(legacyRoot + QStringLiteral("/secrets"));
   const QDir userSecrets(userRoot + QStringLiteral("/secrets"));
   QDirIterator secretFiles(legacySecrets.absolutePath(), QDir::Files, QDirIterator::Subdirectories);
   while (secretFiles.hasNext()) {
     const QString source = secretFiles.next();
+    if (belongsToRemovedAccount(source, removed)) continue;
     const QString relative = legacySecrets.relativeFilePath(source);
     copyIfNewer(source, userSecrets.filePath(relative));
   }
@@ -2810,11 +2846,18 @@ void MainWindow::loadAccounts() {
       remove->setMinimumSize(86, 32);
       connect(remove, &QPushButton::clicked, this, [this, email] {
         if (QMessageBox::question(this, QStringLiteral("Remover conta"),
-              QStringLiteral("Remover %1 deste QMoney?").arg(email)) != QMessageBox::Yes) return;
+              QStringLiteral("Remover definitivamente %1 deste QMoney?\n\n"
+                             "O acesso salvo será apagado e não voltará ao reiniciar. "
+                             "O histórico de campanhas será preservado.").arg(email))
+            != QMessageBox::Yes) return;
         _api.remove(QStringLiteral("/api/accounts/") + encoded(email),
-                    [this](bool ok, const QJsonDocument&, const QString& error) {
+                    [this, email](bool ok, const QJsonDocument&, const QString& error) {
           if (!ok) showError(QStringLiteral("Conta não removida"), error);
-          else loadAccounts();
+          else {
+            _accountChecks.remove(email);
+            setStatus(QStringLiteral("%1 removida definitivamente deste QMoney.").arg(email));
+            loadAccounts();
+          }
         });
       });
       actionsLayout->addWidget(check);
