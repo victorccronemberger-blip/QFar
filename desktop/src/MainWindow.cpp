@@ -956,33 +956,48 @@ QWidget* MainWindow::buildIntegrationsPage() {
   _hostingerStatus->setObjectName(QStringLiteral("integrationStatus"));
   hostLayout->addWidget(_hostingerStatus);
   auto* hostHelp = quietLabel(QStringLiteral(
-      "A Hostinger lê os códigos de verificação usados em novos cadastros. "
-      "Para trocar a API, digite o novo token e salve; o valor protegido nunca é exibido."));
+      "Cole o token da API. O QMoney identifica sozinho as caixas, os endereços e "
+      "os domínios, e passa a buscar cada código no lugar certo."));
   hostHelp->setWordWrap(true);
   hostLayout->addWidget(hostHelp);
   auto* hostFormBody = new QWidget;
   auto* hostForm = new QFormLayout(hostFormBody);
   configureForm(hostForm);
   hostForm->setContentsMargins(0, 0, 0, 0);
+  auto* hostSelector = new QWidget;
+  auto* hostSelectorLayout = new QHBoxLayout(hostSelector);
+  hostSelectorLayout->setContentsMargins(0, 0, 0, 0);
+  hostSelectorLayout->setSpacing(8);
+  _hostingerProfile = new QComboBox;
+  configureCombo(_hostingerProfile, 480);
+  _hostingerProfile->setMinimumHeight(46);
+  connect(_hostingerProfile, qOverload<int>(&QComboBox::currentIndexChanged),
+          this, &MainWindow::selectHostingerIntegration);
+  hostSelectorLayout->addWidget(_hostingerProfile, 1);
+  _hostingerRemove = new QPushButton(QStringLiteral("Remover"));
+  connect(_hostingerRemove, &QPushButton::clicked,
+          this, &MainWindow::removeHostingerIntegration);
+  hostSelectorLayout->addWidget(_hostingerRemove);
+  hostForm->addRow(QStringLiteral("Caixas conectadas"), hostSelector);
   _hostingerToken = new QLineEdit;
   _hostingerToken->setEchoMode(QLineEdit::Password);
-  _hostingerToken->setPlaceholderText(QStringLiteral("Token da API Mail da Hostinger"));
-  hostForm->addRow(QStringLiteral("Token da API"), _hostingerToken);
+  _hostingerToken->setPlaceholderText(
+      QStringLiteral("Cole o token de outra conta Hostinger"));
+  hostForm->addRow(QStringLiteral("Adicionar API"), _hostingerToken);
   connect(_hostingerToken, &QLineEdit::textChanged, this, [this] {
-    if (!_hostingerToken->text().trimmed().isEmpty())
-      _hostingerTest->setEnabled(true);
+    const bool entered = !_hostingerToken->text().trimmed().isEmpty();
+    _hostingerTest->setEnabled(entered || _hostingerProfile->currentIndex() >= 0);
+    _hostingerSave->setEnabled(entered);
   });
-  _hostingerMailbox = new QLineEdit;
-  _hostingerMailbox->setPlaceholderText(QStringLiteral("Em branco usa automaticamente a primeira caixa"));
-  hostForm->addRow(QStringLiteral("ID da caixa"), _hostingerMailbox);
   hostLayout->addWidget(hostFormBody);
   auto* hostActions = new QHBoxLayout;
   hostActions->addStretch();
-  _hostingerTest = new QPushButton(QStringLiteral("Testar conexão"));
+  _hostingerTest = new QPushButton(QStringLiteral("Testar"));
   connect(_hostingerTest, &QPushButton::clicked,
           this, &MainWindow::testHostingerIntegration);
   hostActions->addWidget(_hostingerTest);
-  _hostingerSave = primaryButton(QStringLiteral("Validar e salvar"));
+  _hostingerSave = primaryButton(QStringLiteral("Identificar e conectar"));
+  _hostingerSave->setEnabled(false);
   connect(_hostingerSave, &QPushButton::clicked,
           this, &MainWindow::saveHostingerIntegration);
   hostActions->addWidget(_hostingerSave);
@@ -2189,22 +2204,37 @@ void MainWindow::loadIntegrations() {
     if (egoConfigured && !egoCatalog && !_ego4dCatalogPreparing)
       prepareEgo4dCatalog();
 
-    const QString hostHint = host.value(QStringLiteral("token_hint")).toString();
-    const QString mailboxHint = host.value(QStringLiteral("mailbox_hint")).toString();
+    const auto hostProfiles = host.value(QStringLiteral("profiles")).toArray();
+    const QString selectedHostId = _hostingerProfile->currentData().toMap()
+                                       .value(QStringLiteral("id")).toString();
+    {
+      const QSignalBlocker blocker(_hostingerProfile);
+      _hostingerProfile->clear();
+      int selectedIndex = -1;
+      for (const QJsonValue& value : hostProfiles) {
+        const auto profile = value.toObject();
+        const QString name = profile.value(QStringLiteral("name")).toString(
+            QStringLiteral("Caixa Hostinger"));
+        const QString hint = profile.value(QStringLiteral("token_hint")).toString();
+        _hostingerProfile->addItem(
+            hint.isEmpty() ? name : QStringLiteral("%1 · %2").arg(name, hint),
+            profile.toVariantMap());
+        if (profile.value(QStringLiteral("id")).toString() == selectedHostId)
+          selectedIndex = _hostingerProfile->count() - 1;
+      }
+      if (_hostingerProfile->count() > 0)
+        _hostingerProfile->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
+    }
+    fitComboPopup(_hostingerProfile);
+    selectHostingerIntegration(_hostingerProfile->currentIndex());
+    const int hostCount = host.value(QStringLiteral("connection_count")).toInt();
     _hostingerStatus->setText(hostConfigured
-        ? QStringLiteral("● Token protegido %1 · caixa %2")
-              .arg(hostHint, mailboxHint.isEmpty() ? QStringLiteral("automática") : mailboxHint)
-        : QStringLiteral("● Token ainda não configurado"));
+        ? QStringLiteral("● %1 caixa(s) identificada(s) e disponível(is)").arg(hostCount)
+        : QStringLiteral("● Nenhuma caixa conectada"));
     _hostingerStatus->setProperty("integrationState", hostConfigured ? "ok" : "missing");
     _hostingerStatus->style()->unpolish(_hostingerStatus);
     _hostingerStatus->style()->polish(_hostingerStatus);
-    _hostingerToken->setPlaceholderText(hostConfigured
-        ? QStringLiteral("Protegido %1 — digite somente para substituir").arg(hostHint)
-        : QStringLiteral("Token da API Mail da Hostinger"));
-    _hostingerTest->setEnabled(hostConfigured);
-    _hostingerSave->setText(hostConfigured
-        ? QStringLiteral("Salvar alterações")
-        : QStringLiteral("Validar e salvar"));
+    if (!hostConfigured) selectHostingerIntegration(-1);
 
     _holoIntegrationStatus->setText(holoReady
         ? QStringLiteral("✓ Catálogo e índices instalados. Nenhuma credencial necessária.")
@@ -2287,20 +2317,19 @@ void MainWindow::prepareEgo4dCatalog() {
 
 void MainWindow::saveHostingerIntegration() {
   QJsonObject body;
-  if (!_hostingerToken->text().trimmed().isEmpty())
-    body.insert(QStringLiteral("token"), _hostingerToken->text().trimmed());
-  // O campo sempre vai no PUT: vazio significa voltar para a primeira caixa
-  // automática; omitir preservaria para sempre um ID antigo.
-  body.insert(QStringLiteral("mailbox_id"), _hostingerMailbox->text().trimmed());
+  body.insert(QStringLiteral("auto_detect"), true);
+  body.insert(QStringLiteral("token"), _hostingerToken->text().trimmed());
   _hostingerSave->setEnabled(false);
-  _hostingerSave->setText(QStringLiteral("Validando…"));
+  _hostingerSave->setText(QStringLiteral("Identificando…"));
   _api.put(QStringLiteral("/api/integrations/hostinger"), body,
-           [this](bool ok, const QJsonDocument&, const QString& error) {
+           [this](bool ok, const QJsonDocument& doc, const QString& error) {
     _hostingerSave->setEnabled(true);
+    _hostingerSave->setText(QStringLiteral("Identificar e conectar"));
     if (!ok) return showError(QStringLiteral("Hostinger não configurada"), error);
     _hostingerToken->clear();
-    _hostingerMailbox->clear();
-    setStatus(QStringLiteral("Configuração da Hostinger validada e protegida pelo Windows."));
+    const int detected = doc.object().value(QStringLiteral("detected_count")).toInt();
+    setStatus(QStringLiteral("%1 caixa(s) identificada(s) e conectada(s) automaticamente.")
+                  .arg(detected));
     loadIntegrations();
     loadReadiness();
   });
@@ -2308,20 +2337,56 @@ void MainWindow::saveHostingerIntegration() {
 
 void MainWindow::testHostingerIntegration() {
   QJsonObject body;
-  if (!_hostingerToken->text().trimmed().isEmpty())
+  const auto profile = _hostingerProfile->currentData().toMap();
+  const QString profileId = profile.value(QStringLiteral("id")).toString();
+  if (!_hostingerToken->text().trimmed().isEmpty()) {
     body.insert(QStringLiteral("token"), _hostingerToken->text().trimmed());
-  if (!_hostingerMailbox->text().trimmed().isEmpty())
-    body.insert(QStringLiteral("mailbox_id"), _hostingerMailbox->text().trimmed());
+  } else if (!profileId.isEmpty()) {
+    body.insert(QStringLiteral("profile_id"), profileId);
+  }
   _hostingerTest->setEnabled(false);
   _hostingerTest->setText(QStringLiteral("Testando…"));
   _api.post(QStringLiteral("/api/integrations/hostinger/test"), body,
             [this](bool ok, const QJsonDocument& doc, const QString& error) {
     _hostingerTest->setEnabled(true);
-    _hostingerTest->setText(QStringLiteral("Testar conexão"));
+    _hostingerTest->setText(QStringLiteral("Testar"));
     if (!ok) return showError(QStringLiteral("Teste Hostinger"), error);
     const int boxes = doc.object().value(QStringLiteral("mailboxes")).toInt();
     QMessageBox::information(this, QStringLiteral("Hostinger conectada"),
         QStringLiteral("Credencial válida · %1 caixa(s) disponível(is).").arg(boxes));
+  });
+}
+
+void MainWindow::selectHostingerIntegration(int index) {
+  _hostingerToken->clear();
+  _hostingerToken->setPlaceholderText(
+      QStringLiteral("Cole o token de outra conta Hostinger"));
+  _hostingerRemove->setEnabled(index >= 0);
+  _hostingerTest->setEnabled(index >= 0);
+  _hostingerSave->setEnabled(false);
+  _hostingerSave->setText(QStringLiteral("Identificar e conectar"));
+}
+
+void MainWindow::removeHostingerIntegration() {
+  const auto profile = _hostingerProfile->currentData().toMap();
+  const QString profileId = profile.value(QStringLiteral("id")).toString();
+  const QString name = profile.value(QStringLiteral("name")).toString();
+  if (profileId.isEmpty()) return;
+  if (QMessageBox::question(
+          this, QStringLiteral("Remover conexão Hostinger"),
+          QStringLiteral("Remover a conexão “%1”?\n\n"
+                         "Os códigos dos domínios associados deixarão de ser lidos por ela.")
+              .arg(name)) != QMessageBox::Yes) return;
+  _hostingerRemove->setEnabled(false);
+  _api.remove(QStringLiteral("/api/integrations/hostinger/") + encoded(profileId),
+              [this](bool ok, const QJsonDocument&, const QString& error) {
+    if (!ok) {
+      _hostingerRemove->setEnabled(true);
+      return showError(QStringLiteral("Conexão não removida"), error);
+    }
+    setStatus(QStringLiteral("Conexão Hostinger removida."));
+    loadIntegrations();
+    loadReadiness();
   });
 }
 

@@ -75,6 +75,8 @@ private:
   void prepareEgo4dCatalog();
   void saveHostingerIntegration();
   void testHostingerIntegration();
+  void selectHostingerIntegration(int index);
+  void removeHostingerIntegration();
   void chooseLibrary();
   void exportDiagnostics();
   void loadCampaignData();
@@ -153,8 +155,9 @@ private:
   QPushButton* _ego4dPrepare{};
   bool _ego4dCatalogPreparing{};
   QLabel* _hostingerStatus{};
+  class QComboBox* _hostingerProfile{};
   class QLineEdit* _hostingerToken{};
-  class QLineEdit* _hostingerMailbox{};
+  QPushButton* _hostingerRemove{};
   QPushButton* _hostingerSave{};
   QPushButton* _hostingerTest{};
   QLabel* _holoIntegrationStatus{};

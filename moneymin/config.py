@@ -67,8 +67,15 @@ def _secure_env(key: str, value: object) -> None:
 
 _secure_hostinger = _SECURE_SETTINGS.get("hostinger") or {}
 if isinstance(_secure_hostinger, dict):
-    _secure_env("HOSTINGER_MAIL_TOKEN", _secure_hostinger.get("token"))
-    _secure_env("HOSTINGER_MAILBOX_ID", _secure_hostinger.get("mailbox_id"))
+    _secure_hostinger_profiles = _secure_hostinger.get("profiles")
+    _secure_hostinger_primary = (
+        _secure_hostinger_profiles[0]
+        if isinstance(_secure_hostinger_profiles, list) and _secure_hostinger_profiles
+        and isinstance(_secure_hostinger_profiles[0], dict)
+        else _secure_hostinger
+    )
+    _secure_env("HOSTINGER_MAIL_TOKEN", _secure_hostinger_primary.get("token"))
+    _secure_env("HOSTINGER_MAILBOX_ID", _secure_hostinger_primary.get("mailbox_id"))
 
 _secure_ego4d = _SECURE_SETTINGS.get("ego4d") or {}
 if isinstance(_secure_ego4d, dict):
@@ -121,6 +128,15 @@ HOSTINGER_MAIL_TOKEN = os.environ.get("HOSTINGER_MAIL_TOKEN", "")
 # resourceId da caixa (ex.: AC5ce3f1...); vazio = primeira caixa da conta.
 HOSTINGER_MAILBOX_ID = os.environ.get("HOSTINGER_MAILBOX_ID", "")
 HOSTINGER_MAIL_BASE = "https://api.mail.hostinger.com"
+# Todas as conexões ficam no cofre DPAPI. O par legado acima continua sendo o
+# fallback para instalações antigas e automações configuradas por ambiente.
+HOSTINGER_MAIL_PROFILES = (
+    [dict(item) for item in _secure_hostinger.get("profiles", [])
+     if isinstance(item, dict) and str(item.get("token") or "").strip()]
+    if isinstance(_secure_hostinger, dict)
+    and isinstance(_secure_hostinger.get("profiles"), list)
+    else []
+)
 
 # --- Crowtado (registro de conta com referral) --------------------------------
 # Código de indicação IMUTÁVEL — fixo no código, não configurável.

@@ -216,10 +216,13 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
         "ok" if free_gib >= 20 else "warning",
         f"{free_gib:.1f} GiB livres; recomendado pelo menos 20 GiB",
     ))
+    hostinger_connections = getattr(config, "HOSTINGER_MAIL_PROFILES", None) or []
+    hostinger_ready = bool(hostinger_connections or config.HOSTINGER_MAIL_TOKEN)
     checks.append(_check(
         "Criador de contas",
-        "ok" if config.HOSTINGER_MAIL_TOKEN else "warning",
-        "HOSTINGER_MAIL_TOKEN configurado" if config.HOSTINGER_MAIL_TOKEN
+        "ok" if hostinger_ready else "warning",
+        (f"{len(hostinger_connections)} conexão(ões) Hostinger configurada(s)"
+         if hostinger_connections else "token Hostinger configurado") if hostinger_ready
         else "token Hostinger ausente; campanhas com contas já cadastradas continuam possíveis",
     ))
 

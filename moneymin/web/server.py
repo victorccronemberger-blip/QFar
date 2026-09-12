@@ -65,6 +65,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -236,20 +237,43 @@ def _migrate_legacy_integrations() -> dict[str, Any]:
     with _PERSISTENCE_LOCK:
         secure = load_secure_settings(config.INTEGRATIONS_PATH)
         changed = False
-        if not isinstance(secure.get("hostinger"), dict) and config.HOSTINGER_MAIL_TOKEN:
-            secure["hostinger"] = {
+        host = secure.get("hostinger")
+        if not isinstance(host, dict) and config.HOSTINGER_MAIL_TOKEN:
+            host = {
                 "token": config.HOSTINGER_MAIL_TOKEN,
                 "mailbox_id": config.HOSTINGER_MAILBOX_ID,
             }
+            secure["hostinger"] = host
             changed = True
+        if isinstance(host, dict) and not isinstance(host.get("profiles"), list):
+            token = str(host.get("token") or "").strip()
+            secure["hostinger"] = {
+                "profiles": ([{
+                    "id": uuid.uuid4().hex,
+                    "name": "Caixa principal",
+                    "token": token,
+                    "mailbox_id": str(host.get("mailbox_id") or "").strip(),
+                    "routes": [],
+                }] if token else []),
+            }
+            host = secure["hostinger"]
+            changed = True
+        if isinstance(host, dict) and isinstance(host.get("profiles"), list):
+            normalized_profiles = _hostinger_profiles(host)
+            if normalized_profiles != host.get("profiles"):
+                secure["hostinger"] = {"profiles": normalized_profiles}
+                host = secure["hostinger"]
+                changed = True
         if not isinstance(secure.get("ego4d"), dict):
             legacy = _legacy_aws_credentials()
             if legacy:
                 secure["ego4d"] = legacy
                 changed = True
         if changed:
-            secure["schema"] = 1
+            secure["schema"] = 2
             save_secure_settings(config.INTEGRATIONS_PATH, secure)
+        if isinstance(secure.get("hostinger"), dict):
+            _apply_hostinger(_hostinger_profiles(secure["hostinger"]))
         return secure
 
 
@@ -273,9 +297,46 @@ def _apply_ego4d(values: dict[str, str]) -> None:
     config.EGO4D_AWS_REGION = region
 
 
-def _apply_hostinger(values: dict[str, str]) -> None:
-    token = values.get("token", "").strip()
-    mailbox = values.get("mailbox_id", "").strip()
+def _hostinger_routes(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = value.replace(";", ",").split(",")
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = []
+    return sorted({
+        str(item).strip().lower().lstrip("@")
+        for item in values
+        if str(item).strip()
+    })
+
+
+def _hostinger_profiles(host: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = host.get("profiles")
+    if not isinstance(raw, list):
+        raw = [host] if host.get("token") else []
+    profiles: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        token = str(item.get("token") or "").strip()
+        if not token:
+            continue
+        profiles.append({
+            "id": str(item.get("id") or uuid.uuid4().hex).strip(),
+            "name": str(item.get("name") or f"Caixa {index + 1}").strip(),
+            "token": token,
+            "mailbox_id": str(item.get("mailbox_id") or "").strip(),
+            "routes": _hostinger_routes(item.get("routes")),
+        })
+    return profiles
+
+
+def _apply_hostinger(profiles: list[dict[str, Any]]) -> None:
+    config.HOSTINGER_MAIL_PROFILES = [dict(item) for item in profiles]
+    primary = profiles[0] if profiles else {}
+    token = str(primary.get("token") or "").strip()
+    mailbox = str(primary.get("mailbox_id") or "").strip()
     os.environ["HOSTINGER_MAIL_TOKEN"] = token
     config.HOSTINGER_MAIL_TOKEN = token
     if mailbox:
@@ -330,6 +391,7 @@ def _integration_snapshot() -> dict[str, Any]:
     ego = secure.get("ego4d") if isinstance(secure.get("ego4d"), dict) else {}
     host = (secure.get("hostinger")
             if isinstance(secure.get("hostinger"), dict) else {})
+    host_profiles = _hostinger_profiles(host)
     if not ego:
         ego = _legacy_aws_credentials()
     ego_dir = config.MEDIA_DATA_DIR / "ego4d"
@@ -345,8 +407,8 @@ def _integration_snapshot() -> dict[str, Any]:
     )
     storage = _storage_snapshot(include_path=True)
     access = str(ego.get("access_key_id") or "")
-    host_token = str(host.get("token") or config.HOSTINGER_MAIL_TOKEN or "")
-    host_mailbox = str(host.get("mailbox_id") or config.HOSTINGER_MAILBOX_ID or "")
+    host_token = str(host_profiles[0].get("token") if host_profiles else "")
+    host_mailbox = str(host_profiles[0].get("mailbox_id") if host_profiles else "")
     return {
         "security": {
             "provider": "Windows DPAPI",
@@ -360,12 +422,23 @@ def _integration_snapshot() -> dict[str, Any]:
                               and (ego_dir / "clips.csv").is_file()),
         },
         "hostinger": {
-            "configured": bool(host_token),
+            "configured": bool(host_profiles),
+            "connection_count": len(host_profiles),
             "token_hint": f"••••{host_token[-4:]}" if len(host_token) >= 4 else "",
             "mailbox_configured": bool(host_mailbox),
             "mailbox_hint": (
                 f"••••{host_mailbox[-4:]}" if len(host_mailbox) >= 4 else ""
             ),
+            "profiles": [{
+                "id": item["id"],
+                "name": item["name"],
+                "token_hint": f"••••{item['token'][-4:]}",
+                "mailbox_configured": bool(item["mailbox_id"]),
+                "mailbox_hint": (
+                    f"••••{item['mailbox_id'][-4:]}" if item["mailbox_id"] else ""
+                ),
+                "routes": item["routes"],
+            } for item in host_profiles],
         },
         "holoassist": {
             "catalog_ready": holo_catalog,
@@ -922,35 +995,148 @@ def create_app() -> Flask:
         if not isinstance(body, dict):
             return jsonify({"error": "informe o token da Hostinger"}), 400
         secure = _migrate_legacy_integrations()
-        current = (secure.get("hostinger")
-                   if isinstance(secure.get("hostinger"), dict) else {})
+        host = (secure.get("hostinger")
+                if isinstance(secure.get("hostinger"), dict) else {})
+        profiles = _hostinger_profiles(host)
+        if body.get("auto_detect"):
+            token = str(body.get("token") or "").strip()
+            if len(token) < 16:
+                return jsonify({
+                    "error": "cole um token válido da API Mail da Hostinger",
+                }), 400
+            duplicates = [
+                item["name"] for item in profiles
+                if item["token"] == token and item.get("mailbox_id")
+            ]
+            if duplicates:
+                return jsonify({
+                    "error": (
+                        "esta API Hostinger já está conectada"
+                        + (f" ({', '.join(duplicates)})" if duplicates else "")
+                    ),
+                    "code": "hostinger_already_connected",
+                }), 409
+            try:
+                detected = hostinger_mail.discover_mailboxes(token)
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"error": _integration_error(exc, "Hostinger")}), 400
+            detected_ids = {item["resource_id"] for item in detected}
+            existing_by_mailbox = {
+                item["mailbox_id"]: item
+                for item in profiles if item.get("mailbox_id")
+            }
+            # Uma conexão antiga sem ID de caixa é substituída quando o mesmo
+            # token é identificado. As demais APIs permanecem intactas.
+            profiles = [
+                item for item in profiles
+                if item.get("mailbox_id") not in detected_ids
+                and not (item["token"] == token and not item.get("mailbox_id"))
+            ]
+            imported = []
+            for index, mailbox in enumerate(detected):
+                previous = existing_by_mailbox.get(mailbox["resource_id"], {})
+                address = mailbox.get("address") or ""
+                domain = mailbox.get("domain") or ""
+                item = {
+                    "id": previous.get("id") or uuid.uuid4().hex,
+                    "name": address or f"Caixa Hostinger {index + 1}",
+                    "token": token,
+                    "mailbox_id": mailbox["resource_id"],
+                    "routes": [domain] if domain else [],
+                }
+                profiles.append(item)
+                imported.append({
+                    "name": item["name"],
+                    "domain": domain,
+                })
+            with _PERSISTENCE_LOCK:
+                secure["schema"] = 2
+                secure["hostinger"] = {"profiles": profiles}
+                save_secure_settings(config.INTEGRATIONS_PATH, secure)
+                _apply_hostinger(profiles)
+            return jsonify({
+                "ok": True,
+                "detected_count": len(imported),
+                "detected": imported,
+                "integrations": _integration_snapshot(),
+            })
+        profile_id = str(body.get("profile_id") or "").strip()
+        current = next(
+            (item for item in profiles if item["id"] == profile_id), {})
+        # Compatibilidade com a tela antiga: quando havia apenas uma conexão,
+        # um PUT sem id significava editar aquela conexão, não criar outra.
+        if not current and not body.get("create") and len(profiles) == 1:
+            current = profiles[0]
+            profile_id = current["id"]
         values = {
+            "id": profile_id or uuid.uuid4().hex,
+            "name": str(body.get("name") or current.get("name")
+                        or f"Caixa {len(profiles) + 1}").strip(),
             "token": str(body.get("token") or current.get("token") or "").strip(),
             "mailbox_id": str(
                 body.get("mailbox_id") if "mailbox_id" in body
                 else current.get("mailbox_id") or "").strip(),
+            "routes": _hostinger_routes(
+                body.get("routes") if "routes" in body
+                else current.get("routes") or []),
         }
         if len(values["token"]) < 16:
             return jsonify({"error": "informe um token válido da API Mail da Hostinger"}), 400
+        if any(item["token"] == values["token"] and item["id"] != values["id"]
+               for item in profiles):
+            return jsonify({
+                "error": "esta API Hostinger já está conectada",
+                "code": "hostinger_already_connected",
+            }), 409
         try:
             tested = hostinger_mail.test_connection(
                 token=values["token"], mailbox=values["mailbox_id"] or None)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": _integration_error(exc, "Hostinger")}), 400
+        replaced = False
+        for index, item in enumerate(profiles):
+            if item["id"] == values["id"]:
+                profiles[index] = values
+                replaced = True
+                break
+        if not replaced:
+            profiles.append(values)
         with _PERSISTENCE_LOCK:
-            secure["schema"] = 1
-            secure["hostinger"] = values
+            secure["schema"] = 2
+            secure["hostinger"] = {"profiles": profiles}
             save_secure_settings(config.INTEGRATIONS_PATH, secure)
-            _apply_hostinger(values)
-        return jsonify({"ok": True, "test": tested,
+            _apply_hostinger(profiles)
+        return jsonify({"ok": True, "profile_id": values["id"], "test": tested,
                         "integrations": _integration_snapshot()})
+
+    @app.delete("/api/integrations/hostinger/<profile_id>")
+    def delete_hostinger_integration(profile_id: str):
+        secure = _migrate_legacy_integrations()
+        host = (secure.get("hostinger")
+                if isinstance(secure.get("hostinger"), dict) else {})
+        profiles = _hostinger_profiles(host)
+        remaining = [item for item in profiles if item["id"] != profile_id]
+        if len(remaining) == len(profiles):
+            return jsonify({"error": "conexão Hostinger não encontrada"}), 404
+        with _PERSISTENCE_LOCK:
+            secure["schema"] = 2
+            secure["hostinger"] = {"profiles": remaining}
+            save_secure_settings(config.INTEGRATIONS_PATH, secure)
+            _apply_hostinger(remaining)
+        return jsonify({"ok": True, "integrations": _integration_snapshot()})
 
     @app.post("/api/integrations/hostinger/test")
     def test_hostinger_integration():
         secure = _migrate_legacy_integrations()
-        current = (secure.get("hostinger")
-                   if isinstance(secure.get("hostinger"), dict) else {})
+        host = (secure.get("hostinger")
+                if isinstance(secure.get("hostinger"), dict) else {})
+        profiles = _hostinger_profiles(host)
         body = request.get_json(silent=True) or {}
+        profile_id = str(body.get("profile_id") or "").strip()
+        current = next(
+            (item for item in profiles if item["id"] == profile_id), {})
+        if not current and not body.get("create") and len(profiles) == 1:
+            current = profiles[0]
         token = str(body.get("token") or current.get("token")
                     or config.HOSTINGER_MAIL_TOKEN or "").strip()
         mailbox = str(body.get("mailbox_id") or current.get("mailbox_id")
