@@ -1049,6 +1049,7 @@ def list_task_spans(
 ) -> list[dict[str, Any]]:
     """Trechos PUROS da tarefa no vídeo-pai, cortados pelas narrações temporizadas."""
     from . import task_matching
+    task_name = task_matching.canonical_task_name(task_name)
     rule = task_matching.rule_for(task_name)
     if rule is None:
         return []
@@ -1069,7 +1070,7 @@ def list_task_spans(
         search_text = task_matching.span_search_text(events)
         has_evidence = task_matching.span_evidence_possible(rule, search_text)
         exact_long_scenario = (
-            min_dur_s >= task_matching.LONG_ACTIVITY_MIN_S
+            max_dur_s >= task_matching.SCENARIO_ACTIVITY_MIN_S
             and task_matching.scenario_is_sufficient(rule, scenarios)
         )
         if not has_evidence and not exact_long_scenario:
@@ -1083,23 +1084,28 @@ def list_task_spans(
         event_labels = task_matching.label_span_events(prepared, activity_rules)
         rivals = task_matching.competing_span_names(task_name, activity_rules)
         if exact_long_scenario:
+            scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
             validate_scenario = _export_span_validator(
                 rule, prepared, event_labels, task_name, rivals,
-                min_dur_s=min_dur_s, max_dur_s=max_dur_s, scenario=True)
+                min_dur_s=scenario_min_s, max_dur_s=max_dur_s, scenario=True)
             for span in task_matching.scenario_activity_spans(
                     [
                         (*row[:3], task_name in event_labels[index],
-                         row[3] or bool(event_labels[index] & rivals))
+                         row[3]
+                         or any(task_matching._term_in(row[2], term)
+                                for term in rule.action_excluded)
+                         or (task_name not in event_labels[index]
+                             and bool(event_labels[index] & rivals)))
                         for index, row in enumerate(prepared)
                     ],
-                    min_s=min_dur_s,
+                    min_s=scenario_min_s,
                     max_s=max_dur_s,
                     video_duration_s=duration,
                     allowed_intervals=(
                         imu_coverage_intervals(video) if require_imu else None
                     )):
                 for rec in _iter_span_records(
-                        video, span, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                        video, span, min_dur_s=scenario_min_s, max_dur_s=max_dur_s,
                         revalidate=validate_scenario):
                     rec["match_confidence"] = "scenario"
                     identity = str(rec.get("clip_uid") or "")
@@ -1184,7 +1190,7 @@ def rank_all_task_spans(
         ]
         exact_long_rules = [
             (name, rule) for name, rule in candidate_rules
-            if (min_dur_s >= task_matching.LONG_ACTIVITY_MIN_S
+            if (max_dur_s >= task_matching.SCENARIO_ACTIVITY_MIN_S
                 and task_matching.scenario_is_sufficient(rule, scenarios))
         ]
         eligible_rules = list(dict(possible_rules + exact_long_rules).items())
@@ -1198,23 +1204,28 @@ def rank_all_task_spans(
         for name, rule in eligible_rules:
             rivals = task_matching.competing_span_names(name, activity_rules)
             if name in exact_long_names:
+                scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
                 validate_scenario = _export_span_validator(
                     rule, prepared, event_labels, name, rivals,
-                    min_dur_s=min_dur_s, max_dur_s=max_dur_s, scenario=True)
+                    min_dur_s=scenario_min_s, max_dur_s=max_dur_s, scenario=True)
                 for span in task_matching.scenario_activity_spans(
                         [
                             (*row[:3], name in event_labels[index],
-                             row[3] or bool(event_labels[index] & rivals))
+                             row[3]
+                             or any(task_matching._term_in(row[2], term)
+                                    for term in rule.action_excluded)
+                             or (name not in event_labels[index]
+                                 and bool(event_labels[index] & rivals)))
                             for index, row in enumerate(prepared)
                         ],
-                        min_s=min_dur_s,
+                        min_s=scenario_min_s,
                         max_s=max_dur_s,
                         video_duration_s=duration,
                         allowed_intervals=(
                             imu_coverage_intervals(video) if require_imu else None
                         )):
                     for rec in _iter_span_records(
-                            video, span, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                            video, span, min_dur_s=scenario_min_s, max_dur_s=max_dur_s,
                             revalidate=validate_scenario):
                         rec["match_confidence"] = "scenario"
                         identity = str(rec.get("clip_uid") or "")

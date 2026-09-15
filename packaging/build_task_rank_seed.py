@@ -37,10 +37,14 @@ FIELDS = (
 
 def main() -> None:
     buckets = ego4d.rank_all_task_spans()
-    long_buckets = ego4d.rank_all_task_spans(
-        min_dur_s=600, max_dur_s=1800)
-    for name, items in long_buckets.items():
-        buckets.setdefault(name, []).extend(items)
+    # A minimum changes how nearby actions form a continuous candidate.
+    # Include five-minute windows as well as ten-minute windows so portable
+    # installs retain the catalog available with the user's 5–30 min range.
+    for minimum in (300, 600):
+        duration_buckets = ego4d.rank_all_task_spans(
+            min_dur_s=minimum, max_dur_s=1800)
+        for name, items in duration_buckets.items():
+            buckets.setdefault(name, []).extend(items)
     tasks: dict[str, list[dict]] = {}
     for name, items in sorted(buckets.items()):
         portable: list[dict] = []

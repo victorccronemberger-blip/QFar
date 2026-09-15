@@ -94,6 +94,8 @@ class CampaignLog:
     started_at: str
     accounts: list[str]
     items: list[dict[str, Any]] = field(default_factory=list)
+    issues: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "running"
     _path: Path | None = field(default=None, init=False, repr=False)
 
     def add_item(self, item: dict[str, Any]) -> None:
@@ -104,6 +106,8 @@ class CampaignLog:
             "started_at": self.started_at,
             "accounts": self.accounts,
             "items": self.items,
+            "issues": self.issues,
+            "status": self.status,
         }
 
     def save(self, path: Path | None = None) -> Path:

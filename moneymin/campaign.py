@@ -1678,7 +1678,19 @@ def run_campaign(
       sucesso. Arquivos compartilhados com o prefetch ficam protegidos até o
       próximo item; em falha, parada ou lote parcial tudo é mantido.
     """
+    sends = {"ok": 0, "failed": 0, "skipped": 0}
+
     def _emit(kind: str, **payload: Any) -> None:
+        if kind == "account_done":
+            key = "skipped" if payload.get("skipped") else (
+                "ok" if payload.get("ok") else "failed")
+            sends[key] += 1
+        elif kind == "campaign_stopped":
+            log.status = "stopped"
+        elif (kind in ("task_error", "task_empty")
+              or (kind == "clip_prepare_done" and not payload.get("ok"))):
+            log.issues.append({"kind": kind, **payload})
+            log.save()
         if progress:
             progress(kind, payload)
 
@@ -1744,7 +1756,8 @@ def run_campaign(
                     ego_compatible = {
                         candidate["clip_uid"]: candidate
                         for candidate in _compatible_task_clips(
-                            tsk.task_name, "ego4d")
+                            tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
+                            max_dur_s=tsk.max_dur_s)
                         if tsk.min_dur_s <= float(candidate.get("dur_s") or 0)
                         <= tsk.max_dur_s
                     }
@@ -1803,22 +1816,11 @@ def run_campaign(
                 shorts: list[dict[str, Any]] = []
                 if dataset_provider in ("all", "ego4d"):
                     if tsk.task_name and task_matching.rule_for(tsk.task_name):
-                        if ego4d.has_timed_narrations():
-                            # Biblioteca completa: calcula trechos diretamente
-                            # das narrações temporizadas licenciadas.
-                            shorts = ego4d.list_task_spans(
-                                tsk.task_name, min_dur_s=tsk.min_dur_s,
-                                max_dur_s=tsk.max_dur_s)
-                        else:
-                            # Instalação nova: usa o índice portátil mínimo. A
-                            # mídia e a IMU continuam sendo baixadas sob demanda
-                            # com a credencial Ego4D do próprio usuário.
-                            shorts = [
-                                clip for clip in _compatible_task_clips(
-                                    tsk.task_name, "ego4d")
-                                if tsk.min_dur_s <= float(clip.get("dur_s") or 0)
-                                <= tsk.max_dur_s
-                            ]
+                        # A mesma seleção usada pela tela inclui o índice
+                        # portátil mesmo quando há narrações locais parciais.
+                        shorts = list(_compatible_task_clips(
+                            tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
+                            max_dur_s=tsk.max_dur_s))
                     else:
                         shorts = ego4d.list_clips(
                             scenario=tsk.scenario,
@@ -1866,6 +1868,9 @@ def run_campaign(
             continue
         if not clips:
             _log(f"  [!] nenhum clipe encontrado p/ cenário '{tsk.scenario}'")
+            _emit("task_empty", scenario=tsk.scenario, task_name=display_name,
+                  min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
+                  dataset=dataset_provider)
             continue
         if tsk.clip_uids:
             clips = _maybe_shuffle(clips)
@@ -1969,7 +1974,7 @@ def run_campaign(
                 error = f"{type(exc).__name__}: {exc}"
                 _log(f"    [!] prepare falhou: {error}")
                 _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
-                      ok=False, error=error)
+                      task_name=display_name, ok=False, error=error)
                 continue
             _emit("clip_ready", clip_uid=clip_info["clip_uid"],
                   duration_ms=item["duration_ms"], imu_real=item["imu_real"])
@@ -2410,11 +2415,16 @@ def run_campaign(
             break
 
     prefetch.shutdown()
+    if log.status != "stopped":
+        log.status = ("error" if not sends["ok"] and not sends["skipped"] else
+                      "partial" if log.issues or sends["failed"] else "done")
     log_path = log.save()
     _log(f"\nlog salvo: {log_path.name}")
-    if not abort_reason:
+    if not abort_reason and log.status != "stopped":
         # Só o nome do arquivo vai para a UI — nada de caminhos absolutos.
-        _emit("campaign_done", log_path=log_path.name)
+        _emit("campaign_done", log_path=log_path.name, status=log.status,
+              ok_sends=sends["ok"], failed_sends=sends["failed"],
+              skipped_sends=sends["skipped"], issues=len(log.issues))
     return log
 
 
@@ -2681,6 +2691,9 @@ def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
 def _compatible_task_clips(
     task_name: str,
     dataset_provider: str = "all",
+    *,
+    min_dur_s: float = 60,
+    max_dur_s: float = 1800,
 ) -> tuple[dict[str, Any], ...]:
     """Combina fontes compatíveis sem reinterpretar categorias.
 
@@ -2689,17 +2702,26 @@ def _compatible_task_clips(
     """
     provider = normalize_dataset_provider(dataset_provider)
     ego_clips: tuple[dict[str, Any], ...] = ()
+    task_name = task_matching.canonical_task_name(task_name)
     if provider in ("all", "ego4d"):
-        pools = _ranked_pools()
+        if ((min_dur_s, max_dur_s) != (60, 1800)
+                and ego4d.has_timed_narrations()):
+            with _RANK_LOCK:
+                pools = _duration_ranked_pools(min_dur_s, max_dur_s)
+        else:
+            pools = _ranked_pools()
         if task_name in pools:
             ego_clips = pools[task_name]
         else:
             ego_clips = tuple(task_matching.ranked_clips(task_name, _task_candidates()))
+        ego_clips = tuple(c for c in ego_clips
+                          if min_dur_s <= float(c.get("dur_s") or 0) <= max_dur_s)
     if provider == "ego4d":
         return ego_clips
     holo_clips: tuple[dict[str, Any], ...]
     try:
-        holo_clips = tuple(holoassist.list_clips(task_name))
+        holo_clips = tuple(holoassist.list_clips(
+            task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
     except FileNotFoundError:
         holo_clips = ()
     return (*holo_clips, *ego_clips)
@@ -2730,26 +2752,24 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
     elif not getattr(sess, "_live", False):
         sess.ensure_auth(org_key=org_key)
     tasks = sess.all_tasks(org_key)
-    duration_pools = None
-    if (normalize_dataset_provider(dataset_provider) in ("all", "ego4d")
-            and (min_dur_s, max_dur_s) != (60, 1800)
-            and ego4d.has_timed_narrations()):
-        # Os trechos de 30 min do cache geral não representam os cortes menores
-        # que a seleção real pode gerar. Recalcule todas as tarefas em uma passada.
-        with _RANK_LOCK:
-            duration_pools = _duration_ranked_pools(min_dur_s, max_dur_s)
     out = []
     for t in tasks:
         name = (t.get("name") or "").strip()
         rule = task_matching.rule_for(name)
         if not rule:
+            if include_unavailable:
+                out.append({
+                    "id": t.get("id"), "name": name, "name_pt": name,
+                    "description": str(t.get("description") or ""),
+                    "clip_count": 0, "clip_sources": {}, "overall_clip_count": 0,
+                    "available_for_duration": False, "mapping_supported": False,
+                    "unavailable_reason": "Esta tarefa ainda não tem uma regra de seleção no QMoney.",
+                })
             continue
         all_clips = [c for c in _compatible_task_clips(name, dataset_provider)
                      if 60 <= c["dur_s"] <= 1800]
-        clips = [c for c in all_clips if min_dur_s <= c["dur_s"] <= max_dur_s]
-        if duration_pools is not None:
-            clips = [c for c in clips if c.get("source") == "holoassist"] + list(
-                duration_pools.get(name, ()))
+        clips = list(_compatible_task_clips(
+            name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
         if clips or include_unavailable:
             source_counts: dict[str, int] = {}
             for clip in clips:
@@ -2763,7 +2783,8 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                 "description": str(t.get("description") or ""),
                 # scenario permanece por compatibilidade; a seleção nova usa rule.
                 "scenario": rule.primary[0],
-                "name_pt": TASK_NAME_PT.get(name, name),
+                "name_pt": TASK_NAME_PT.get(name, TASK_NAME_PT.get(
+                    task_matching.canonical_task_name(name), name)),
                 "boosted": name in BOOSTED_TASKS,
                 "category_slug": category_slug,
                 "category_label": CATEGORY_PT.get(
@@ -2777,6 +2798,11 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                                          max(c["dur_s"] for c in all_clips))
                                         if all_clips else None),
                 "available_for_duration": bool(clips),
+                "mapping_supported": True,
+                "unavailable_reason": ("" if clips else
+                    "Há conteúdo no catálogo, mas nenhum trecho nesta faixa de duração."
+                    if all_clips else
+                    "Nenhum trecho atende à atividade e aos sensores no provedor escolhido."),
                 "match_confidence": rule.confidence,
                 "match_scenarios": list(rule.primary),
             })

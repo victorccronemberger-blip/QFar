@@ -264,7 +264,8 @@ TASK_RULES: dict[str, TaskRule] = {
     ),
     "Change Sheets & Make Bed": _r(
         "Cleaning / laundry",
-        ("bed", "bedsheet", "bed sheet", "sheet", "duvet", "pillow", "blanket"),
+        ("make the bed", "makes the bed", "making the bed", "makes a bed",
+         "bedsheet", "bed sheet", "sheet", "duvet", "pillow", "blanket", "mattress"),
         ("make", "change", "strip", "arrange", "cover", "fit", "put"),
         action_excluded=("bag", "couch", "sofa", "chair", "t-shirt", "tshirt"),
     ),
@@ -426,7 +427,104 @@ TASK_RULES: dict[str, TaskRule] = {
     ),
 }
 
+# Current Minute tasks, matched against their published action descriptions.
+# Broader new tasks get their own rule; they are not aliases for all gardening
+# or all household cleaning.
+TASK_RULES.update({
+    "Cleaning Car": _r(
+        "Car/scooter washing",
+        ("wash", "scrub", "rinse", "soap", "sponge", "wipe", "clean",
+         "vacuum", "dry", "trash", "garbage"),
+        ("car", "vehicle", "windshield", "wheel", "tire", "dashboard", "car seat"),
+        scenario_sufficient=("Car/scooter washing",)),
+    "Planting or Pulling Weeds": _r(
+        ("Gardening", "Farmer"),
+        ("plant", "seedling", "seed", "weed", "grass", "root", "flower", "crop"),
+        ("planting", "plants a", "plants the", "plants seed", "plants flower",
+         "plants sapling", "transplant", "sow", "pull", "pluck", "uproot",
+         "removes weeds", "removes grass", "dig"),
+        action_excluded=("watering", "waters", "sprayer", "hedge", "harvest",
+                         "pruning", "pruner", "shear", "cuts the plant", "cuts plants")),
+    "Folding Clothes or Putting Them on Hangers": _r(
+        "Cleaning / laundry",
+        ("clothes", "cloth", "garment", "shirt", "dress", "jacket", "trouser",
+         "laundry", "towel", "pants"),
+        ("fold", "hanger", "hangs", "hanging", "wardrobe", "closet"),
+        action_excluded=("washing machine", "scrub", "wring")),
+    "Using the Laundry Machine": _r(
+        "Cleaning / laundry", ("washer", "washing machine", "dryer"),
+        ("clothes", "cloth", "laundry", "garment", "shirt", "trouser", "linen"),
+        ("load", "unload", "put", "remove", "take", "transfer", "start", "switch")),
+    "Watering Outdoor Plants": _r(
+        ("Gardening", "Doing yardwork / shoveling snow", "Farmer"),
+        ("water", "watering", "hose", "sprinkl"),
+        ("plant", "flower", "garden", "bed", "crop", "seedling")),
+    "Spreading Mulch or Fertilizer": _r(
+        ("Gardening", "Farmer", "Doing yardwork / shoveling snow"),
+        ("mulch", "compost", "wood chip", "fertiliz", "fertilis", "seed"),
+        ("spread", "shovel", "pour", "distribute", "rake", "scatter"),
+        ("bed", "ground", "soil", "garden", "field")),
+    "Leaf Raking or Blowing": _r(
+        ("Doing yardwork / shoveling snow", "Gardening"),
+        ("leaf", "leaves", "yard debris"), ("rake", "raking", "blower", "blow")),
+    "Pack or Unpack a Car for a Trip": _r(
+        "Car - commuting, road trip", ("car", "vehicle", "trunk", "boot", "back seat"),
+        ("bag", "luggage", "suitcase", "cooler", "box"),
+        ("load", "unload", "pack", "unpack", "place", "put", "remove", "take")),
+    "Shopping": _r(
+        ("Grocery shopping", "Clothes, other shopping"),
+        ("shop", "store", "shelf", "cart", "basket", "cashier", "checkout"),
+        ("pick", "select", "put", "buy", "pay", "browse", "take"),
+        scenario_sufficient=("Grocery shopping indoors", "Clothes, other shopping")),
+    "Putting Groceries Away": _r(
+        ("Cleaning / laundry", "Cooking"),
+        ("fridge", "refrigerator", "freezer", "pantry", "cupboard"),
+        ("grocer", "food", "vegetable", "fruit", "milk", "bottle", "packet"),
+        ("put", "place", "store", "arrange", "unpack")),
+    "Organize the Garage": _r(
+        ("Cleaning / laundry", "Fixing something in the home", "Carpenter"),
+        ("garage", "storage room", "storage area"),
+        ("sort", "organiz", "arrange", "tidy", "shelf", "shelves", "clutter")),
+    "Bedroom Deep Clean": _r(
+        "Cleaning / laundry", ("bedroom", "bed room"),
+        ("dust", "wipe", "vacuum", "mop", "scrub", "clean", "organiz"),
+        action_excluded=("laundry", "washing clothes", "folding clothes")),
+    "Hand Washing Clothes": _r(
+        "Cleaning / laundry", ("clothes", "cloth", "shirt", "garment", "laundry"),
+        ("wash", "scrub", "wring", "rinse"),
+        ("hand", "basin", "bucket", "sink", "tub"),
+        action_excluded=("washing machine", "washer")),
+    "Hotel Laundry Operations": _r(
+        ("Cleaning / laundry", "Household cleaners"), ("hotel", "laundromat"),
+        ("linen", "towel", "sheet"), ("sort", "wash", "dry", "fold")),
+    "Running Industrial Laundry": _r(
+        "Cleaning / laundry", ("industrial washer", "industrial dryer", "laundromat"),
+        ("load", "unload", "cycle", "start", "switch")),
+    "Pump Gas": _r(
+        ("Car - commuting", "Getting car fixed"),
+        ("fuel", "gas", "petrol", "diesel"), ("pump", "nozzle", "refuel", "fill")),
+    "Shoveling Snow": _r(
+        "Doing yardwork / shoveling snow", ("snow", "ice"),
+        ("shovel", "clear", "salt", "ice melt")),
+    "Toy or Clothing Pickup": _r(
+        "Cleaning / laundry", ("toy", "clothes", "cloth", "garment"),
+        ("pick", "collect", "gather", "put away"),
+        ("floor", "bin", "basket", "shelf", "storage")),
+})
+
 TASK_ALIASES: dict[str, str] = {
+    "Check & Add Engine Oil": "Check & add engine oil",
+    "Change a Tire": "Change a tire",
+    "Check Tire Pressure & Add Air": "Check tire pressure & add air",
+    "Replace Showerhead": "Replace showerhead",
+    "Stack Firewood": "Stack firewood",
+    "Sweep the Porch": "Sweep the porch",
+    "Pool Cleaning": "Pool cleaning",
+    "Replace Bulbs or Batteries": "Replace Bulbs & Batteries",
+    "Taking Out Trash": "Taking Out the Trash",
+    "Tighten Cabinet or Door Hinges": "Tighten Cabinet & Door Hinges",
+    "Trim Hedges and Branches": "Trim a hedge",
+    "Bathroom Deep Clean": "Clean the Bathroom",
     "Changing Light Bulbs / Smoke Detectors": "Replace Bulbs & Batteries",
     "Tighten cabinet & door hardware": "Tighten Cabinet & Door Hinges",
     "Hang curtains on a rod (rings/hooks)": "Hang Curtains",
@@ -463,6 +561,17 @@ _NORMALIZED_RULES.update({
 
 def rule_for(task_name: str) -> TaskRule | None:
     return _NORMALIZED_RULES.get(_norm(task_name))
+
+
+def canonical_task_name(task_name: str) -> str:
+    normalized = _norm(task_name)
+    for name in TASK_RULES:
+        if _norm(name) == normalized:
+            return name
+    for alias, canonical in TASK_ALIASES.items():
+        if _norm(alias) == normalized:
+            return canonical
+    return task_name.strip()
 
 
 def _has(values: set[str], pattern: str) -> bool:
@@ -640,6 +749,9 @@ SPAN_MAX_GAP_S = 15.0
 SPAN_PAD_S = 2.0
 ACTIVITY_TARGET_MAX_GAP_S = 30.0
 LONG_ACTIVITY_MIN_S = 600.0
+# Explicit human scene labels can support five-minute windows. They do not
+# require the ten-minute threshold used for expanding sparse action evidence.
+SCENARIO_ACTIVITY_MIN_S = 300.0
 LONG_ACTIVITY_ROW_MAX_GAP_S = 120.0
 LONG_ACTIVITY_TARGET_MAX_GAP_S = 180.0
 LONG_ACTIVITY_CONTEXT_S = 300.0
@@ -650,10 +762,14 @@ SCENARIO_BOUNDARY_BUFFER_S = 60.0
 # específica (nem vice-versa). Tarefas irmãs continuam concorrentes: aparar a
 # cerca deve encerrar um trecho de arrancar ervas, por exemplo.
 _TASK_CONTAINS: dict[str, frozenset[str]] = {
-    "Gardening": frozenset({"Pull weeds by hand", "Trim a hedge"}),
+    "Gardening": frozenset({"Pull weeds by hand", "Trim a hedge",
+        "Planting or Pulling Weeds", "Watering Outdoor Plants",
+        "Spreading Mulch or Fertilizer", "Leaf Raking or Blowing"}),
     "Full Yard Maintenance": frozenset({
         "Gardening", "Pull weeds by hand", "Trim a hedge",
         "Leaf Raking & Bagging",
+        "Planting or Pulling Weeds", "Watering Outdoor Plants",
+        "Spreading Mulch or Fertilizer", "Leaf Raking or Blowing",
     }),
     "Car Wash & Detail": frozenset({"Cleaning Out Car"}),
     "Pet Care Routine": frozenset({"Pet Grooming & Bath", "Pet Feeding"}),
@@ -661,6 +777,14 @@ _TASK_CONTAINS: dict[str, frozenset[str]] = {
         "Drink Station Setup", "Party Cleanup",
     }),
     "Unpack & Set Up a Room": frozenset({"Furniture Assembly"}),
+    "Furniture Assembly/ Disassembly": frozenset({"Furniture Assembly"}),
+    "Cleaning Car": frozenset({"Car Wash & Detail", "Cleaning Out Car"}),
+    "Planting or Pulling Weeds": frozenset({"Pull weeds by hand"}),
+    "Folding Clothes or Putting Them on Hangers": frozenset({"Hanging clothes on hangers"}),
+    "Using the Laundry Machine": frozenset({"Loading the Laundry Machine", "Unloading the Laundry Machine"}),
+    "Spreading Mulch or Fertilizer": frozenset({"Spread Mulch"}),
+    "Leaf Raking or Blowing": frozenset({"Leaf Raking & Bagging"}),
+    "Pack or Unpack a Car for a Trip": frozenset({"Pack the Car for a Trip"}),
 }
 
 
@@ -713,6 +837,37 @@ def _activity_spans(
     limites de higiene e qualquer tarefa concorrente continuam encerrando o
     trecho imediatamente.
     """
+    if allowed_intervals is not None:
+        # Recorte ANTES de procurar a maior sessão. Se o IMU termina no meio
+        # de uma ação longa, descartar a sessão inteira perde o início válido.
+        # Relógios relativos também mantêm a expansão do modo longo dentro
+        # de cada componente, sem preencher lacunas reais dos sensores.
+        intervals: list[tuple[float, float]] = []
+        for raw_start, raw_end in sorted(allowed_intervals):
+            start = max(0.0, float(raw_start))
+            end = float(raw_end)
+            if video_duration_s is not None:
+                end = min(end, float(video_duration_s))
+            if end <= start:
+                continue
+            if intervals and start <= intervals[-1][1]:
+                intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
+            else:
+                intervals.append((start, end))
+        covered: list[dict[str, Any]] = []
+        for start, end in intervals:
+            if end - start < min_s:
+                continue
+            rows = [(t - start, text, normed, on_task, boundary)
+                    for t, text, normed, on_task, boundary in flagged
+                    if start <= t <= end]
+            for span in _activity_spans(
+                    rule, rows, min_s=min_s, max_s=max_s, max_gap_s=max_gap_s,
+                    video_duration_s=end - start, allowed_intervals=None):
+                covered.append({**span, "start": span["start"] + start,
+                                "end": span["end"] + start})
+        return covered
+
     long_mode = min_s >= LONG_ACTIVITY_MIN_S
     strict_cores: list[dict[str, Any]] = []
     if long_mode:
@@ -816,18 +971,6 @@ def _activity_spans(
             corridor_end = core_end + LONG_ACTIVITY_CONTEXT_S
             if video_duration_s:
                 corridor_end = min(corridor_end, float(video_duration_s))
-            if allowed_intervals is not None:
-                containing = [
-                    (start, end) for start, end in allowed_intervals
-                    if float(start) <= core_start + 1e-6
-                    and float(end) >= core_end - 1e-6
-                ]
-                if not containing:
-                    continue
-                covered_start, covered_end = max(
-                    containing, key=lambda interval: interval[1] - interval[0])
-                corridor_start = max(corridor_start, float(covered_start))
-                corridor_end = min(corridor_end, float(covered_end))
             for t, _text, _normed, _on_task, boundary in flagged:
                 if not boundary:
                     continue
@@ -898,7 +1041,8 @@ def scenario_activity_spans(
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
             merged.append((start, end))
-    sources = list(allowed_intervals or [(0.0, duration)])
+    sources = ([(0.0, duration)] if allowed_intervals is None
+               else list(allowed_intervals))
     safe: list[tuple[float, float]] = []
     for source_start, source_end in sources:
         source_start = max(0.0, float(source_start))

@@ -82,7 +82,7 @@ from ..minute_api import AuthError, Session, login
 from ..secure_store import load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
 from .runner import (
-    BALANCES_RUNNER, HOLO_CACHE_RUNNER, RUNNER, friendly_campaign_error,
+    BALANCES_RUNNER, HOLO_CACHE_RUNNER, RUNNER, friendly_campaign_error, _public_event,
 )
 
 PREFS_PATH = config.DATA_DIR / "webui_prefs.json"
@@ -514,6 +514,10 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
         },
         "accounts": sorted(by_account.values(), key=lambda item: item["email"].lower()),
         "items": items,
+        "status": data.get("status"),
+        "issues": [event for issue in data.get("issues", [])
+                   if isinstance(issue, dict)
+                   and (event := _public_event(str(issue.get("kind") or ""), issue))],
     }
 
 

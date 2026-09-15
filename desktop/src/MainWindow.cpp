@@ -1592,8 +1592,19 @@ QWidget* MainWindow::buildHistoryPage() {
                    .arg(summary.value(QStringLiteral("success")).toInt())
                    .arg(summary.value(QStringLiteral("skipped")).toInt())
                    .arg(summary.value(QStringLiteral("failed")).toInt())
-            << QString()
-            << QStringLiteral("POR CONTA");
+            << QString();
+      const auto issues = root.value(QStringLiteral("issues")).toArray();
+      if (!issues.isEmpty()) {
+        lines << QStringLiteral("PENDÊNCIAS");
+        for (const auto issueValue : issues) {
+          const auto issue = issueValue.toObject();
+          lines << QStringLiteral("! %1 — %2")
+                       .arg(issue.value(QStringLiteral("title")).toString(),
+                            issue.value(QStringLiteral("detail")).toString());
+        }
+        lines << QString();
+      }
+      lines << QStringLiteral("POR CONTA");
       for (const auto accountValue : root.value(QStringLiteral("accounts")).toArray()) {
         const auto account = accountValue.toObject();
         const int success = account.value(QStringLiteral("success")).toInt();
@@ -2492,6 +2503,8 @@ void MainWindow::loadTasks() {
       const bool available = task.value(QStringLiteral("available_for_duration")).toBool(false);
       QString label = task.value(QStringLiteral("name_pt")).toString();
       if (label.isEmpty()) label = task.value(QStringLiteral("name")).toString();
+      if (available) label += QStringLiteral("  ·  %1 vídeo(s)")
+                                  .arg(task.value(QStringLiteral("clip_count")).toInt());
       if (task.value(QStringLiteral("boosted")).toBool()) label += QStringLiteral("  ·  turbinada");
       if (!available) label += QStringLiteral("  ·  sem clipe compatível");
       auto* item = new QListWidgetItem(label);
@@ -2502,7 +2515,8 @@ void MainWindow::loadTasks() {
       if (available) ++compatible;
       if (!available) {
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
-        item->setToolTip(QStringLiteral("Categoria sem clipe compatível no conjunto escolhido."));
+        item->setToolTip(task.value(QStringLiteral("unavailable_reason")).toString(
+            QStringLiteral("Categoria sem clipe compatível no conjunto escolhido.")));
       }
       _campaignTasks->addItem(item);
     }
@@ -2706,7 +2720,7 @@ void MainWindow::pollCampaign() {
       _campaignPoll.stop();
       const QString logName = QFileInfo(
           snap.value(QStringLiteral("log_path")).toString()).fileName();
-      if (state == QStringLiteral("done") && !logName.isEmpty()
+      if (state == QStringLiteral("done") && successful > 0 && !logName.isEmpty()
           && _previewLogName.isEmpty()) {
         _previewLogName = logName;
         QSettings().setValue(QStringLiteral("previewLogName"), logName);

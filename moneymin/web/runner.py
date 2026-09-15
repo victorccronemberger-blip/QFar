@@ -109,7 +109,17 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         return {
             "level": "error", "stage": "Conteúdo",
             "title": "Categoria ignorada",
-            "detail": "Não foi possível selecionar um vídeo compatível para esta categoria.",
+            "detail": (f"{payload.get('task_name') or 'Categoria'}: "
+                       + friendly_campaign_error(payload.get("error"))),
+        }
+    if kind == "task_empty":
+        return {
+            "level": "warning", "stage": "Conteúdo",
+            "title": "Nenhum vídeo compatível",
+            "detail": (f"{payload.get('task_name') or 'Categoria'}: nenhum vídeo "
+                       f"entre {_fmt_wait(int(payload.get('min_dur_s') or 0))} e "
+                       f"{_fmt_wait(int(payload.get('max_dur_s') or 0))} no catálogo "
+                       "selecionado. Revise a duração ou o provedor."),
         }
     if kind == "delay_start":
         return {
@@ -198,6 +208,25 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             "detail": "A operação foi parada com segurança.",
         }
     if kind == "campaign_done":
+        successful = int(payload.get("ok_sends") or 0)
+        if payload.get("status") == "error":
+            return {
+                "level": "error", "stage": "Sem envios",
+                "title": "Campanha encerrada sem envios",
+                "detail": "Nenhum vídeo foi enviado. Confira os motivos no Histórico.",
+            }
+        if payload.get("status") == "partial":
+            return {
+                "level": "warning", "stage": "Com pendências",
+                "title": "Campanha encerrada com pendências",
+                "detail": f"{successful} envio(s) concluído(s). Confira os motivos no Histórico.",
+            }
+        if "ok_sends" in payload and not successful:
+            return {
+                "level": "warning", "stage": "Sem novos envios",
+                "title": "Campanha encerrada sem novos envios",
+                "detail": f"{payload.get('skipped_sends', 0)} envio(s) ignorado(s).",
+            }
         return {
             "level": "success", "stage": "Concluída", "title": "Campanha concluída",
             "detail": "Todos os resultados foram salvos no Histórico.",
@@ -326,9 +355,11 @@ class CampaignRunner:
             elif kind == "campaign_done":
                 self.log_path = payload.get("log_path")
                 if self.state != "stopped":
-                    self.state = "done"
-                self.current = ""
-                self.stage = "Concluída"
+                    event = _public_event(kind, payload)
+                    self.state = "error" if payload.get("status") == "error" else "done"
+                    self.error = event["detail"] if self.state == "error" else None
+                    self.current = event["detail"]
+                    self.stage = event["stage"]
             elif kind == "campaign_stopped":
                 self.state = "stopped"
                 self.current = ""

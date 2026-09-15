@@ -7,6 +7,17 @@ from moneymin import ego4d
 
 
 class PortableTaskCatalogTests(unittest.TestCase):
+    def test_current_five_to_thirty_minute_tasks_are_embedded(self) -> None:
+        seed = campaign._load_rank_seed()
+        assert seed is not None
+        for name in ("Furniture Assembly", "Cleaning Car", "Planting or Pulling Weeds",
+                     "Trim a hedge", "Walk the Dog", "Watering Outdoor Plants",
+                     "Clean the Bathroom", "Shopping",
+                     "Folding Clothes or Putting Them on Hangers"):
+            with self.subTest(name=name):
+                self.assertTrue(any(300 <= float(c["dur_s"]) <= 1800
+                                    for c in seed.get(name, ())))
+
     def test_empty_legacy_cache_is_recovered_from_embedded_seed(self) -> None:
         seed = campaign._load_rank_seed()
         self.assertIsNotNone(seed)
