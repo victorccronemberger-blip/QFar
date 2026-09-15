@@ -35,11 +35,12 @@ import urllib.error
 import urllib.request
 import uuid
 from array import array
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 from . import config, tls
@@ -102,15 +103,43 @@ def _action_units(text: str) -> list[str]:
 
 # --- Acesso S3 ----------------------------------------------------------------
 
+S3_DOWNLOAD_WORKERS = 16
+
+
+def _download_config():
+    """Fila de partes pequenas; conexões livres seguem buscando o próximo trecho."""
+    from boto3.s3.transfer import TransferConfig
+    return TransferConfig(
+        max_concurrency=S3_DOWNLOAD_WORKERS,
+        multipart_threshold=8 * 1024 * 1024,
+        # Export de ~120 MiB gera ~60 partes em vez de uma por conexão.
+        # Assim as conexões rápidas continuam úteis enquanto outra está lenta.
+        multipart_chunksize=2 * 1024 * 1024,
+        io_chunksize=1024 * 1024,
+        max_io_queue=64,
+        num_download_attempts=5,
+        max_bandwidth=None,
+        use_threads=True,
+    )
+
+
 def _s3():
     """Cliente S3 do perfil configurado para o Ego4D."""
     import boto3
+    from botocore.config import Config
     profile = config.EGO4D_AWS_PROFILE or None
     session = boto3.session.Session(
         profile_name=profile,
         region_name=config.EGO4D_AWS_REGION or None,
     )
-    return session.resource("s3")
+    return session.resource("s3", config=Config(
+        max_pool_connections=S3_DOWNLOAD_WORKERS * 2,
+        # Um trecho sem resposta não deve ocupar uma conexão por dois minutos.
+        # O SDK repete a parte interrompida sem descartar as partes concluídas.
+        connect_timeout=15, read_timeout=30,
+        tcp_keepalive=True,
+        retries={"mode": "standard", "total_max_attempts": 5},
+    ))
 
 
 def _aws_creds() -> tuple[str, str, str | None]:
@@ -238,7 +267,7 @@ def _s3_get_stdlib(bucket: str, key: str, dest: Path,
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         with tls.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
-            shutil.copyfileobj(resp, f)
+            shutil.copyfileobj(resp, f, length=1024 * 1024)
     except urllib.error.HTTPError as exc:
         new_region = exc.headers.get("x-amz-bucket-region") if exc.headers else None
         if new_region and new_region != region:
@@ -261,7 +290,7 @@ def _download_to(bucket: str, key: str, dest: Path) -> Path:
     part = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.part")
     try:
         try:
-            _s3().Bucket(bucket).download_file(key, str(part))
+            _s3().Bucket(bucket).download_file(key, str(part), Config=_download_config())
         except ImportError:
             # boto3 ausente no interpretador atual -> cliente SigV4 stdlib.
             _s3_get_stdlib(bucket, key, part)
@@ -645,12 +674,16 @@ def _window_row_from_uid(
     video = videos.get(video_uid)
     if not video or not video.get("s3_path"):
         return None
+    s3_path, media_uid, media_offset = _best_media_source(
+        video_uid, start, end, str(video.get("s3_path") or ""))
     return {
         "exported_clip_uid": clip_uid,
         "parent_video_uid": video_uid,
         "parent_start_sec": str(start),
         "parent_end_sec": str(end),
-        "s3_path": video["s3_path"],
+        "s3_path": s3_path,
+        "media_uid": media_uid,
+        "media_time_offset_s": media_offset,
         "needs_cut": True,
     }
 
@@ -880,6 +913,104 @@ def _best_media_source(
     return fallback_s3, parent_uid, 0.0
 
 
+def _exported_span_windows(
+    parent_uid: str, start: float, end: float,
+    *, min_dur_s: float = WINDOW_MIN_S,
+) -> list[tuple[float, float]]:
+    """Interseções elegíveis, preferindo a maior cobertura no mesmo início."""
+    cat = _cat()
+    by_uid = getattr(cat, "by_uid", {})
+    candidates: list[tuple[float, float]] = []
+    for uid, clip_start, clip_end in getattr(cat, "by_parent", {}).get(
+            parent_uid, ()):
+        if not str((by_uid.get(uid) or {}).get("s3_path") or ""):
+            continue
+        piece_start = max(start, clip_start)
+        piece_end = min(end, clip_end)
+        if piece_end > piece_start and piece_end - piece_start >= min_dur_s:
+            candidates.append((piece_start, piece_end))
+    pieces: list[tuple[float, float]] = []
+    furthest = start
+    for piece_start, piece_end in sorted(set(candidates), key=lambda p: (p[0], -p[1])):
+        if piece_end > furthest + 1e-6:
+            pieces.append((piece_start, piece_end))
+            furthest = piece_end
+    return pieces
+
+
+def _iter_span_records(
+    video: dict[str, Any], span: dict[str, Any],
+    *, min_dur_s: float = WINDOW_MIN_S, max_dur_s: float = WINDOW_TARGET_S,
+    revalidate: Callable[[float, float], list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Prefere exports válidos; mantém a janela original se nenhum servir."""
+    parent = str(video.get("video_uid") or "")
+    start = float(span["start"])
+    end = float(span["end"])
+    if not min_dur_s <= end - start <= max_dur_s + 1e-6:
+        return []
+    original = _span_record(video, span)
+    # Uma janela já contida num export não precisa ser dividida nem revalidada.
+    if _uses_exported_clip(original) or revalidate is None:
+        return [original]
+    pieces = _exported_span_windows(parent, start, end, min_dur_s=min_dur_s)
+    records: list[dict[str, Any]] = []
+    cursor = start
+    for piece_start, piece_end in pieces:
+        piece_start = max(cursor, piece_start)
+        if piece_end - piece_start < min_dur_s:
+            continue
+        for piece in sorted(revalidate(piece_start, piece_end), key=lambda p: p["start"]):
+            ps, pe = float(piece["start"]), float(piece["end"])
+            if (ps < max(cursor, piece_start) or pe > piece_end + 1e-6
+                    or not min_dur_s <= pe - ps <= max_dur_s + 1e-6):
+                continue
+            record = _span_record(video, piece)
+            if _uses_exported_clip(record):
+                records.append(record)
+                cursor = pe
+    return records or [original]
+
+
+def _export_span_validator(
+    rule: Any, prepared: tuple, labels: tuple, task_name: str, rivals: frozenset,
+    *, min_dur_s: float, max_dur_s: float, scenario: bool = False,
+) -> Callable[[float, float], list[dict[str, Any]]]:
+    """Reusa as narrações já preparadas; verifica apenas o intervalo do export."""
+    from . import task_matching
+    times = tuple(row[0] for row in prepared)
+
+    @lru_cache(maxsize=256)
+    def validate(start: float, end: float) -> list[dict[str, Any]]:
+        first, last = bisect_left(times, start), bisect_right(times, end)
+        rows = prepared[first:last]
+        if scenario:
+            # A janela original já passou pelos limites de cenário/IMU.
+            # O subconjunto mantém essa classificação, mas só relata eventos locais.
+            units = [row[2] for row in rows if row[2]]
+            return [{"start": start, "end": end, "action_text": " ".join(units),
+                     "action_units": units, "match_score": 100,
+                     "scenario_verified": True, "n_events": len(rows)}]
+        return task_matching.extract_spans(
+            rule, (), min_s=min_dur_s, max_s=max_dur_s, pad_s=0.0,
+            video_duration_s=end, prepared_events=rows, activity_mode=True,
+            task_name=task_name, event_task_names=labels[first:last],
+            competing_task_names=rivals, allowed_intervals=[(start, end)])
+
+    return validate
+
+
+def _uses_exported_clip(clip: dict[str, Any]) -> bool:
+    parent = str(clip.get("parent_video_uid") or "")
+    media = str(clip.get("media_uid") or "")
+    if media:
+        return bool(parent) and media != parent
+    # Os registros oficiais legados não têm media_uid nem precisam de corte.
+    return (bool(parent) and bool(clip.get("clip_uid"))
+            and str(clip.get("s3_path") or "").startswith("s3://")
+            and not clip.get("needs_cut"))
+
+
 def _span_record(video: dict[str, Any], span: dict[str, Any]) -> dict[str, Any]:
     parent = str(video.get("video_uid") or "")
     start = float(span["start"])
@@ -952,6 +1083,9 @@ def list_task_spans(
         event_labels = task_matching.label_span_events(prepared, activity_rules)
         rivals = task_matching.competing_span_names(task_name, activity_rules)
         if exact_long_scenario:
+            validate_scenario = _export_span_validator(
+                rule, prepared, event_labels, task_name, rivals,
+                min_dur_s=min_dur_s, max_dur_s=max_dur_s, scenario=True)
             for span in task_matching.scenario_activity_spans(
                     [
                         (*row[:3], task_name in event_labels[index],
@@ -964,20 +1098,25 @@ def list_task_spans(
                     allowed_intervals=(
                         imu_coverage_intervals(video) if require_imu else None
                     )):
-                rec = _span_record(video, span)
-                rec["match_confidence"] = "scenario"
-                identity = str(rec.get("clip_uid") or "")
-                if (identity and identity not in seen
-                        and (not require_imu or imu_window_is_covered(
-                            video, tuple(rec["window_s"])))):
-                    seen.add(identity)
-                    out.append(rec)
+                for rec in _iter_span_records(
+                        video, span, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                        revalidate=validate_scenario):
+                    rec["match_confidence"] = "scenario"
+                    identity = str(rec.get("clip_uid") or "")
+                    if (identity and identity not in seen
+                            and (not require_imu or imu_window_is_covered(
+                                video, tuple(rec["window_s"])))):
+                        seen.add(identity)
+                        out.append(rec)
         base_min = max(min_dur_s, rule.min_span_s or 0.0)
         span_minimums = [base_min] if has_evidence else []
         if (has_evidence
                 and base_min < task_matching.LONG_ACTIVITY_MIN_S <= max_dur_s):
             span_minimums.append(task_matching.LONG_ACTIVITY_MIN_S)
         for span_minimum in span_minimums:
+            validate_actions = _export_span_validator(
+                rule, prepared, event_labels, task_name, rivals,
+                min_dur_s=span_minimum, max_dur_s=max_dur_s)
             for span in task_matching.extract_spans(
                     rule, events,
                     min_s=span_minimum,
@@ -992,15 +1131,17 @@ def list_task_spans(
                     allowed_intervals=(
                         imu_coverage_intervals(video) if require_imu else None
                     )):
-                rec = _span_record(video, span)
-                rec["match_confidence"] = rule.confidence
-                identity = str(rec.get("clip_uid") or "")
-                if (identity and identity not in seen
-                        and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
-                        and (not require_imu or imu_window_is_covered(
-                            video, tuple(rec["window_s"])))):
-                    seen.add(identity)
-                    out.append(rec)
+                for rec in _iter_span_records(
+                        video, span, min_dur_s=span_minimum, max_dur_s=max_dur_s,
+                        revalidate=validate_actions):
+                    rec["match_confidence"] = rule.confidence
+                    identity = str(rec.get("clip_uid") or "")
+                    if (identity and identity not in seen
+                            and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
+                            and (not require_imu or imu_window_is_covered(
+                                video, tuple(rec["window_s"])))):
+                        seen.add(identity)
+                        out.append(rec)
     out.sort(key=lambda r: (-(r.get("match_score") or 0), -(r.get("dur_s") or 0),
                             str(r.get("clip_uid") or "")))
     return out
@@ -1057,6 +1198,9 @@ def rank_all_task_spans(
         for name, rule in eligible_rules:
             rivals = task_matching.competing_span_names(name, activity_rules)
             if name in exact_long_names:
+                validate_scenario = _export_span_validator(
+                    rule, prepared, event_labels, name, rivals,
+                    min_dur_s=min_dur_s, max_dur_s=max_dur_s, scenario=True)
                 for span in task_matching.scenario_activity_spans(
                         [
                             (*row[:3], name in event_labels[index],
@@ -1069,20 +1213,25 @@ def rank_all_task_spans(
                         allowed_intervals=(
                             imu_coverage_intervals(video) if require_imu else None
                         )):
-                    rec = _span_record(video, span)
-                    rec["match_confidence"] = "scenario"
-                    identity = str(rec.get("clip_uid") or "")
-                    if (identity and identity not in seen_by_task[name]
-                            and (not require_imu or imu_window_is_covered(
-                                video, tuple(rec["window_s"])))):
-                        seen_by_task[name].add(identity)
-                        buckets[name].append(rec)
+                    for rec in _iter_span_records(
+                            video, span, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                            revalidate=validate_scenario):
+                        rec["match_confidence"] = "scenario"
+                        identity = str(rec.get("clip_uid") or "")
+                        if (identity and identity not in seen_by_task[name]
+                                and (not require_imu or imu_window_is_covered(
+                                    video, tuple(rec["window_s"])))):
+                            seen_by_task[name].add(identity)
+                            buckets[name].append(rec)
             base_min = max(min_dur_s, rule.min_span_s or 0.0)
             span_minimums = [base_min] if name in possible_names else []
             if (name in possible_names
                     and base_min < task_matching.LONG_ACTIVITY_MIN_S <= max_dur_s):
                 span_minimums.append(task_matching.LONG_ACTIVITY_MIN_S)
             for span_minimum in span_minimums:
+                validate_actions = _export_span_validator(
+                    rule, prepared, event_labels, name, rivals,
+                    min_dur_s=span_minimum, max_dur_s=max_dur_s)
                 for span in task_matching.extract_spans(
                         rule, events,
                         min_s=span_minimum,
@@ -1097,15 +1246,17 @@ def rank_all_task_spans(
                         allowed_intervals=(
                             imu_coverage_intervals(video) if require_imu else None
                         )):
-                    rec = _span_record(video, span)
-                    rec["match_confidence"] = rule.confidence
-                    identity = str(rec.get("clip_uid") or "")
-                    if (identity and identity not in seen_by_task[name]
-                            and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
-                            and (not require_imu or imu_window_is_covered(
-                                video, tuple(rec["window_s"])))):
-                        seen_by_task[name].add(identity)
-                        buckets[name].append(rec)
+                    for rec in _iter_span_records(
+                            video, span, min_dur_s=span_minimum, max_dur_s=max_dur_s,
+                            revalidate=validate_actions):
+                        rec["match_confidence"] = rule.confidence
+                        identity = str(rec.get("clip_uid") or "")
+                        if (identity and identity not in seen_by_task[name]
+                                and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
+                                and (not require_imu or imu_window_is_covered(
+                                    video, tuple(rec["window_s"])))):
+                            seen_by_task[name].add(identity)
+                            buckets[name].append(rec)
     for _name, items in buckets.items():
         items.sort(key=lambda r: (
             -(r.get("match_score") or 0), -(r.get("dur_s") or 0),
@@ -1189,24 +1340,31 @@ def list_windows(
 
 def prefer_long_clips(clips: list[dict[str, Any]], *,
                      shuffle: bool = False) -> list[dict[str, Any]]:
-    """Longos primeiro (≥10 min, depois ≥5 min), para encher horas com menos PUT."""
-    long: list[dict[str, Any]] = []
-    mid: list[dict[str, Any]] = []
-    short: list[dict[str, Any]] = []
+    """Export oficial primeiro; dentro disso, longos (≥10 min, depois ≥5 min).
+
+    O clipe CRF 18 já era a mídia preferida. Enfileirar o full-scale só porque
+    a janela é mais longa invertia essa preferência e baixava o pai inteiro.
+    """
+    buckets = {
+        True: ([], [], []),
+        False: ([], [], []),
+    }
     for clip in clips:
         dur = float(clip.get("dur_s") or 0)
+        group = buckets[_uses_exported_clip(clip)]
         if dur >= 600:
-            long.append(clip)
+            group[0].append(clip)
         elif dur >= 300:
-            mid.append(clip)
+            group[1].append(clip)
         else:
-            short.append(clip)
-    if shuffle:
-        random.shuffle(long)
-        random.shuffle(mid)
-        random.shuffle(short)
-    ordered = long + mid + short
-    return cluster_by_parent(ordered)
+            group[2].append(clip)
+    ordered: list[dict[str, Any]] = []
+    for exported in (True, False):
+        for bucket in buckets[exported]:
+            if shuffle:
+                random.shuffle(bucket)
+            ordered.extend(cluster_by_parent(bucket))
+    return ordered
 
 
 # Só cola clipes colados de verdade. Gap de 30s + cobertura 0.7 mandava
@@ -1261,7 +1419,9 @@ def merge_ranked_spans(
                 out.append(segs[0][2])
             elif _span_coverage(segs, start, end) >= min_coverage:
                 merged = _merged_span_record(parent, start, end, segs)
-                if merged.get("needs_cut") and merged.get("s3_path"):
+                # Só cola se o resultado ainda cabe num export oficial.
+                # Senão os pedaços já são o mp4 CRF 18; juntá-los forçava o pai.
+                if _uses_exported_clip(merged) and merged.get("s3_path"):
                     out.append(merged)
                 else:
                     out.extend(seg[2] for seg in segs)

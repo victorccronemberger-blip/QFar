@@ -109,6 +109,10 @@ NATIVE_BITRATE = "8000k"
 # deixar cada processo x264 tentar monopolizar todos os núcleos.
 ACCOUNT_ENCODE_WORKERS = max(1, min(6, (os.cpu_count() or 2) // 2))
 _ACCOUNT_ENCODE_SLOTS = threading.BoundedSemaphore(ACCOUNT_ENCODE_WORKERS)
+# Serializa apenas a aquisição de reservas. Sem isso, dois prepares podem
+# segurar metade dos slots cada um e esperar eternamente pela outra metade.
+# A execução e a liberação permanecem concorrentes.
+_ACCOUNT_ENCODE_RESERVATION_LOCK = threading.Lock()
 # Teto de PUTs simultâneos. O vídeo-base já está pronto antes dos PUTs e o
 # hardware desta estação comporta seis conexões sem disparar todas as contas
 # de uma vez. Todas as contas entram no lote; só N voam em cada onda.
@@ -184,14 +188,28 @@ def _heavy_encode_threads() -> int:
 
 @lru_cache(maxsize=4)
 def _ffmpeg_encoder_available(ff: str, encoder: str) -> bool:
-    """Confirma que o ffmpeg instalado anuncia o encoder solicitado."""
+    """Confirma o encoder e, para NVENC, testa o hardware uma vez por processo."""
     import subprocess
     try:
         res = _ffmpeg_run([ff, "-hide_banner", "-encoders"], timeout=20)
     except (OSError, TimeoutError, subprocess.TimeoutExpired):
         return False
     output = f"{getattr(res, 'stdout', '')}\n{getattr(res, 'stderr', '')}"
-    return res.returncode == 0 and encoder in output
+    if res.returncode != 0 or encoder not in output:
+        return False
+    if encoder == "h264_nvenc":
+        # Builds Windows anunciam NVENC mesmo em PCs sem placa NVIDIA/driver.
+        # Valide um frame com a configuração real antes de preparar mídia longa.
+        try:
+            probe = _ffmpeg_run([
+                *_ffmpeg_head(ff), "-f", "lavfi", "-i",
+                "color=c=black:s=1440x1080:r=30", "-frames:v", "1", "-an",
+                *_native_video_codec_args(nvenc=True), "-f", "null", "-",
+            ], timeout=20)
+        except (OSError, TimeoutError, subprocess.TimeoutExpired):
+            return False
+        return probe.returncode == 0
+    return True
 
 
 def _use_nvenc(ff: str) -> bool:
@@ -226,7 +244,7 @@ def _native_video_codec_args(
             "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
             "-rc", "vbr", "-b:v", br, "-maxrate", br, "-bufsize", "16000k",
             "-profile:v", "high", "-level:v", "4.2",
-            "-spatial_aq", "1", "-temporal_aq", "1",
+            "-spatial-aq", "1", "-temporal-aq", "1",
             "-rc-lookahead", "20", "-bf", "0",
             *gop_args,
         ]
@@ -263,9 +281,10 @@ def _cpu_slots(n: int) -> Iterator[None]:
     n = max(1, min(int(n), ACCOUNT_ENCODE_WORKERS))
     acquired = 0
     try:
-        for _ in range(n):
-            _ACCOUNT_ENCODE_SLOTS.acquire()
-            acquired += 1
+        with _ACCOUNT_ENCODE_RESERVATION_LOCK:
+            for _ in range(n):
+                _ACCOUNT_ENCODE_SLOTS.acquire()
+                acquired += 1
         yield
     finally:
         for _ in range(acquired):
