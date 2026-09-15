@@ -89,6 +89,12 @@ private:
   void loadAccounts();
   void checkAllAccounts();
   void addAccount(bool registerNew);
+  void importAccounts();
+  void exportAccounts(bool selectedOnly);
+  QPushButton* _accountsImport{};
+  QPushButton* _accountsExport{};
+  QPushButton* _accountsExportSelected{};
+  void setAccountTransferBusy(bool busy);
   void loadBalances();
   void configureCrowtadoAccess(const QString& email);
   void loadHistory();

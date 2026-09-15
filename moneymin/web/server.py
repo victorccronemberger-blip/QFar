@@ -77,6 +77,7 @@ from .. import (
     hostinger_mail, readiness, sent_registry,
 )
 from ..atomic_io import load_json, save_json
+from .. import account_transfer
 from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import load_secure_settings, save_secure_settings
@@ -529,16 +530,23 @@ def _list_accounts() -> list[dict[str, Any]]:
     org_keys = prefs.get("org_keys", {})
     removed = _removed_accounts()
     out: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for path in sorted(config.tokens_dir().glob("token_*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
             continue
         email = data.get("email")
         if not email:
             continue
         if str(email).strip().casefold() in removed:
             continue
+        key = str(email).strip().casefold()
+        if key in seen:
+            continue
+        seen.add(key)
         out.append({
             "email": email,
             "expires_at": data.get("expires_at", 0),
@@ -727,6 +735,41 @@ def create_app() -> Flask:
     @app.get("/api/accounts")
     def get_accounts():
         return jsonify({"accounts": _list_accounts()})
+
+    @app.post("/api/accounts/import")
+    def import_accounts():
+        if request.content_length and request.content_length > account_transfer.MAX_BYTES * 2:
+            return jsonify({"error": "Arquivo muito grande; limite de 10 MB."}), 413
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or not isinstance(body.get("content"), str) or type(body.get("apply", False)) is not bool:
+            return jsonify({"error": "Informe o conteúdo JSON e uma opção de importação válida."}), 400
+        if body.get("apply") and (RUNNER.running or BALANCES_RUNNER.running):
+            return jsonify({"error": "Aguarde a campanha ou consulta de saldos terminar antes de importar."}), 409
+        try:
+            with _PERSISTENCE_LOCK:
+                result = account_transfer.import_accounts(body["content"], apply=body.get("apply", False),
+                    passwords_path=CROWTADO_PW_PATH, removed_path=_removed_accounts_path())
+            return jsonify(result)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except OSError:
+            return jsonify({"error": "Não foi possível acessar os arquivos locais das contas."}), 500
+
+    @app.post("/api/accounts/export")
+    def export_accounts():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or ("emails" in body and not isinstance(body["emails"], list)):
+            return jsonify({"error": "Seleção de contas inválida."}), 400
+        try:
+            with _PERSISTENCE_LOCK:
+                result = account_transfer.export_accounts(body.get("emails"), _crowtado_creds(), _removed_accounts())
+            response = jsonify(result)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except OSError:
+            return jsonify({"error": "Não foi possível ler as contas para exportação."}), 500
 
     @app.post("/api/accounts")
     def add_account():

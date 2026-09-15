@@ -1387,6 +1387,7 @@ QWidget* MainWindow::buildAccountsPage() {
   _accountsTable->setColumnWidth(2, 245);
   _accountsTable->setColumnWidth(3, 232);
   _accountsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+  _accountsTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
 
   auto* accountsBody = new QWidget;
   auto* accountsLayout = new QVBoxLayout(accountsBody);
@@ -1399,6 +1400,20 @@ QWidget* MainWindow::buildAccountsPage() {
   connect(_accountsCheckAll, &QPushButton::clicked, this, &MainWindow::checkAllAccounts);
   tableActions->addWidget(_accountsCheckAll);
   accountsLayout->addLayout(tableActions);
+  auto* transferActions = new QHBoxLayout;
+  _accountsImport = new QPushButton(QStringLiteral("Importar JSON"));
+  _accountsExport = new QPushButton(QStringLiteral("Exportar todas"));
+  _accountsExportSelected = new QPushButton(QStringLiteral("Exportar selecionadas"));
+  connect(_accountsImport, &QPushButton::clicked, this, &MainWindow::importAccounts);
+  connect(_accountsExport, &QPushButton::clicked, this, [this] { exportAccounts(false); });
+  connect(_accountsExportSelected, &QPushButton::clicked, this, [this] { exportAccounts(true); });
+  transferActions->addWidget(_accountsImport);
+  transferActions->addWidget(_accountsExport);
+  transferActions->addWidget(_accountsExportSelected);
+  transferActions->addStretch();
+  accountsLayout->addLayout(transferActions);
+  accountsLayout->addWidget(quietLabel(QStringLiteral(
+      "Backup JSON com credenciais de acesso. Guarde em local seguro. Use Ctrl ou Shift para selecionar contas.")));
   accountsLayout->addWidget(_accountsTable, 1);
   layout->addWidget(card(QStringLiteral("Contas cadastradas"), accountsBody), 1);
 
@@ -2870,6 +2885,130 @@ void MainWindow::startAccelerator() {
     _cachePoll.start();
     loadAccelerator();
   });
+}
+
+void MainWindow::setAccountTransferBusy(bool busy) {
+  _accountsImport->setEnabled(!busy);
+  _accountsExport->setEnabled(!busy);
+  _accountsExportSelected->setEnabled(!busy);
+  _accountAdd->setEnabled(!busy);
+  _accountRegister->setEnabled(!busy);
+  _accountsCheckAll->setEnabled(!busy);
+  _accountsTable->setEnabled(!busy);
+}
+
+void MainWindow::importAccounts() {
+  const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Importar contas"),
+      QString(), QStringLiteral("Contas JSON (*.json)"));
+  if (path.isEmpty()) return;
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly) || file.size() > 10 * 1024 * 1024) {
+    QMessageBox::warning(this, QStringLiteral("Importação"),
+        QStringLiteral("Não foi possível ler o arquivo. O limite é de 10 MB."));
+    return;
+  }
+  QByteArray bytes = file.readAll();
+  if (bytes.startsWith("\xEF\xBB\xBF")) bytes.remove(0, 3);
+  const QString content = QString::fromUtf8(bytes);
+  if (content.toUtf8() != bytes) {
+    QMessageBox::warning(this, QStringLiteral("Importação"), QStringLiteral("Salve o JSON usando UTF-8."));
+    return;
+  }
+  setAccountTransferBusy(true);
+  setStatus(QStringLiteral("Validando arquivo de contas…"));
+  _api.post(QStringLiteral("/api/accounts/import"), {{"content", content}, {"apply", false}},
+    [this, content](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (!ok) {
+        setAccountTransferBusy(false);
+        QMessageBox::warning(this, QStringLiteral("Importação"), error);
+        return;
+      }
+      const auto counts = doc.object().value("counts").toObject();
+      QStringList details;
+      for (const auto value : doc.object().value("results").toArray()) {
+        const auto row = value.toObject();
+        details << QStringLiteral("Linha %1 · %2 · %3").arg(row.value("row").toInt())
+            .arg(row.value("email").toString(), row.value("message").toString());
+      }
+      const int fresh = counts.value("new").toInt();
+      QMessageBox review(QMessageBox::Information, QStringLiteral("Revisar importação"),
+          QStringLiteral("%1 novas · %2 duplicadas · %3 inválidas\n\n"
+                         "Contas existentes serão preservadas. Somente as novas e válidas serão importadas. "
+                         "A validade dos acessos será conferida em Verificar todas.")
+              .arg(fresh).arg(counts.value("duplicate").toInt()).arg(counts.value("invalid").toInt()),
+          fresh > 0 ? QMessageBox::Ok | QMessageBox::Cancel : QMessageBox::Close, this);
+      review.setDetailedText(details.join('\n'));
+      if (fresh > 0) review.button(QMessageBox::Ok)->setText(QStringLiteral("Importar %1 conta(s)").arg(fresh));
+      if (review.exec() != QMessageBox::Ok || fresh == 0) {
+        setAccountTransferBusy(false);
+        return;
+      }
+      setStatus(QStringLiteral("Importando contas… Aguarde a conclusão antes de fechar o aplicativo."));
+      _api.post(QStringLiteral("/api/accounts/import"), {{"content", content}, {"apply", true}},
+        [this](bool saved, const QJsonDocument& result, const QString& failure) {
+          setAccountTransferBusy(false);
+          loadAccounts();
+          if (!saved) {
+            QMessageBox::warning(this, QStringLiteral("Importação"),
+                failure + QStringLiteral("\nAtualize a lista antes de tentar novamente; contas já importadas serão ignoradas."));
+            return;
+          }
+          const auto count = result.object().value("counts").toObject();
+          QStringList details;
+          for (const auto value : result.object().value("results").toArray()) {
+            const auto row = value.toObject();
+            details << QStringLiteral("Linha %1 · %2 · %3").arg(row.value("row").toInt())
+                .arg(row.value("email").toString(), row.value("message").toString());
+          }
+          const QString summary = QStringLiteral("%1 importadas · %2 duplicadas preservadas · %3 inválidas · %4 falhas")
+              .arg(count.value("imported").toInt()).arg(count.value("duplicate").toInt())
+              .arg(count.value("invalid").toInt()).arg(count.value("error").toInt());
+          QMessageBox report(QMessageBox::Information, QStringLiteral("Resultado da importação"),
+              summary + QStringLiteral("\n\nUse Verificar todas para conferir os acessos importados."), QMessageBox::Ok, this);
+          report.setDetailedText(details.join('\n'));
+          setStatus(summary);
+          report.exec();
+        });
+    });
+}
+
+void MainWindow::exportAccounts(bool selectedOnly) {
+  QJsonObject body;
+  if (selectedOnly) {
+    QJsonArray emails;
+    for (const auto& index : _accountsTable->selectionModel()->selectedRows())
+      emails.append(_accountsTable->item(index.row(), 0)->text());
+    if (emails.isEmpty()) {
+      QMessageBox::information(this, QStringLiteral("Exportação"), QStringLiteral("Selecione uma ou mais contas na tabela."));
+      return;
+    }
+    body.insert("emails", emails);
+  }
+  QString path = QFileDialog::getSaveFileName(this,
+      QStringLiteral("Salvar backup de contas — contém credenciais de acesso"),
+      QStringLiteral("QMoney-contas-%1.json").arg(QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss")),
+      QStringLiteral("Contas JSON (*.json)"));
+  if (path.isEmpty()) return;
+  if (!path.endsWith(".json", Qt::CaseInsensitive)) path += QStringLiteral(".json");
+  setAccountTransferBusy(true);
+  _api.post(QStringLiteral("/api/accounts/export"), body,
+    [this, path](bool ok, const QJsonDocument& doc, const QString& error) {
+      setAccountTransferBusy(false);
+      if (!ok) { QMessageBox::warning(this, QStringLiteral("Exportação"), error); return; }
+      QSaveFile output(path);
+      const auto bytes = doc.toJson(QJsonDocument::Indented);
+      if (!output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() || !output.commit()) {
+        QMessageBox::warning(this, QStringLiteral("Exportação"),
+            QStringLiteral("Não foi possível salvar o backup completo. Confira as permissões e o espaço disponível."));
+        return;
+      }
+      QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+      const int count = doc.object().value("accounts").toArray().size();
+      setStatus(QStringLiteral("%1 conta(s) exportada(s).").arg(count));
+      QMessageBox::information(this, QStringLiteral("Backup salvo"),
+          QStringLiteral("%1 conta(s) exportada(s) para:\n%2\n\nO JSON contém credenciais de acesso. Guarde em local seguro.")
+              .arg(count).arg(QDir::toNativeSeparators(path)));
+    });
 }
 
 void MainWindow::loadAccounts() {
