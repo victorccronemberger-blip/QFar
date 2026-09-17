@@ -1,7 +1,7 @@
 """Organização Minute por conta, sem cair na primeira org da lista.
 
 Contas Crowtado usam PE8EAR5V / Datoric. Contas Claru (@supply.claru.ai)
-usam WSNEHSKC / Claru. Ter as duas orgs no perfil (join acidental) não
+mantêm a org Claru sem aplicar código de convite. Ter as duas orgs no perfil não
 pode mandar Claru para a Crowtado nem Crowtado para o Hub antigo.
 """
 from __future__ import annotations
@@ -53,13 +53,18 @@ def pick_org_key(email: str, orgs: list[dict[str, Any]]) -> str | None:
 def ensure_membership(session: Any, email: str, orgs: list[dict[str, Any]]) -> str:
     """Garante a org certa e devolve o resourceKey.
 
-    Crowtado sem Datoric entra com PE8EAR5V. Claru sem Claru entra com
-    WSNEHSKC. Nunca escolhe a primeira org da lista. Levanta RuntimeError
+    Crowtado sem Datoric entra com PE8EAR5V. Claru nunca recebe join automático.
+    Nunca escolhe a primeira org da lista. Levanta RuntimeError
     se a org alvo não aparecer.
     """
     chosen = pick_org_key(email, orgs)
     if chosen:
         return chosen
+    if account_kind(email) == "claru":
+        raise RuntimeError(
+            f"{email}: organização Claru ausente no perfil; "
+            "nenhum código de convite foi aplicado"
+        )
     invite = target_invite(email)
     wanted = target_org_key(email)
     status, _body = session.join_org(invite)

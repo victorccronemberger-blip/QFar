@@ -2045,6 +2045,7 @@ def pump_pending(
     max_retries: int = 3,
     retry_backoff: float = 1.5,
     account_email: str | None = None,
+    required_org_key: str | None = None,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Processa sidecars pendentes (retry-late / loss / failed) e tenta de novo.
@@ -2057,7 +2058,8 @@ def pump_pending(
     chunk_index, preservando a identidade do envio. Se o blob já chegou, retoma
     somente complete/finalize, sem reenviar o vídeo. O vídeo local precisa existir
     para retomadas anteriores ao transporte. Quando account_email é informado,
-    somente journals daquela conta são processados.
+    somente journals daquela conta são processados. Com required_org_key,
+    pendências de outras organizações ficam preservadas sem reenvio.
 
     Retorna a lista de sidecars atualizados (estado final de cada tentativa).
     """
@@ -2071,6 +2073,10 @@ def pump_pending(
         pending = [item for item in pending
                    if str(item.get("account_email") or "").strip().casefold()
                    == wanted_email]
+
+    if required_org_key is not None:
+        pending = [item for item in pending
+                   if item.get("org_key") == required_org_key]
 
     updated: list[dict[str, Any]] = []
     touched_sessions: set[str] = set()
@@ -2201,6 +2207,9 @@ def pump_pending(
     for sid in touched_sessions:
         journals = [item for item in list_sidecars()
                     if str(item.get("session_id") or "") == sid]
+        if required_org_key is not None and any(
+                item.get("org_key") != required_org_key for item in journals):
+            continue
         if not journals or not any(item.get("finalize_requested") for item in journals):
             continue
         expected = max(int(item.get("expected_chunk_count") or 1)

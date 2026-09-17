@@ -47,11 +47,27 @@ class OrgPolicyTests(unittest.TestCase):
         self.assertEqual(key, CLARU)
         sess.join_org.assert_not_called()
 
-    def test_ensure_rejoins_claru_if_only_datoric_is_present(self) -> None:
+    def test_claru_never_receives_invite_even_when_membership_is_missing(self) -> None:
         email = "7pzb35xh@supply.claru.ai"
         sess = mock.Mock()
-        sess.join_org.return_value = (200, "{}")
-        sess.me.return_value = {"organizations": orgs(CROW, CLARU)}
-        key = org_policy.ensure_membership(sess, email, orgs(CROW))
-        self.assertEqual(key, CLARU)
-        sess.join_org.assert_called_once_with(config.CLARU_INVITE_CODE)
+        with self.assertRaisesRegex(RuntimeError, "Claru ausente"):
+            org_policy.ensure_membership(sess, email, orgs(CROW))
+        sess.join_org.assert_not_called()
+
+    def test_crowtado_join_must_be_confirmed_in_profile(self) -> None:
+        for status, after in ((403, orgs(HUB)), (200, orgs(HUB)), (201, [])):
+            with self.subTest(status=status, after=after):
+                sess = mock.Mock()
+                sess.join_org.return_value = (status, "{}")
+                sess.me.return_value = {"organizations": after}
+                with self.assertRaises(RuntimeError):
+                    org_policy.ensure_membership(sess, "crow@example.com", orgs(HUB))
+                sess.join_org.assert_called_once_with(config.INVITE_CODE)
+
+    def test_crowtado_already_in_new_org_does_not_need_another_invite(self) -> None:
+        sess = mock.Mock()
+        self.assertEqual(
+            org_policy.ensure_membership(sess, "crow@example.com", orgs(HUB, CROW)),
+            CROW,
+        )
+        sess.join_org.assert_not_called()

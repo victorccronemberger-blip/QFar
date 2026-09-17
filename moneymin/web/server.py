@@ -1613,9 +1613,10 @@ def create_app() -> Flask:
                 except (AuthError, RuntimeError, OSError) as exc:
                     skipped.append(f"{emails[i]}: {exc}")
         accounts = [acc for acc in resolved if acc is not None]
-        if not accounts:
+        if skipped:
             return jsonify({
-                "error": "nenhuma conta autenticou. " + "; ".join(skipped),
+                "error": "campanha bloqueada: não foi possível validar o acesso "
+                         "e a organização de todas as contas. " + "; ".join(skipped),
             }), 400
 
         # Nunca aceite do browser a associação task_id -> cenário. Uma aba

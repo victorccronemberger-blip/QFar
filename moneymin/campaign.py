@@ -44,6 +44,7 @@ from . import (
     device_profile,
     ego4d,
     holoassist,
+    org_policy,
     recording_timeline,
     sent_registry,
     task_matching,
@@ -1474,6 +1475,12 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
     """
     result: dict[str, Any] = {"email": account.email, "ok": False}
     try:
+        if (org_policy.account_kind(account.email) == "crowtado"
+                and account.org_key != config.ORG_KEY):
+            raise AuthError(
+                f"{account.email}: envio bloqueado; Crowtado exige a organização "
+                f"do código {config.INVITE_CODE}. Inicie uma nova campanha."
+            )
         sess = session
         if sess is None and session_cache is not None:
             sess = session_cache.get(account.email)
@@ -1489,7 +1496,9 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         result["org_key"] = account.org_key
         profile = device_profile.get_profile(account.email)
         if not getattr(sess, "_moneymin_pending_pumped", False):
-            recovered = pump_pending(sess, account_email=account.email)
+            recovered = pump_pending(
+                sess, account_email=account.email, required_org_key=account.org_key,
+            )
             sess._moneymin_pending_pumped = True
             if recovered:
                 result["recovered_uploads"] = len(recovered)
