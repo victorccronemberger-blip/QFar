@@ -340,15 +340,17 @@ def _lookup_password(email: str | None) -> str | None:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("email") == email and rec.get("senha"):
+            if str(rec.get("email") or "").strip().casefold() == email.strip().casefold() and rec.get("senha"):
                 found = str(rec["senha"])
     except OSError:
         pass
     pw_path = config.SECRETS_DIR / "crowtado_passwords.json"
     try:
         creds = json.loads(pw_path.read_text(encoding="utf-8-sig"))
-        if isinstance(creds, dict) and creds.get(email):
-            found = str(creds[email])
+        if isinstance(creds, dict):
+            for key, value in creds.items():
+                if str(key).strip().casefold() == email.strip().casefold() and isinstance(value, str) and value:
+                    found = value
     except (OSError, json.JSONDecodeError):
         pass
     return found or None

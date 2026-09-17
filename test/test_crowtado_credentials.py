@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
 import urllib.error
 from unittest import mock
 
@@ -71,6 +74,32 @@ class CrowtadoCredentialTests(unittest.TestCase):
 
         with self.assertRaisesRegex(crowtado.CrowtadoError, "Reparar instalação"):
             session._fapi("/v1/client", {})
+
+    def test_creation_batch_password_is_reused_without_second_entry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'novas_contas_20260916.json').write_text(json.dumps([
+                {'email': ' NEW@Example.com ', 'senha': ' kept spaces '},
+                {'email': 'removed@example.com', 'senha': 'old'}, None]), encoding='utf-8')
+            with mock.patch.object(server.config, 'DATA_DIR', root), \
+                 mock.patch.object(server, 'CROWTADO_PW_PATH', root / 'passwords.json'), \
+                 mock.patch.object(server, '_list_accounts', return_value=[{'email': 'New@example.com'}]):
+                self.assertEqual(server._configured_crowtado_creds(), {'New@example.com': ' kept spaces '})
+                with mock.patch.object(server.BALANCES_RUNNER, 'start') as start:
+                    response = self.client.post('/api/balances/refresh', json={})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(start.call_args.args[0], {'New@example.com': ' kept spaces '})
+
+    def test_explicit_saved_password_wins_and_case_variants_are_replaced(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); pw = root / 'passwords.json'
+            (root / 'novas_contas_20260916.json').write_text(json.dumps([
+                {'email': 'test@example.com', 'senha': 'outdated'}]), encoding='utf-8')
+            pw.write_text(json.dumps({'TEST@example.com': 'current'}), encoding='utf-8')
+            with mock.patch.object(server.config, 'DATA_DIR', root), mock.patch.object(server, 'CROWTADO_PW_PATH', pw):
+                self.assertEqual(server._crowtado_creds()['test@example.com'], 'current')
+                server._save_crowtado_cred(' Test@example.com ', 'replacement')
+                self.assertEqual(json.loads(pw.read_text()), {'test@example.com': 'replacement'})
 
 
 if __name__ == "__main__":

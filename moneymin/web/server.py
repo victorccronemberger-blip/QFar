@@ -611,8 +611,21 @@ def _save_balances(balances: dict[str, Any]) -> None:
 
 
 def _crowtado_creds() -> dict[str, str]:
-    """Senhas do crowtado por email: contas.jsonl (registrar_conta) + arquivo de senhas."""
+    """Reutiliza credenciais da mesma identidade, inclusive lotes de criação."""
     creds: dict[str, str] = {}
+    def collect(rec):
+        if not isinstance(rec, dict):
+            return
+        email = rec.get("email")
+        password = rec.get("password") or rec.get("senha")
+        if isinstance(email, str) and isinstance(password, str) and password:
+            creds[email.strip().casefold()] = password
+
+    for path in sorted(config.DATA_DIR.glob("novas_contas_*.json")):
+        rows = load_json(path, [])
+        if isinstance(rows, list):
+            for rec in rows:
+                collect(rec)
     contas = config.DATA_DIR / "contas.jsonl"
     try:
         for line in contas.read_text(encoding="utf-8-sig").splitlines():
@@ -620,22 +633,32 @@ def _crowtado_creds() -> dict[str, str]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("email") and rec.get("senha"):
-                creds[rec["email"]] = rec["senha"]
+            collect(rec)
     except OSError:
         pass
     stored = load_json(CROWTADO_PW_PATH, {})
     if isinstance(stored, dict):
-        creds.update({str(email): str(password)
-                      for email, password in stored.items()})
+        creds.update({str(email).strip().casefold(): password
+                      for email, password in stored.items()
+                      if isinstance(password, str) and password})
     return creds
+
+
+def _configured_crowtado_creds() -> dict[str, str]:
+    """Mantém a grafia da conta ativa e não recupera identidades removidas."""
+    saved = {str(e).strip().casefold(): p for e, p in _crowtado_creds().items()}
+    return {a["email"]: saved[str(a["email"]).strip().casefold()]
+            for a in _list_accounts() if str(a["email"]).strip().casefold() in saved}
 
 
 def _save_crowtado_cred(email: str, password: str) -> None:
     with _PERSISTENCE_LOCK:
         stored = load_json(CROWTADO_PW_PATH, {})
         creds = stored if isinstance(stored, dict) else {}
-        creds[email] = password
+        normalized = email.strip().casefold()
+        creds = {key: value for key, value in creds.items()
+                 if str(key).strip().casefold() != normalized}
+        creds[normalized] = password
         save_json(CROWTADO_PW_PATH, creds)
 
 
@@ -1935,7 +1958,7 @@ def create_app() -> Flask:
         # pertencem mais à operação atual e não devem inflar a contagem exibida
         # nem aparecer como contas conectadas no desktop.
         with_password = sorted(
-            email for email in _crowtado_creds() if email in configured_set
+            email for email in _configured_crowtado_creds() if email in configured_set
         )
         return jsonify({
             "balances": _load_balances(),
@@ -1949,7 +1972,7 @@ def create_app() -> Flask:
     def refresh_balances():
         body = request.get_json(silent=True) or {}
         configured = {a["email"] for a in _list_accounts()}
-        creds = {e: p for e, p in _crowtado_creds().items() if e in configured}
+        creds = {e: p for e, p in _configured_crowtado_creds().items() if e in configured}
         emails = [str(e).strip() for e in body.get("emails", []) if str(e).strip()]
         if emails:
             creds = {e: creds[e] for e in emails if e in creds}
@@ -1977,7 +2000,7 @@ def create_app() -> Flask:
         configured = {a["email"] for a in _list_accounts()}
         if email not in configured:
             return jsonify({"error": "conta não está configurada"}), 404
-        password = _crowtado_creds().get(email)
+        password = _configured_crowtado_creds().get(email)
         if not password:
             return jsonify({"error": "salve a senha do crowtado primeiro"}), 400
         if BALANCES_RUNNER.running:
