@@ -74,7 +74,7 @@ from flask import Flask, jsonify, request
 
 from .. import (
     campaign, config, crowtado, ego4d, fx, holo_accelerator, holoassist,
-    hostinger_mail, readiness, sent_registry,
+    hostinger_mail, org_policy, readiness, sent_registry,
 )
 from ..atomic_io import load_json, save_json
 from .. import account_transfer
@@ -556,21 +556,14 @@ def _list_accounts() -> list[dict[str, Any]]:
 
 
 def _resolve_org(email: str, session: Session | None = None) -> str:
-    """Resolve (e cacheia) a org_key da conta: prefs -> me()['organizations'][0]."""
+    """Resolve (e cacheia) a org_key pela política da conta, não pela 1ª org."""
     # Validar sempre, inclusive quando a organização já está no cache. O HUB
     # devolve /users/me = 200 para contas desativadas; ensure_auth inspeciona o
     # campo `disabled` e impede que a campanha comece com uma conta bloqueada.
     sess = session or Session.from_email(email)
     profile = sess.ensure_auth()
-    cached = _load_prefs().get("org_keys", {}).get(email)
-    if cached:
-        return cached
-    orgs = profile.get("organizations") or []
-    if not orgs:
-        raise RuntimeError(f"a conta {email} não pertence a nenhuma organização")
-    org_key = orgs[0]["resourceKey"]
-    # Outra resolução pode terminar ao mesmo tempo. Releia dentro do lock para
-    # não sobrescrever a org_key que a thread vizinha acabou de persistir.
+    orgs = [org for org in (profile.get("organizations") or []) if isinstance(org, dict)]
+    org_key = org_policy.ensure_membership(sess, email, orgs)
     with _PERSISTENCE_LOCK:
         prefs = _load_prefs()
         prefs.setdefault("org_keys", {})[email] = org_key
