@@ -426,6 +426,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   _campaignPoll.stop();
   _previewPoll.stop();
   _cachePoll.stop();
+  _orgMigrationPoll.stop();
   _balancePoll.stop();
   _backendProbe.stop();
   stopBackend();
@@ -1412,6 +1413,22 @@ QWidget* MainWindow::buildAccountsPage() {
   transferActions->addWidget(_accountsExportSelected);
   transferActions->addStretch();
   accountsLayout->addLayout(transferActions);
+  auto* migrationActions = new QHBoxLayout;
+  _accountsMigrate = new QPushButton(QStringLiteral("Atualizar organização Crowtado"));
+  _accountsMigrate->setToolTip(QStringLiteral("Atualiza todas as contas Crowtado cadastradas. Contas Claru são ignoradas."));
+  _migrationReport = new QPushButton(QStringLiteral("Ver relatório"));
+  _migrationReport->setEnabled(false);
+  connect(_accountsMigrate, &QPushButton::clicked, this, &MainWindow::startOrgMigration);
+  connect(_migrationReport, &QPushButton::clicked, this, &MainWindow::showOrgMigrationReport);
+  migrationActions->addWidget(_accountsMigrate);
+  migrationActions->addWidget(_migrationReport);
+  migrationActions->addStretch();
+  accountsLayout->addLayout(migrationActions);
+  _migrationStatus = quietLabel(QStringLiteral("Crowtado: organização nova obrigatória. Claru: mantida sem troca de código."));
+  _migrationStatus->setWordWrap(true);
+  accountsLayout->addWidget(_migrationStatus);
+  _orgMigrationPoll.setInterval(1200);
+  connect(&_orgMigrationPoll, &QTimer::timeout, this, &MainWindow::pollOrgMigration);
   accountsLayout->addWidget(quietLabel(QStringLiteral(
       "Backup JSON com credenciais de acesso. Guarde em local seguro. Use Ctrl ou Shift para selecionar contas.")));
   accountsLayout->addWidget(_accountsTable, 1);
@@ -2888,6 +2905,8 @@ void MainWindow::startAccelerator() {
 }
 
 void MainWindow::setAccountTransferBusy(bool busy) {
+  _accountTransferBusy = busy;
+  busy = busy || _orgMigrationRunning;
   _accountsImport->setEnabled(!busy);
   _accountsExport->setEnabled(!busy);
   _accountsExportSelected->setEnabled(!busy);
@@ -2895,6 +2914,111 @@ void MainWindow::setAccountTransferBusy(bool busy) {
   _accountRegister->setEnabled(!busy);
   _accountsCheckAll->setEnabled(!busy);
   _accountsTable->setEnabled(!busy);
+  _accountsMigrate->setEnabled(!busy && _accountsTable->rowCount() > 0);
+}
+
+void MainWindow::startOrgMigration() {
+  setAccountTransferBusy(true);
+  _migrationStatus->setText(QStringLiteral("Iniciando atualização das organizações…"));
+  _api.post(QStringLiteral("/api/accounts/migration"), {},
+    [this](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (ok) {
+        _orgMigrationSnapshot = doc.object();
+        _orgMigrationRunning = true;
+      }
+      setAccountTransferBusy(false);
+      if (!ok) {
+        _migrationStatus->setText(error);
+        pollOrgMigration();
+        return showError(QStringLiteral("Migração não iniciada"), error);
+      }
+      _orgMigrationPoll.start();
+      pollOrgMigration();
+    });
+}
+
+void MainWindow::pollOrgMigration() {
+  if (_orgMigrationPolling) return;
+  _orgMigrationPolling = true;
+  _api.get(QStringLiteral("/api/accounts/migration"),
+    [this](bool ok, const QJsonDocument& doc, const QString&) {
+      _orgMigrationPolling = false;
+      if (!ok) {
+        if (_orgMigrationRunning)
+          _migrationStatus->setText(QStringLiteral("Reconectando ao progresso da migração…"));
+        return;
+      }
+      const bool wasRunning = _orgMigrationRunning;
+      _orgMigrationSnapshot = doc.object();
+      const QString state = _orgMigrationSnapshot.value("state").toString();
+      _orgMigrationRunning = state == QStringLiteral("running");
+      setAccountTransferBusy(_accountTransferBusy);
+      _migrationReport->setEnabled(!_orgMigrationSnapshot.value("results").toArray().isEmpty());
+      if (_orgMigrationRunning) {
+        _orgMigrationPoll.start();
+        _migrationStatus->setText(QStringLiteral("Atualizando %1 de %2 · %3 · mantenha o QMoney aberto")
+            .arg(_orgMigrationSnapshot.value("completed").toInt())
+            .arg(_orgMigrationSnapshot.value("total").toInt())
+            .arg(_orgMigrationSnapshot.value("current_email").toString()));
+      } else {
+        _orgMigrationPoll.stop();
+        const auto counts = _orgMigrationSnapshot.value("counts").toObject();
+        if (state == QStringLiteral("completed"))
+          _migrationStatus->setText(QStringLiteral("%1 atualizadas · %2 já corretas · %3 Claru preservadas · %4 com pendências")
+              .arg(counts.value("migrated").toInt()).arg(counts.value("already").toInt())
+              .arg(counts.value("skipped").toInt())
+              .arg(counts.value("error").toInt() + counts.value("restricted").toInt()));
+        else if (state == QStringLiteral("interrupted"))
+          _migrationStatus->setText(QStringLiteral("Migração interrompida. Confira o relatório e execute novamente para concluir."));
+        else if (state == QStringLiteral("error"))
+          _migrationStatus->setText(_orgMigrationSnapshot.value("error").toString(QStringLiteral("Migração interrompida. Tente novamente.")));
+        if (wasRunning) {
+          _accountChecks.clear();
+          loadAccounts();
+        }
+      }
+    });
+}
+
+void MainWindow::showOrgMigrationReport() {
+  QDialog dialog(this);
+  dialog.setWindowTitle(QStringLiteral("Migração das organizações"));
+  dialog.resize(850, 440);
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* table = new QTableWidget(0, 3, &dialog);
+  configureTable(table);
+  table->setHorizontalHeaderLabels({QStringLiteral("Conta"), QStringLiteral("Tipo"), QStringLiteral("Resultado")});
+  table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+  table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+  table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+  const auto report = _orgMigrationSnapshot;
+  for (const auto value : report.value("results").toArray()) {
+    const auto result = value.toObject();
+    const int row = table->rowCount();
+    table->insertRow(row);
+    table->setItem(row, 0, cell(result.value("email").toString()));
+    table->setItem(row, 1, cell(result.value("account_kind").toString() == "claru" ? QStringLiteral("Claru") : QStringLiteral("Crowtado")));
+    auto* message = cell(result.value("message").toString());
+    const auto issue = result.value("issue").toObject();
+    message->setToolTip(issue.value("action").toString());
+    table->setItem(row, 2, message);
+  }
+  layout->addWidget(table);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+  auto* save = buttons->addButton(QStringLiteral("Salvar relatório"), QDialogButtonBox::ActionRole);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  connect(save, &QPushButton::clicked, &dialog, [this, report, &dialog] {
+    QString path = QFileDialog::getSaveFileName(&dialog, QStringLiteral("Salvar relatório"),
+        QStringLiteral("QMoney-migracao.json"), QStringLiteral("JSON (*.json)"));
+    if (path.isEmpty()) return;
+    if (!path.endsWith(".json", Qt::CaseInsensitive)) path += QStringLiteral(".json");
+    QSaveFile output(path);
+    const auto bytes = QJsonDocument(report).toJson(QJsonDocument::Indented);
+    if (!output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() || !output.commit())
+      showError(QStringLiteral("Relatório não salvo"), QStringLiteral("Confira o espaço e as permissões da pasta."));
+  });
+  layout->addWidget(buttons);
+  dialog.exec();
 }
 
 void MainWindow::importAccounts() {
@@ -3012,9 +3136,10 @@ void MainWindow::exportAccounts(bool selectedOnly) {
 }
 
 void MainWindow::loadAccounts() {
+  pollOrgMigration();
   _api.get(QStringLiteral("/api/accounts"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
     if (!ok) {
-      if (_accountsCheckAll) _accountsCheckAll->setEnabled(true);
+      setAccountTransferBusy(_accountTransferBusy);
       return showError(QStringLiteral("Falha ao carregar contas"), error);
     }
     const auto accounts = doc.object().value(QStringLiteral("accounts")).toArray();
@@ -3024,7 +3149,12 @@ void MainWindow::loadAccounts() {
       const auto account = value.toObject();
       const QString email = account.value(QStringLiteral("email")).toString();
       _accountsTable->setItem(row, 0, cell(email));
-      _accountsTable->setItem(row, 1, cell(account.value(QStringLiteral("org_key")).toString(QStringLiteral("não verificada"))));
+      const bool isClaru = account.value(QStringLiteral("account_kind")).toString() == QStringLiteral("claru");
+      const QString org = account.value(QStringLiteral("org_key")).toString();
+      const QString kind = isClaru ? QStringLiteral("Claru") : QStringLiteral("Crowtado");
+      auto* orgCell = cell(kind + QStringLiteral(" · ") + account.value("org_name").toString(QStringLiteral("Não verificada")));
+      orgCell->setToolTip(kind + QStringLiteral("\n") + org);
+      _accountsTable->setItem(row, 1, orgCell);
       const qint64 expiry = static_cast<qint64>(account.value(QStringLiteral("expires_at")).toDouble());
       const auto lastCheck = _accountChecks.value(email);
       QString state = expiry > QDateTime::currentSecsSinceEpoch()
@@ -3083,7 +3213,8 @@ void MainWindow::loadAccounts() {
       _accountsTable->setCellWidget(row, 3, actions);
       ++row;
     }
-    if (_accountsCheckAll) _accountsCheckAll->setEnabled(!accounts.isEmpty());
+    setAccountTransferBusy(_accountTransferBusy);
+    if (_accountsCheckAll) _accountsCheckAll->setEnabled(!accounts.isEmpty() && !_accountTransferBusy && !_orgMigrationRunning);
     setStatus(QStringLiteral("%1 conta(s) cadastrada(s).").arg(accounts.size()));
   });
 }

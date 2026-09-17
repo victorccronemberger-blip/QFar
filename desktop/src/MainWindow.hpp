@@ -91,6 +91,17 @@ private:
   void addAccount(bool registerNew);
   void importAccounts();
   void exportAccounts(bool selectedOnly);
+  void startOrgMigration();
+  void pollOrgMigration();
+  void showOrgMigrationReport();
+  QTimer _orgMigrationPoll;
+  bool _orgMigrationRunning{false};
+  bool _orgMigrationPolling{false};
+  bool _accountTransferBusy{false};
+  QJsonObject _orgMigrationSnapshot;
+  QPushButton* _accountsMigrate{};
+  QPushButton* _migrationReport{};
+  QLabel* _migrationStatus{};
   QPushButton* _accountsImport{};
   QPushButton* _accountsExport{};
   QPushButton* _accountsExportSelected{};

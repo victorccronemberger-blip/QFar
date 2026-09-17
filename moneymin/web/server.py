@@ -70,7 +70,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
 from .. import (
     campaign, config, crowtado, ego4d, fx, holo_accelerator, holoassist,
@@ -82,6 +82,7 @@ from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
+from .org_migration import OrgMigrationRunner
 from .runner import (
     BALANCES_RUNNER, HOLO_CACHE_RUNNER, RUNNER, friendly_campaign_error, _public_event,
 )
@@ -91,6 +92,8 @@ BALANCES_PATH = config.DATA_DIR / "balances.json"
 CROWTADO_PW_PATH = config.SECRETS_DIR / "crowtado_passwords.json"
 MAX_DUR_S = 1800.0  # cap do recording-config do Minute
 _PERSISTENCE_LOCK = threading.RLock()
+_ACCOUNT_OPERATION_LOCK = threading.Lock()
+ORG_MIGRATION = OrgMigrationRunner(config.DATA_DIR / "org_migration_report.json")
 _HEAVY_RUNNER_LOCK = threading.Lock()
 _WITHDRAW_LOCK = threading.Lock()
 _WITHDRAW_IN_FLIGHT: set[str] = set()
@@ -551,6 +554,11 @@ def _list_accounts() -> list[dict[str, Any]]:
             "email": email,
             "expires_at": data.get("expires_at", 0),
             "org_key": org_keys.get(email),
+            "account_kind": org_policy.account_kind(email),
+            "org_name": {
+                config.ORG_KEY: "Datoric", config.CLARU_ORG_KEY: "Claru",
+                config.HUB_ORG_KEY: "Hub antigo",
+            }.get(org_keys.get(email), "Não verificada"),
         })
     return out
 
@@ -588,6 +596,26 @@ def _check_account_health(email: str) -> dict[str, Any]:
             "status": "disabled" if disabled else "error",
             "error": issue_text(issue), "issue": issue,
         }
+
+
+def _migrate_account_org(email: str) -> dict[str, Any]:
+    kind = org_policy.account_kind(email)
+    row = {"email": email, "account_kind": kind}
+    if kind == "claru":
+        return {**row, "status": "skipped", "message": "Claru: mantida sem aplicar código."}
+    session = Session.from_email(email)
+    profile = session.ensure_auth()
+    before = org_policy.pick_org_key(email, profile.get("organizations") or [])
+    target = org_policy.ensure_membership(session, email, profile.get("organizations") or [])
+    with _PERSISTENCE_LOCK:
+        prefs = _load_prefs()
+        prefs.setdefault("org_keys", {})[email] = target
+        _save_prefs(prefs)
+    return {
+        **row, "status": "already" if before else "migrated", "org_key": target,
+        "message": ("Já estava na organização nova." if before else "Organização atualizada.")
+                   + f" Crowtado · {config.INVITE_CODE}",
+    }
 
 
 # --- saldos (crowtado) ----------------------------------------------------------
@@ -743,6 +771,21 @@ def create_app() -> Flask:
     # Nenhum frontend web e publicado ou usado como fallback.
     app = Flask(__name__, static_folder=None)
 
+    @app.before_request
+    def guard_account_operations():
+        account_write = request.path.startswith("/api/accounts") and request.method != "GET"
+        campaign_start = request.path in ("/api/campaigns", "/api/campaigns/preflight") and request.method == "POST"
+        if account_write or campaign_start or request.path == "/api/tasks":
+            _ACCOUNT_OPERATION_LOCK.acquire()
+            g.account_operation_locked = True
+            if ORG_MIGRATION.running:
+                return jsonify({"error": "Aguarde a migração das organizações terminar."}), 409
+
+    @app.teardown_request
+    def release_account_operation(_error):
+        if g.pop("account_operation_locked", False):
+            _ACCOUNT_OPERATION_LOCK.release()
+
     @app.get("/")
     def index():
         return jsonify({"service": "qmoney", "ui": "qt", "ok": True})
@@ -751,6 +794,33 @@ def create_app() -> Flask:
     @app.get("/api/accounts")
     def get_accounts():
         return jsonify({"accounts": _list_accounts()})
+
+    @app.get("/api/accounts/migration")
+    def get_org_migration():
+        response = jsonify(ORG_MIGRATION.snapshot())
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/api/accounts/migration")
+    def start_org_migration():
+        if RUNNER.running or BALANCES_RUNNER.running:
+            return jsonify({"error": "Aguarde a campanha ou consulta de saldos terminar antes de migrar."}), 409
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "Seleção de contas inválida."}), 400
+        known = {item["email"].strip().casefold(): item["email"] for item in _list_accounts()}
+        selected = body.get("emails", list(known))
+        if not isinstance(selected, list) or not selected or any(
+                not isinstance(email, str) or email.strip().casefold() not in known for email in selected):
+            return jsonify({"error": "Selecione contas cadastradas no QMoney."}), 400
+        emails = list(dict.fromkeys(known[email.strip().casefold()] for email in selected))
+        try:
+            result = ORG_MIGRATION.start(emails, _migrate_account_org)
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except OSError:
+            return jsonify({"error": "Não foi possível salvar o relatório da migração."}), 500
+        return jsonify(result), 202
 
     @app.post("/api/accounts/import")
     def import_accounts():

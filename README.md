@@ -26,7 +26,23 @@ são validados antes de salvar, e os valores ficam criptografados pelo DPAPI do
 Windows em `%LOCALAPPDATA%\QMoney\secrets\integrations.dat`, acessível somente
 ao mesmo usuário do Windows.
 
-## Publicação
+## Migração de contas
+
+Na aba **Contas**, use **Atualizar organização Crowtado** para migrar as contas
+cadastradas para Datoric (`PE8EAR5V`). Se elas estiverem em um arquivo, use
+**Importar JSON** primeiro. O progresso aparece na própria tela e **Ver relatório**
+mostra o resultado por conta, com opção de salvar um JSON sem credenciais.
+
+Contas com domínio `claru.ai` ou seus subdomínios, como `supply.claru.ai`, são
+identificadas como Claru e ignoradas pela migração, sem login nem aplicação de
+convite. As demais contas seguem a política Crowtado. A tabela identifica o tipo
+e a organização salva; o início da campanha continua exigindo confirmação ao vivo.
+
+Mantenha o QMoney aberto durante a migração. Se houver interrupção, o relatório
+parcial é preservado e o lote pode ser executado novamente; contas já na
+organização nova não recebem outro convite.
+
+## Publicação de versões
 
 Cada Release precisa conter exatamente estes três arquivos:
 
