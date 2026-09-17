@@ -1378,6 +1378,7 @@ QWidget* MainWindow::buildAccountsPage() {
 
   _accountsTable = new QTableWidget(0, 4);
   configureTable(_accountsTable);
+  _accountsTable->setMinimumHeight(230);
   _accountsTable->setHorizontalHeaderLabels(
       {QStringLiteral("Conta"), QStringLiteral("Organização"), QStringLiteral("Última verificação"), QStringLiteral("Ações")});
   _accountsTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -1434,8 +1435,13 @@ QWidget* MainWindow::buildAccountsPage() {
   accountsLayout->addWidget(_accountsTable, 1);
   layout->addWidget(card(QStringLiteral("Contas cadastradas"), accountsBody), 1);
 
+  layout->setSizeConstraint(QLayout::SetMinimumSize);
+  auto* scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  scroll->setWidget(body);
   return pageShell(QStringLiteral("Contas"),
-                   QStringLiteral("Gerencie as identidades usadas no Minute e valide cada acesso."), body);
+                   QStringLiteral("Gerencie as identidades usadas no Minute e valide cada acesso."), scroll);
 }
 
 QWidget* MainWindow::buildBalancesPage() {
