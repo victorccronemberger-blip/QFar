@@ -85,7 +85,7 @@ class OrgMigrateTests(unittest.TestCase):
         record = org_migrate.account_transfer.clean_record(self._account())
         with mock.patch.object(
             org_migrate, "session_from_record",
-            side_effect=AuthError("conta desativada no HUB: user@example.com"),
+            side_effect=AuthError("conta desativada no HUB: user@example.com", code="restricted"),
         ):
             row = org_migrate.migrate_one(record, code="PE8EAR5V", org_key="NEWORG")
         self.assertEqual(row["status"], "restricted")

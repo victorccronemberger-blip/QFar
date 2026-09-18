@@ -94,6 +94,7 @@ MAX_DUR_S = 1800.0  # cap do recording-config do Minute
 _PERSISTENCE_LOCK = threading.RLock()
 _ACCOUNT_OPERATION_LOCK = threading.Lock()
 ORG_MIGRATION = OrgMigrationRunner(config.DATA_DIR / "org_migration_report.json")
+ACCOUNT_HEALTH_PATH = config.DATA_DIR / "account_health.json"
 _HEAVY_RUNNER_LOCK = threading.Lock()
 _WITHDRAW_LOCK = threading.Lock()
 _WITHDRAW_IN_FLIGHT: set[str] = set()
@@ -530,6 +531,9 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
 def _list_accounts() -> list[dict[str, Any]]:
     """Contas = token_*.json em secrets/ (sem rede). org_key vem do cache de prefs."""
     prefs = _load_prefs()
+    health = load_json(ACCOUNT_HEALTH_PATH, {})
+    if not isinstance(health, dict):
+        health = {}
     org_keys = prefs.get("org_keys", {})
     removed = _removed_accounts()
     out: list[dict[str, Any]] = []
@@ -555,6 +559,7 @@ def _list_accounts() -> list[dict[str, Any]]:
             "expires_at": data.get("expires_at", 0),
             "org_key": org_keys.get(email),
             "account_kind": org_policy.account_kind(email),
+            "last_check": health.get(key, {}),
             "org_name": {
                 config.ORG_KEY: "Datoric", config.CLARU_ORG_KEY: "Claru",
                 config.HUB_ORG_KEY: "Hub antigo",
@@ -580,22 +585,61 @@ def _resolve_org(email: str, session: Session | None = None) -> str:
 
 
 def _check_account_health(email: str) -> dict[str, Any]:
-    """Valida uma conta e devolve um estado estável para a verificação em lote."""
-    try:
-        session = Session.from_email(email)
-        org_key = _resolve_org(email, session=session)
-        return {
-            "email": email, "status": "active", "org_key": org_key,
-            "expires_at": session.data.get("expires_at", 0),
-        }
-    except (AuthError, RuntimeError, OSError) as exc:
-        issue = account_issue(email, exc)
-        disabled = issue["code"] == "restricted"
-        return {
-            "email": email,
-            "status": "disabled" if disabled else "error",
-            "error": issue_text(issue), "issue": issue,
-        }
+    """Verificação sem migração: falhas temporárias não condenam uma conta."""
+    session = None
+    for attempt in range(1, 3):
+        try:
+            session = session or Session.from_email(email)
+            profile = session.ensure_auth()
+            org_key = org_policy.pick_org_key(email, profile.get("organizations") or [])
+            if not org_key:
+                raise AuthError("Organização de destino não confirmada.", code="organization")
+            if any(isinstance(org, dict) and org.get("resourceKey") == org_key
+                   and org.get("disabled") is True for org in profile.get("organizations", [])):
+                raise AuthError("Restrição explícita na organização de destino.", code="restricted")
+            result = {
+                "email": email, "status": "active", "status_label": "Acesso verificado",
+                "org_key": org_key, "expires_at": session.data.get("expires_at", 0),
+            }
+            break
+        except Exception as exc:  # noqa: BLE001 — qualquer falha ambígua é inconclusiva
+            issue = account_issue(email, exc)
+            if issue["retryable"] and attempt < 2:
+                time.sleep(2.0 if issue["code"] == "rate_limit" else 0.5)
+                continue
+            status, label = {
+                "restricted": ("disabled", "Restrição confirmada"),
+                "authentication": ("needs_reauth", "Reconectar acesso"),
+                "missing_access": ("needs_reauth", "Reconectar acesso"),
+                "organization": ("needs_org", "Organização pendente"),
+            }.get(issue["code"], ("inconclusive", "Verificação inconclusiva"))
+            result = {"email": email, "status": status, "status_label": label,
+                      "error": issue_text(issue), "issue": issue}
+            break
+    result["attempts"] = attempt
+    result["checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    _save_account_check(email, result)
+    return result
+
+
+def _save_account_check(email: str, result: dict[str, Any]) -> None:
+    with _PERSISTENCE_LOCK:
+        health = load_json(ACCOUNT_HEALTH_PATH, {})
+        if not isinstance(health, dict):
+            health = {}
+        previous = health.get(email.strip().casefold(), {})
+        result["last_success_at"] = (result["checked_at"] if result["status"] == "active"
+                                     else previous.get("last_success_at") if isinstance(previous, dict) else None)
+        health[email.strip().casefold()] = dict(result)
+        try:
+            save_json(ACCOUNT_HEALTH_PATH, health)
+            if result["status"] == "active" and result.get("org_key"):
+                prefs = _load_prefs()
+                prefs.setdefault("org_keys", {})[email] = result["org_key"]
+                _save_prefs(prefs)
+        except OSError:
+            # Falha no histórico local não altera o diagnóstico remoto.
+            result["history_saved"] = False
 
 
 def _migrate_account_org(email: str) -> dict[str, Any]:
@@ -712,12 +756,19 @@ def _remove_account_data(email: str) -> None:
 def _on_balance_result(email: str, summary: dict | None, erro: str | None) -> None:
     with _PERSISTENCE_LOCK:
         balances = _load_balances()
-        rec = {"updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-        if summary:
+        rec = dict(balances.get(email) or {})
+        rec["checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        if summary is not None:
             rec.update(summary)
+            rec["updated_at"] = rec["checked_at"]
             rec["error"] = None
+            rec["issue"] = None
+            rec["stale"] = False
         else:
-            rec["error"] = erro
+            issue = account_issue(email, RuntimeError(erro or "Consulta inconclusiva"), stage="Consulta de saldo Crowtado")
+            rec["error"] = issue_text(issue)
+            rec["issue"] = issue
+            rec["stale"] = True
         balances[email] = rec
         _save_balances(balances)
 
@@ -954,7 +1005,7 @@ def create_app() -> Flask:
         emails = [account["email"] for account in _list_accounts()]
         results_by_email: dict[str, dict[str, Any]] = {}
         if emails:
-            workers = min(6, len(emails))
+            workers = min(3, len(emails))
             with ThreadPoolExecutor(max_workers=workers,
                                     thread_name_prefix="moneymin-account-check") as pool:
                 futures = {pool.submit(_check_account_health, email): email
@@ -966,7 +1017,7 @@ def create_app() -> Flask:
                     except Exception as exc:  # noqa: BLE001 — uma conta não mata o lote
                         issue = account_issue(email, exc)
                         results_by_email[email] = {
-                            "email": email, "status": "error",
+                            "email": email, "status": "inconclusive", "status_label": "Verificação inconclusiva",
                             "error": issue_text(issue), "issue": issue,
                         }
         results = [results_by_email[email] for email in emails]
@@ -976,7 +1027,8 @@ def create_app() -> Flask:
             "active": sum(result["status"] == "active" for result in results),
             "disabled": [result for result in results
                          if result["status"] == "disabled"],
-            "errors": [result for result in results if result["status"] == "error"],
+            "errors": [result for result in results if result["status"] not in ("active", "disabled")],
+            "inconclusive": sum(result["status"] == "inconclusive" for result in results),
             "results": results,
         })
 

@@ -56,11 +56,11 @@ def friendly_campaign_error(value: Any) -> str:
     if "acesso negado ao ego4d" in text or "accessdenied" in text:
         return "A licença Ego4D não autorizou este arquivo. O QMoney seguirá com outro vídeo."
     if any(term in text for term in ("disabled", "desativad", "blocked account")):
-        return "A conta foi desativada no Minute. Valide-a antes de continuar."
+        return "O serviço recusou a operação. Confira o diagnóstico em Contas; uma mensagem de envio isolada não comprova desativação. Não remova a conta por este erro."
     if any(term in text for term in (
             "unauthorized", "forbidden", "authentication", "autherror",
             "token expired", "token inválido", "http 401", "http 403")):
-        return "A autenticação da conta expirou. Use “Verificar todas” na aba Contas."
+        return "Não foi possível validar o acesso nesta operação. Use “Verificar todas” em Contas; não é necessário remover a conta."
     if "http 429" in text or "rate limit" in text or "too many requests" in text:
         return "O serviço limitou novas tentativas. Aguarde alguns minutos e tente novamente."
     if any(term in text for term in ("timeout", "timed out", "tempo esgotado")):
@@ -554,7 +554,7 @@ class BalancesRunner:
 
         try:
             failures: list[tuple[str, str, Exception]] = []
-            workers = min(6, max(1, len(creds)))
+            workers = min(3, max(1, len(creds)))
             with ThreadPoolExecutor(max_workers=workers,
                                     thread_name_prefix="moneymin-balance") as pool:
                 futures = {

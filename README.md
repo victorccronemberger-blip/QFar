@@ -42,7 +42,22 @@ Mantenha o QMoney aberto durante a migração. Se houver interrupção, o relat�
 parcial é preservado e o lote pode ser executado novamente; contas já na
 organização nova não recebem outro convite.
 
-## Publicação de versões
+## Verificação de contas
+
+Em **Contas**, uma verificação inconclusiva significa que o serviço não pôde
+confirmar o acesso naquele momento; não significa conta inválida. O QMoney tenta
+novamente uma vez em falhas temporárias e preserva a data do último acesso
+confirmado. **Reconectar acesso** indica uma pendência de sessão local;
+**Organização pendente** indica vínculo de destino ausente. Somente uma resposta
+explícita de restrição é apresentada como **Restrição confirmada**.
+
+**Verificar todas** não aplica convites nem migra organizações. Use a ação de
+migração para isso. Erros de campanha não substituem a verificação da conta.
+Em Saldos, um `*` indica o último valor salvo quando a atualização falhou; passe
+o mouse para consultar o diagnóstico. Não remova uma conta para resolver falhas
+temporárias de rede, saldo ou envio.
+
+## Build e publicação
 
 Cada Release precisa conter exatamente estes três arquivos:
 

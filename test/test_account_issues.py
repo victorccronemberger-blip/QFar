@@ -12,7 +12,7 @@ class AccountIssueTests(unittest.TestCase):
     def test_causes_have_distinct_actions(self):
         cases = [
             (AuthError("HTTP 401 INVALID_PASSWORD"), "authentication"),
-            (AuthError("conta desativada no HUB"), "restricted"),
+            (AuthError("conta desativada no HUB", code="restricted"), "restricted"),
             (AuthError("sem token salvo"), "missing_access"),
             (RuntimeError("a conta não pertence a nenhuma organização"), "organization"),
             (RuntimeError("HTTP 429"), "rate_limit"),
@@ -42,6 +42,9 @@ class AccountIssueTests(unittest.TestCase):
 
 class AccountDiagnosticEndpointsTests(unittest.TestCase):
     def setUp(self):
+        patch = mock.patch.object(server, "_save_account_check")
+        patch.start()
+        self.addCleanup(patch.stop)
         self.client = server.create_app().test_client()
 
     def preflight(self, accounts, known, resolve):

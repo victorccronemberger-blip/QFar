@@ -2043,12 +2043,6 @@ void MainWindow::showAccountIssues(const QString& title, const QStringList& bloc
              issue.value(QStringLiteral("reason")).toString(),
              issue.value(QStringLiteral("action")).toString(),
              issue.value(QStringLiteral("detail")).toString());
-    if (!email.isEmpty()) {
-      _accountChecks.insert(email, QJsonObject{
-          {QStringLiteral("status"), QStringLiteral("error")},
-          {QStringLiteral("checked_at"), checkedAt},
-          {QStringLiteral("error"), issue.value(QStringLiteral("reason"))}});
-    }
   }
   const QString report = sections.join(QStringLiteral("\n\n"));
   QDialog dialog(this);
@@ -3162,17 +3156,22 @@ void MainWindow::loadAccounts() {
       orgCell->setToolTip(kind + QStringLiteral("\n") + org);
       _accountsTable->setItem(row, 1, orgCell);
       const qint64 expiry = static_cast<qint64>(account.value(QStringLiteral("expires_at")).toDouble());
-      const auto lastCheck = _accountChecks.value(email);
+      const auto lastCheck = _accountChecks.contains(email)
+          ? _accountChecks.value(email) : account.value(QStringLiteral("last_check")).toObject();
       QString state = expiry > QDateTime::currentSecsSinceEpoch()
           ? QStringLiteral("Token no prazo · não verificada")
           : QStringLiteral("Acesso precisa ser verificado");
       if (!lastCheck.isEmpty()) {
-        state = (lastCheck.value(QStringLiteral("status")).toString() == QStringLiteral("active")
-                     ? QStringLiteral("Acesso verificado · ") : QStringLiteral("Falha na verificação · "))
-                + lastCheck.value(QStringLiteral("checked_at")).toString();
+        state = lastCheck.value(QStringLiteral("status_label")).toString(
+                    lastCheck.value(QStringLiteral("status")).toString() == QStringLiteral("active")
+                        ? QStringLiteral("Acesso verificado") : QStringLiteral("Verificação inconclusiva"))
+                + QStringLiteral(" · ") + friendlyDate(lastCheck.value(QStringLiteral("checked_at")).toString());
       }
       auto* statusCell = cell(state);
-      statusCell->setToolTip(state + QStringLiteral("\n") + lastCheck.value(QStringLiteral("error")).toString());
+      QString checkDetails = state + QStringLiteral("\n") + lastCheck.value(QStringLiteral("error")).toString();
+      if (!lastCheck.value("last_success_at").toString().isEmpty())
+        checkDetails += QStringLiteral("\nÚltimo acesso confirmado: ") + friendlyDate(lastCheck.value("last_success_at").toString());
+      statusCell->setToolTip(checkDetails);
       _accountsTable->setItem(row, 2, statusCell);
       auto* actions = new QWidget;
       auto* actionsLayout = new QHBoxLayout(actions);
@@ -3184,8 +3183,12 @@ void MainWindow::loadAccounts() {
         _api.post(QStringLiteral("/api/accounts/") + encoded(email) + QStringLiteral("/check"), {},
           [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
             auto check = doc.object();
-            check.insert(QStringLiteral("status"), ok ? QStringLiteral("active") : QStringLiteral("error"));
-            check.insert(QStringLiteral("checked_at"), QDateTime::currentDateTime().toString(QStringLiteral("dd/MM HH:mm:ss")));
+            if (!check.contains(QStringLiteral("status"))) {
+              check.insert(QStringLiteral("status"), QStringLiteral("inconclusive"));
+              check.insert(QStringLiteral("status_label"), QStringLiteral("Verificação inconclusiva"));
+              check.insert(QStringLiteral("error"), error);
+            }
+            check.insert(QStringLiteral("checked_at"), QDateTime::currentDateTime().toString(Qt::ISODate));
             _accountChecks.insert(email, check);
             if (!ok) {
               const auto issue = check.value(QStringLiteral("issue")).toObject();
@@ -3201,8 +3204,11 @@ void MainWindow::loadAccounts() {
       connect(remove, &QPushButton::clicked, this, [this, email] {
         if (QMessageBox::question(this, QStringLiteral("Remover conta"),
               QStringLiteral("Remover definitivamente %1 deste QMoney?\n\n"
+                             "Falhas de verificação, saldo ou envio não comprovam que a conta está inválida. "
+                             "Para corrigir o acesso, verifique novamente ou conecte a mesma conta com a senha.\n\n"
                              "O acesso salvo será apagado e não voltará ao reiniciar. "
-                             "O histórico de campanhas será preservado.").arg(email))
+                             "O histórico de campanhas será preservado.").arg(email),
+              QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
             != QMessageBox::Yes) return;
         _api.remove(QStringLiteral("/api/accounts/") + encoded(email),
                     [this, email](bool ok, const QJsonDocument&, const QString& error) {
@@ -3246,7 +3252,7 @@ void MainWindow::checkAllAccounts() {
     for (const auto& value : result.value(QStringLiteral("results")).toArray()) {
       auto check = value.toObject();
       const QString email = check.value(QStringLiteral("email")).toString();
-      check.insert(QStringLiteral("checked_at"), QDateTime::currentDateTime().toString(QStringLiteral("dd/MM HH:mm:ss")));
+      check.insert(QStringLiteral("checked_at"), QDateTime::currentDateTime().toString(Qt::ISODate));
       _accountChecks.insert(email, check);
       if (check.value(QStringLiteral("status")).toString() != QStringLiteral("active")) {
         const auto issue = check.value(QStringLiteral("issue")).toObject();
@@ -3254,7 +3260,7 @@ void MainWindow::checkAllAccounts() {
         else legacyErrors << email + QStringLiteral(": ") + check.value(QStringLiteral("error")).toString();
       }
     }
-    setStatus(QStringLiteral("Verificação concluída: %1 ativas · %2 desativadas · %3 com erro · %4 no total.")
+    setStatus(QStringLiteral("Verificação: %1 acessos confirmados · %2 restrições confirmadas · %3 pendências · %4 no total. Não remova contas por falhas temporárias.")
                   .arg(active).arg(disabled).arg(errors).arg(total));
     loadAccounts();
     if (!issues.isEmpty() || !legacyErrors.isEmpty())
@@ -3319,11 +3325,17 @@ void MainWindow::loadBalances() {
           ? usdMoney(pendingCents)
           : QStringLiteral("—");
       if (!balance.value(QStringLiteral("error")).toString().isEmpty()) {
-        available = QStringLiteral("erro");
-        pending = QStringLiteral("erro");
+        available = hasAvailable ? available + QStringLiteral(" *") : QStringLiteral("não confirmado");
+        pending = hasPending ? pending + QStringLiteral(" *") : QStringLiteral("não confirmado");
       }
       auto* availableItem = cell(available);
       auto* pendingItem = cell(pending);
+      if (!balance.value(QStringLiteral("error")).toString().isEmpty()) {
+        const QString hint = QStringLiteral("Consulta inconclusiva. * indica o último saldo salvo, não um saldo atualizado.\n")
+                             + balance.value(QStringLiteral("error")).toString();
+        availableItem->setToolTip(hint);
+        pendingItem->setToolTip(hint);
+      }
       availableItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
       pendingItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
       _balancesTable->setItem(row, 1, availableItem);

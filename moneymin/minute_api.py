@@ -49,6 +49,43 @@ _REFRESH_URL = f"https://securetoken.googleapis.com/v1/token?key={config.FIREBAS
 class AuthError(RuntimeError):
     """Falha de autenticação (token ausente, expirado sem refresh válido, etc.)."""
 
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.account_issue_code = code
+
+
+def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False) -> AuthError:
+    """Preserva a causa sem confundir indisponibilidade com senha ou bloqueio."""
+    raw = (body or "").casefold()
+    code = "unknown"
+    if status == 429:
+        code = "rate_limit"
+    elif status >= 500:
+        code = "service"
+    elif status == 408 or (status == -1 and any(s in raw for s in ("timeout", "timed out"))):
+        code = "timeout"
+    elif status == -1:
+        code = "tls" if any(s in raw for s in ("certificate", "ssl", "tls")) else "network"
+    elif status == 401:
+        code = "authentication"
+    elif status == 403:
+        code = "forbidden"
+    if firebase and status in (400, 401, 403):
+        try:
+            payload = json.loads(body)
+            error = payload.get("error") if isinstance(payload, dict) else None
+            message = error.get("message") if isinstance(error, dict) else error
+        except (ValueError, TypeError):
+            message = None
+        if message == "USER_DISABLED":
+            code = "restricted"
+        elif message in ("INVALID_PASSWORD", "INVALID_LOGIN_CREDENTIALS", "INVALID_REFRESH_TOKEN",
+                         "TOKEN_EXPIRED", "USER_NOT_FOUND", "EMAIL_NOT_FOUND", "INVALID_GRANT"):
+            code = "authentication"
+        elif message == "TOO_MANY_ATTEMPTS_TRY_LATER":
+            code = "rate_limit"
+    return AuthError(f"{stage}: resposta HTTP {status}; verificação não concluída.", code=code)
+
 
 @dataclass(frozen=True)
 class HttpResponse:
@@ -221,7 +258,7 @@ def login(email: str, password: str) -> dict[str, Any]:
         body={"email": email, "password": password, "returnSecureToken": True},
     )
     if status != 200:
-        raise RuntimeError(f"login falhou ({status}): {body[:300]}")
+        raise _auth_failure(status, body, "Login", firebase=True)
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -364,7 +401,7 @@ def _refresh(token_data: dict[str, Any]) -> dict[str, Any]:
     """
     refresh_token = token_data.get("refreshToken") or token_data.get("refresh_token")
     if not refresh_token:
-        raise AuthError("sem refreshToken no arquivo — refaça o login (comando 'login').")
+        raise AuthError("sem refreshToken no arquivo — reconecte o acesso.", code="authentication")
     status, body = _request(
         _REFRESH_URL,
         "POST",
@@ -376,22 +413,24 @@ def _refresh(token_data: dict[str, Any]) -> dict[str, Any]:
         raw_form=True,
     )
     if status != 200:
-        raise AuthError(
-            f"refresh do token falhou ({status}) — refaça o login (comando 'login'). {body[:200]}"
-        )
+        raise _auth_failure(status, body, "Renovação da sessão", firebase=True)
     try:
         resp = json.loads(body) if (body or "").strip() else None
     except json.JSONDecodeError as exc:
         raise AuthError(
-            f"refresh devolveu resposta vazia/não-JSON ({status})."
+            f"refresh devolveu resposta vazia/não-JSON ({status}).", code="invalid_response",
         ) from exc
-    if not isinstance(resp, dict) or not resp.get("id_token"):
-        raise AuthError("refresh devolveu resposta vazia/não-JSON.")
+    if not isinstance(resp, dict) or not resp.get("id_token") or not resp.get("refresh_token"):
+        raise AuthError("refresh devolveu resposta vazia/não-JSON.", code="invalid_response")
+    try:
+        expires_in = int(resp.get("expires_in", "3600"))
+    except (TypeError, ValueError) as exc:
+        raise AuthError("refresh devolveu validade inválida.", code="invalid_response") from exc
     token_data["idToken"] = resp["id_token"]
     token_data["refreshToken"] = resp["refresh_token"]
     token_data["expiresIn"] = str(resp.get("expires_in", "3600"))
     token_data["expires_at"] = _expiry_from_token(
-        resp["id_token"], int(resp.get("expires_in", "3600"))
+        resp["id_token"], expires_in
     )
     return token_data
 
@@ -531,7 +570,7 @@ class Session:
             try:
                 self.refresh()
             except AuthError:
-                return status, text
+                raise
             headers["Authorization"] = f"Bearer {self._bearer()}"
             status2, text2 = _request(
                 config.BASE_URL + path, method, headers=headers, body=body)
@@ -540,7 +579,7 @@ class Session:
             try:
                 self._relogin()
             except AuthError:
-                return status2, text2
+                raise
             headers["Authorization"] = f"Bearer {self._bearer()}"
             return _request(config.BASE_URL + path, method, headers=headers, body=body)
         finally:
@@ -573,7 +612,7 @@ class Session:
             try:
                 self.refresh()
             except AuthError:
-                return response
+                raise
             headers["Authorization"] = f"Bearer {self._bearer()}"
             refreshed = _request_detailed(
                 config.BASE_URL + path, method, headers=headers, body=body)
@@ -582,7 +621,7 @@ class Session:
             try:
                 self._relogin()
             except AuthError:
-                return refreshed
+                raise
             headers["Authorization"] = f"Bearer {self._bearer()}"
             return _request_detailed(
                 config.BASE_URL + path, method, headers=headers, body=body)
@@ -740,10 +779,12 @@ class Session:
             if not password:
                 raise AuthError(
                     f"{email}: sem senha salva para re-login "
-                    "(secrets/crowtado_passwords.json)."
+                    "(secrets/crowtado_passwords.json).", code="missing_access",
                 )
             try:
                 self.data = login(email, password)
+            except AuthError:
+                raise
             except RuntimeError as login_exc:
                 raise AuthError(
                     f"{email}: login com senha salva falhou: {login_exc}"
@@ -766,10 +807,12 @@ class Session:
             try:
                 self.data = _refresh(self.data)
             except AuthError as exc:
+                if exc.account_issue_code and exc.account_issue_code != "authentication":
+                    raise
                 try:
                     self._relogin()
                 except AuthError as login_exc:
-                    raise AuthError(f"{email}: {exc}") from login_exc
+                    raise login_exc from exc
             self._persist()
             self._live = True
         return self
@@ -800,8 +843,10 @@ class Session:
                 profile = json.loads(body)
             except (json.JSONDecodeError, ValueError) as exc:
                 raise AuthError(
-                    f"resposta inválida ao validar {email}: {body[:200]}"
+                    f"resposta inválida ao validar {email}", code="invalid_response",
                 ) from exc
+            if not isinstance(profile, dict) or not isinstance(profile.get("organizations"), list):
+                raise AuthError("O perfil devolvido pelo serviço está incompleto.", code="invalid_response")
             # Gate de versão (kill-switch via 403) — independente de org.
             gate = self.version_gate()
             if gate and gate.get("minVersion"):
@@ -810,7 +855,7 @@ class Session:
                     raise AuthError(
                         f"{email}: versão {config.APP_VERSION} bloqueada pelo "
                         f"backend (mínimo {gate['minVersion']}). Atualize o "
-                        "QMoney antes de novos envios."
+                        "QMoney antes de novos envios.", code="version",
                     )
             # Bloqueio POR ORG ALVO (disabled da conta/org + userState). Uma org
             # desativada entre várias NÃO bloqueia a conta inteira — só a org
@@ -824,21 +869,17 @@ class Session:
                             else "indisponível")
                     raise AuthError(
                         f"{email}: {what} para {org_key} — a plataforma não "
-                        "aceita envios agora (o app Minute pararia aqui)."
+                        "aceita envios agora (o app Minute pararia aqui).", code="restricted",
                     )
             elif profile.get("disabled") is True:
                 who = profile.get("email") or email
                 raise AuthError(
                     f"conta desativada no HUB: {who}. "
-                    "A plataforma precisa reativá-la antes de novos envios."
+                    "A plataforma precisa reativá-la antes de novos envios.", code="restricted",
                 )
             self.warmup()
             return profile
-        raise AuthError(
-            f"{email}: sessão inválida ({status}) — o token pode ter expirado. "
-            "Refaça o login pela aba Contas do QMoney. "
-            f"Detalhe: {body[:200]}"
-        )
+        raise _auth_failure(status, body, "Consulta do perfil")
 
     # -- orgs / tasks (respostas normalizadas) -------------------------------
     def my_orgs(self) -> list[dict[str, Any]]:
