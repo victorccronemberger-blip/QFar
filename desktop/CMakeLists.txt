@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 if(DEFINED ENV{QMONEY_VERSION} AND NOT "$ENV{QMONEY_VERSION}" STREQUAL "")
   set(QMONEY_VERSION "$ENV{QMONEY_VERSION}")
 else()
-  set(QMONEY_VERSION "1.0.41")
+  set(QMONEY_VERSION "1.0.42")
 endif()
 project(QMoney VERSION ${QMONEY_VERSION} LANGUAGES CXX)
 
@@ -49,6 +49,7 @@ qt_add_executable(QMoney WIN32
   src/ApiClient.hpp
   src/ApiClient.cpp
   src/MainWindow.hpp
+  src/ComboBox.hpp
   src/MainWindow.cpp
   src/UpdateManager.hpp
   src/UpdateManager.cpp

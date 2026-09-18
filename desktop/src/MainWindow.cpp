@@ -1,4 +1,5 @@
 #include "MainWindow.hpp"
+#include "ComboBox.hpp"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -176,34 +177,13 @@ void configureCombo(QComboBox* combo, int minimumWidth = 360) {
   combo->setMinimumWidth(minimumWidth);
   combo->setMinimumHeight(42);
   combo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-  combo->setMaxVisibleItems(10);
+  combo->setMaxVisibleItems(8);
   combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
   combo->setMinimumContentsLength(24);
-  combo->view()->setTextElideMode(Qt::ElideNone);
-  combo->view()->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+  combo->view()->setTextElideMode(Qt::ElideRight);
+  combo->view()->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   combo->view()->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-  combo->view()->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-}
-
-void fitComboPopup(QComboBox* combo) {
-  const QFontMetrics metrics(combo->view()->font());
-  int width = qMax(combo->width(), combo->minimumWidth());
-  for (int i = 0; i < combo->count(); ++i) {
-    const QString text = combo->itemText(i);
-    width = qMax(width, metrics.horizontalAdvance(text) + 76);
-    combo->setItemData(i, text, Qt::ToolTipRole);
-  }
-
-  // Categorias do Minute/HoloAssist são descritivas e frequentemente longas.
-  // O popup pode crescer além do campo, mas mantém rolagem em telas menores.
-  const int popupWidth = qMin(width, 900);
-  const int visibleRows = qMin(qMax(combo->count(), 1), combo->maxVisibleItems());
-  const int rowHeight = qMax(40, combo->view()->sizeHintForRow(0));
-  const int popupHeight = visibleRows * rowHeight + 14;
-  combo->view()->setMinimumWidth(popupWidth);
-  combo->view()->setMaximumWidth(popupWidth);
-  combo->view()->setMinimumHeight(popupHeight);
-  combo->view()->setMaximumHeight(popupHeight);
+  combo->view()->setVerticalScrollMode(QAbstractItemView::ScrollPerItem);
 }
 
 void configureTable(QTableWidget* table) {
@@ -972,9 +952,8 @@ QWidget* MainWindow::buildIntegrationsPage() {
   auto* hostSelectorLayout = new QHBoxLayout(hostSelector);
   hostSelectorLayout->setContentsMargins(0, 0, 0, 0);
   hostSelectorLayout->setSpacing(8);
-  _hostingerProfile = new QComboBox;
+  _hostingerProfile = new ComboBox;
   configureCombo(_hostingerProfile, 480);
-  _hostingerProfile->setMinimumHeight(46);
   connect(_hostingerProfile, qOverload<int>(&QComboBox::currentIndexChanged),
           this, &MainWindow::selectHostingerIntegration);
   hostSelectorLayout->addWidget(_hostingerProfile, 1);
@@ -1069,13 +1048,12 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* sourceBody = new QWidget;
   auto* sourceLayout = new QHBoxLayout(sourceBody);
   sourceLayout->setContentsMargins(0, 0, 0, 0);
-  _dataset = new QComboBox;
+  _dataset = new ComboBox;
   configureCombo(_dataset, 420);
   _dataset->addItem(QStringLiteral("Conteúdo combinado"), QStringLiteral("all"));
   _dataset->addItem(QStringLiteral("Somente Ego4D"), QStringLiteral("ego4d"));
   _dataset->addItem(QStringLiteral("Somente HoloAssist"), QStringLiteral("holoassist"));
   _dataset->setCurrentIndex(0);
-  fitComboPopup(_dataset);
   connect(_dataset, &QComboBox::currentIndexChanged, this,
           [this] { _taskReload.start(); });
   sourceLayout->addWidget(new QLabel(QStringLiteral("Origem")));
@@ -1180,13 +1158,12 @@ QWidget* MainWindow::buildCampaignPage() {
   });
   form->addRow(QStringLiteral("Duração mínima"), _minDuration);
   form->addRow(QStringLiteral("Duração máxima"), _maxDuration);
-  _delayMode = new QComboBox;
+  _delayMode = new ComboBox;
   configureCombo(_delayMode, 420);
   _delayMode->addItem(QStringLiteral("Sem intervalo"), QStringLiteral("off"));
   _delayMode->addItem(QStringLiteral("Duração do clipe"), QStringLiteral("clip"));
   _delayMode->addItem(QStringLiteral("Intervalo fixo"), QStringLiteral("fixed"));
   _delayMode->setCurrentIndex(0);
-  fitComboPopup(_delayMode);
   form->addRow(QStringLiteral("Intervalo"), _delayMode);
   _delaySeconds = new QSpinBox;
   _delaySeconds->setRange(0, 3600);
@@ -1300,7 +1277,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   auto* form = new QFormLayout(config);
   configureForm(form);
   form->setContentsMargins(0, 0, 0, 0);
-  _cacheTask = new QComboBox;
+  _cacheTask = new ComboBox;
   configureCombo(_cacheTask, 620);
   form->addRow(QStringLiteral("Tarefa HoloAssist"), _cacheTask);
   _cacheLimit = new QSpinBox;
@@ -1384,7 +1361,8 @@ QWidget* MainWindow::buildAccountsPage() {
   auto* bulkForm = new QFormLayout(bulkBody);
   configureForm(bulkForm);
   bulkForm->setContentsMargins(0, 0, 0, 0);
-  _bulkRegisterDomain = new QComboBox;
+  _bulkRegisterDomain = new ComboBox;
+  configureCombo(_bulkRegisterDomain);
   _bulkRegisterDomain->setEditable(false);
   _bulkRegisterDomain->addItem(QStringLiteral("carregando domínios…"));
   bulkForm->addRow(QStringLiteral("Domínio"), _bulkRegisterDomain);
@@ -1930,10 +1908,11 @@ void MainWindow::applyStructuralStyle(bool dark) {
     }
     QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 40px; padding-left: 12px; padding-right: 12px; }
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus, QListWidget:focus { border-color: #ff7a36; }
-    QComboBox { padding-right: 44px; }
+    QComboBox { combobox-popup: 0; padding-right: 44px; }
     QComboBox::drop-down { width: 40px; border-left: 1px solid %6; }
-    QComboBox QAbstractItemView { color: %4; background-color: %2; border: 1px solid %6; selection-background-color: #d9652b; padding: 6px; }
-    QComboBox QAbstractItemView::item { min-height: 38px; padding: 7px 12px; }
+    QComboBox::down-arrow { image: url(:/qmoney/icons/chevron-down.svg); width: 14px; height: 14px; }
+    QComboBox QAbstractItemView { color: %4; background-color: %2; border: 1px solid %6; border-radius: 0; selection-background-color: #d9652b; selection-color: white; padding: 0; }
+    QComboBox QAbstractItemView::item { padding: 0 12px; }
     QListWidget::item { padding: 7px 9px; border-radius: 4px; }
     QListWidget::item:selected { background: #3b2920; color: white; }
     QTableWidget { gridline-color: %6; selection-background-color: #3b2920; selection-color: white; alternate-background-color: %9; }
@@ -2455,7 +2434,6 @@ void MainWindow::loadIntegrations() {
       if (_hostingerProfile->count() > 0)
         _hostingerProfile->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
     }
-    fitComboPopup(_hostingerProfile);
     selectHostingerIntegration(_hostingerProfile->currentIndex());
     const int hostCount = host.value(QStringLiteral("connection_count")).toInt();
     _hostingerStatus->setText(hostConfigured
@@ -3087,7 +3065,6 @@ void MainWindow::loadAccelerator() {
     if (_cacheTask->count() == 0) {
       for (const auto task : root.value(QStringLiteral("tasks")).toArray()) _cacheTask->addItem(task.toString());
       if (_cacheTask->count()) _cacheTask->setCurrentIndex(0);
-      fitComboPopup(_cacheTask);
     }
     const auto cache = root.value(QStringLiteral("cache")).toObject();
     const auto runner = root.value(QStringLiteral("runner")).toObject();
