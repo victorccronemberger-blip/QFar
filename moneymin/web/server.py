@@ -769,9 +769,13 @@ def _ban_accounts(issues: list[dict]) -> None:
                        for row in archive.get("accounts", []))):
             raise ValueError("Registro de contas banidas inválido; remoção cancelada.")
         records = {row["email"].casefold(): row for row in archive["accounts"]}
+        passwords = _crowtado_creds()
         for issue in issues:
             email = account_transfer.email_key(issue.get("email"))
-            records[email] = {"email": email, "removed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            previous = records.get(email, {})
+            banned_at = previous.get("banned_at") or previous.get("removed_at") or time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            records[email] = {"email": email, "password": passwords.get(email) or previous.get("password"),
+                              "banned_at": banned_at, "removed_at": previous.get("removed_at") or banned_at,
                               "reason": issue.get("reason", "Restrição confirmada pela plataforma."),
                               "stage": issue.get("stage", "Envio"), "restriction_confirmed": True}
         archive["accounts"] = list(records.values())
@@ -923,7 +927,21 @@ def create_app() -> Flask:
 
     @app.get("/api/accounts/banned")
     def banned_accounts():
-        return jsonify(load_json(config.DATA_DIR / "banned_accounts.json", {"schema": 1, "accounts": []}))
+        with _PERSISTENCE_LOCK:
+            path = config.DATA_DIR / "banned_accounts.json"
+            archive = load_json(path, {"schema": 1, "accounts": []})
+            passwords = _crowtado_creds()
+            changed = False
+            for row in archive.get("accounts", []):
+                email = str(row.get("email", "")).strip().casefold()
+                for key, value in (("password", row.get("password") or passwords.get(email)),
+                                   ("banned_at", row.get("banned_at") or row.get("removed_at"))):
+                    if key not in row or row[key] != value:
+                        row[key] = value
+                        changed = True
+            if changed:
+                save_json(path, archive)
+            return jsonify(archive)
 
     @app.post("/api/accounts/import")
     def import_accounts():

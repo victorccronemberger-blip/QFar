@@ -30,6 +30,7 @@ class PreflightContinuationTests(unittest.TestCase):
             server.config.token_path(email).write_text(json.dumps({'email': email, 'idToken': 'secret', 'refreshToken': 'private'}))
         self.body = {'accounts': ['good@example.com', 'bad@example.com'],
                      'tasks': [{'task_id': 'task'}], 'dataset': 'ego4d'}
+        server.CROWTADO_PW_PATH.write_text(json.dumps({'bad@example.com': 'saved-password', 'good@example.com': 'healthy-password'}))
         self.failure = AuthError('disabled', code='restricted')
         def resolve(email):
             if email.startswith('bad'): raise self.failure
@@ -46,7 +47,7 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.get_json()
 
-    def test_remove_continue_reuses_validation_and_archives_without_credentials(self):
+    def test_remove_continue_archives_password_and_date_without_tokens(self):
         result = self.preflight()
         self.assertTrue(result['can_remove_and_continue'])
         self.assertTrue(server.config.token_path('bad@example.com').exists())
@@ -59,6 +60,14 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertIn('bad@example.com', server._removed_accounts())
         archive = self.client.get('/api/accounts/banned').get_json()
         self.assertEqual(archive['accounts'][0]['email'], 'bad@example.com')
+        self.assertEqual(archive['accounts'][0]['password'], 'saved-password')
+        self.assertTrue(archive['accounts'][0]['banned_at'])
+        self.assertNotIn('bad@example.com', json.loads(server.CROWTADO_PW_PATH.read_text()))
+        saved_date = archive['accounts'][0]['banned_at']
+        server._ban_accounts([{'email': 'bad@example.com', 'restriction_confirmed': True}])
+        archived_again = self.client.get('/api/accounts/banned').get_json()['accounts'][0]
+        self.assertEqual(archived_again['password'], 'saved-password')
+        self.assertEqual(archived_again['banned_at'], saved_date)
         self.assertNotIn('private', json.dumps(archive))
         self.assertNotIn('secret', json.dumps(archive))
         attempt = self.client.post('/api/accounts/import', json={'content': json.dumps([
@@ -120,6 +129,16 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertTrue(server.config.token_path('bad@example.com').exists())
         self.runner.start.assert_not_called()
+
+    def test_legacy_export_recovers_available_password_and_marks_missing_as_null(self):
+        path = self.root / 'banned_accounts.json'
+        path.write_text(json.dumps({'schema': 1, 'accounts': [
+            {'email': 'bad@example.com', 'removed_at': '2026-09-17T10:00:00-0300'},
+            {'email': 'missing@example.com', 'removed_at': '2026-09-16T10:00:00-0300'}]}))
+        rows = self.client.get('/api/accounts/banned').get_json()['accounts']
+        self.assertEqual(rows[0]['password'], 'saved-password')
+        self.assertEqual(rows[0]['banned_at'], '2026-09-17T10:00:00-0300')
+        self.assertIsNone(rows[1]['password'])
 
     def test_confirmation_required_and_unknown_receipt_rejected(self):
         result = self.preflight()
