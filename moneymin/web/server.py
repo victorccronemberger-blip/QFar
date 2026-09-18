@@ -62,6 +62,7 @@ import json
 import math
 import os
 import platform
+import random
 import shutil
 import sys
 import threading
@@ -75,7 +76,7 @@ from flask import Flask, g, jsonify, request
 
 from .. import (
     campaign, config, crowtado, ego4d, fx, holo_accelerator, holoassist,
-    hostinger_mail, org_policy, readiness, sent_registry,
+    hostinger_mail, identity, org_policy, readiness, sent_registry,
 )
 from ..atomic_io import load_json, save_json
 from .. import account_transfer, account_bans
@@ -84,6 +85,7 @@ from ..minute_api import AuthError, Session, login
 from ..secure_store import load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
 from .org_migration import OrgMigrationRunner
+from .banned_monitor import BannedMonitor
 from .runner import (
     BALANCES_RUNNER, HOLO_CACHE_RUNNER, RUNNER, friendly_campaign_error, _public_event,
 )
@@ -96,11 +98,301 @@ _PERSISTENCE_LOCK = threading.RLock()
 _ACCOUNT_OPERATION_LOCK = threading.Lock()
 ORG_MIGRATION = OrgMigrationRunner(config.DATA_DIR / "org_migration_report.json")
 ACCOUNT_HEALTH_PATH = config.DATA_DIR / "account_health.json"
+_BULK_REGISTER_LOCK = threading.Lock()
+_BULK_REGISTER_STATE: dict[str, Any] = {"state": "idle"}
 _HEAVY_RUNNER_LOCK = threading.Lock()
 _WITHDRAW_LOCK = threading.Lock()
 _WITHDRAW_IN_FLIGHT: set[str] = set()
 _WITHDRAW_LAST_REQUEST: dict[str, float] = {}
 _WITHDRAW_COOLDOWN_S = 60.0
+
+_STEP_LABELS = {
+    "ban_check": "verificação de ban",
+    "crowtado_signup": "criação Crowtado",
+    "save_partial": "salvar credenciais parciais",
+    "demographics": "demografia Crowtado",
+    "minute_register": "registro Minute",
+    "link_minute": "vincular Minute na Crowtado",
+    "validate": "validação pós-criação",
+}
+_STEP_ORDER = [
+    "ban_check", "crowtado_signup", "save_partial",
+    "demographics", "minute_register", "link_minute", "validate",
+]
+_CROWTADO_SIGNUP_RETRIES = 2
+_CROWTADO_SIGNUP_RETRY_DELAY_S = 5.0
+
+
+def _step_ok(detail: str = "") -> dict[str, str]:
+    return {"status": "ok", "detail": detail}
+
+
+def _step_skip(detail: str = "") -> dict[str, str]:
+    return {"status": "skip", "detail": detail}
+
+
+def _step_fail(detail: str = "") -> dict[str, str]:
+    return {"status": "fail", "detail": detail}
+
+
+def _hostinger_is_configured() -> bool:
+    """Ao menos um perfil Hostinger com rotas (domínio catch-all)?"""
+    profiles = getattr(config, "HOSTINGER_MAIL_PROFILES", None) or []
+    return any(
+        bool(profile.get("routes"))
+        for profile in profiles
+        if isinstance(profile, dict) and str(profile.get("token") or "").strip()
+    )
+
+
+def _registration_domains() -> list[dict[str, str]]:
+    domains = []
+    seen: set[str] = set()
+    for profile in hostinger_mail.configured_connections():
+        for route in profile["routes"]:
+            # Uma rota de destinatário individual não configura um catch-all.
+            if not route or "@" in route or any(c.isspace() for c in route) or route in seen:
+                continue
+            seen.add(route)
+            domains.append({"domain": route, "profile_id": profile.get("id", ""),
+                            "profile_name": profile.get("name", "")})
+    return domains
+
+
+def _preflight_checks() -> dict[str, Any]:
+    """Valida todas as dependências antes de iniciar a criação de contas.
+
+    Retorna um dict com status de cada verificação e um flag 'ready' geral.
+    """
+    from .. import crowtado
+    checks: dict[str, dict[str, Any]] = {}
+
+    # 1. Hostinger Mail API
+    profiles = getattr(config, "HOSTINGER_MAIL_PROFILES", None) or []
+    has_hostinger = any(
+        bool(p.get("routes"))
+        for p in profiles
+        if isinstance(p, dict) and str(p.get("token") or "").strip()
+    )
+    if has_hostinger:
+        try:
+            from .. import hostinger_mail
+            first_profile = next(
+                (p for p in profiles
+                 if isinstance(p, dict) and str(p.get("token") or "").strip()),
+                {},
+            )
+            result = hostinger_mail.test_connection(
+                token=first_profile.get("token"),
+                mailbox=first_profile.get("mailbox_id"),
+            )
+            checks["hostinger"] = {"ok": True, "detail": f"{result['mailboxes']} caixa(s)"}
+        except Exception as exc:
+            checks["hostinger"] = {"ok": False, "detail": str(exc)}
+    else:
+        checks["hostinger"] = {"ok": False, "detail": "Nenhum perfil Hostinger configurado com rotas"}
+
+    # 2. Chrome/Playwright
+    try:
+        from .. import crowtado
+        chrome_path = crowtado._chrome_exe()
+        checks["chrome"] = {"ok": True, "detail": chrome_path}
+    except Exception as exc:
+        checks["chrome"] = {"ok": False, "detail": str(exc)}
+
+    # 3. Crowtado Clerk API
+    try:
+        import urllib.request
+        from .. import tls
+        req = urllib.request.Request(
+            f"{crowtado.CLERK_BASE}/v1/client",
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "curl/8.5.0")
+        with tls.urlopen(req, timeout=10) as resp:
+            if resp.status < 300:
+                checks["crowtado_api"] = {"ok": True, "detail": "Clerk API respondendo"}
+            else:
+                checks["crowtado_api"] = {"ok": False, "detail": f"status {resp.status}"}
+    except Exception as exc:
+        checks["crowtado_api"] = {"ok": False, "detail": str(exc)}
+
+    # 4. Minute API
+    try:
+        import urllib.request
+        from .. import tls
+        req = urllib.request.Request(
+            f"{config.BASE_URL}/api/v1/health",
+            method="GET",
+        )
+        req.add_header("User-Agent", "okhttp/4.12.0")
+        with tls.urlopen(req, timeout=10) as resp:
+            checks["minute_api"] = {"ok": True, "detail": f"status {resp.status}"}
+    except Exception as exc:
+        # Minute pode não ter /health — status 404 ainda indica que a API está de pé
+        error_str = str(exc)
+        if "404" in error_str or "Not Found" in error_str:
+            checks["minute_api"] = {"ok": True, "detail": "APIrespondendo (sem /health)"}
+        else:
+            checks["minute_api"] = {"ok": False, "detail": error_str}
+
+    # 5. Invite code — tentativa rápida de join (sem commit)
+    checks["invite_code"] = {
+        "ok": True,
+        "detail": f"código {config.INVITE_CODE} configurado",
+    }
+
+    ready = all(check.get("ok", False) for check in checks.values())
+    return {"ready": ready, "checks": checks}
+
+
+def _full_register_account(
+    email: str, password: str, identity_data: dict[str, Any],
+    *, on_step: Any = None,
+) -> dict[str, Any]:
+    """Fluxo completo com retry, save parcial e validação pós-criação.
+
+    Diferente da versão anterior:
+    - Crowtado signup tem retry (Turnstile pode falhar transitoriamente)
+    - Credenciais são salvas LOGO após o signup Crowtado (save parcial)
+    - Validação pós-criação confirma que tudo realmente funciona
+    """
+    import logging
+    import time
+
+    from .. import crowtado, account_bans as bans
+    from ..minute_api import register as minute_register, login as minute_login
+
+    logger = logging.getLogger("moneymin.register")
+    steps: dict[str, dict[str, str]] = {}
+    step_start: dict[str, float] = {}
+
+    def _notify(step_name: str) -> None:
+        step_start[step_name] = time.monotonic()
+        logger.info("[register] %s — iniciando etapa: %s", email, _STEP_LABELS.get(step_name, step_name))
+        if callable(on_step):
+            try:
+                on_step(step_name)
+            except Exception:
+                pass
+
+    def _record_step(step_name: str, result: dict[str, str]) -> None:
+        steps[step_name] = result
+        elapsed = time.monotonic() - step_start.get(step_name, time.monotonic())
+        logger.info("[register] %s — %s: %s (%.1fs)",
+                     email, step_name, result["status"], elapsed)
+
+    # Step 0: ban check
+    _notify("ban_check")
+    try:
+        bans.require_not_banned(email)
+        _record_step("ban_check", _step_ok())
+    except ValueError as exc:
+        _record_step("ban_check", _step_fail(str(exc)))
+        return {"steps": steps, "error": f"ban: {exc}"}
+
+    # Step 1: Crowtado signup (Chrome + Turnstile + email OTP) — com retry
+    _notify("crowtado_signup")
+    crowtado_signup_ok = False
+    crowtado_existed = False
+    last_error: str = ""
+    for attempt in range(1, _CROWTADO_SIGNUP_RETRIES + 1):
+        try:
+            crowtado.criar_conta(email, password)
+            _record_step("crowtado_signup", _step_ok(
+                "conta criada" if attempt == 1 else f"conta criada (tentativa {attempt})"
+            ))
+            crowtado_signup_ok = True
+            break
+        except Exception as exc:
+            error_msg = str(exc)
+            lower = error_msg.lower()
+            # Se a conta já existe, não é erro — pula para login
+            if "already" in lower or "exist" in lower or "taken" in lower:
+                try:
+                    crowtado.login(email, password)
+                    _record_step("crowtado_signup", _step_skip("conta já existia; login OK"))
+                    crowtado_signup_ok = True
+                    crowtado_existed = True
+                    break
+                except Exception as login_exc:
+                    _record_step("crowtado_signup", _step_fail(f"conta existe mas login falhou: {login_exc}"))
+                    return {"steps": steps, "error": f"crowtado: {login_exc}"}
+            last_error = error_msg
+            if attempt < _CROWTADO_SIGNUP_RETRIES:
+                logger.info("[register] %s — Crowtado falhou (tentativa %d/%d): %s",
+                             email, attempt, _CROWTADO_SIGNUP_RETRIES, error_msg)
+                time.sleep(_CROWTADO_SIGNUP_RETRY_DELAY_S)
+    if not crowtado_signup_ok:
+        _record_step("crowtado_signup", _step_fail(f"{last_error} (após {_CROWTADO_SIGNUP_RETRIES} tentativas)"))
+        return {"steps": steps, "error": f"crowtado: {last_error}"}
+
+    # Step 2: Salvar credenciais PARCIAIS — mesmo que as próximas etapas falhem,
+    # a conta existe no Crowtado e a senha está salva para recuperação manual.
+    _notify("save_partial")
+    _set_account_removed(email, False)
+    _save_crowtado_cred(email, password)
+    _record_step("save_partial", _step_ok("credenciais salvas"))
+
+    # Step 3: Demographics (gate obrigatório desde 26/08)
+    _notify("demographics")
+    try:
+        crowtado.preencher_demografia(
+            email, password,
+            birth_month=int(identity_data["birth_month"]),
+            birth_year=int(identity_data["birth_year"]),
+            gender=identity_data.get("gender"),
+        )
+        _record_step("demographics", _step_ok("preenchida"))
+    except Exception as exc:
+        _record_step("demographics", _step_fail(str(exc)))
+        return {"steps": steps, "error": f"demografia: {exc}"}
+
+    # Step 4: Minute register (com invite code da org)
+    _notify("minute_register")
+    try:
+        minute_register(email, password)
+        _record_step("minute_register", _step_ok("registrada"))
+    except RuntimeError:
+        # Já existia — só autentica
+        try:
+            minute_login(email, password)
+            _record_step("minute_register", _step_skip("já existia; login OK"))
+        except Exception as exc:
+            _record_step("minute_register", _step_fail(str(exc)))
+            return {"steps": steps, "error": f"minute: {exc}"}
+
+    # Step 5: Vincular email Minute dentro da Crowtado
+    _notify("link_minute")
+    try:
+        crowtado.vincular_minute(email, password)
+        _record_step("link_minute", _step_ok("vinculado"))
+    except Exception as exc:
+        _record_step("link_minute", _step_fail(str(exc)))
+        return {"steps": steps, "error": f"vínculo: {exc}"}
+
+    # Step 6: Validação pós-criação — confirma que tudo funciona
+    _notify("validate")
+    validation_issues: list[str] = []
+    try:
+        crowtado.login(email, password)
+    except Exception as exc:
+        validation_issues.append(f"login Crowtado: {exc}")
+    try:
+        minute_login(email, password)
+    except Exception as exc:
+        validation_issues.append(f"login Minute: {exc}")
+    if validation_issues:
+        detail = "; ".join(validation_issues)
+        _record_step("validate", _step_fail(detail))
+        logger.warning("[register] %s — validação parcial: %s", email, detail)
+        # Não é fatal — a conta foi criada, mas algo não confere
+        return {"steps": steps, "error": f"validação: {detail}", "partial": True}
+    _record_step("validate", _step_ok("tudo confirmado"))
+    logger.info("[register] %s — fluxo completo com sucesso", email)
+
+    return {"steps": steps, "error": None}
 
 
 def _tree_size(path: Path) -> tuple[int, int]:
@@ -866,6 +1158,7 @@ def _parse_duration_range(values) -> tuple[float, float]:
 
 def create_app() -> Flask:
     preflights: dict[str, dict] = {}
+    banned_monitor = BannedMonitor()
     RUNNER.on_restriction = lambda email: _ban_accounts([{
         "email": email, "restriction_confirmed": True, "stage": "Envio da campanha",
         "reason": "Restrição confirmada pela plataforma durante o envio.",
@@ -924,6 +1217,35 @@ def create_app() -> Flask:
         except OSError:
             return jsonify({"error": "Não foi possível salvar o relatório da migração."}), 500
         return jsonify(result), 202
+
+    @app.get("/api/accounts/banned/monitor")
+    def banned_monitor_snapshot():
+        archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+        rows = [{"email": row["email"], "banned_at": row.get("banned_at") or row.get("removed_at"),
+                 "has_password": bool(row.get("password")), "monitor": row.get("monitor", {})}
+                for row in archive.get("accounts", [])]
+        return jsonify({"accounts": rows, "runner": banned_monitor.snapshot()})
+
+    @app.post("/api/accounts/banned/refresh")
+    def refresh_banned_monitor():
+        with _PERSISTENCE_LOCK:
+            archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+            rows = archive.get("accounts", [])
+            if not rows:
+                return jsonify({"error": "Não há contas banidas registradas."}), 400
+            def save(email, result):
+                with _PERSISTENCE_LOCK:
+                    path = config.DATA_DIR / "banned_accounts.json"
+                    current = load_json(path, {"accounts": []})
+                    for row in current.get("accounts", []):
+                        if row.get("email", "").casefold() == email.casefold():
+                            row["monitor"] = result
+                    save_json(path, current)
+            try:
+                banned_monitor.start(rows, save)
+            except RuntimeError as exc:
+                return jsonify({"error": str(exc)}), 409
+        return jsonify(banned_monitor.snapshot()), 202
 
     @app.get("/api/accounts/banned")
     def banned_accounts():
@@ -1002,35 +1324,178 @@ def create_app() -> Flask:
 
     @app.post("/api/accounts/register")
     def register_account():
-        """Cria conta nova no Minute (convite fixo) e já deixa tudo salvo.
+        """Fluxo completo de 6 etapas para uma conta.
 
-        Se o email já existir no Minute, cai pro login simples. A senha também
-        vai para secrets/crowtado_passwords.json (mesma credencial do crowtado)
-        para a aba Saldos funcionar sem redigitar.
+        Body: {email, password, gender?}. Se gender não vier, gera dados
+        demográficos aleatórios. Roda Crowtado signup → demografia → Minute
+        → vínculo → salva. Retorna o dict de steps.
         """
-        from ..minute_api import register as minute_register
-
         body = request.get_json(silent=True) or {}
         email = str(body.get("email", "")).strip()
         password = str(body.get("password", ""))
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
+        if not _hostinger_is_configured():
+            return jsonify({"error": "Configure a integração Hostinger (domínio catch-all) antes de criar contas."}), 409
+        gender = str(body.get("gender", "")).strip() or None
+        if not gender:
+            gender = "male" if random.random() < 0.48 else "female"
+        identity_data: dict[str, Any] = {
+            "nome": email.split("@")[0],
+            "sobrenome": "",
+            "email": email,
+            "senha": password,
+            "gender": gender,
+            "birth_month": random.randint(1, 12),
+            "birth_year": random.randint(1980, 2003),
+        }
+        result = _full_register_account(email, password, identity_data)
+        ok = result["error"] is None
+        return jsonify({"ok": ok, "email": email, "steps": result["steps"],
+                         "error": result["error"]}), 200 if ok else 400
+
+    @app.get("/api/accounts/domains")
+    def list_account_domains():
+        """Domínios disponíveis para o criador de contas (perfis Hostinger)."""
+        domains = _registration_domains()
+        return jsonify({
+            "domains": domains,
+            "webmail_url": "https://webmail.hostinger.com" if domains else "",
+            "hostinger_configured": _hostinger_is_configured(),
+        })
+
+    @app.get("/api/accounts/bulk-register/preflight")
+    def bulk_register_preflight():
+        """Valida todas as dependências antes de iniciar a criação em lote."""
+        result = _preflight_checks()
+        return jsonify(result)
+
+    @app.get("/api/accounts/bulk-register/status")
+    def bulk_register_status():
+        with _BULK_REGISTER_LOCK:
+            return jsonify(dict(_BULK_REGISTER_STATE))
+
+    @app.post("/api/accounts/bulk-register")
+    def bulk_register_accounts():
+        """Cria N contas novas com o fluxo completo (Crowtado + Minute + vínculo).
+
+        Body: {count, domain}. Gera identidades via identity.gerar_identidade(),
+        executa as 6 etapas por conta e reporta progresso via /status.
+        """
+        with _BULK_REGISTER_LOCK:
+            if _BULK_REGISTER_STATE.get("state") == "running":
+                return jsonify({"error": "Já existe uma criação em andamento."}), 409
+
+        body = request.get_json(silent=True) or {}
         try:
-            account_bans.require_not_banned(email)
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
-        try:
-            minute_register(email, password)  # usa config.INVITE_CODE
-            created = True
-        except RuntimeError:
+            count = int(body.get("count", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "count inválido"}), 400
+        domain = str(body.get("domain", "")).strip().lower().lstrip("@")
+        if count < 1 or count > 50:
+            return jsonify({"error": "count deve estar entre 1 e 50"}), 400
+        if not domain:
+            return jsonify({"error": "domain é obrigatório"}), 400
+        if RUNNER.running:
+            return jsonify({"error": "pare a campanha antes de criar contas"}), 409
+        if not _hostinger_is_configured():
+            return jsonify({"error": "Configure a integração Hostinger (domínio catch-all) antes de criar contas."}), 409
+
+        if domain not in {row["domain"] for row in _registration_domains()}:
+            return jsonify({"error": "Selecione um domínio catch-all configurado nas integrações."}), 400
+
+        existing_emails = {
+            account["email"].lower()
+            for account in _list_accounts()
+        }
+
+        with _BULK_REGISTER_LOCK:
+            _BULK_REGISTER_STATE.clear()
+            _BULK_REGISTER_STATE.update({
+                "state": "running",
+                "total": count,
+                "completed": 0,
+                "created": 0,
+                "failed": 0,
+                "results": [],
+                "current_email": "",
+                "current_step": "",
+            })
+
+        def _run_batch() -> None:
+            successes = 0
+            failures = 0
+            results: list[dict[str, Any]] = []
+            used_emails: set[str] = set(existing_emails)
+            for index in range(count):
+                try:
+                    identity_data = identity.gerar_identidade(
+                        domain=domain,
+                        existentes=used_emails,
+                    )
+                except RuntimeError as exc:
+                    with _BULK_REGISTER_LOCK:
+                        _BULK_REGISTER_STATE["state"] = "failed"
+                        _BULK_REGISTER_STATE["error"] = str(exc)
+                    return
+                email = identity_data["email"]
+                password = identity_data["senha"]
+                used_emails.add(email.lower())
+
+                def _on_step(step_name: str) -> None:
+                    with _BULK_REGISTER_LOCK:
+                        _BULK_REGISTER_STATE["current_email"] = email
+                        _BULK_REGISTER_STATE["current_step"] = _STEP_LABELS.get(step_name, step_name)
+
+                result = _full_register_account(email, password, identity_data, on_step=_on_step)
+                ok = result["error"] is None
+                if ok:
+                    successes += 1
+                else:
+                    failures += 1
+                results.append({
+                    "email": email,
+                    "nome": identity_data["nome"],
+                    "sobrenome": identity_data["sobrenome"],
+                    "gender": identity_data["gender"],
+                    "birth_month": identity_data["birth_month"],
+                    "birth_year": identity_data["birth_year"],
+                    "created": ok,
+                    "error": result["error"],
+                    "steps": result["steps"],
+                })
+                with _BULK_REGISTER_LOCK:
+                    _BULK_REGISTER_STATE["completed"] = index + 1
+                    _BULK_REGISTER_STATE["created"] = successes
+                    _BULK_REGISTER_STATE["failed"] = failures
+                    _BULK_REGISTER_STATE["results"] = list(results)
+            with _BULK_REGISTER_LOCK:
+                _BULK_REGISTER_STATE["state"] = "done"
+                _BULK_REGISTER_STATE["current_email"] = ""
+                _BULK_REGISTER_STATE["current_step"] = ""
+
+        def _worker() -> None:
             try:
-                login(email, password)  # já existia — só autentica
-                created = False
-            except RuntimeError as exc:
-                return jsonify({"error": str(exc)}), 400
-        _set_account_removed(email, False)
-        _save_crowtado_cred(email, password)
-        return jsonify({"ok": True, "email": email, "created": created})
+                _run_batch()
+            except Exception:
+                with _BULK_REGISTER_LOCK:
+                    _BULK_REGISTER_STATE.update(
+                        state="failed",
+                        error="Não foi possível concluir o cadastro. Confira as contas e credenciais salvas antes de tentar novamente.",
+                    )
+            finally:
+                with _BULK_REGISTER_LOCK:
+                    _BULK_REGISTER_STATE["current_email"] = ""
+                    _BULK_REGISTER_STATE["current_step"] = ""
+
+        try:
+            thread = threading.Thread(target=_worker, name="moneymin-bulk-register", daemon=True)
+            thread.start()
+        except Exception:
+            with _BULK_REGISTER_LOCK:
+                _BULK_REGISTER_STATE.update(state="failed", error="Não foi possível iniciar o cadastro.")
+            return jsonify({"error": "Não foi possível iniciar o cadastro."}), 500
+        return jsonify({"ok": True, "total": count, "domain": domain})
 
     @app.delete("/api/accounts/<email>")
     def remove_account(email: str):

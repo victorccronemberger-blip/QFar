@@ -630,11 +630,34 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
             # o form Clerk fica atrás do aceite dos termos + CTA custom do site
             page.locator("input[type=checkbox]").first.check()
             page.wait_for_timeout(1000)
-            page.get_by_text("Cadastre-se como Colaborador", exact=False).first.click()
+            if not page.query_selector("#emailAddress-field"):
+                clicked = False
+                for label in (
+                    "Crie sua conta",
+                    "Cadastre-se como Colaborador",
+                    "Create account",
+                    "Sign up as a Contributor",
+                ):
+                    loc = page.get_by_role("button", name=label)
+                    if loc.count() == 0:
+                        loc = page.get_by_text(label, exact=False)
+                    if loc.count() == 0:
+                        continue
+                    try:
+                        loc.first.click(timeout=8_000)
+                        clicked = True
+                        break
+                    except Exception:
+                        continue
+                if not clicked:
+                    raise CrowtadoError(
+                        "CTA de cadastro não apareceu "
+                        "(esperado 'Crie sua conta' / 'Cadastre-se como Colaborador')"
+                    )
             page.wait_for_selector("#emailAddress-field", timeout=30_000)
             page.fill("#emailAddress-field", email)
             page.fill("#password-field", senha)
-            uid_base = max_uid()
+            uid_base = max_uid(email)
             page.click("button.cl-formButtonPrimary")
 
             destino = None

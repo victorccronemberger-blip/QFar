@@ -46,6 +46,13 @@ private:
   QWidget* buildAccountsPage();
   QWidget* buildBalancesPage();
   QWidget* buildHistoryPage();
+  QWidget* buildBannedPage();
+  void loadBanned();
+  QTableWidget* _bannedTable{};
+  QPushButton* _bannedRefresh{};
+  QLabel* _bannedState{};
+  QTimer _bannedPoll;
+  bool _bannedPolling{false};
   QWidget* pageShell(const QString& title, const QString& subtitle, QWidget* body);
   QWidget* card(const QString& title, QWidget* content = nullptr);
   QWidget* metric(const QString& value, const QString& caption, QLabel** valueLabel);
@@ -93,6 +100,10 @@ private:
   void addAccount(bool registerNew);
   void importAccounts();
   void exportAccounts(bool selectedOnly);
+  void loadBulkRegisterDomains();
+  void startBulkRegister();
+  void pollBulkRegister();
+  void openWebmail();
   void startOrgMigration();
   void pollOrgMigration();
   void showOrgMigrationReport();
@@ -101,6 +112,16 @@ private:
   bool _orgMigrationPolling{false};
   bool _accountTransferBusy{false};
   QJsonObject _orgMigrationSnapshot;
+
+  QComboBox* _bulkRegisterDomain{};
+  QSpinBox* _bulkRegisterCount{};
+  QPushButton* _bulkRegisterStart{};
+  QProgressBar* _bulkRegisterProgress{};
+  QLabel* _bulkRegisterStatus{};
+  QLabel* _bulkRegisterWebmail{};
+  QTableWidget* _bulkRegisterTable{};
+  QTimer _bulkRegisterPoll;
+  bool _bulkRegisterPolling{false};
   QPushButton* _accountsMigrate{};
   QPushButton* _migrationReport{};
   QLabel* _migrationStatus{};

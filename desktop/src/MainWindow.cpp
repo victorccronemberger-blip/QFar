@@ -41,6 +41,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollArea>
 #include <QScreen>
 #include <QSaveFile>
@@ -480,7 +481,7 @@ void MainWindow::buildShell() {
       QStringLiteral("Integrações"), QStringLiteral("Nova campanha"),
       QStringLiteral("Acelerador"),
       QStringLiteral("Contas"), QStringLiteral("Saldos"),
-      QStringLiteral("Histórico")};
+      QStringLiteral("Histórico"), QStringLiteral("Banidas")};
   const QStringList icons = {QStringLiteral(":/qmoney/icons/home.svg"),
                              QStringLiteral(":/qmoney/icons/readiness.svg"),
                              QStringLiteral(":/qmoney/icons/integrations.svg"),
@@ -488,7 +489,8 @@ void MainWindow::buildShell() {
                              QStringLiteral(":/qmoney/icons/bolt.svg"),
                              QStringLiteral(":/qmoney/icons/users.svg"),
                              QStringLiteral(":/qmoney/icons/wallet.svg"),
-                             QStringLiteral(":/qmoney/icons/history.svg")};
+                             QStringLiteral(":/qmoney/icons/history.svg"),
+                             QStringLiteral(":/qmoney/icons/users.svg")};
   _navigation->setIconSize(QSize(19, 19));
   for (int i = 0; i < pages.size(); ++i) {
     auto* item = new QListWidgetItem(QIcon(icons[i]), pages[i]);
@@ -553,6 +555,7 @@ void MainWindow::buildShell() {
   _pages->addWidget(buildBalancesPage());
   qInfo() << "QMoney: construindo historico";
   _pages->addWidget(buildHistoryPage());
+  _pages->addWidget(buildBannedPage());
   qInfo() << "QMoney: paginas prontas";
   workspaceLayout->addWidget(_pages, 1);
 
@@ -1376,6 +1379,71 @@ QWidget* MainWindow::buildAccountsPage() {
   form->addRow(QString(), actions);
   layout->addWidget(card(QStringLiteral("Conectar conta"), formBody));
 
+  // --- Criador de contas ---------------------------------------------------
+  auto* bulkBody = new QWidget;
+  auto* bulkForm = new QFormLayout(bulkBody);
+  configureForm(bulkForm);
+  bulkForm->setContentsMargins(0, 0, 0, 0);
+  _bulkRegisterDomain = new QComboBox;
+  _bulkRegisterDomain->setEditable(false);
+  _bulkRegisterDomain->addItem(QStringLiteral("carregando domínios…"));
+  bulkForm->addRow(QStringLiteral("Domínio"), _bulkRegisterDomain);
+  _bulkRegisterCount = new QSpinBox;
+  _bulkRegisterCount->setRange(1, 50);
+  _bulkRegisterCount->setValue(5);
+  bulkForm->addRow(QStringLiteral("Quantidade"), _bulkRegisterCount);
+  auto* bulkActions = new QWidget;
+  auto* bulkActionLayout = new QHBoxLayout(bulkActions);
+  bulkActionLayout->setContentsMargins(0, 0, 0, 0);
+  bulkActionLayout->addStretch();
+  auto* bulkRefreshDomains = new QPushButton(QStringLiteral("Atualizar domínios"));
+  connect(bulkRefreshDomains, &QPushButton::clicked, this, &MainWindow::loadBulkRegisterDomains);
+  bulkActionLayout->addWidget(bulkRefreshDomains);
+  _bulkRegisterStart = primaryButton(QStringLiteral("Criar contas"));
+  connect(_bulkRegisterStart, &QPushButton::clicked, this, &MainWindow::startBulkRegister);
+  bulkActionLayout->addWidget(_bulkRegisterStart);
+  bulkForm->addRow(QString(), bulkActions);
+  _bulkRegisterStatus = quietLabel(QStringLiteral(
+      "Fluxo completo: Crowtado → demografia → Minute → vínculo. "
+      "Cada conta leva alguns minutos (Turnstile + verificação de email)."));
+  _bulkRegisterStatus->setWordWrap(true);
+  bulkForm->addRow(QString(), _bulkRegisterStatus);
+  _bulkRegisterWebmail = new QLabel;
+  _bulkRegisterWebmail->setOpenExternalLinks(false);
+  _bulkRegisterWebmail->setTextFormat(Qt::RichText);
+  _bulkRegisterWebmail->hide();
+  connect(_bulkRegisterWebmail, &QLabel::linkActivated, this, &MainWindow::openWebmail);
+  bulkForm->addRow(QString(), _bulkRegisterWebmail);
+  _bulkRegisterProgress = new QProgressBar;
+  _bulkRegisterProgress->setRange(0, 100);
+  _bulkRegisterProgress->setValue(0);
+  _bulkRegisterProgress->setTextVisible(true);
+  _bulkRegisterProgress->setFormat(QStringLiteral("%v/%m"));
+  bulkForm->addRow(QStringLiteral("Progresso"), _bulkRegisterProgress);
+  _bulkRegisterTable = new QTableWidget(0, 5);
+  configureTable(_bulkRegisterTable);
+  _bulkRegisterTable->setMinimumHeight(160);
+  _bulkRegisterTable->setHorizontalHeaderLabels({
+      QStringLiteral("Email"), QStringLiteral("Nome"), QStringLiteral("Sobrenome"),
+      QStringLiteral("Gênero"), QStringLiteral("Resultado"),
+  });
+  _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+  _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
+  _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
+  _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
+  _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Interactive);
+  _bulkRegisterTable->setColumnWidth(1, 140);
+  _bulkRegisterTable->setColumnWidth(2, 140);
+  _bulkRegisterTable->setColumnWidth(3, 90);
+  _bulkRegisterTable->setColumnWidth(4, 180);
+  _bulkRegisterTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+  _bulkRegisterTable->setSelectionMode(QAbstractItemView::NoSelection);
+  bulkForm->addRow(QStringLiteral("Resultados"), _bulkRegisterTable);
+  _bulkRegisterPoll.setInterval(900);
+  connect(&_bulkRegisterPoll, &QTimer::timeout, this, &MainWindow::pollBulkRegister);
+  _bulkRegisterStart->setEnabled(false);
+  layout->addWidget(card(QStringLiteral("Criador de contas"), bulkBody));
+
   _accountsTable = new QTableWidget(0, 4);
   configureTable(_accountsTable);
   _accountsTable->setMinimumHeight(230);
@@ -1554,6 +1622,92 @@ QWidget* MainWindow::buildBalancesPage() {
 
   return pageShell(QStringLiteral("Saldos"),
                    QStringLiteral("Acompanhe valores disponíveis e pendentes e solicite o link de saque."), body);
+}
+
+QWidget* MainWindow::buildBannedPage() {
+  auto* body = new QWidget;
+  auto* layout = new QVBoxLayout(body);
+  layout->setContentsMargins(0, 0, 0, 0);
+  auto* actions = new QHBoxLayout;
+  _bannedState = quietLabel(QStringLiteral("Carregando contas banidas…"));
+  actions->addWidget(_bannedState, 1);
+  _bannedRefresh = primaryButton(QStringLiteral("Consultar saldos e status"));
+  actions->addWidget(_bannedRefresh);
+  layout->addLayout(actions);
+  auto* help = quietLabel(QStringLiteral(
+      "O status é consultado no Minute e o saldo no Crowtado. Contas desbanidas permanecem fora das campanhas. "
+      "Valores com * são da última consulta de saldo concluída."));
+  help->setWordWrap(true);
+  layout->addWidget(help);
+  _bannedTable = new QTableWidget(0, 6);
+  configureTable(_bannedTable);
+  _bannedTable->setHorizontalHeaderLabels({QStringLiteral("E-mail"), QStringLiteral("Status atual"),
+      QStringLiteral("Disponível (USD)"), QStringLiteral("Pendente (USD)"),
+      QStringLiteral("Banimento"), QStringLiteral("Última consulta")});
+  _bannedTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+  _bannedTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+  layout->addWidget(_bannedTable, 1);
+  _bannedPoll.setInterval(2000);
+  connect(&_bannedPoll, &QTimer::timeout, this, &MainWindow::loadBanned);
+  connect(_bannedRefresh, &QPushButton::clicked, this, [this] {
+    _bannedRefresh->setEnabled(false);
+    _api.post(QStringLiteral("/api/accounts/banned/refresh"), {},
+      [this](bool ok, const QJsonDocument&, const QString& error) {
+        if (!ok) {
+          _bannedRefresh->setEnabled(true);
+          return showError(QStringLiteral("Consulta não iniciada"), error);
+        }
+        _bannedPoll.start();
+        loadBanned();
+      });
+  });
+  return pageShell(QStringLiteral("Banidas"), QStringLiteral("Saldos e situação atual das contas removidas."), body);
+}
+
+void MainWindow::loadBanned() {
+  if (_bannedPolling) return;
+  _bannedPolling = true;
+  _api.get(QStringLiteral("/api/accounts/banned/monitor"),
+    [this](bool ok, const QJsonDocument& doc, const QString& error) {
+      _bannedPolling = false;
+      if (!ok) { _bannedState->setText(error); return; }
+      const auto root = doc.object();
+      const auto rows = root.value(QStringLiteral("accounts")).toArray();
+      const auto runner = root.value(QStringLiteral("runner")).toObject();
+      const bool running = runner.value(QStringLiteral("state")).toString() == QStringLiteral("running");
+      _bannedRefresh->setEnabled(!running && !rows.isEmpty());
+      if (running) {
+        _bannedState->setText(QStringLiteral("Consultando %1 de %2 contas…")
+            .arg(runner.value(QStringLiteral("completed")).toInt()).arg(runner.value(QStringLiteral("total")).toInt()));
+        if (_pages->currentIndex() == 8) _bannedPoll.start();
+      } else {
+        _bannedPoll.stop();
+        _bannedState->setText(runner.value(QStringLiteral("error")).toString(
+            rows.isEmpty() ? QStringLiteral("Nenhuma conta banida registrada.") : QStringLiteral("%1 contas no registro de banidas").arg(rows.size())));
+      }
+      _bannedTable->setRowCount(rows.size());
+      for (int row = 0; row < rows.size(); ++row) {
+        const auto account = rows[row].toObject();
+        const auto monitor = account.value(QStringLiteral("monitor")).toObject();
+        const auto balance = monitor.value(QStringLiteral("balance")).toObject();
+        const QString suffix = monitor.value(QStringLiteral("balance_stale")).toBool() ? QStringLiteral(" *") : QString();
+        const QString absent = monitor.value(QStringLiteral("balance_status")).toString() == QStringLiteral("not_applicable") ? QStringLiteral("Não se aplica") : QStringLiteral("Não consultado");
+        QStringList values{account.value(QStringLiteral("email")).toString(),
+            monitor.value(QStringLiteral("status_label")).toString(account.value(QStringLiteral("has_password")).toBool() ? QStringLiteral("Ainda não consultada") : QStringLiteral("Sem senha salva")),
+            balance.contains(QStringLiteral("availableCents")) ? usdMoney(balance.value(QStringLiteral("availableCents")).toInteger()) + suffix : absent,
+            balance.contains(QStringLiteral("pendingCents")) ? usdMoney(balance.value(QStringLiteral("pendingCents")).toInteger()) + suffix : absent,
+            friendlyDate(account.value(QStringLiteral("banned_at")).toString()),
+            friendlyDate(monitor.value(QStringLiteral("checked_at")).toString())};
+        const QString detail = monitor.value(QStringLiteral("detail")).toString() + QStringLiteral("\n")
+            + monitor.value(QStringLiteral("balance_detail")).toString() + QStringLiteral("\nSaldo atualizado: ")
+            + friendlyDate(monitor.value(QStringLiteral("balance_updated_at")).toString());
+        for (int col = 0; col < values.size(); ++col) {
+          auto* item = new QTableWidgetItem(values[col]);
+          item->setToolTip(detail.trimmed());
+          _bannedTable->setItem(row, col, item);
+        }
+      }
+    });
 }
 
 QWidget* MainWindow::buildHistoryPage() {
@@ -1994,6 +2148,7 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
     // motor sobe, a própria interface verifica e prepara o catálogo Ego4D
     // quando já existem credenciais protegidas neste computador.
     loadIntegrations();
+    loadBulkRegisterDomains();
     const QString healthPath = qApp->property("updateHealthPath").toString();
     if (!healthPath.isEmpty()) {
       QSaveFile marker(healthPath);
@@ -2020,6 +2175,7 @@ void MainWindow::navigate(int index) {
   else if (index != 3) _campaignPoll.stop();
   if (index != 4) _cachePoll.stop();
   if (index != 6) _balancePoll.stop();
+  if (index != 8) _bannedPoll.stop();
   if (_backendReady) refreshCurrentPage();
 }
 
@@ -2031,9 +2187,13 @@ void MainWindow::refreshCurrentPage() {
     case 2: loadIntegrations(); break;
     case 3: loadCampaignData(); break;
     case 4: loadAccelerator(); break;
-    case 5: loadAccounts(); break;
+    case 5:
+      loadAccounts();
+      if (!_bulkRegisterPolling) loadBulkRegisterDomains();
+      break;
     case 6: loadBalances(); break;
     case 7: loadHistory(); break;
+    case 8: loadBanned(); break;
     default: break;
   }
 }
@@ -3340,16 +3500,273 @@ void MainWindow::addAccount(bool registerNew) {
   _accountRegister->setEnabled(false);
   const QString endpoint = registerNew ? QStringLiteral("/api/accounts/register")
                                        : QStringLiteral("/api/accounts");
+  if (registerNew) {
+    setStatus(QStringLiteral("Registrando %1 — fluxo completo (Crowtado + Minute)… pode levar alguns minutos.")
+                  .arg(email));
+  }
   _api.post(endpoint, {{QStringLiteral("email"), email}, {QStringLiteral("password"), password}},
-            [this, email](bool ok, const QJsonDocument&, const QString& error) {
+            [this, email, registerNew](bool ok, const QJsonDocument& doc, const QString& error) {
     _accountAdd->setEnabled(true);
     _accountRegister->setEnabled(true);
     if (!ok) return showError(QStringLiteral("Conta não conectada"), error);
     _accountChecks.remove(email);
     _accountEmail->clear();
     _accountPassword->clear();
-    setStatus(QStringLiteral("Conta conectada."));
+    if (registerNew) {
+      // Montar resumo das etapas para o status
+      const auto steps = doc.object().value(QStringLiteral("steps")).toObject();
+      QStringList summary;
+      const QStringList stepNames = {
+          QStringLiteral("Crowtado"), QStringLiteral("Credenciais"),
+          QStringLiteral("Demografia"), QStringLiteral("Minute"),
+          QStringLiteral("Vínculo"), QStringLiteral("Validação"),
+      };
+      const QStringList stepKeys = {
+          QStringLiteral("crowtado_signup"), QStringLiteral("save_partial"),
+          QStringLiteral("demographics"), QStringLiteral("minute_register"),
+          QStringLiteral("link_minute"), QStringLiteral("validate"),
+      };
+      for (int s = 0; s < stepKeys.size(); ++s) {
+        const auto stepObj = steps.value(stepKeys.at(s)).toObject();
+        const QString status = stepObj.value(QStringLiteral("status")).toString();
+        if (status == QStringLiteral("ok")) summary << QStringLiteral("✓ ") + stepNames.at(s);
+        else if (status == QStringLiteral("skip")) summary << QStringLiteral("↷ ") + stepNames.at(s);
+        else summary << QStringLiteral("✗ ") + stepNames.at(s);
+      }
+      setStatus(QStringLiteral("Conta %1 registrada — %2").arg(email, summary.join(QStringLiteral(" · "))));
+    } else {
+      setStatus(QStringLiteral("Conta conectada."));
+    }
     loadAccounts();
+  });
+}
+
+void MainWindow::loadBulkRegisterDomains() {
+  if (!_backendReady || _bulkRegisterPolling) return;
+  _bulkRegisterStart->setEnabled(false);
+  _bulkRegisterDomain->clear();
+  _bulkRegisterDomain->addItem(QStringLiteral("carregando domínios…"));
+  _bulkRegisterDomain->setEnabled(false);
+  _api.get(QStringLiteral("/api/accounts/domains"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _bulkRegisterDomain->clear();
+    _bulkRegisterWebmail->hide();
+    if (!ok) {
+      _bulkRegisterDomain->addItem(QStringLiteral("não foi possível carregar"));
+      _bulkRegisterDomain->setEnabled(false);
+      return;
+    }
+    const auto root = doc.object();
+    const auto domains = root.value(QStringLiteral("domains")).toArray();
+    const QString webmailUrl = root.value(QStringLiteral("webmail_url")).toString();
+    if (domains.isEmpty()) {
+      _bulkRegisterDomain->addItem(QStringLiteral("configure um domínio em Integrações"));
+      _bulkRegisterDomain->setEnabled(false);
+      _bulkRegisterStart->setEnabled(false);
+      return;
+    }
+    for (const auto value : domains) {
+      const auto entry = value.toObject();
+      const QString domain = entry.value(QStringLiteral("domain")).toString();
+      const QString profile = entry.value(QStringLiteral("profile_name")).toString();
+      _bulkRegisterDomain->addItem(profile.isEmpty() ? domain : QStringLiteral("%1 (%2)").arg(domain, profile), domain);
+    }
+    _bulkRegisterDomain->setEnabled(true);
+    _bulkRegisterStart->setEnabled(true);
+    if (!webmailUrl.isEmpty()) {
+      _bulkRegisterWebmail->setText(
+          QStringLiteral("Conferir caixa de entrada: <a href=\"%1\">%1</a>")
+              .arg(webmailUrl));
+      _bulkRegisterWebmail->show();
+    }
+    // Após carregar domínios, validar dependências (preflight)
+    _bulkRegisterStart->setEnabled(false);
+    _bulkRegisterStatus->setText(QStringLiteral("Validando dependências (Hostinger, Chrome, APIs)…"));
+    _api.get(QStringLiteral("/api/accounts/bulk-register/preflight"),
+             [this](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (!ok) {
+        _bulkRegisterStatus->setText(QStringLiteral("Preflight falhou: ") + error);
+        return;
+      }
+      const auto root = doc.object();
+      const bool ready = root.value(QStringLiteral("ready")).toBool();
+      const auto checks = root.value(QStringLiteral("checks")).toObject();
+      QStringList issues;
+      const QStringList checkKeys = {
+          QStringLiteral("hostinger"), QStringLiteral("chrome"),
+          QStringLiteral("crowtado_api"), QStringLiteral("minute_api"),
+      };
+      const QStringList checkNames = {
+          QStringLiteral("Hostinger"), QStringLiteral("Chrome"),
+          QStringLiteral("Crowtado API"), QStringLiteral("Minute API"),
+      };
+      for (int i = 0; i < checkKeys.size(); ++i) {
+        const auto check = checks.value(checkKeys.at(i)).toObject();
+        if (!check.value(QStringLiteral("ok")).toBool()) {
+          issues << QStringLiteral("%1: %2")
+                        .arg(checkNames.at(i), check.value(QStringLiteral("detail")).toString());
+        }
+      }
+      if (ready) {
+        _bulkRegisterStatus->setText(QStringLiteral(
+            "Todas as dependências OK. Pronto para criar contas."));
+        _bulkRegisterStart->setEnabled(true);
+      } else {
+        _bulkRegisterStatus->setText(
+            QStringLiteral("Dependências com problema: %1").arg(issues.join(QStringLiteral("; "))));
+      }
+    });
+  });
+}
+
+void MainWindow::startBulkRegister() {
+  const QString domain = _bulkRegisterDomain->currentData().toString();
+  if (domain.isEmpty()) {
+    return showError(QStringLiteral("Domínio indisponível"),
+                     QStringLiteral("Configure um domínio catch-all em Integrações."));
+  }
+  const int count = _bulkRegisterCount->value();
+  _bulkRegisterStart->setEnabled(false);
+  _bulkRegisterDomain->setEnabled(false);
+  _bulkRegisterCount->setEnabled(false);
+  _bulkRegisterTable->setRowCount(0);
+  _bulkRegisterProgress->setRange(0, count);
+  _bulkRegisterProgress->setValue(0);
+  _bulkRegisterStatus->setText(QStringLiteral("Iniciando criação de %1 contas…").arg(count));
+  _api.post(QStringLiteral("/api/accounts/bulk-register"),
+            {{QStringLiteral("count"), count}, {QStringLiteral("domain"), domain}},
+            [this](bool ok, const QJsonDocument&, const QString& error) {
+    if (!ok) {
+      _bulkRegisterStart->setEnabled(true);
+      _bulkRegisterDomain->setEnabled(true);
+      _bulkRegisterCount->setEnabled(true);
+      _bulkRegisterStatus->setText(QStringLiteral("Falha ao iniciar: ") + error);
+      return;
+    }
+    _bulkRegisterPolling = true;
+    _bulkRegisterPoll.start();
+  });
+}
+
+void MainWindow::openWebmail() {
+  const QString text = _bulkRegisterWebmail->text();
+  // Extrai o href do link
+  const QRegularExpression hrefRe(QStringLiteral("href=\"([^\"]+)\""));
+  const auto match = hrefRe.match(text);
+  if (match.hasMatch()) {
+    QDesktopServices::openUrl(QUrl(match.captured(1)));
+  }
+}
+
+void MainWindow::pollBulkRegister() {
+  _api.get(QStringLiteral("/api/accounts/bulk-register/status"),
+           [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (!ok) {
+      _bulkRegisterPoll.stop();
+      _bulkRegisterPolling = false;
+      _bulkRegisterStart->setEnabled(true);
+      _bulkRegisterDomain->setEnabled(true);
+      _bulkRegisterCount->setEnabled(true);
+      return showError(QStringLiteral("Falha ao consultar progresso"), error);
+    }
+    const auto root = doc.object();
+    const QString state = root.value(QStringLiteral("state")).toString();
+    const int total = root.value(QStringLiteral("total")).toInt();
+    const int completed = root.value(QStringLiteral("completed")).toInt();
+    const int created = root.value(QStringLiteral("created")).toInt();
+    const int failed = root.value(QStringLiteral("failed")).toInt();
+    const QString current = root.value(QStringLiteral("current_email")).toString();
+    const QString currentStep = root.value(QStringLiteral("current_step")).toString();
+    _bulkRegisterProgress->setRange(0, qMax(1, total));
+    _bulkRegisterProgress->setValue(completed);
+    const auto results = root.value(QStringLiteral("results")).toArray();
+    _bulkRegisterTable->setRowCount(results.size());
+    for (int row = 0; row < results.size(); ++row) {
+      const auto item = results.at(row).toObject();
+      auto* emailItem = cell(item.value(QStringLiteral("email")).toString());
+      _bulkRegisterTable->setItem(row, 0, emailItem);
+      _bulkRegisterTable->setItem(row, 1, cell(item.value(QStringLiteral("nome")).toString()));
+      _bulkRegisterTable->setItem(row, 2, cell(item.value(QStringLiteral("sobrenome")).toString()));
+      _bulkRegisterTable->setItem(row, 3, cell(item.value(QStringLiteral("gender")).toString()));
+      // Construir tooltip com todas as etapas
+      QStringList stepLines;
+      const auto steps = item.value(QStringLiteral("steps")).toObject();
+      const QStringList stepKeys = {
+          QStringLiteral("ban_check"), QStringLiteral("crowtado_signup"),
+          QStringLiteral("save_partial"), QStringLiteral("demographics"),
+          QStringLiteral("minute_register"), QStringLiteral("link_minute"),
+          QStringLiteral("validate"),
+      };
+      const QStringList stepNames = {
+          QStringLiteral("Verificação"), QStringLiteral("Crowtado"),
+          QStringLiteral("Credenciais"), QStringLiteral("Demografia"),
+          QStringLiteral("Minute"), QStringLiteral("Vínculo"),
+          QStringLiteral("Validação"),
+      };
+      for (int s = 0; s < stepKeys.size(); ++s) {
+        const auto stepObj = steps.value(stepKeys.at(s)).toObject();
+        const QString status = stepObj.value(QStringLiteral("status")).toString();
+        const QString detail = stepObj.value(QStringLiteral("detail")).toString();
+        QString icon;
+        if (status == QStringLiteral("ok")) icon = QStringLiteral("✓");
+        else if (status == QStringLiteral("skip")) icon = QStringLiteral("↷");
+        else if (status == QStringLiteral("fail")) icon = QStringLiteral("✗");
+        else icon = QStringLiteral("·");
+        const QString line = detail.isEmpty()
+            ? QStringLiteral("%1 %2").arg(icon, stepNames.at(s))
+            : QStringLiteral("%1 %2: %3").arg(icon, stepNames.at(s), detail);
+        stepLines << line;
+      }
+      emailItem->setToolTip(stepLines.join(QStringLiteral("\n")));
+      const QString errorText = item.value(QStringLiteral("error")).toString();
+      QString outcome;
+      if (errorText.isEmpty()) {
+        outcome = QStringLiteral("✓ completa");
+      } else {
+        // Descobrir em qual etapa falhou
+        QString failedStep;
+        for (int s = stepKeys.size() - 1; s >= 0; --s) {
+          const auto stepObj = steps.value(stepKeys.at(s)).toObject();
+          if (stepObj.value(QStringLiteral("status")).toString() == QStringLiteral("fail")) {
+            failedStep = stepNames.at(s);
+            break;
+          }
+        }
+        outcome = failedStep.isEmpty()
+            ? QStringLiteral("✗ ") + errorText
+            : QStringLiteral("✗ falhou em: ") + failedStep;
+      }
+      auto* outcomeItem = cell(outcome);
+      outcomeItem->setToolTip(stepLines.join(QStringLiteral("\n")));
+      _bulkRegisterTable->setItem(row, 4, outcomeItem);
+    }
+    if (state == QStringLiteral("done") || state == QStringLiteral("failed")) {
+      _bulkRegisterPoll.stop();
+      _bulkRegisterPolling = false;
+      _bulkRegisterStart->setEnabled(true);
+      _bulkRegisterDomain->setEnabled(true);
+      _bulkRegisterCount->setEnabled(true);
+      if (state == QStringLiteral("failed")) {
+        _bulkRegisterStatus->setText(QStringLiteral("Falha: ")
+                                     + root.value(QStringLiteral("error")).toString());
+      } else {
+        _bulkRegisterStatus->setText(
+            QStringLiteral("Concluído: %1 criada(s), %2 falha(s) de %3.")
+                .arg(created).arg(failed).arg(total));
+        loadAccounts();
+      }
+    } else {
+      QString label;
+      if (current.isEmpty()) {
+        label = QStringLiteral("Processando…");
+      } else if (currentStep.isEmpty()) {
+        label = QStringLiteral("Registrando %1").arg(current);
+      } else {
+        label = QStringLiteral("%1 — etapa: %2").arg(current, currentStep);
+      }
+      _bulkRegisterStatus->setText(
+          QStringLiteral("%1 — %2/%3 concluído(s).")
+              .arg(label).arg(completed).arg(total));
+    }
   });
 }
 
