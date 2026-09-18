@@ -119,6 +119,13 @@ jobs:
           Copy-Item dist/work/pyinstaller/QMoneyService.exe dist/QMoney/runtime/
           windeployqt --release --no-translations --compiler-runtime dist/QMoney/QMoney.exe
           if ($LASTEXITCODE -ne 0) { throw "Distribuição Qt incompleta." }
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $visualStudio) { throw "Visual Studio não encontrado." }
+          $crt = Get-ChildItem "$visualStudio/VC/Redist/MSVC" -Recurse -Directory -Filter Microsoft.VC143.CRT |
+            Where-Object FullName -Match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "Runtime MSVC x64 não encontrado." }
+          Copy-Item (Join-Path $crt.FullName '*.dll') dist/QMoney/
 
           New-Item -ItemType Directory -Force dist/QMoney/runtime/tools/ffmpeg/bin | Out-Null
           Copy-Item (Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName dist/QMoney/runtime/tools/ffmpeg/bin/
