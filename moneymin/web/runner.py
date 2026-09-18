@@ -156,6 +156,11 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             "detail": (f"{email} · tentativa {attempt + 1} de {maximum} em "
                        f"{_fmt_wait(int(payload.get('delay_s') or 0))}"),
         }
+    if kind == "account_excluded":
+        return {
+            "level": "warning", "stage": "Envio", "title": "Conta retirada da campanha",
+            "detail": f"{email} · restrição confirmada; as demais contas continuam. Cadastro preservado.",
+        }
     if kind == "account_done":
         skipped = bool(payload.get("skipped"))
         ok = bool(payload.get("ok"))

@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -140,7 +141,8 @@ def clamp_account_workers(requested: int, n_accounts: int) -> int:
 
 def _is_disabled_error(error: str | None) -> bool:
     text = (error or "").lower()
-    return "desativad" in text or "disabled" in text or "conta desativada" in text
+    # Só a resposta explícita conhecida confirma desativação; palavras soltas não.
+    return bool(re.search(r"\(403\):\s*user account is disabled\.(?:\s|$)", text))
 # Janela de duração aceita (recording-config: min 60s / max 1800s).
 MIN_DUR_MS, MAX_DUR_MS = 60000, 1800000
 # Cada vídeo selecionado deve permanecer um único envio sempre que couber no
@@ -1623,6 +1625,7 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             )
     except (AuthError, UploadError) as exc:
         result["error"] = str(exc)
+        result["restriction_confirmed"] = getattr(exc, "account_issue_code", None) == "restricted"
     return result
 
 
@@ -1728,7 +1731,6 @@ def run_campaign(
     prefetch = _ClipPrefetch(work_dir)
     sessions: dict[str, Session] = {}
     banned: set[str] = set()
-    abort_reason: list[str] = []
     account_seconds: dict[str, float] = {}
     quota_s = max(0.0, float(config.target_hours_per_account or 0) * 3600.0)
     n_tasks = max(1, len(config.tasks))
@@ -1891,7 +1893,7 @@ def run_campaign(
         task_sends: dict[str, int] = {}
         task_seconds: dict[str, float] = {}
         for clip_info in clips:
-            if abort_reason:
+            if len(banned) == len(config.accounts):
                 break
             if quota_s and all(
                     account_seconds.get(a.email, 0) >= quota_s
@@ -2166,8 +2168,8 @@ def run_campaign(
                     last_result["campaign_attempts"] = attempt
                     if last_result.get("ok"):
                         return last_result
-                    if _is_disabled_error(last_result.get("error")):
-                        # Retry em conta já derrubada só acelera o lote inteiro.
+                    if last_result.get("restriction_confirmed") or _is_disabled_error(last_result.get("error")):
+                        # Restrição confirmada não deve provocar novas tentativas.
                         return last_result
                     if should_stop and should_stop():
                         return last_result
@@ -2222,9 +2224,10 @@ def run_campaign(
                       finalized=acc_res.get("finalized"),
                       evaluate=ev, error=acc_res.get("error"),
                       session_id=acc_res.get("session_id"))
-                if _is_disabled_error(acc_res.get("error")):
+                if not ok and (acc_res.get("restriction_confirmed") or _is_disabled_error(acc_res.get("error"))):
                     banned.add(account.email)
-                    abort_reason.append(account.email)
+                    acc_res["excluded_from_campaign"] = True
+                    _emit("account_excluded", email=account.email)
 
             batch_started_at = time.monotonic() if pending_accounts else None
             # Reserva TODAS as contas no mesmo instante, antes de disputar
@@ -2279,11 +2282,11 @@ def run_campaign(
 
                     while queued or futures:
                         # Colhe todas as conclusões antes de abrir novas vagas:
-                        # uma conta desativada ou parada não libera a fila.
+                        # só a parada solicitada interrompe as demais contas.
                         for future in [f for f in futures if f.done()]:
                             account = futures.pop(future)
                             _record_account(account, future.result())
-                        if abort_reason or (should_stop and should_stop()):
+                        if should_stop and should_stop():
                             accepting = False
                         while accepting and queued and len(futures) < workers:
                             if queued[0][0] > time.time():
@@ -2353,16 +2356,10 @@ def run_campaign(
             # Não espera tarefa de fundo: todas as variantes usadas por contas
             # bem-sucedidas já terminaram; o prefetch do próximo segue ativo.
             _stop_warm()
-            if abort_reason:
-                _log("  [!] conta desativada no HUB "
-                     f"({abort_reason[0]}) — parando a campanha para não "
-                     "queimar as outras contas")
-                _emit("campaign_stopped", reason="conta desativada",
-                      email=abort_reason[0])
-                break
             failed_accounts = [
                 result for result in account_results.values()
                 if not result.get("ok") and not result.get("skipped")
+                and not result.get("excluded_from_campaign")
             ]
             if config.require_all_accounts and failed_accounts:
                 details = "; ".join(
@@ -2416,7 +2413,7 @@ def run_campaign(
                       task=tsk.scenario, partial=False)
             # (log: sem os blobs/csv brutos — grandes; identity fica por conta)
 
-        if abort_reason:
+        if len(banned) == len(config.accounts):
             break
         if quota_s and all(account_seconds.get(a.email, 0) >= quota_s
                            for a in config.accounts):
@@ -2429,7 +2426,7 @@ def run_campaign(
                       "partial" if log.issues or sends["failed"] else "done")
     log_path = log.save()
     _log(f"\nlog salvo: {log_path.name}")
-    if not abort_reason and log.status != "stopped":
+    if log.status != "stopped":
         # Só o nome do arquivo vai para a UI — nada de caminhos absolutos.
         _emit("campaign_done", log_path=log_path.name, status=log.status,
               ok_sends=sends["ok"], failed_sends=sends["failed"],

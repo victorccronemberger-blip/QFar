@@ -95,6 +95,40 @@ class CampaignSelectionTests(unittest.TestCase):
         self.assertEqual(result.issues[0]["error"], "RuntimeError: AccessDenied")
         self.assertEqual(len(_campaign_log_view(result.to_dict())["issues"]), 2)
 
+    def test_disabled_account_is_excluded_while_queue_and_next_task_continue(self):
+        self.cfg.accounts = self.cfg.accounts[:3]
+        self.cfg.account_workers = 1
+        self.cfg.account_gap_s = 0
+        self.cfg.account_max_attempts = 3
+        self.cfg.require_all_accounts = True
+        self.cfg.cleanup_after_upload = False
+        events, calls = [], []
+        def send(item, account, *args, **kwargs):
+            calls.append(account.email)
+            if account.email == self.cfg.accounts[0].email:
+                return {"email": account.email, "ok": False,
+                        "error": "complete falhou após 1 tentativas: PATCH /complete falhou (403): User account is disabled. [bloqueio: user]"}
+            return {"email": account.email, "ok": True}
+        with patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
+             patch.object(campaign, "prepare_clip", side_effect=lambda *a, **k: {
+                 "duration_ms": 300000, "imu_real": True, "video_path": str(self.tmp / "fake.mp4")}), \
+             patch.object(campaign, "upload_to_account", side_effect=send), \
+             patch.object(campaign.sent_registry, "mark_sent"), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            result = campaign.run_campaign(self.cfg, progress=lambda k, p: events.append((k, p)))
+        self.assertEqual(calls.count(self.cfg.accounts[0].email), 1)
+        for account in self.cfg.accounts[1:]:
+            self.assertEqual(calls.count(account.email), 2)
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(sum(k == "account_excluded" for k, p in events), 1)
+        self.assertFalse(any(k == "campaign_stopped" for k, p in events))
+        self.assertEqual(events[-1][0], "campaign_done")
+
+    def test_generic_disabled_word_or_403_is_not_confirmed_restriction(self):
+        for error in ["HTTP 403 Forbidden", "feature disabled", "timeout: disabled proxy",
+                      "PATCH /complete falhou (503): User account is disabled."]:
+            self.assertFalse(campaign._is_disabled_error(error))
+
     def test_stop_does_not_emit_done(self):
         events = []
         result = campaign.run_campaign(self.cfg, should_stop=lambda: True,
