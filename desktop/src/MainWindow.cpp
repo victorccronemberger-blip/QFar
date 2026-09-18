@@ -54,6 +54,7 @@
 #include <QStandardPaths>
 #include <QSignalBlocker>
 #include <QTableWidget>
+#include <QTabWidget>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
@@ -566,16 +567,13 @@ void MainWindow::buildShell() {
 QWidget* MainWindow::pageShell(const QString& title, const QString& subtitle, QWidget* body) {
   auto* shell = new QWidget;
   auto* outer = new QVBoxLayout(shell);
-  outer->setContentsMargins(40, 30, 40, 30);
-  outer->setSpacing(15);
+  outer->setContentsMargins(28, 20, 28, 20);
+  outer->setSpacing(9);
   auto* contextRow = new QHBoxLayout;
   auto* context = new QLabel(QStringLiteral("QMONEY  /  %1").arg(title.toUpper()));
   context->setObjectName(QStringLiteral("pageContext"));
   contextRow->addWidget(context);
   contextRow->addStretch();
-  auto* mode = new QLabel(QStringLiteral("CONSOLE OPERACIONAL"));
-  mode->setObjectName(QStringLiteral("modeBadge"));
-  contextRow->addWidget(mode);
   outer->addLayout(contextRow);
   auto* titleLabel = new QLabel(title);
   titleLabel->setObjectName(QStringLiteral("pageTitle"));
@@ -592,7 +590,7 @@ QWidget* MainWindow::card(const QString& title, QWidget* content) {
   auto* frame = new QFrame;
   frame->setObjectName(QStringLiteral("card"));
   auto* layout = new QVBoxLayout(frame);
-  layout->setContentsMargins(22, 20, 22, 20);
+  layout->setContentsMargins(18, 16, 18, 16);
   layout->setSpacing(13);
   if (!title.isEmpty()) {
     auto* heading = new QLabel(title);
@@ -1049,7 +1047,7 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* sourceLayout = new QHBoxLayout(sourceBody);
   sourceLayout->setContentsMargins(0, 0, 0, 0);
   _dataset = new ComboBox;
-  configureCombo(_dataset, 420);
+  configureCombo(_dataset, 180);
   _dataset->addItem(QStringLiteral("Conteúdo combinado"), QStringLiteral("all"));
   _dataset->addItem(QStringLiteral("Somente Ego4D"), QStringLiteral("ego4d"));
   _dataset->addItem(QStringLiteral("Somente HoloAssist"), QStringLiteral("holoassist"));
@@ -1093,7 +1091,10 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* selectionLayout = new QHBoxLayout(selection);
   selectionLayout->setContentsMargins(0, 0, 0, 0);
   auto* accountCol = new QVBoxLayout;
-  accountCol->addWidget(quietLabel(QStringLiteral("CONTAS DE DESTINO")));
+  auto* accountHeading = quietLabel(QStringLiteral("CONTAS DE DESTINO"));
+  accountHeading->setWordWrap(false);
+  accountHeading->setMinimumHeight(36);
+  accountCol->addWidget(accountHeading);
   _campaignAccounts = new QListWidget;
   _campaignAccounts->setMinimumHeight(190);
   _campaignAccounts->setSpacing(2);
@@ -1103,10 +1104,14 @@ QWidget* MainWindow::buildCampaignPage() {
   accountCol->addWidget(_campaignAccounts);
   auto* taskCol = new QVBoxLayout;
   auto* taskHead = new QHBoxLayout;
-  taskHead->addWidget(quietLabel(QStringLiteral("CATEGORIAS DO MINUTE")));
+  auto* taskHeading = quietLabel(QStringLiteral("CATEGORIAS DO MINUTE"));
+  taskHeading->setWordWrap(false);
+  taskHeading->setMinimumHeight(36);
+  taskHead->addWidget(taskHeading);
   taskHead->addStretch();
   auto* allTasks = new QPushButton(QStringLiteral("Marcar todas"));
   allTasks->setFlat(true);
+  allTasks->setFixedHeight(36);
   connect(allTasks, &QPushButton::clicked, this, [this] {
     for (int i = 0; i < _campaignTasks->count(); ++i) {
       auto* item = _campaignTasks->item(i);
@@ -1121,7 +1126,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignTasks->setUniformItemSizes(true);
   taskCol->addWidget(_campaignTasks);
   selectionLayout->addLayout(accountCol, 1);
-  selectionLayout->addLayout(taskCol, 2);
+  selectionLayout->addLayout(taskCol, 1);
   layout->addWidget(card(QStringLiteral("Seleção"), selection));
 
   auto* parameters = new QWidget;
@@ -1156,10 +1161,21 @@ QWidget* MainWindow::buildCampaignPage() {
     _minDuration->setMaximum(maximum);
     _taskReload.start();
   });
-  form->addRow(QStringLiteral("Duração mínima"), _minDuration);
-  form->addRow(QStringLiteral("Duração máxima"), _maxDuration);
+  auto* duration = new QWidget;
+  auto* durationLayout = new QHBoxLayout(duration);
+  durationLayout->setContentsMargins(0, 0, 0, 0);
+  durationLayout->addWidget(_minDuration);
+  durationLayout->addWidget(new QLabel(QStringLiteral("até")));
+  durationLayout->addWidget(_maxDuration);
+  durationLayout->addStretch();
+  _minDuration->setAccessibleName(QStringLiteral("Duração mínima"));
+  _maxDuration->setAccessibleName(QStringLiteral("Duração máxima"));
+  _targetHours->setMaximumWidth(200);
+  _minDuration->setFixedWidth(130);
+  _maxDuration->setFixedWidth(130);
+  form->addRow(QStringLiteral("Duração dos vídeos"), duration);
   _delayMode = new ComboBox;
-  configureCombo(_delayMode, 420);
+  configureCombo(_delayMode, 240);
   _delayMode->addItem(QStringLiteral("Sem intervalo"), QStringLiteral("off"));
   _delayMode->addItem(QStringLiteral("Duração do clipe"), QStringLiteral("clip"));
   _delayMode->addItem(QStringLiteral("Intervalo fixo"), QStringLiteral("fixed"));
@@ -1169,6 +1185,11 @@ QWidget* MainWindow::buildCampaignPage() {
   _delaySeconds->setRange(0, 3600);
   _delaySeconds->setSuffix(QStringLiteral(" s"));
   form->addRow(QStringLiteral("Intervalo fixo"), _delaySeconds);
+  _delaySeconds->setMaximumWidth(200);
+  form->setRowVisible(_delaySeconds, false);
+  connect(_delayMode, &QComboBox::currentIndexChanged, parameters, [this, form] {
+    form->setRowVisible(_delaySeconds, _delayMode->currentData().toString() == QStringLiteral("fixed"));
+  });
   _cleanupAfter = new QCheckBox(QStringLiteral("Liberar mídia local após cada envio"));
   _cleanupAfter->setChecked(true);
   form->addRow(QString(), _cleanupAfter);
@@ -1185,6 +1206,10 @@ QWidget* MainWindow::buildCampaignPage() {
   _hourEnd->setRange(1, 24);
   _hourEnd->setValue(18);
   _hourEnd->setSuffix(QStringLiteral("h"));
+  _hourStart->setFixedWidth(100);
+  _hourEnd->setFixedWidth(100);
+  connect(_activeHours, &QCheckBox::toggled, _hourStart, &QWidget::setEnabled);
+  connect(_activeHours, &QCheckBox::toggled, _hourEnd, &QWidget::setEnabled);
   hoursLayout->addWidget(_activeHours);
   hoursLayout->addWidget(_hourStart);
   hoursLayout->addWidget(new QLabel(QStringLiteral("e")));
@@ -1241,11 +1266,11 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignStart = primaryButton(QStringLiteral("Iniciar campanha"));
   connect(_campaignStart, &QPushButton::clicked, this, &MainWindow::startCampaign);
   actions->addWidget(_campaignStart);
-  executionLayout->addLayout(actions);
   layout->addWidget(card(QStringLiteral("Execução"), execution));
   layout->addStretch();
   scroll->setWidget(content);
   bodyLayout->addWidget(scroll);
+  bodyLayout->addLayout(actions);
 
   return pageShell(QStringLiteral("Nova campanha"),
                    QStringLiteral("Escolha o conteúdo, calibre a operação e acompanhe cada envio."), body);
@@ -1331,6 +1356,21 @@ QWidget* MainWindow::buildAccountsPage() {
   auto* layout = new QVBoxLayout(body);
   layout->setContentsMargins(0, 0, 0, 0);
   layout->setSpacing(14);
+  auto* tabs = new QTabWidget;
+  tabs->setDocumentMode(true);
+  layout->addWidget(tabs);
+  auto addTab = [tabs](const QString& title, QWidget* widget) {
+    auto* content = new QWidget;
+    auto* contentLayout = new QVBoxLayout(content);
+    contentLayout->setContentsMargins(0, 0, 0, 0);
+    contentLayout->addWidget(widget);
+    contentLayout->addStretch();
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidget(content);
+    tabs->addTab(scroll, title);
+  };
 
   auto* formBody = new QWidget;
   auto* form = new QFormLayout(formBody);
@@ -1354,7 +1394,7 @@ QWidget* MainWindow::buildAccountsPage() {
   connect(_accountRegister, &QPushButton::clicked, this, [this] { addAccount(true); });
   actionLayout->addWidget(_accountRegister);
   form->addRow(QString(), actions);
-  layout->addWidget(card(QStringLiteral("Conectar conta"), formBody));
+  addTab(QStringLiteral("Conectar conta"), card(QStringLiteral("Conectar conta"), formBody));
 
   // --- Criador de contas ---------------------------------------------------
   auto* bulkBody = new QWidget;
@@ -1371,6 +1411,7 @@ QWidget* MainWindow::buildAccountsPage() {
   _bulkRegisterCount = new QSpinBox;
   _bulkRegisterCount->setRange(1, 50);
   _bulkRegisterCount->setValue(5);
+  _bulkRegisterCount->setMaximumWidth(200);
   bulkForm->addRow(QStringLiteral("Quantidade"), _bulkRegisterCount);
   auto* bulkActions = new QWidget;
   auto* bulkActionLayout = new QHBoxLayout(bulkActions);
@@ -1419,11 +1460,12 @@ QWidget* MainWindow::buildAccountsPage() {
   _bulkRegisterTable->setColumnWidth(4, 180);
   _bulkRegisterTable->setSelectionBehavior(QAbstractItemView::SelectRows);
   _bulkRegisterTable->setSelectionMode(QAbstractItemView::NoSelection);
-  bulkForm->addRow(QStringLiteral("Resultados"), _bulkRegisterTable);
+  bulkForm->addRow(quietLabel(QStringLiteral("Resultados")));
+  bulkForm->addRow(_bulkRegisterTable);
   _bulkRegisterPoll.setInterval(900);
   connect(&_bulkRegisterPoll, &QTimer::timeout, this, &MainWindow::pollBulkRegister);
   _bulkRegisterStart->setEnabled(false);
-  layout->addWidget(card(QStringLiteral("Criador de contas"), bulkBody));
+  addTab(QStringLiteral("Criar contas"), card(QStringLiteral("Criador de contas"), bulkBody));
 
   _accountsTable = new QTableWidget(0, 4);
   configureTable(_accountsTable);
@@ -1434,8 +1476,8 @@ QWidget* MainWindow::buildAccountsPage() {
   _accountsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
   _accountsTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
   _accountsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
-  _accountsTable->setColumnWidth(1, 220);
-  _accountsTable->setColumnWidth(2, 245);
+  _accountsTable->setColumnWidth(1, 150);
+  _accountsTable->setColumnWidth(2, 175);
   _accountsTable->setColumnWidth(3, 232);
   _accountsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
   _accountsTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -1496,15 +1538,14 @@ QWidget* MainWindow::buildAccountsPage() {
   accountsLayout->addWidget(quietLabel(QStringLiteral(
       "Backup JSON com credenciais de acesso. Guarde em local seguro. Use Ctrl ou Shift para selecionar contas.")));
   accountsLayout->addWidget(_accountsTable, 1);
-  layout->addWidget(card(QStringLiteral("Contas cadastradas"), accountsBody), 1);
-
-  layout->setSizeConstraint(QLayout::SetMinimumSize);
-  auto* scroll = new QScrollArea;
-  scroll->setWidgetResizable(true);
-  scroll->setFrameShape(QFrame::NoFrame);
-  scroll->setWidget(body);
+  auto* accountsScroll = new QScrollArea;
+  accountsScroll->setWidgetResizable(true);
+  accountsScroll->setFrameShape(QFrame::NoFrame);
+  accountsScroll->setWidget(card(QStringLiteral("Contas cadastradas"), accountsBody));
+  tabs->insertTab(0, accountsScroll, QStringLiteral("Contas cadastradas"));
+  tabs->setCurrentIndex(0);
   return pageShell(QStringLiteral("Contas"),
-                   QStringLiteral("Gerencie as identidades usadas no Minute e valide cada acesso."), scroll);
+                   QStringLiteral("Gerencie as identidades usadas no Minute e valide cada acesso."), body);
 }
 
 QWidget* MainWindow::buildBalancesPage() {
@@ -1856,6 +1897,16 @@ void MainWindow::applyStructuralStyle(bool dark) {
 
   setStyleSheet(QStringLiteral(R"(
     * { font-family: "Inter", "Segoe UI"; }
+    QPushButton { color: %4; background: %9; border: 1px solid %6; border-radius: 6px; padding: 5px 12px; font-weight: 600; }
+    QPushButton:hover { border-color: #ff7a36; }
+    QPushButton:pressed { background: %8; }
+    QPushButton:focus { border-color: #ff7a36; }
+    QPushButton[role="primary"] { color: #181a1b; background: #ff7a36; border-color: #ff7a36; }
+    QPushButton[role="primary"]:hover { background: #ff934f; }
+    QPushButton[role="primary"]:pressed { background: #e86b2b; }
+    QPushButton:disabled, QPushButton[role="primary"]:disabled { color: %5; background: %8; border-color: %6; }
+    QPushButton:flat { background: transparent; border-color: transparent; }
+    QPushButton:flat:hover { color: #ff7a36; background: %9; }
     #workspace { background: %1; }
     #sidebar { background: %3; color: #f7f8f7; border-right: 1px solid #282c2e; }
     #brandMark { background: transparent; border: none; }
@@ -1933,6 +1984,8 @@ void MainWindow::applyStructuralStyle(bool dark) {
     QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
     QScrollBar::handle:horizontal { background: %6; min-width: 30px; border-radius: 4px; }
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+    QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+    #sidebar QScrollBar::handle:vertical { background: #3a4144; }
     QToolTip { color: #f6f7f6; background: #202426; border: 1px solid #3a4144; padding: 6px; }
   )").arg(bg, panel, sidebar, text, muted, border, selected, field, soft));
 }
