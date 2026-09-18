@@ -26,13 +26,13 @@ class _SafeStream:
     def write(self, data):
         try:
             return self._stream.write(data)
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, ValueError):
             return len(data)
 
     def flush(self) -> None:
         try:
             self._stream.flush()
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, ValueError):
             pass
 
     def __getattr__(self, name: str):
@@ -70,16 +70,30 @@ def _watch_parent(parent_pid: int | None) -> None:
 
     def wait_for_parent() -> None:
         import ctypes
+        from ctypes import wintypes
+
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # HANDLE tem largura de ponteiro: o retorno padrão c_int trunca em x64.
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         synchronize = 0x00100000
         handle = kernel32.OpenProcess(synchronize, False, int(parent_pid))
         if not handle:
-            os._exit(0)
+            # ERROR_INVALID_PARAMETER: o PID já não existe. Acesso negado ou
+            # outra falha de observação não comprovam que o desktop terminou.
+            if ctypes.get_last_error() == 87:
+                os._exit(0)
+            return
         try:
-            kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
         finally:
             kernel32.CloseHandle(handle)
-        os._exit(0)
+        if result == 0:  # WAIT_OBJECT_0: término confirmado
+            os._exit(0)
 
     threading.Thread(target=wait_for_parent, daemon=True,
                      name="qmoney-parent-watch").start()

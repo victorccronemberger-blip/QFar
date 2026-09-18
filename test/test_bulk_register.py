@@ -37,8 +37,10 @@ class BulkRegisterTests(unittest.TestCase):
             self.assertEqual(self.start().status_code, 200)
             self.thread.call_args.kwargs["target"]()
         state = self.snapshot()
-        self.assertEqual(state["state"], "failed")
-        self.assertEqual(state["completed"], 0)
+        self.assertEqual(state["state"], "done")
+        self.assertEqual(state["completed"], 1)
+        self.assertEqual(state["failed"], 1)
+        self.assertEqual(state["results"][0]["steps"]["save_partial"]["status"], "fail")
         self.assertEqual(state["current_email"], "")
         self.assertEqual(state["current_step"], "")
         self.assertNotIn("private diagnostic", str(state))
@@ -70,6 +72,20 @@ class BulkRegisterTests(unittest.TestCase):
             self.thread.call_args.kwargs["target"]()
         self.assertEqual(self.snapshot()["state"], "done")
         self.assertEqual(self.snapshot()["created"], 1)
+
+    def test_running_batch_blocks_manual_registration_and_account_mutations(self):
+        with patch.object(server, "_full_register_account", return_value={"steps": {}, "error": None}) as register:
+            self.assertEqual(self.start().status_code, 200)
+            for endpoint in ("/api/accounts/register", "/api/accounts/migration", "/api/accounts",
+                             "/api/campaigns", "/api/campaigns/preflight"):
+                with self.subTest(endpoint=endpoint):
+                    response = self.client.post(endpoint, json={"email": "review@example.invalid", "password": "test-only"})
+                    self.assertEqual(response.status_code, 409)
+            self.assertEqual(self.client.get("/api/accounts").status_code, 200)
+            register.assert_not_called()
+            self.thread.call_args.kwargs["target"]()
+            self.assertEqual(self.client.post("/api/accounts/register", json={
+                "email": "review@example.invalid", "password": "test-only"}).status_code, 200)
 
     def test_domain_list_excludes_email_routes_and_profiles_without_tokens(self):
         self.profiles.extend([

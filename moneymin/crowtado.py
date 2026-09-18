@@ -576,8 +576,8 @@ def _playwright_chrome() -> str | None:
 def _wait_port(port: int, timeout: float = 30.0) -> None:
     import socket
     import time as _time
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
         try:
             socket.create_connection(("127.0.0.1", port), timeout=1).close()
             return
@@ -701,4 +701,12 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
     except Exception as exc:  # noqa: BLE001 — Playwright quebra de N jeitos
         raise CrowtadoError(f"criação de conta falhou: {type(exc).__name__}: {exc}") from exc
     finally:
-        proc.terminate()
+        # terminate() só solicita o encerramento. Aguarde a liberação do
+        # perfil antes de permitir o cadastro seguinte usar o mesmo diretório.
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)

@@ -8,6 +8,17 @@ from moneymin.web import banned_monitor as monitor, server
 
 
 class BannedMonitorTests(unittest.TestCase):
+    def test_thread_start_failure_allows_retry(self):
+        runner = monitor.BannedMonitor()
+        with patch.object(monitor.threading.Thread, "start", side_effect=RuntimeError("private diagnostic")):
+            with self.assertRaisesRegex(RuntimeError, "Não foi possível iniciar"):
+                runner.start([{"email": "test@example.invalid"}], Mock())
+        self.assertEqual(runner.snapshot()["state"], "error")
+        self.assertNotIn("private diagnostic", str(runner.snapshot()))
+        with patch.object(monitor.threading.Thread, "start") as start:
+            runner.start([], Mock())
+        start.assert_called_once()
+
     def profile_responses(self, disabled=False, state='active'):
         return [(200, json.dumps({'idToken': 'private-token'})),
                 (200, json.dumps({'disabled': disabled, 'organizations': [

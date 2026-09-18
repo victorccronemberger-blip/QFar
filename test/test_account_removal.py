@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -71,6 +73,41 @@ class AccountRemovalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["email"] for item in server._list_accounts()], [email])
         self.assertEqual(server._removed_accounts(), set())
+
+    def test_removal_does_not_overwrite_concurrent_preference_save(self):
+        email = "remove@example.com"
+        self._write_token(email)
+        server._save_prefs({"selected_accounts": [email], "theme": "old"})
+        read_by_removal = threading.Event()
+        preference_saved = threading.Event()
+        original_load = server._load_prefs
+
+        def load():
+            prefs = original_load()
+            if threading.current_thread().name.startswith("removal"):
+                read_by_removal.set()
+                preference_saved.wait(0.5)
+            return prefs
+
+        def remove():
+            with server.create_app().test_client() as client:
+                return client.delete(f"/api/accounts/{email}").status_code
+
+        def update():
+            self.assertTrue(read_by_removal.wait(3))
+            with server.create_app().test_client() as client:
+                response = client.put("/api/preferences", json={"theme": "new"})
+            preference_saved.set()
+            return response.status_code
+
+        with mock.patch.object(server, "_load_prefs", side_effect=load), \
+             ThreadPoolExecutor(1, thread_name_prefix="removal") as removals, \
+             ThreadPoolExecutor(1, thread_name_prefix="preferences") as preferences:
+            deletion = removals.submit(remove)
+            change = preferences.submit(update)
+            self.assertEqual(deletion.result(timeout=5), 200)
+            self.assertEqual(change.result(timeout=5), 200)
+        self.assertEqual(server._load_prefs(), {"selected_accounts": [], "theme": "new"})
 
 
 if __name__ == "__main__":

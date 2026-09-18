@@ -310,9 +310,17 @@ class CampaignRunner:
                     else:
                         total += n * n_acc
                 self.total_sends = total
-            self._thread = threading.Thread(target=self._run, args=(cfg,),
-                                            daemon=True, name="moneymin-campaign")
-            self._thread.start()
+            try:
+                self._thread = threading.Thread(target=self._run, args=(cfg,),
+                                                daemon=True, name="moneymin-campaign")
+                self._thread.start()
+            except Exception as exc:
+                self._thread = None
+                self.state = "error"
+                self.current = ""
+                self.error = "Não foi possível iniciar a operação. Tente novamente."
+                self.stage = "Erro"
+                raise RuntimeError("Não foi possível iniciar a operação. Tente novamente.") from exc
 
     def stop(self) -> None:
         """Pede parada cooperativa (o motor para entre envios e no delay)."""
@@ -561,15 +569,21 @@ class BalancesRunner:
             self.fast_done = 0
             self.fallbacks = 0
             self.current = "iniciando consulta rápida…"
-            self._thread = threading.Thread(target=self._run, args=(creds, on_result),
-                                            daemon=True, name="moneymin-balances")
-            self._thread.start()
+            try:
+                self._thread = threading.Thread(target=self._run, args=(creds, on_result),
+                                                daemon=True, name="moneymin-balances")
+                self._thread.start()
+            except Exception as exc:
+                self._thread = None
+                self.state = "error"
+                self.current = ""
+                raise RuntimeError("Não foi possível iniciar a operação. Tente novamente.") from exc
 
     def _run(self, creds: dict[str, str], on_result) -> None:
         # Import tardio: Playwright só é carregado se algum fallback for necessário.
-        from ..crowtado import consultar_saldo_api, consultar_saldo_navegador
-
         try:
+            from ..crowtado import consultar_saldo_api, consultar_saldo_navegador
+
             failures: list[tuple[str, str, Exception]] = []
             workers = min(3, max(1, len(creds)))
             with ThreadPoolExecutor(max_workers=workers,
@@ -633,6 +647,7 @@ class HoloCacheRunner:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.state = "idle"  # idle|running|stopping|done|stopped|disk_limit|error
         self.current = ""
@@ -660,6 +675,7 @@ class HoloCacheRunner:
         with self._lock:
             if self.running:
                 raise RuntimeError("o acelerador HoloAssist já está em andamento")
+            self._stop.clear()
             self.state = "running"
             self.current = "preparando catálogo…"
             self.phase = "catalog"
@@ -676,29 +692,35 @@ class HoloCacheRunner:
                 "limit": limit,
                 "min_free_gb": min_free_gb,
             }
-            self._thread = threading.Thread(
-                target=self._run,
-                kwargs=kwargs,
-                daemon=True,
-                name="moneymin-holo-cache",
-            )
-            self._thread.start()
+            try:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    kwargs=kwargs,
+                    daemon=True,
+                    name="moneymin-holo-cache",
+                )
+                self._thread.start()
+            except Exception as exc:
+                self._thread = None
+                self.state = "error"
+                self.current = ""
+                self.error = "Não foi possível iniciar a operação. Tente novamente."
+                self.phase = ""
+                raise RuntimeError("Não foi possível iniciar a operação. Tente novamente.") from exc
 
     def stop(self) -> None:
-        requested = False
         with self._lock:
             if self.state == "running":
                 self.state = "stopping"
                 self.current = "parada solicitada — concluindo o clipe atual…"
-                requested = True
-        if requested:
-            holo_accelerator.request_stop()
+                self._stop.set()
 
     def _run(self, **kwargs: Any) -> None:
         try:
             result = holo_accelerator.warm_cache(
                 **kwargs,
                 progress=self._on_event,
+                should_stop=self._stop.is_set,
             )
         except Exception as exc:  # noqa: BLE001 — erro precisa aparecer na interface
             with self._lock:

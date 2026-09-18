@@ -57,6 +57,8 @@ packaging/*.spec
 docs/
 scripts/*
 !scripts/build_release.ps1
+!scripts/browser_parts.ps1
+!scripts/run_tests.py
 *.bat
 HowUseMe.md
 PARA_RODAR_NO_DESTINO.md

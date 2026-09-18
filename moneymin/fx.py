@@ -25,7 +25,7 @@ def _valid_quote(value: Any) -> bool:
     try:
         rate = float(value.get("rate"))
         fetched_at = int(value.get("fetched_at"))
-    except (AttributeError, TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError, OverflowError):
         return False
     return math.isfinite(rate) and 0.5 < rate < 20.0 and fetched_at > 0
 
@@ -57,12 +57,12 @@ def usd_brl_quote(
     """Devolve BRL por USD; usa cache por 6 h e o preserva quando offline."""
     current = int(time.time() if now is None else now)
     cached = load_json(CACHE_PATH, {})
-    if _valid_quote(cached) and current - int(cached["fetched_at"]) < CACHE_TTL_S:
+    if _valid_quote(cached) and 0 <= current - int(cached["fetched_at"]) < CACHE_TTL_S:
         return {**cached, "available": True, "stale": False}
 
     with _LOCK:
         cached = load_json(CACHE_PATH, {})
-        if _valid_quote(cached) and current - int(cached["fetched_at"]) < CACHE_TTL_S:
+        if _valid_quote(cached) and 0 <= current - int(cached["fetched_at"]) < CACHE_TTL_S:
             return {**cached, "available": True, "stale": False}
         try:
             request = urllib.request.Request(

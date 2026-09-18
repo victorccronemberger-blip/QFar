@@ -18,6 +18,10 @@ MAX_ACCOUNTS = 1000
 FORMAT = "qmoney-accounts"
 
 
+class ImportRecoveryError(RuntimeError):
+    """Uma gravação falhou e nem todos os arquivos puderam ser restaurados."""
+
+
 def _mapping(path: Path) -> dict:
     value = load_json(path, None) if path.exists() else {}
     if not isinstance(value, dict):
@@ -94,7 +98,12 @@ def clean_record(raw: Any) -> dict:
         if not token.get("refreshToken") or not token.get("idToken"):
             raise ValueError("Token incompleto: faltam idToken ou refreshToken.")
         expiry = source.get("expires_at", 0)
-        if isinstance(expiry, bool) or not isinstance(expiry, (int, float)) or not math.isfinite(expiry) or expiry < 0:
+        try:
+            valid_expiry = (not isinstance(expiry, bool) and isinstance(expiry, (int, float))
+                            and math.isfinite(expiry) and expiry >= 0)
+        except OverflowError:
+            valid_expiry = False
+        if not valid_expiry:
             raise ValueError("Validade do token inválida.")
         token["expires_at"] = expiry
     if token is None and password is None:
@@ -114,8 +123,13 @@ def import_accounts(raw: str, *, apply: bool, passwords_path: Path, removed_path
         seen = set()
         destinations = {}
         results = []
+        recovery_failed = False
         for index, source in enumerate(records, 1):
             row = {"row": index, "email": "", "status": "invalid"}
+            if recovery_failed:
+                row.update(status="error", message="Não importada: o lote foi interrompido por falha na restauração dos arquivos locais.")
+                results.append(row)
+                continue
             try:
                 record = clean_record(source)
                 email = row["email"] = record["email"]
@@ -138,6 +152,9 @@ def import_accounts(raw: str, *, apply: bool, passwords_path: Path, removed_path
                         row.update(status="imported", message="Importada. Use Verificar todas para validar o acesso.")
             except ValueError as exc:
                 row["message"] = str(exc)
+            except ImportRecoveryError:
+                recovery_failed = True
+                row.update(status="error", message="Falha ao restaurar os arquivos locais. O lote foi interrompido; confira as contas e o armazenamento antes de tentar novamente.")
             except (OSError, RuntimeError):
                 row.update(status="error", message="Falha ao autenticar ou salvar a conta. Verifique o acesso e tente novamente.")
             results.append(row)
@@ -164,11 +181,17 @@ def _save_record(record: dict, token_path: Path, passwords_path: Path, removed_p
         removed["schema"] = 1
         save_json(removed_path, removed)
     except Exception:
+        failed = False
         for path, content in before.items():
-            if content is None:
-                path.unlink(missing_ok=True)
-            else:
-                save_bytes(path, content)
+            try:
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    save_bytes(path, content)
+            except OSError:
+                failed = True
+        if failed:
+            raise ImportRecoveryError("Falha na restauração dos arquivos locais.")
         raise
 
 

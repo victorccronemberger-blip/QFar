@@ -96,7 +96,11 @@ class BannedMonitor:
             if self.state["state"] == "running":
                 raise RuntimeError("Uma consulta das banidas já está em andamento.")
             self.state = {"state": "running", "completed": 0, "total": len(rows)}
-            threading.Thread(target=self._run, args=(rows, save), daemon=True, name="banned-monitor").start()
+            try:
+                threading.Thread(target=self._run, args=(rows, save), daemon=True, name="banned-monitor").start()
+            except Exception as exc:
+                self.state.update(state="error", error="Não foi possível iniciar a consulta. Tente novamente.")
+                raise RuntimeError(self.state["error"]) from exc
 
     def _run(self, rows, save):
         try:

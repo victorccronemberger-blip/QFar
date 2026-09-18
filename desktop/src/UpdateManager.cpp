@@ -72,6 +72,7 @@ QNetworkRequest requestFor(const QUrl& url) {
   request.setRawHeader("Accept", "application/vnd.github+json");
   request.setRawHeader("X-GitHub-Api-Version", "2022-11-28");
   request.setRawHeader("User-Agent", "QMoney-Updater");
+  request.setTransferTimeout(60000);
   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                        QNetworkRequest::NoLessSafeRedirectPolicy);
   return request;
@@ -247,12 +248,19 @@ void UpdateManager::fetchPackage() {
   emit statusChanged(QStringLiteral("Baixando QMoney %1…").arg(_version));
   auto* reply = _network.get(requestFor(_packageUrl));
   connect(reply, &QNetworkReply::readyRead, this, [this, reply] {
-    if (_output) _output->write(reply->readAll());
+    const QByteArray bytes = reply->readAll();
+    if (_output && _output->write(bytes) != bytes.size()) {
+      reply->setProperty("qmoneyWriteFailed", true);
+      reply->abort();
+    }
   });
   connect(reply, &QNetworkReply::downloadProgress, this, &UpdateManager::progress);
   connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    bool writeFailed = reply->property("qmoneyWriteFailed").toBool();
     if (_output) {
-      _output->write(reply->readAll());
+      const QByteArray bytes = reply->readAll();
+      if (!writeFailed && _output->write(bytes) != bytes.size()) writeFailed = true;
+      if (!_output->flush()) writeFailed = true;
       _output->close();
       _output->deleteLater();
       _output = nullptr;
@@ -260,6 +268,10 @@ void UpdateManager::fetchPackage() {
     const QString networkError = reply->errorString();
     const bool failed = reply->error() != QNetworkReply::NoError;
     reply->deleteLater();
+    if (writeFailed) {
+      QFile::remove(_packagePath);
+      return fail(QStringLiteral("Não foi possível gravar a atualização. Confira o espaço livre e as permissões da pasta temporária."));
+    }
     if (failed) return fail(QStringLiteral("Falha ao baixar a atualização: %1").arg(networkError));
 
     QFile package(_packagePath);
@@ -267,6 +279,7 @@ void UpdateManager::fetchPackage() {
     QCryptographicHash hash(QCryptographicHash::Sha256);
     if (!hash.addData(&package)) return fail(QStringLiteral("Não foi possível verificar o pacote baixado."));
     const QString actual = QString::fromLatin1(hash.result().toHex());
+    package.close();
     if (actual != _expectedSha256) {
       QFile::remove(_packagePath);
       return fail(QStringLiteral("A atualização foi recusada: o SHA-256 não confere."));

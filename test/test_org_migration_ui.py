@@ -100,6 +100,13 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(restarted.snapshot()["state"], "interrupted")
         self.assertEqual(restarted.snapshot()["completed"], 1)
 
+    def test_invalid_report_encoding_does_not_prevent_initialization(self):
+        original = b'{"state": "\xff"}'
+        self.report.write_bytes(original)
+        restarted = OrgMigrationRunner(self.report)
+        self.assertEqual(restarted.snapshot()["state"], "idle")
+        self.assertEqual(self.report.read_bytes(), original)
+
     def test_no_remote_change_when_initial_report_cannot_be_saved(self):
         migrate = mock.Mock()
         with mock.patch("moneymin.web.org_migration.save_json", side_effect=OSError("disk")):

@@ -17,6 +17,7 @@ class CrowtadoCredentialTests(unittest.TestCase):
 
     def test_connecting_existing_identity_also_keeps_balance_password(self):
         with mock.patch.object(server, "login"), \
+             mock.patch.object(server, "_set_account_removed"), \
              mock.patch.object(server, "_save_crowtado_cred") as save:
             response = self.client.post("/api/accounts", json={
                 "email": "conta@example.com",
@@ -89,6 +90,20 @@ class CrowtadoCredentialTests(unittest.TestCase):
                     response = self.client.post('/api/balances/refresh', json={})
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(start.call_args.args[0], {'New@example.com': ' kept spaces '})
+
+    def test_invalid_legacy_line_does_not_hide_valid_credentials(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = (b'\xef\xbb\xbf{"email":"first@example.com","senha":"first"}\n'
+                        b'{"email":"bad@example.com","senha":"\xff"}\n'
+                        b'{"email":"last@example.com","senha":"last"}\n')
+            legacy = root / "contas.jsonl"
+            legacy.write_bytes(original)
+            with mock.patch.object(server.config, "DATA_DIR", root), \
+                 mock.patch.object(server, "CROWTADO_PW_PATH", root / "passwords.json"):
+                self.assertEqual(server._crowtado_creds(), {
+                    "first@example.com": "first", "last@example.com": "last"})
+            self.assertEqual(legacy.read_bytes(), original)
 
     def test_explicit_saved_password_wins_and_case_variants_are_replaced(self):
         with tempfile.TemporaryDirectory() as folder:

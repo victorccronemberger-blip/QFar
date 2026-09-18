@@ -10,6 +10,26 @@
 namespace fs = std::filesystem;
 
 namespace {
+DWORD parseProcessId(const std::wstring& text) {
+  if (text.empty() || text.find_first_not_of(L"0123456789") != std::wstring::npos) return 0;
+  try {
+    const auto value = std::stoull(text);
+    return value > 0 && value <= MAXDWORD ? static_cast<DWORD>(value) : 0;
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
+bool waitForParentExit(DWORD pid, DWORD timeout = 60000) {
+  if (!pid) return false;
+  HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+  // Acesso negado não significa que o processo terminou.
+  if (!process) return GetLastError() == ERROR_INVALID_PARAMETER;
+  const DWORD result = WaitForSingleObject(process, timeout);
+  CloseHandle(process);
+  return result == WAIT_OBJECT_0;
+}
+
 std::wstring quote(const std::wstring& value) { return L"\"" + value + L"\""; }
 
 std::string utf8(const std::wstring& value) {
@@ -40,7 +60,8 @@ void logLine(const fs::path& target, const std::wstring& line) {
       << utf8(line) << "\n";
 }
 
-bool runProcess(const std::wstring& command, DWORD timeout = 300000) {
+bool runProcess(const std::wstring& command, DWORD timeout = 300000,
+                bool terminateOnTimeout = true) {
   std::vector<wchar_t> mutableCommand(command.begin(), command.end());
   mutableCommand.push_back(L'\0');
   STARTUPINFOW startup{sizeof(startup)};
@@ -48,6 +69,10 @@ bool runProcess(const std::wstring& command, DWORD timeout = 300000) {
   if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return false;
   const DWORD wait = WaitForSingleObject(process.hProcess, timeout);
+  if (wait != WAIT_OBJECT_0 && terminateOnTimeout) {
+    TerminateProcess(process.hProcess, 5);
+    WaitForSingleObject(process.hProcess, 5000);
+  }
   DWORD exitCode = 1;
   if (wait == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &exitCode);
   CloseHandle(process.hThread);
@@ -150,12 +175,25 @@ bool rollbackPackage(const fs::path& source, const fs::path& target,
   }
   const fs::path savedUpdater = backup / L"QMoneyUpdater.installed.exe";
   if (fs::exists(savedUpdater)) {
-    const fs::path installedUpdater = target / L"QMoneyUpdater.exe";
-    if (fs::exists(installedUpdater)) fs::remove(installedUpdater, ec);
-    if (!ec) fs::copy_file(savedUpdater, installedUpdater,
+    // This updater is still executing from QMoneyUpdater.exe on Windows.
+    // Stage its restoration for the next launch instead of deleting a running binary.
+    const fs::path pendingUpdater = target / L"QMoneyUpdater.new.exe";
+    if (fs::exists(pendingUpdater)) fs::remove(pendingUpdater, ec);
+    if (!ec) fs::copy_file(savedUpdater, pendingUpdater,
                            fs::copy_options::none, ec);
   }
   return !ec;
+}
+
+enum class InstallResult { Installed, BackupFailed, CopyFailed, RollbackFailed };
+
+InstallResult installPackage(const fs::path& source, const fs::path& target,
+                             const fs::path& backup) {
+  // A partial backup must never be used to restore an untouched installation.
+  if (!backupPackageTargets(source, target, backup)) return InstallResult::BackupFailed;
+  if (copyPackage(source, target)) return InstallResult::Installed;
+  return rollbackPackage(source, target, backup) ? InstallResult::CopyFailed
+                                                : InstallResult::RollbackFailed;
 }
 
 bool launchAndValidate(const fs::path& executable, const fs::path& marker,
@@ -200,10 +238,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   LocalFree(argv);
   if (package.empty() || target.empty() || pidText.empty() || launch.empty()) return 2;
 
-  const DWORD pid = std::wcstoul(pidText.c_str(), nullptr, 10);
-  if (HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid)) {
-    WaitForSingleObject(process, 60000);
-    CloseHandle(process);
+  const DWORD pid = parseProcessId(pidText);
+  if (!pid) return 2;
+  if (!waitForParentExit(pid)) {
+    logLine(target, L"O aplicativo não encerrou; atualização cancelada antes de alterar arquivos.");
+    if (!silent)
+      MessageBoxW(nullptr, L"Feche o QMoney e tente atualizar novamente.",
+                  L"QMoney", MB_OK | MB_ICONERROR);
+    return 4;
   }
 
   wchar_t tempPath[MAX_PATH]{};
@@ -218,13 +260,26 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   if (ec) return 3;
 
   const std::wstring extract = L"tar.exe -xf " + quote(package.wstring()) + L" -C " + quote(staging.wstring());
-  if (!runProcess(extract) || !backupPackageTargets(staging, target, backup)
-      || !copyPackage(staging, target)) {
-    logLine(target, L"Falha ao extrair ou copiar o pacote.");
-    rollbackPackage(staging, target, backup);
+  if (!runProcess(extract)) {
+    logLine(target, L"Falha ao extrair o pacote; instalação original preservada.");
     fs::remove_all(staging, ec);
     if (!silent)
-      MessageBoxW(nullptr, L"A atualização não pôde ser instalada. Seus dados não foram alterados.",
+      MessageBoxW(nullptr, L"Não foi possível extrair a atualização. A instalação não foi alterada.",
+                  L"QMoney", MB_OK | MB_ICONERROR);
+    return 4;
+  }
+  const auto installation = installPackage(staging, target, backup);
+  if (installation != InstallResult::Installed) {
+    logLine(target, installation == InstallResult::BackupFailed
+        ? L"Falha no backup; instalação original preservada."
+        : installation == InstallResult::RollbackFailed
+            ? L"Falha na cópia e na restauração; backup mantido para recuperação."
+            : L"Falha na cópia; instalação anterior restaurada.");
+    fs::remove_all(staging, ec);
+    if (!silent)
+      MessageBoxW(nullptr, installation == InstallResult::RollbackFailed
+                  ? L"A atualização e a restauração falharam. Consulte update.log e preserve a pasta .qmoney-rollback."
+                  : L"A atualização não pôde ser instalada. A instalação anterior foi preservada.",
                   L"QMoney", MB_OK | MB_ICONERROR);
     return 4;
   }
@@ -239,7 +294,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
       fs::remove_all(staging, ec);
       return 5;
     }
-    runProcess(quote((target / launch).wstring()), 1000);
+    runProcess(quote((target / launch).wstring()), 1000, false);
     if (!silent)
       MessageBoxW(nullptr,
                   L"A nova versão não iniciou. O QMoney restaurou automaticamente a versão anterior.",

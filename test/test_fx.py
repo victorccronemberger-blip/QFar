@@ -78,6 +78,19 @@ class ExchangeRateTests(unittest.TestCase):
         self.assertFalse(quote["available"])
         self.assertIsNone(quote["rate"])
 
+    def test_clock_rollback_refreshes_future_dated_cache(self):
+        self.cache.write_text(json.dumps({"rate": 5.1, "fetched_at": 999999}), encoding="utf-8")
+        opener = mock.Mock(return_value=_Response([{"data": "01/09/2026", "valor": "5.2"}]))
+        quote = fx.usd_brl_quote(now=100, opener=opener)
+        opener.assert_called_once()
+        self.assertEqual(quote["rate"], 5.2)
+        self.assertEqual(quote["fetched_at"], 100)
+
+    def test_invalid_cached_timestamp_does_not_break_offline_balances(self):
+        self.cache.write_text(json.dumps({"rate": 5.1, "fetched_at": float("inf")}), encoding="utf-8")
+        quote = fx.usd_brl_quote(now=100, opener=mock.Mock(side_effect=OSError("offline")))
+        self.assertFalse(quote["available"])
+
 
 if __name__ == "__main__":
     unittest.main()

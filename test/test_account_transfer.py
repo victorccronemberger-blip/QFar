@@ -64,6 +64,13 @@ class AccountTransferTests(unittest.TestCase):
         self.assertEqual(result["counts"]["imported"], 1)
         self.assertNotIn("fixture-password", json.dumps(result))
 
+    def test_oversized_expiry_is_invalid_and_does_not_abort_other_rows(self):
+        bad = self.account("bad@example.com")
+        bad["token"]["expires_at"] = 10 ** 1000
+        result = self.run_import([bad, self.account()])
+        self.assertEqual(result["counts"]["invalid"], 1)
+        self.assertEqual(result["counts"]["imported"], 1)
+
     def test_password_only_login_failure_rolls_back_and_continues(self):
         def failed(email, password):
             save_json(transfer.config.token_path(email), {"email": email})
@@ -93,6 +100,36 @@ class AccountTransferTests(unittest.TestCase):
         save_json(self.removed, {"emails": ["test@example.com"]})
         self.run_import([self.account()])
         self.assertEqual(load_json(self.removed, {})["emails"], [])
+
+    def test_failed_rollback_still_restores_other_files_and_stops_batch(self):
+        email = "test@example.com"
+        token_path = transfer.config.token_path(email)
+        save_json(token_path, self.account()["token"])
+        save_json(self.passwords, {email: "original password"})
+        save_json(self.removed, {"emails": [email]})
+        original_passwords = self.passwords.read_bytes()
+        original_removed = self.removed.read_bytes()
+        real_save = transfer.save_json
+        real_restore = transfer.save_bytes
+
+        def save(path, data):
+            if path == self.removed:
+                raise OSError("disk failure")
+            real_save(path, data)
+
+        def restore(path, data):
+            if path == token_path:
+                raise OSError("private path")
+            real_restore(path, data)
+
+        with patch.object(transfer, "save_json", side_effect=save), \
+             patch.object(transfer, "save_bytes", side_effect=restore):
+            result = self.run_import([self.account(), self.account("next@example.com")])
+        self.assertEqual(result["counts"]["error"], 2)
+        self.assertEqual(self.passwords.read_bytes(), original_passwords)
+        self.assertEqual(self.removed.read_bytes(), original_removed)
+        self.assertFalse(transfer.config.token_path("next@example.com").exists())
+        self.assertNotIn("private path", json.dumps(result))
 
     def test_concurrent_imports_create_one_account(self):
         with ThreadPoolExecutor(max_workers=2) as pool:

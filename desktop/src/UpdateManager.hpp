@@ -30,6 +30,7 @@ signals:
   void installReady(const QString& packagePath);
 
 private:
+  friend class UpdateManagerTests;
   void fail(const QString& message);
   void fetchChecksum();
   void fetchSignature();

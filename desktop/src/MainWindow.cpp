@@ -1365,6 +1365,8 @@ QWidget* MainWindow::buildAccountsPage() {
   configureCombo(_bulkRegisterDomain);
   _bulkRegisterDomain->setEditable(false);
   _bulkRegisterDomain->addItem(QStringLiteral("carregando domínios…"));
+  connect(_bulkRegisterDomain, qOverload<int>(&QComboBox::currentIndexChanged),
+          this, [this] { checkBulkRegisterDomain(); });
   bulkForm->addRow(QStringLiteral("Domínio"), _bulkRegisterDomain);
   _bulkRegisterCount = new QSpinBox;
   _bulkRegisterCount->setRange(1, 50);
@@ -1393,6 +1395,7 @@ QWidget* MainWindow::buildAccountsPage() {
   connect(_bulkRegisterWebmail, &QLabel::linkActivated, this, &MainWindow::openWebmail);
   bulkForm->addRow(QString(), _bulkRegisterWebmail);
   _bulkRegisterProgress = new QProgressBar;
+  _bulkRegisterProgress->setObjectName(QStringLiteral("bulkRegisterProgress"));
   _bulkRegisterProgress->setRange(0, 100);
   _bulkRegisterProgress->setValue(0);
   _bulkRegisterProgress->setTextVisible(true);
@@ -1923,7 +1926,7 @@ void MainWindow::applyStructuralStyle(bool dark) {
     #campaignTimeline { font-family: "Inter", "Segoe UI"; font-size: 12px; line-height: 1.35; padding: 12px; }
     QProgressBar { min-height: 7px; max-height: 7px; background: %8; border: none; border-radius: 3px; }
     QProgressBar::chunk { background: #ff7a36; border-radius: 3px; }
-    #campaignProgress { min-height: 22px; max-height: 22px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 700; }
+    #campaignProgress, #bulkRegisterProgress { min-height: 22px; max-height: 22px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 700; }
     QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
     QScrollBar::handle:vertical { background: %6; min-height: 30px; border-radius: 4px; }
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -3519,12 +3522,18 @@ void MainWindow::addAccount(bool registerNew) {
 }
 
 void MainWindow::loadBulkRegisterDomains() {
-  if (!_backendReady || _bulkRegisterPolling) return;
+  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
+  const int revision = ++_bulkRegisterDomainsRevision;
+  const QString selectedDomain = _bulkRegisterDomain->currentData().toString();
+  ++_bulkRegisterPreflightRevision;
+  const QSignalBlocker blocker(_bulkRegisterDomain);
   _bulkRegisterStart->setEnabled(false);
   _bulkRegisterDomain->clear();
   _bulkRegisterDomain->addItem(QStringLiteral("carregando domínios…"));
   _bulkRegisterDomain->setEnabled(false);
-  _api.get(QStringLiteral("/api/accounts/domains"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
+  _api.get(QStringLiteral("/api/accounts/domains"), [this, revision, selectedDomain](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (revision != _bulkRegisterDomainsRevision || _bulkRegisterPolling || _bulkRegisterStarting) return;
+    const QSignalBlocker blocker(_bulkRegisterDomain);
     _bulkRegisterDomain->clear();
     _bulkRegisterWebmail->hide();
     if (!ok) {
@@ -3547,19 +3556,30 @@ void MainWindow::loadBulkRegisterDomains() {
       const QString profile = entry.value(QStringLiteral("profile_name")).toString();
       _bulkRegisterDomain->addItem(profile.isEmpty() ? domain : QStringLiteral("%1 (%2)").arg(domain, profile), domain);
     }
+    const int previousIndex = _bulkRegisterDomain->findData(selectedDomain);
+    if (previousIndex >= 0) _bulkRegisterDomain->setCurrentIndex(previousIndex);
     _bulkRegisterDomain->setEnabled(true);
-    _bulkRegisterStart->setEnabled(true);
     if (!webmailUrl.isEmpty()) {
       _bulkRegisterWebmail->setText(
           QStringLiteral("Conferir caixa de entrada: <a href=\"%1\">%1</a>")
               .arg(webmailUrl));
       _bulkRegisterWebmail->show();
     }
-    // Após carregar domínios, validar dependências (preflight)
+    checkBulkRegisterDomain();
+  });
+}
+
+void MainWindow::checkBulkRegisterDomain() {
+    if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
+    const int revision = ++_bulkRegisterPreflightRevision;
+    const QString domain = _bulkRegisterDomain->currentData().toString();
     _bulkRegisterStart->setEnabled(false);
+    if (domain.isEmpty()) return;
     _bulkRegisterStatus->setText(QStringLiteral("Validando dependências (Hostinger, Chrome, APIs)…"));
-    _api.get(QStringLiteral("/api/accounts/bulk-register/preflight"),
-             [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _api.get(QStringLiteral("/api/accounts/bulk-register/preflight?domain=")
+                 + QString::fromLatin1(QUrl::toPercentEncoding(domain)),
+             [this, revision](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (revision != _bulkRegisterPreflightRevision || _bulkRegisterPolling || _bulkRegisterStarting) return;
       if (!ok) {
         _bulkRegisterStatus->setText(QStringLiteral("Preflight falhou: ") + error);
         return;
@@ -3592,16 +3612,19 @@ void MainWindow::loadBulkRegisterDomains() {
             QStringLiteral("Dependências com problema: %1").arg(issues.join(QStringLiteral("; "))));
       }
     });
-  });
 }
 
 void MainWindow::startBulkRegister() {
+  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
   const QString domain = _bulkRegisterDomain->currentData().toString();
   if (domain.isEmpty()) {
     return showError(QStringLiteral("Domínio indisponível"),
                      QStringLiteral("Configure um domínio catch-all em Integrações."));
   }
   const int count = _bulkRegisterCount->value();
+  _bulkRegisterStarting = true;
+  ++_bulkRegisterDomainsRevision;
+  ++_bulkRegisterPreflightRevision;
   _bulkRegisterStart->setEnabled(false);
   _bulkRegisterDomain->setEnabled(false);
   _bulkRegisterCount->setEnabled(false);
@@ -3612,6 +3635,7 @@ void MainWindow::startBulkRegister() {
   _api.post(QStringLiteral("/api/accounts/bulk-register"),
             {{QStringLiteral("count"), count}, {QStringLiteral("domain"), domain}},
             [this](bool ok, const QJsonDocument&, const QString& error) {
+    _bulkRegisterStarting = false;
     if (!ok) {
       _bulkRegisterStart->setEnabled(true);
       _bulkRegisterDomain->setEnabled(true);
@@ -3635,18 +3659,30 @@ void MainWindow::openWebmail() {
 }
 
 void MainWindow::pollBulkRegister() {
+  if (_bulkRegisterRequestInFlight) return;
+  _bulkRegisterRequestInFlight = true;
   _api.get(QStringLiteral("/api/accounts/bulk-register/status"),
            [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _bulkRegisterRequestInFlight = false;
     if (!ok) {
+      _bulkRegisterPoll.setInterval(3000);
+      _bulkRegisterStatus->setText(QStringLiteral("Conexão interrompida. Tentando recuperar o progresso… ") + error);
+      return;
+    }
+    _bulkRegisterPoll.setInterval(900);
+    const auto root = doc.object();
+    const QString state = root.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("idle")) {
       _bulkRegisterPoll.stop();
       _bulkRegisterPolling = false;
       _bulkRegisterStart->setEnabled(true);
       _bulkRegisterDomain->setEnabled(true);
       _bulkRegisterCount->setEnabled(true);
-      return showError(QStringLiteral("Falha ao consultar progresso"), error);
+      _bulkRegisterStatus->setText(QStringLiteral(
+          "O serviço não possui um lote em andamento. Confira as contas salvas antes de iniciar outro cadastro."));
+      loadAccounts();
+      return;
     }
-    const auto root = doc.object();
-    const QString state = root.value(QStringLiteral("state")).toString();
     const int total = root.value(QStringLiteral("total")).toInt();
     const int completed = root.value(QStringLiteral("completed")).toInt();
     const int created = root.value(QStringLiteral("created")).toInt();

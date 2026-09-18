@@ -95,6 +95,7 @@ BALANCES_PATH = config.DATA_DIR / "balances.json"
 CROWTADO_PW_PATH = config.SECRETS_DIR / "crowtado_passwords.json"
 MAX_DUR_S = 1800.0  # cap do recording-config do Minute
 _PERSISTENCE_LOCK = threading.RLock()
+_INTEGRATION_OPERATION_LOCK = threading.Lock()
 _ACCOUNT_OPERATION_LOCK = threading.Lock()
 ORG_MIGRATION = OrgMigrationRunner(config.DATA_DIR / "org_migration_report.json")
 ACCOUNT_HEALTH_PATH = config.DATA_DIR / "account_health.json"
@@ -159,7 +160,7 @@ def _registration_domains() -> list[dict[str, str]]:
     return domains
 
 
-def _preflight_checks() -> dict[str, Any]:
+def _preflight_checks(domain: str = "") -> dict[str, Any]:
     """Valida todas as dependências antes de iniciar a criação de contas.
 
     Retorna um dict com status de cada verificação e um flag 'ready' geral.
@@ -168,29 +169,26 @@ def _preflight_checks() -> dict[str, Any]:
     checks: dict[str, dict[str, Any]] = {}
 
     # 1. Hostinger Mail API
-    profiles = getattr(config, "HOSTINGER_MAIL_PROFILES", None) or []
-    has_hostinger = any(
-        bool(p.get("routes"))
-        for p in profiles
-        if isinstance(p, dict) and str(p.get("token") or "").strip()
-    )
-    if has_hostinger:
-        try:
-            from .. import hostinger_mail
-            first_profile = next(
-                (p for p in profiles
-                 if isinstance(p, dict) and str(p.get("token") or "").strip()),
-                {},
-            )
-            result = hostinger_mail.test_connection(
-                token=first_profile.get("token"),
-                mailbox=first_profile.get("mailbox_id"),
-            )
-            checks["hostinger"] = {"ok": True, "detail": f"{result['mailboxes']} caixa(s)"}
-        except Exception as exc:
-            checks["hostinger"] = {"ok": False, "detail": str(exc)}
+    domain = domain.strip().lower().lstrip("@")
+    profiles = [p for p in hostinger_mail.configured_connections()
+                if domain and domain in p["routes"]]
+    if profiles:
+        mailboxes = 0
+        working_profiles = 0
+        for profile in profiles:
+            try:
+                result = hostinger_mail.test_connection(
+                    token=profile.get("token"), mailbox=profile.get("mailbox_id"))
+                mailboxes += result["mailboxes"]
+                working_profiles += 1
+            except Exception:
+                continue
+        if working_profiles:
+            checks["hostinger"] = {"ok": True, "detail": f"{mailboxes} caixa(s) para {domain}"}
+        else:
+            checks["hostinger"] = {"ok": False, "detail": "Nenhum perfil do domínio respondeu. Confira as credenciais e a conexão."}
     else:
-        checks["hostinger"] = {"ok": False, "detail": "Nenhum perfil Hostinger configurado com rotas"}
+        checks["hostinger"] = {"ok": False, "detail": "Selecione um domínio com rota Hostinger configurada"}
 
     # 2. Chrome/Playwright
     try:
@@ -245,6 +243,17 @@ def _preflight_checks() -> dict[str, Any]:
 
     ready = all(check.get("ok", False) for check in checks.values())
     return {"ready": ready, "checks": checks}
+
+
+def _validate_minute_membership(email: str) -> None:
+    profile = Session.from_email(email).ensure_auth()
+    organizations = profile.get("organizations") or []
+    key = org_policy.pick_org_key(email, organizations)
+    if not key:
+        raise RuntimeError("Organização de destino não confirmada no Minute.")
+    if any(org.get("resourceKey") == key and org.get("disabled") is True
+           for org in organizations if isinstance(org, dict)):
+        raise RuntimeError("Conta suspensa na organização de destino.")
 
 
 def _full_register_account(
@@ -308,8 +317,17 @@ def _full_register_account(
         except Exception as exc:
             error_msg = str(exc)
             lower = error_msg.lower()
-            # Se a conta já existe, não é erro — pula para login
-            if "already" in lower or "exist" in lower or "taken" in lower:
+            # Somente duplicidade explícita permite retomar uma conta. Erros
+            # como "executable doesn't exist" não indicam cadastro existente.
+            if any(marker in lower for marker in (
+                "form_identifier_exists", "email_exists", "account already exists",
+                "email already exists", "email address already exists",
+                "email is already taken", "email address is already taken",
+                "email address is taken", "email already in use",
+                "email address is already in use", "conta já existe",
+                "e-mail já existe", "email já existe", "e-mail já está em uso",
+                "email já está em uso", "endereço de e-mail já está em uso",
+            )):
                 try:
                     crowtado.login(email, password)
                     _record_step("crowtado_signup", _step_skip("conta já existia; login OK"))
@@ -331,20 +349,28 @@ def _full_register_account(
     # Step 2: Salvar credenciais PARCIAIS — mesmo que as próximas etapas falhem,
     # a conta existe no Crowtado e a senha está salva para recuperação manual.
     _notify("save_partial")
-    _set_account_removed(email, False)
-    _save_crowtado_cred(email, password)
+    try:
+        _save_crowtado_cred(email, password)
+        _set_account_removed(email, False)
+    except Exception:
+        detail = "A conta Crowtado existe, mas não foi possível salvar o acesso local. Guarde as credenciais e confira o armazenamento antes de tentar novamente."
+        _record_step("save_partial", _step_fail(detail))
+        return {"steps": steps, "error": detail, "partial": True}
     _record_step("save_partial", _step_ok("credenciais salvas"))
 
     # Step 3: Demographics (gate obrigatório desde 26/08)
     _notify("demographics")
     try:
-        crowtado.preencher_demografia(
-            email, password,
-            birth_month=int(identity_data["birth_month"]),
-            birth_year=int(identity_data["birth_year"]),
-            gender=identity_data.get("gender"),
-        )
-        _record_step("demographics", _step_ok("preenchida"))
+        if crowtado_existed:
+            _record_step("demographics", _step_skip("dados da conta existente preservados"))
+        else:
+            crowtado.preencher_demografia(
+                email, password,
+                birth_month=int(identity_data["birth_month"]),
+                birth_year=int(identity_data["birth_year"]),
+                gender=identity_data.get("gender"),
+            )
+            _record_step("demographics", _step_ok("preenchida"))
     except Exception as exc:
         _record_step("demographics", _step_fail(str(exc)))
         return {"steps": steps, "error": f"demografia: {exc}"}
@@ -352,21 +378,47 @@ def _full_register_account(
     # Step 4: Minute register (com invite code da org)
     _notify("minute_register")
     try:
-        minute_register(email, password)
-        _record_step("minute_register", _step_ok("registrada"))
-    except RuntimeError:
-        # Já existia — só autentica
+        existed = False
         try:
+            minute_register(email, password)
+        except RuntimeError as exc:
+            # Apenas uma resposta explícita de e-mail duplicado permite recuperação.
+            detail = str(exc).casefold()
+            if not any(marker in detail for marker in (
+                "email_exists", "email_already_exists", "email already exists",
+                "email already in use", "email-already-in-use",
+            )):
+                raise
             minute_login(email, password)
-            _record_step("minute_register", _step_skip("já existia; login OK"))
-        except Exception as exc:
-            _record_step("minute_register", _step_fail(str(exc)))
-            return {"steps": steps, "error": f"minute: {exc}"}
+            existed = True
+        _validate_minute_membership(email)
+        _record_step("minute_register", _step_skip("já existia; acesso e organização confirmados")
+                     if existed else _step_ok("registro e organização confirmados"))
+    except Exception as exc:
+        _record_step("minute_register", _step_fail(str(exc)))
+        return {"steps": steps, "error": f"minute: {exc}"}
 
     # Step 5: Vincular email Minute dentro da Crowtado
     _notify("link_minute")
     try:
-        crowtado.vincular_minute(email, password)
+        try:
+            crowtado.vincular_minute(email, password)
+        except Exception as exc:
+            # O gate explícito permite completar cadastros interrompidos sem
+            # alterar demografia de contas que já estão completas.
+            if not crowtado_existed or "DEMOGRAPHICS_REQUIRED" not in str(exc):
+                raise
+            _notify("demographics")
+            try:
+                crowtado.preencher_demografia(
+                    email, password, birth_month=int(identity_data["birth_month"]),
+                    birth_year=int(identity_data["birth_year"]), gender=identity_data.get("gender"))
+                _record_step("demographics", _step_ok("cadastro incompleto recuperado"))
+            except Exception as demographic_exc:
+                _record_step("demographics", _step_fail(str(demographic_exc)))
+                raise
+            _notify("link_minute")
+            crowtado.vincular_minute(email, password)
         _record_step("link_minute", _step_ok("vinculado"))
     except Exception as exc:
         _record_step("link_minute", _step_fail(str(exc)))
@@ -381,6 +433,7 @@ def _full_register_account(
         validation_issues.append(f"login Crowtado: {exc}")
     try:
         minute_login(email, password)
+        _validate_minute_membership(email)
     except Exception as exc:
         validation_issues.append(f"login Minute: {exc}")
     if validation_issues:
@@ -989,10 +1042,10 @@ def _crowtado_creds() -> dict[str, str]:
                 collect(rec)
     contas = config.DATA_DIR / "contas.jsonl"
     try:
-        for line in contas.read_text(encoding="utf-8-sig").splitlines():
+        for line in contas.read_bytes().splitlines():
             try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
+                rec = json.loads(line.decode("utf-8-sig"))
+            except (UnicodeError, json.JSONDecodeError):
                 continue
             collect(rec)
     except OSError:
@@ -1168,17 +1221,32 @@ def create_app() -> Flask:
     app = Flask(__name__, static_folder=None)
 
     @app.before_request
+    def validate_json_body():
+        if (request.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH")
+                and request.get_data(cache=True)):
+            if not request.is_json or not isinstance(request.get_json(silent=True), dict):
+                return jsonify({"error": "O corpo da requisição deve ser um objeto JSON válido."}), 400
+
+    @app.before_request
     def guard_account_operations():
+        if request.path.startswith("/api/integrations/") and request.method in ("PUT", "DELETE"):
+            _INTEGRATION_OPERATION_LOCK.acquire()
+            g.integration_operation_locked = True
         account_write = request.path.startswith("/api/accounts") and request.method != "GET"
         campaign_start = request.path in ("/api/campaigns", "/api/campaigns/preflight") and request.method == "POST"
         if account_write or campaign_start or request.path == "/api/tasks":
             _ACCOUNT_OPERATION_LOCK.acquire()
             g.account_operation_locked = True
+            with _BULK_REGISTER_LOCK:
+                if _BULK_REGISTER_STATE.get("state") == "running":
+                    return jsonify({"error": "Aguarde o cadastro em lote terminar."}), 409
             if ORG_MIGRATION.running:
                 return jsonify({"error": "Aguarde a migração das organizações terminar."}), 409
 
     @app.teardown_request
     def release_account_operation(_error):
+        if g.pop("integration_operation_locked", False):
+            _INTEGRATION_OPERATION_LOCK.release()
         if g.pop("account_operation_locked", False):
             _ACCOUNT_OPERATION_LOCK.release()
 
@@ -1367,7 +1435,7 @@ def create_app() -> Flask:
     @app.get("/api/accounts/bulk-register/preflight")
     def bulk_register_preflight():
         """Valida todas as dependências antes de iniciar a criação em lote."""
-        result = _preflight_checks()
+        result = _preflight_checks(request.args.get("domain", ""))
         return jsonify(result)
 
     @app.get("/api/accounts/bulk-register/status")
@@ -1469,22 +1537,18 @@ def create_app() -> Flask:
                     _BULK_REGISTER_STATE["created"] = successes
                     _BULK_REGISTER_STATE["failed"] = failures
                     _BULK_REGISTER_STATE["results"] = list(results)
-            with _BULK_REGISTER_LOCK:
-                _BULK_REGISTER_STATE["state"] = "done"
-                _BULK_REGISTER_STATE["current_email"] = ""
-                _BULK_REGISTER_STATE["current_step"] = ""
-
         def _worker() -> None:
+            terminal = {"state": "done"}
             try:
                 _run_batch()
             except Exception:
-                with _BULK_REGISTER_LOCK:
-                    _BULK_REGISTER_STATE.update(
-                        state="failed",
-                        error="Não foi possível concluir o cadastro. Confira as contas e credenciais salvas antes de tentar novamente.",
-                    )
+                terminal = {
+                    "state": "failed",
+                    "error": "Não foi possível concluir o cadastro. Confira as contas e credenciais salvas antes de tentar novamente.",
+                }
             finally:
                 with _BULK_REGISTER_LOCK:
+                    _BULK_REGISTER_STATE.update(terminal)
                     _BULK_REGISTER_STATE["current_email"] = ""
                     _BULK_REGISTER_STATE["current_step"] = ""
 
@@ -1511,20 +1575,21 @@ def create_app() -> Flask:
         _set_account_removed(email, True)
         try:
             path.unlink(missing_ok=True)
-            prefs = _load_prefs()
-            normalized = email.casefold()
-            org_keys = prefs.get("org_keys", {})
-            if isinstance(org_keys, dict):
-                for key in list(org_keys):
-                    if str(key).casefold() == normalized:
-                        org_keys.pop(key, None)
-            selected = prefs.get("selected_accounts")
-            if isinstance(selected, list):
-                prefs["selected_accounts"] = [
-                    value for value in selected
-                    if str(value).casefold() != normalized
-                ]
-            _save_prefs(prefs)
+            with _PERSISTENCE_LOCK:
+                prefs = _load_prefs()
+                normalized = email.casefold()
+                org_keys = prefs.get("org_keys", {})
+                if isinstance(org_keys, dict):
+                    for key in list(org_keys):
+                        if str(key).casefold() == normalized:
+                            org_keys.pop(key, None)
+                selected = prefs.get("selected_accounts")
+                if isinstance(selected, list):
+                    prefs["selected_accounts"] = [
+                        value for value in selected
+                        if str(value).casefold() != normalized
+                    ]
+                _save_prefs(prefs)
             _remove_account_data(email)
         except OSError as exc:
             return jsonify({

@@ -33,8 +33,10 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   QNetworkRequest req(QUrl(_baseUrl + path));
   req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
   req.setRawHeader("Accept", "application/json");
-  // Limite apenas do handshake: operações longas mantêm seu comportamento.
-  if (path == QStringLiteral("/api/health")) req.setTransferTimeout(3000);
+  // Consultas sem resposta precisam liberar o polling para uma nova tentativa.
+  // Operações de escrita podem incluir cadastro remoto e não são repetidas aqui.
+  if (method == "GET")
+    req.setTransferTimeout(path == QStringLiteral("/api/health") ? 3000 : 60000);
 
   QNetworkReply* reply = nullptr;
   const QByteArray payload = body ? QJsonDocument(*body).toJson(QJsonDocument::Compact) : QByteArray();
@@ -54,8 +56,8 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       if (doc.isObject()) error = doc.object().value(QStringLiteral("error")).toString();
       if (error.isEmpty()) error = reply->errorString();
       if (status) error = QStringLiteral("%1 (HTTP %2)").arg(error).arg(status);
-    } else if (parseError.error != QJsonParseError::NoError && !bytes.isEmpty()) {
-      error = QStringLiteral("Resposta inválida do serviço: %1").arg(parseError.errorString());
+    } else if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+      error = QStringLiteral("O serviço retornou uma resposta JSON inválida ou incompleta.");
     }
     reply->deleteLater();
     callback(ok && error.isEmpty(), doc, error);

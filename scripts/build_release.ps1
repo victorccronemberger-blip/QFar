@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.42",
+    [string]$Version = "1.0.43",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [switch]$Staging
 )
@@ -52,10 +52,13 @@ New-Item -ItemType Directory -Force "$WorkDir\spec" | Out-Null
     --add-data "$ProjectRoot\moneymin\resources;moneymin/resources" `
     --add-data "$ProjectRoot\reference;reference" `
     "$ProjectRoot\packaging\qmoney_service.py"
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller falhou; pacote não será publicado." }
 $env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path "$WorkDir\pyinstaller\QMoneyService.exe").Path
 cmake -S "$ProjectRoot\desktop" -B $BuildDir -G Ninja `
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$QtRoot
+if ($LASTEXITCODE -ne 0) { throw "Configuração CMake falhou." }
 cmake --build $BuildDir --config Release --parallel
+if ($LASTEXITCODE -ne 0) { throw "Compilação CMake falhou." }
 
 New-Item -ItemType Directory -Force $Package | Out-Null
 New-Item -ItemType Directory -Force "$Package\runtime" | Out-Null
@@ -63,6 +66,7 @@ Copy-Item "$BuildDir\QMoney.exe" $Package -Force
 Copy-Item "$BuildDir\QMoneyUpdater.exe" $Package -Force
 & "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler `
     --no-opengl-sw "$Package\QMoney.exe"
+if ($LASTEXITCODE -ne 0) { throw "windeployqt falhou; distribuição Qt incompleta." }
 Copy-Item "$WorkDir\pyinstaller\QMoneyService.exe" "$Package\runtime" -Force
 
 $Ffmpeg = Get-ChildItem "$ProjectRoot\tools\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
@@ -89,21 +93,22 @@ Copy-Item (Join-Path $UcrtBase.Directory.FullName "*.dll") $MediaBin -Force
 
 # O navegador é privado ao runtime do QMoney; o usuário não precisa instalar
 # Playwright ou Chrome. Copiamos apenas a revisão atual esperada pelo pacote.
-& "$ProjectRoot\.venv\Scripts\playwright.exe" install chromium
 $BrowserSource = Join-Path $env:LOCALAPPDATA "ms-playwright"
+$PreviousBrowserPath = $env:PLAYWRIGHT_BROWSERS_PATH
+$env:PLAYWRIGHT_BROWSERS_PATH = $BrowserSource
+try {
+    & "$ProjectRoot\.venv\Scripts\playwright.exe" install chromium
+    if ($LASTEXITCODE -ne 0) { throw "Instalação do Chromium falhou." }
+} finally {
+    $env:PLAYWRIGHT_BROWSERS_PATH = $PreviousBrowserPath
+}
 $BrowserTarget = "$Package\runtime\ms-playwright"
 New-Item -ItemType Directory -Force $BrowserTarget | Out-Null
-$Chromium = Get-ChildItem $BrowserSource -Directory -Filter "chromium-*" |
-    Where-Object Name -NotLike "chromium_headless_shell-*" |
-    Sort-Object Name -Descending | Select-Object -First 1
-$Headless = Get-ChildItem $BrowserSource -Directory -Filter "chromium_headless_shell-*" |
-    Sort-Object Name -Descending | Select-Object -First 1
-foreach ($BrowserPart in @($Chromium, $Headless)) {
-    if ($BrowserPart) { Copy-Item $BrowserPart.FullName $BrowserTarget -Recurse -Force }
+. "$PSScriptRoot\browser_parts.ps1"
+$BrowserManifest = "$ProjectRoot\.venv\Lib\site-packages\playwright\driver\package\browsers.json"
+foreach ($BrowserPart in (Get-QMoneyBrowserParts -ManifestPath $BrowserManifest -BrowserSource $BrowserSource)) {
+    Copy-Item $BrowserPart.FullName $BrowserTarget -Recurse -Force
 }
-Get-ChildItem $BrowserSource -Directory | Where-Object Name -Match "^(ffmpeg|winldd)-" |
-    Sort-Object Name -Descending | Group-Object { $_.Name.Split('-')[0] } |
-    ForEach-Object { Copy-Item $_.Group[0].FullName $BrowserTarget -Recurse -Force }
 
 $Zip = Join-Path $OutputDir "QMoney-windows-x64.zip"
 foreach ($OldArtifact in @($Zip, "$Zip.sha256", "$Zip.sig")) {

@@ -12,7 +12,7 @@ jobs:
   windows:
     runs-on: windows-2022
     env:
-      QMONEY_VERSION: ${{ github.event.release.tag_name || '1.0.0' }}
+      QMONEY_VERSION: ${{ github.event.release.tag_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +20,15 @@ jobs:
       - name: Normalizar versão
         shell: pwsh
         run: |
-          "QMONEY_VERSION=$($env:QMONEY_VERSION.TrimStart('v'))" >> $env:GITHUB_ENV
+          $version = $env:QMONEY_VERSION
+          if (-not $version) {
+            $match = [regex]::Match((Get-Content desktop/CMakeLists.txt -Raw), 'set\(QMONEY_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"\)')
+            if (-not $match.Success) { throw "Versão do projeto não encontrada." }
+            $version = $match.Groups[1].Value
+          }
+          $version = $version.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versão inválida: $version" }
+          "QMONEY_VERSION=$version" >> $env:GITHUB_ENV
 
       - uses: actions/setup-python@v5
         with:
@@ -30,6 +38,31 @@ jobs:
       - name: Instalar dependências Python
         run: python -m pip install -r requirements.txt pyinstaller
 
+      - name: Preparar FFmpeg para testes e distribuição
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/work | Out-Null
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile dist/work/ffmpeg.zip
+          Expand-Archive dist/work/ffmpeg.zip dist/work/ffmpeg
+          $ffmpeg = Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $ffmpeg) { throw "FFmpeg não encontrado." }
+          & $ffmpeg.FullName -version
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg não pôde iniciar." }
+          $ffmpeg.Directory.FullName >> $env:GITHUB_PATH
+
+      - name: Testar backend
+        run: python scripts/run_tests.py
+
+      - name: Testar transação do atualizador
+        shell: pwsh
+        run: |
+          cmake -S test/native -B dist/work/native-tests -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Configuração dos testes nativos falhou." }
+          cmake --build dist/work/native-tests --config Release
+          if ($LASTEXITCODE -ne 0) { throw "Compilação dos testes nativos falhou." }
+          ctest --test-dir dist/work/native-tests -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Testes do atualizador falharam." }
+
       - name: Instalar Qt
         uses: jurplel/install-qt-action@v4
         with:
@@ -37,12 +70,23 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      - name: Testar respostas da API na interface Qt
+        shell: pwsh
+        run: |
+          cmake -S test/qt -B dist/work/qt-tests -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Configuração dos testes Qt falhou." }
+          cmake --build dist/work/qt-tests --config Release
+          if ($LASTEXITCODE -ne 0) { throw "Compilação dos testes Qt falhou." }
+          ctest --test-dir dist/work/qt-tests -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Testes Qt falharam." }
+
       - name: Empacotar serviço local
         shell: pwsh
         run: |
           $root = (Get-Location).Path
           New-Item -ItemType Directory -Force dist/work/spec | Out-Null
           playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw "Instalação do navegador falhou." }
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name QMoneyService --paths $root `
             --icon "$root/desktop/resources/qmoney.ico" `
@@ -54,13 +98,16 @@ jobs:
             --add-data "$root/moneymin/resources;moneymin/resources" `
             --add-data "$root/reference;reference" `
             "$root/packaging/qmoney_service.py"
+          if ($LASTEXITCODE -ne 0) { throw "Empacotamento do serviço falhou." }
 
       - name: Compilar interface nativa com motor incorporado
         shell: pwsh
         run: |
           $env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path dist/work/pyinstaller/QMoneyService.exe).Path
           cmake -S desktop -B dist/work/cmake -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Configuração CMake falhou." }
           cmake --build dist/work/cmake --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Compilação da interface falhou." }
 
       - name: Montar distribuição
         shell: pwsh
@@ -70,9 +117,8 @@ jobs:
           Copy-Item dist/work/cmake/Release/QMoneyUpdater.exe dist/QMoney/
           Copy-Item dist/work/pyinstaller/QMoneyService.exe dist/QMoney/runtime/
           windeployqt --release --no-translations --compiler-runtime dist/QMoney/QMoney.exe
+          if ($LASTEXITCODE -ne 0) { throw "Distribuição Qt incompleta." }
 
-          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile dist/work/ffmpeg.zip
-          Expand-Archive dist/work/ffmpeg.zip dist/work/ffmpeg
           New-Item -ItemType Directory -Force dist/QMoney/runtime/tools/ffmpeg/bin | Out-Null
           Copy-Item (Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName dist/QMoney/runtime/tools/ffmpeg/bin/
           Copy-Item (Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffprobe.exe | Select-Object -First 1).FullName dist/QMoney/runtime/tools/ffmpeg/bin/
@@ -83,7 +129,13 @@ jobs:
           if (-not $ucrt) { throw "UCRT x64 não encontrado no Windows SDK." }
           Copy-Item (Join-Path $ucrt.Directory.FullName "*.dll") dist/QMoney/runtime/tools/ffmpeg/bin/
 
-          Copy-Item "$env:LOCALAPPDATA/ms-playwright" dist/QMoney/runtime/ms-playwright -Recurse
+          . ./scripts/browser_parts.ps1
+          $manifest = python -c "import pathlib, playwright; print(pathlib.Path(playwright.__file__).parent / 'driver/package/browsers.json')"
+          if ($LASTEXITCODE -ne 0) { throw "Manifesto Playwright não encontrado." }
+          New-Item -ItemType Directory -Force dist/QMoney/runtime/ms-playwright | Out-Null
+          foreach ($part in (Get-QMoneyBrowserParts -ManifestPath $manifest -BrowserSource "$env:LOCALAPPDATA/ms-playwright")) {
+            Copy-Item $part.FullName dist/QMoney/runtime/ms-playwright -Recurse
+          }
 
           Compress-Archive -Path dist/QMoney/* -DestinationPath dist/QMoney-windows-x64.zip -CompressionLevel Optimal
           $hash = (Get-FileHash dist/QMoney-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()

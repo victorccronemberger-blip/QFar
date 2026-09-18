@@ -101,6 +101,7 @@ private:
   void importAccounts();
   void exportAccounts(bool selectedOnly);
   void loadBulkRegisterDomains();
+  void checkBulkRegisterDomain();
   void startBulkRegister();
   void pollBulkRegister();
   void openWebmail();
@@ -122,6 +123,10 @@ private:
   QTableWidget* _bulkRegisterTable{};
   QTimer _bulkRegisterPoll;
   bool _bulkRegisterPolling{false};
+  bool _bulkRegisterStarting{false};
+  bool _bulkRegisterRequestInFlight{false};
+  int _bulkRegisterDomainsRevision{0};
+  int _bulkRegisterPreflightRevision{0};
   QPushButton* _accountsMigrate{};
   QPushButton* _migrationReport{};
   QLabel* _migrationStatus{};

@@ -112,6 +112,7 @@ def warm_cache(
     min_free_gb: float = 150.0,
     work_dir: Path | None = None,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Baixa e normaliza clips elegíveis; cache pronto é pulado com segurança."""
     # Import tardio evita ciclo: campaign importa holoassist.
@@ -148,7 +149,7 @@ def warm_cache(
     persist()
     try:
         for index, clip in enumerate(clips, 1):
-            if stop_path().exists():
+            if stop_path().exists() or (should_stop is not None and should_stop()):
                 state["status"] = "stopped"
                 break
             name = str(clip["video_name"])
