@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include "ApiClient.hpp"
 #include "UpdateManager.hpp"
@@ -64,7 +65,8 @@ private:
   void refreshCurrentPage();
   void showError(const QString& title, const QString& error);
   void showAccountIssues(const QString& title, const QStringList& blockers,
-                         const QJsonArray& issues);
+                         const QJsonArray& issues, std::function<void()> continueAction = {});
+  void submitCampaign(QJsonObject body);
   void setStatus(const QString& text);
 
   void loadHome();

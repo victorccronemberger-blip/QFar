@@ -159,7 +159,12 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if kind == "account_excluded":
         return {
             "level": "warning", "stage": "Envio", "title": "Conta retirada da campanha",
-            "detail": f"{email} · restrição confirmada; as demais contas continuam. Cadastro preservado.",
+            "email": email, "permanently_removed": bool(payload.get("permanently_removed")),
+            "detail": f"{email} · restrição confirmada; as demais contas continuam. " + (
+                "Conta removida permanentemente e registrada em banned_accounts.json."
+                if payload.get("permanently_removed") else
+                "Não foi possível salvar a remoção permanente; conta excluída desta campanha."
+                if payload.get("removal_failed") else "Cadastro preservado."),
         }
     if kind == "account_done":
         skipped = bool(payload.get("skipped"))
@@ -264,6 +269,7 @@ class CampaignRunner:
         self.skipped_sends = 0
         self.current = ""  # descrição da atividade atual (p/ a barra de status)
         self.stage = "Aguardando"
+        self.on_restriction = None
 
     # --- ciclo de vida ----------------------------------------------------
     @property
@@ -347,6 +353,12 @@ class CampaignRunner:
                     self.stage = "Encerrada"
 
     def _on_event(self, kind: str, payload: dict[str, Any]) -> None:
+        if kind == "account_excluded" and self.on_restriction:
+            try:
+                self.on_restriction(payload["email"])
+                payload = {**payload, "permanently_removed": True}
+            except (OSError, ValueError, RuntimeError):
+                payload = {**payload, "removal_failed": True}
         self._record(kind, **payload)
         with self._lock:
             if kind == "account_done":

@@ -16,6 +16,7 @@ class HealthResilienceTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         for patch in (
+            mock.patch.object(server, "_ban_accounts"),
             mock.patch.object(server, "ACCOUNT_HEALTH_PATH", Path(self.tmp.name) / "health.json"),
             mock.patch.object(server, "BALANCES_PATH", Path(self.tmp.name) / "balances.json"),
             mock.patch.object(server, "PREFS_PATH", Path(self.tmp.name) / "prefs.json"),

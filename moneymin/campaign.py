@@ -2226,6 +2226,7 @@ def run_campaign(
                       session_id=acc_res.get("session_id"))
                 if not ok and (acc_res.get("restriction_confirmed") or _is_disabled_error(acc_res.get("error"))):
                     banned.add(account.email)
+                    sessions.pop(account.email, None)
                     acc_res["excluded_from_campaign"] = True
                     _emit("account_excluded", email=account.email)
 

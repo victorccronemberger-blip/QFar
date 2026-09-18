@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import config, minute_api
+from . import config, minute_api, account_bans
 from .atomic_io import load_json, save_json, save_bytes
 
 LOCK = threading.RLock()
@@ -119,6 +119,7 @@ def import_accounts(raw: str, *, apply: bool, passwords_path: Path, removed_path
             try:
                 record = clean_record(source)
                 email = row["email"] = record["email"]
+                account_bans.require_not_banned(email)
                 path = config.token_path(email)
                 destination = str(path).casefold()
                 if email in seen or (email in existing and email not in removed):

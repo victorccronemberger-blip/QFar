@@ -252,6 +252,8 @@ def login(email: str, password: str) -> dict[str, Any]:
 
     Devolve o dict do token. Levanta RuntimeError se o login falhar.
     """
+    from .account_bans import require_not_banned
+    require_not_banned(email)
     status, body = _request(
         _SIGNIN_URL,
         "POST",
@@ -286,6 +288,8 @@ def register(email: str, password: str, code: str = config.INVITE_CODE) -> dict[
 
     Devolve o dict do token. Levanta RuntimeError se o registro falhar.
     """
+    from .account_bans import require_not_banned
+    require_not_banned(email)
     profile = device_profile.get_profile(email)
     headers = profile.headers(include_location=False)
     status, body = _request(

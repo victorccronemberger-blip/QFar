@@ -57,6 +57,7 @@ Endpoints JSON consumidos exclusivamente pelo aplicativo desktop:
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 import math
 import os
@@ -77,7 +78,7 @@ from .. import (
     hostinger_mail, org_policy, readiness, sent_registry,
 )
 from ..atomic_io import load_json, save_json
-from .. import account_transfer
+from .. import account_transfer, account_bans
 from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import load_secure_settings, save_secure_settings
@@ -176,7 +177,7 @@ def _removed_accounts() -> set[str]:
         str(email).strip().casefold()
         for email in emails
         if str(email).strip()
-    }
+    } | account_bans.banned_emails()
 
 
 def _set_account_removed(email: str, removed: bool) -> None:
@@ -633,11 +634,14 @@ def _save_account_check(email: str, result: dict[str, Any]) -> None:
         health[email.strip().casefold()] = dict(result)
         try:
             save_json(ACCOUNT_HEALTH_PATH, health)
+            if result["status"] == "disabled" and result.get("issue", {}).get("restriction_confirmed"):
+                _ban_accounts([result["issue"]])
+                result["permanently_removed"] = True
             if result["status"] == "active" and result.get("org_key"):
                 prefs = _load_prefs()
                 prefs.setdefault("org_keys", {})[email] = result["org_key"]
                 _save_prefs(prefs)
-        except OSError:
+        except (OSError, ValueError):
             # Falha no histórico local não altera o diagnóstico remoto.
             result["history_saved"] = False
 
@@ -753,6 +757,45 @@ def _remove_account_data(email: str) -> None:
     crowtado.clear_cached_session(email)
 
 
+def _ban_accounts(issues: list[dict]) -> None:
+    """Registra primeiro a restrição, depois remove o acesso local permanentemente."""
+    if not issues or any(i.get("restriction_confirmed") is not True for i in issues):
+        raise ValueError("A remoção exige restrição confirmada pela plataforma.")
+    with _PERSISTENCE_LOCK:
+        path = config.DATA_DIR / "banned_accounts.json"
+        archive = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {"schema": 1, "accounts": []}
+        if (not isinstance(archive, dict) or not isinstance(archive.get("accounts"), list)
+                or any(not isinstance(row, dict) or not isinstance(row.get("email"), str)
+                       for row in archive.get("accounts", []))):
+            raise ValueError("Registro de contas banidas inválido; remoção cancelada.")
+        records = {row["email"].casefold(): row for row in archive["accounts"]}
+        for issue in issues:
+            email = account_transfer.email_key(issue.get("email"))
+            records[email] = {"email": email, "removed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                              "reason": issue.get("reason", "Restrição confirmada pela plataforma."),
+                              "stage": issue.get("stage", "Envio"), "restriction_confirmed": True}
+        archive["accounts"] = list(records.values())
+        save_json(path, archive)
+        for issue in issues:
+            email = account_transfer.email_key(issue["email"])
+            _set_account_removed(email, True)
+            config.token_path(email).unlink(missing_ok=True)
+            prefs = _load_prefs()
+            prefs["selected_accounts"] = [e for e in prefs.get("selected_accounts", []) if e.casefold() != email]
+            prefs["org_keys"] = {e: key for e, key in prefs.get("org_keys", {}).items() if e.casefold() != email}
+            _save_prefs(prefs)
+            _remove_account_data(email)
+        account_bans.purge_local_records({account_transfer.email_key(i["email"]) for i in issues})
+
+
+def _preflight_fingerprint(emails: list[str]) -> str:
+    digest = hashlib.sha256()
+    for path in [*[config.token_path(e) for e in sorted(set(emails))], _removed_accounts_path()]:
+        digest.update(str(path).encode())
+        digest.update(path.read_bytes() if path.exists() else b"missing")
+    return digest.hexdigest()
+
+
 def _on_balance_result(email: str, summary: dict | None, erro: str | None) -> None:
     with _PERSISTENCE_LOCK:
         balances = _load_balances()
@@ -818,6 +861,11 @@ def _parse_duration_range(values) -> tuple[float, float]:
 
 
 def create_app() -> Flask:
+    preflights: dict[str, dict] = {}
+    RUNNER.on_restriction = lambda email: _ban_accounts([{
+        "email": email, "restriction_confirmed": True, "stage": "Envio da campanha",
+        "reason": "Restrição confirmada pela plataforma durante o envio.",
+    }])
     # No QMoney o Flask e apenas o servico local consumido pela interface Qt.
     # Nenhum frontend web e publicado ou usado como fallback.
     app = Flask(__name__, static_folder=None)
@@ -873,6 +921,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Não foi possível salvar o relatório da migração."}), 500
         return jsonify(result), 202
 
+    @app.get("/api/accounts/banned")
+    def banned_accounts():
+        return jsonify(load_json(config.DATA_DIR / "banned_accounts.json", {"schema": 1, "accounts": []}))
+
     @app.post("/api/accounts/import")
     def import_accounts():
         if request.content_length and request.content_length > account_transfer.MAX_BYTES * 2:
@@ -916,6 +968,10 @@ def create_app() -> Flask:
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
         try:
+            account_bans.require_not_banned(email)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
             login(email, password)
         except (RuntimeError, OSError) as exc:
             return jsonify({"error": str(exc)}), 400
@@ -941,6 +997,10 @@ def create_app() -> Flask:
         password = str(body.get("password", ""))
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
+        try:
+            account_bans.require_not_banned(email)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         try:
             minute_register(email, password)  # usa config.INVITE_CODE
             created = True
@@ -1628,8 +1688,29 @@ def create_app() -> Flask:
         if storage.get("free_bytes", 0) < 10 * 1024 ** 3:
             warnings.append("há menos de 10 GiB livres na unidade da biblioteca")
 
+        removable = {i["email"] for i in account_issues if i.get("restriction_confirmed") is True}
+        survivors = [a for a in accounts if a.email not in removable]
+        reusable = (bool(survivors) and bool(selected) and catalog_loaded and ready.get("ready") is True
+                    and len(blockers) == len(account_errors)
+                    and all(i.get("restriction_confirmed") is True for i in account_issues))
+        receipt_id = None
+        if reusable:
+            now = time.monotonic()
+            for key in list(preflights):
+                if preflights[key]["expires"] <= now:
+                    preflights.pop(key)
+            if len(preflights) >= 32:
+                preflights.pop(next(iter(preflights)))
+            receipt_id = uuid.uuid4().hex
+            preflights[receipt_id] = {"body": body, "accounts": survivors, "catalog": catalog,
+                                      "issues": account_issues, "expires": now + 600,
+                                      "fingerprint": _preflight_fingerprint(emails)}
+
         return jsonify({
             "ok": not blockers,
+            "preflight_id": receipt_id,
+            "can_remove_and_continue": reusable and bool(removable),
+            "removable_accounts": sorted(removable),
             "provider": provider,
             "accounts": {"selected": len(emails), "validated": len(accounts)},
             "tasks": {"selected": len(raw_tasks), "compatible": len(selected)},
@@ -1658,6 +1739,19 @@ def create_app() -> Flask:
                 "error": "pare o acelerador HoloAssist antes de iniciar a campanha",
             }), 409
         body = request.get_json(silent=True) or {}
+        receipt = None
+        receipt_id = body.get("preflight_id")
+        if receipt_id:
+            receipt = preflights.get(str(receipt_id))
+            original = {k: v for k, v in body.items() if k not in {"preflight_id", "remove_restricted"}}
+            if (receipt is None or receipt["expires"] <= time.monotonic()
+                    or original != receipt["body"]
+                    or receipt["fingerprint"] != _preflight_fingerprint(original.get("accounts", []))):
+                return jsonify({"error": "A verificação expirou ou as contas mudaram. Execute o preflight novamente."}), 409
+            if receipt["issues"] and body.get("remove_restricted") is not True:
+                return jsonify({"error": "Confirme a remoção das contas com restrição para continuar."}), 400
+        elif body.get("remove_restricted"):
+            return jsonify({"error": "Execute o preflight antes de remover contas e continuar."}), 400
         cleanup_after_upload = body.get("cleanup_after_upload", True)
         if not isinstance(cleanup_after_upload, bool):
             return jsonify({
@@ -1670,6 +1764,8 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         emails = [str(e).strip() for e in body.get("accounts", []) if str(e).strip()]
+        if receipt:
+            emails = [a.email for a in receipt["accounts"]]
         raw_tasks = body.get("tasks", [])
         if not emails:
             return jsonify({"error": "selecione ao menos uma conta"}), 400
@@ -1699,7 +1795,10 @@ def create_app() -> Flask:
             return jsonify({"error": "active_hours inválido — use [início, fim] "
                             "com 0 <= início < fim <= 24"}), 400
 
-        known = {a["email"] for a in _list_accounts()}
+        try:
+            known = {a["email"] for a in _list_accounts()}
+        except ValueError:
+            return jsonify({"error": "Registro de contas banidas inválido. A campanha não iniciou."}), 500
         missing = [e for e in emails if e not in known]
         if missing:
             return jsonify({"error": "conta(s) sem token: " + ", ".join(missing)}), 400
@@ -1707,58 +1806,63 @@ def create_app() -> Flask:
         # O POST público continua seguro mesmo se um cliente antigo pular o
         # preflight. Sem ferramentas, índices ou credenciais da origem, iniciar
         # uma thread apenas produziria uma falha tardia depois do download.
-        try:
-            environment = readiness.campaign_readiness(dataset_provider)
-        except (ValueError, OSError, RuntimeError) as exc:
-            return jsonify({"error": f"não foi possível validar a prontidão: {exc}"}), 400
-        environment_errors = [
-            item for item in environment.get("checks", [])
-            if item.get("status") == "error"
-        ]
-        if environment_errors:
-            details = "; ".join(
-                f"{item.get('name')}: {item.get('detail')}"
-                for item in environment_errors
-            )
-            return jsonify({"error": "ambiente não está pronto: " + details}), 400
+        if receipt:
+            accounts = receipt["accounts"]
+            available = receipt["catalog"]
+            skipped = []
+        else:
+            try:
+                environment = readiness.campaign_readiness(dataset_provider)
+            except (ValueError, OSError, RuntimeError) as exc:
+                return jsonify({"error": f"não foi possível validar a prontidão: {exc}"}), 400
+            environment_errors = [
+                item for item in environment.get("checks", [])
+                if item.get("status") == "error"
+            ]
+            if environment_errors:
+                details = "; ".join(
+                    f"{item.get('name')}: {item.get('detail')}"
+                    for item in environment_errors
+                )
+                return jsonify({"error": "ambiente não está pronto: " + details}), 400
 
-        resolved: list[AccountSpec | None] = [None] * len(emails)
-        skipped: list[str] = []
-        workers = max(1, min(8, len(emails)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(_resolve_org, email): i
-                    for i, email in enumerate(emails)}
-            for fut in as_completed(futs):
-                i = futs[fut]
-                try:
-                    resolved[i] = AccountSpec(emails[i], fut.result())
-                except (AuthError, RuntimeError, OSError) as exc:
-                    skipped.append(f"{emails[i]}: {exc}")
-        accounts = [acc for acc in resolved if acc is not None]
-        if skipped:
-            return jsonify({
-                "error": "campanha bloqueada: não foi possível validar o acesso "
-                         "e a organização de todas as contas. " + "; ".join(skipped),
-            }), 400
+            resolved: list[AccountSpec | None] = [None] * len(emails)
+            skipped: list[str] = []
+            workers = max(1, min(8, len(emails)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {pool.submit(_resolve_org, email): i
+                        for i, email in enumerate(emails)}
+                for fut in as_completed(futs):
+                    i = futs[fut]
+                    try:
+                        resolved[i] = AccountSpec(emails[i], fut.result())
+                    except (AuthError, RuntimeError, OSError) as exc:
+                        skipped.append(f"{emails[i]}: {exc}")
+            accounts = [acc for acc in resolved if acc is not None]
+            if skipped:
+                return jsonify({
+                    "error": "campanha bloqueada: não foi possível validar o acesso "
+                             "e a organização de todas as contas. " + "; ".join(skipped),
+                }), 400
 
-        # Nunca aceite do browser a associação task_id -> cenário. Uma aba
-        # antiga ou uma troca rápida de conta podia mandar um par inconsistente
-        # e selecionar vídeos de outra categoria. O catálogo atual da conta é a
-        # fonte de verdade.
-        try:
-            available = campaign.available_tasks(
-                accounts[0].email, accounts[0].org_key,
-                min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                include_unavailable=True, dataset_provider=dataset_provider)
-        except json.JSONDecodeError:
-            return jsonify({
-                "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
-            }), 400
-        except (AuthError, RuntimeError, OSError) as exc:
-            msg = str(exc)
-            if "Expecting value" in msg:
-                msg = "a API devolveu resposta vazia (não-JSON). Tente de novo."
-            return jsonify({"error": msg}), 400
+            # Nunca aceite do browser a associação task_id -> cenário. Uma aba
+            # antiga ou uma troca rápida de conta podia mandar um par inconsistente
+            # e selecionar vídeos de outra categoria. O catálogo atual da conta é a
+            # fonte de verdade.
+            try:
+                available = campaign.available_tasks(
+                    accounts[0].email, accounts[0].org_key,
+                    min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                    include_unavailable=True, dataset_provider=dataset_provider)
+            except json.JSONDecodeError:
+                return jsonify({
+                    "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
+                }), 400
+            except (AuthError, RuntimeError, OSError) as exc:
+                msg = str(exc)
+                if "Expecting value" in msg:
+                    msg = "a API devolveu resposta vazia (não-JSON). Tente de novo."
+                return jsonify({"error": msg}), 400
         by_id = {str(t.get("id")): t for t in available if t.get("id")}
 
         tasks: list[TaskSpec] = []
@@ -1814,7 +1918,7 @@ def create_app() -> Flask:
             missing_tasks = selected_ids - account_task_ids
             return account.email, missing_tasks
 
-        others = accounts[1:]
+        others = [] if receipt else accounts[1:]
         if others:
             by_email = {acc.email: acc for acc in accounts}
             viable = [accounts[0]]
@@ -1867,8 +1971,17 @@ def create_app() -> Flask:
                 return jsonify({
                     "error": "pare o acelerador HoloAssist antes de iniciar a campanha",
                 }), 409
+            if receipt and receipt["issues"]:
+                if BALANCES_RUNNER.running:
+                    return jsonify({"error": "Aguarde a consulta de saldos terminar."}), 409
+                try:
+                    _ban_accounts(receipt["issues"])
+                except (OSError, ValueError) as exc:
+                    return jsonify({"error": "Não foi possível registrar e remover as contas. A campanha não iniciou."}), 500
             try:
                 RUNNER.start(cfg)
+                if receipt_id:
+                    preflights.pop(str(receipt_id), None)
             except RuntimeError as exc:
                 # Corrida entre dois cliques/abas: se o outro request venceu e
                 # iniciou, este POST também é sucesso idempotente, nunca erro 409.
@@ -1887,6 +2000,7 @@ def create_app() -> Flask:
                 {"task_id": t.task_id, "scenario": t.scenario} for t in tasks
             ],
             "accounts": [acc.email for acc in accounts],
+            "removed_accounts": sorted({i["email"] for i in receipt["issues"]}) if receipt else [],
             "dataset": dataset_provider,
         }
         if skipped:
@@ -2159,6 +2273,10 @@ def create_app() -> Flask:
         password = str(body.get("password", ""))
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
+        try:
+            account_bans.require_not_banned(email)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         configured = {a["email"] for a in _list_accounts()}
         if email not in configured:
             return jsonify({"error": "essa identidade não está conectada ao QMoney"}), 404

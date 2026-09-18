@@ -1412,6 +1412,20 @@ QWidget* MainWindow::buildAccountsPage() {
   transferActions->addWidget(_accountsImport);
   transferActions->addWidget(_accountsExport);
   transferActions->addWidget(_accountsExportSelected);
+  auto* exportBanned = new QPushButton(QStringLiteral("Exportar banidas"));
+  transferActions->addWidget(exportBanned);
+  connect(exportBanned, &QPushButton::clicked, this, [this] {
+    const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Salvar contas banidas"),
+        QStringLiteral("banned_accounts.json"), QStringLiteral("JSON (*.json)"));
+    if (path.isEmpty()) return;
+    _api.get(QStringLiteral("/api/accounts/banned"), [this, path](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (!ok) return showError(QStringLiteral("Falha ao exportar banidas"), error);
+      QSaveFile output(path);
+      if (!output.open(QIODevice::WriteOnly) || output.write(doc.toJson(QJsonDocument::Indented)) < 0 || !output.commit())
+        return showError(QStringLiteral("Falha ao exportar banidas"), QStringLiteral("Não foi possível salvar o arquivo."));
+      setStatus(QStringLiteral("Registro de contas banidas salvo."));
+    });
+  });
   transferActions->addStretch();
   accountsLayout->addLayout(transferActions);
   auto* migrationActions = new QHBoxLayout;
@@ -2030,7 +2044,7 @@ void MainWindow::showError(const QString& title, const QString& error) {
 }
 
 void MainWindow::showAccountIssues(const QString& title, const QStringList& blockers,
-                                  const QJsonArray& issues) {
+                                  const QJsonArray& issues, std::function<void()> continueAction) {
   const QString checkedAt = QDateTime::currentDateTime().toString(QStringLiteral("dd/MM/yyyy HH:mm:ss"));
   QStringList sections;
   sections << QStringLiteral("Verificação em %1").arg(checkedAt);
@@ -2066,12 +2080,24 @@ void MainWindow::showAccountIssues(const QString& title, const QStringList& bloc
       "Falhas de rede não significam necessariamente senha incorreta."));
   explanation->setWordWrap(true);
   layout->addWidget(explanation);
+  if (continueAction)
+    explanation->setText(explanation->text() + QStringLiteral(
+        "\nRemover contas e continuar apaga permanentemente os acessos com restrição confirmada, "
+        "salva o registro em banned_accounts.json e inicia com as contas aprovadas, sem repetir a verificação."));
+  bool continueRequested = false;
   auto* details = new QPlainTextEdit;
   details->setReadOnly(true);
   details->setLineWrapMode(QPlainTextEdit::WidgetWidth);
   details->setPlainText(report);
   layout->addWidget(details, 1);
   auto* buttons = new QDialogButtonBox;
+  if (continueAction) {
+    auto* remove = buttons->addButton(QStringLiteral("Remover contas e continuar"), QDialogButtonBox::ActionRole);
+    connect(remove, &QPushButton::clicked, &dialog, [&dialog, &continueRequested] {
+      continueRequested = true;
+      dialog.accept();
+    });
+  }
   auto* copy = buttons->addButton(QStringLiteral("Copiar diagnóstico"), QDialogButtonBox::ActionRole);
   auto* accounts = buttons->addButton(QStringLiteral("Abrir Contas"), QDialogButtonBox::ActionRole);
   auto* close = buttons->addButton(QStringLiteral("Fechar"), QDialogButtonBox::RejectRole);
@@ -2086,6 +2112,7 @@ void MainWindow::showAccountIssues(const QString& title, const QStringList& bloc
   layout->addWidget(buttons);
   setStatus(title);
   dialog.exec();
+  if (continueRequested) continueAction();
 }
 
 void MainWindow::setStatus(const QString& text) {
@@ -2630,8 +2657,15 @@ void MainWindow::startCampaign() {
       if (issues.isEmpty())
         return showError(QStringLiteral("Campanha não iniciada"),
                          blockerLines.join(QLatin1Char('\n')));
+      std::function<void()> continueAction;
+      if (result.value(QStringLiteral("can_remove_and_continue")).toBool()) {
+        QJsonObject continuation = body;
+        continuation.insert(QStringLiteral("preflight_id"), result.value(QStringLiteral("preflight_id")));
+        continuation.insert(QStringLiteral("remove_restricted"), true);
+        continueAction = [this, continuation] { submitCampaign(continuation); };
+      }
       return showAccountIssues(QStringLiteral("Campanha não iniciada — verificação pendente"),
-                               blockerLines, issues);
+                               blockerLines, issues, continueAction);
     }
 
     const auto accountInfo = result.value(QStringLiteral("accounts")).toObject();
@@ -2653,6 +2687,14 @@ void MainWindow::startCampaign() {
       return;
     }
 
+    QJsonObject approved = body;
+    approved.insert(QStringLiteral("preflight_id"), result.value(QStringLiteral("preflight_id")));
+    submitCampaign(approved);
+  });
+}
+
+void MainWindow::submitCampaign(QJsonObject body) {
+  _campaignStart->setEnabled(false);
     _campaignStart->setText(QStringLiteral("Iniciando…"));
     _api.post(QStringLiteral("/api/campaigns"), body,
               [this](bool started, const QJsonDocument& startDoc, const QString& startError) {
@@ -2671,6 +2713,14 @@ void MainWindow::startCampaign() {
                          QStringLiteral("A campanha anterior ainda está executando ou encerrando. "
                                         "Aguarde a conclusão antes de iniciar outra."));
       }
+      {
+        const QSignalBlocker blocker(_campaignAccounts);
+        for (const auto& removed : startDoc.object().value(QStringLiteral("removed_accounts")).toArray()) {
+          for (int i = _campaignAccounts->count() - 1; i >= 0; --i)
+            if (_campaignAccounts->item(i)->data(Qt::UserRole).toString() == removed.toString())
+              delete _campaignAccounts->takeItem(i);
+        }
+      }
       _campaignActive = true;
       _campaignReset->setEnabled(false);
       _lastCampaignSeq = 0;
@@ -2683,8 +2733,8 @@ void MainWindow::startCampaign() {
       pollCampaign();
       setStatus(QStringLiteral("Campanha iniciada após preflight aprovado."));
     });
-  });
-}
+  }
+
 
 void MainWindow::pollCampaign() {
   _api.get(QStringLiteral("/api/campaigns/current?since=%1").arg(_lastCampaignSeq),
@@ -2732,6 +2782,18 @@ void MainWindow::pollCampaign() {
         .arg(successful).arg(skipped).arg(failed));
     for (const auto eventValue : snap.value(QStringLiteral("events")).toArray()) {
       const auto event = eventValue.toObject();
+      if (event.value(QStringLiteral("permanently_removed")).toBool()) {
+        const QString removedEmail = event.value(QStringLiteral("email")).toString();
+        _accountChecks.remove(removedEmail);
+        const QSignalBlocker blocker(_campaignAccounts);
+        for (int i = _campaignAccounts->count() - 1; i >= 0; --i)
+          if (_campaignAccounts->item(i)->data(Qt::UserRole).toString() == removedEmail)
+            delete _campaignAccounts->takeItem(i);
+        for (auto* table : {_accountsTable, _balancesTable})
+          for (int row = table->rowCount() - 1; row >= 0; --row)
+            if (table->item(row, 0) && table->item(row, 0)->text() == removedEmail)
+              table->removeRow(row);
+      }
       _lastCampaignSeq = qMax(_lastCampaignSeq, event.value(QStringLiteral("seq")).toInt());
       const QString level = event.value(QStringLiteral("level")).toString();
       const QString marker = level == QStringLiteral("success") ? QStringLiteral("✓")
