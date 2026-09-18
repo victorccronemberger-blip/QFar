@@ -31,6 +31,7 @@ jobs:
           "QMONEY_VERSION=$version" >> $env:GITHUB_ENV
 
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: '3.12'
           cache: pip
@@ -85,9 +86,9 @@ jobs:
         run: |
           $root = (Get-Location).Path
           New-Item -ItemType Directory -Force dist/work/spec | Out-Null
-          playwright install chromium
+          & "${{ steps.python.outputs.python-path }}" -m playwright install chromium
           if ($LASTEXITCODE -ne 0) { throw "Instalação do navegador falhou." }
-          pyinstaller --noconfirm --clean --onefile --windowed `
+          & "${{ steps.python.outputs.python-path }}" -m PyInstaller --noconfirm --clean --onefile --windowed `
             --name QMoneyService --paths $root `
             --icon "$root/desktop/resources/qmoney.ico" `
             --distpath dist/work/pyinstaller --workpath dist/work/pyinstaller-build `
@@ -130,7 +131,7 @@ jobs:
           Copy-Item (Join-Path $ucrt.Directory.FullName "*.dll") dist/QMoney/runtime/tools/ffmpeg/bin/
 
           . ./scripts/browser_parts.ps1
-          $manifest = python -c "import pathlib, playwright; print(pathlib.Path(playwright.__file__).parent / 'driver/package/browsers.json')"
+          $manifest = & "${{ steps.python.outputs.python-path }}" -c "import pathlib, playwright; print(pathlib.Path(playwright.__file__).parent / 'driver/package/browsers.json')"
           if ($LASTEXITCODE -ne 0) { throw "Manifesto Playwright não encontrado." }
           New-Item -ItemType Directory -Force dist/QMoney/runtime/ms-playwright | Out-Null
           foreach ($part in (Get-QMoneyBrowserParts -ManifestPath $manifest -BrowserSource "$env:LOCALAPPDATA/ms-playwright")) {
