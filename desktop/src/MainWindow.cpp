@@ -2594,6 +2594,7 @@ void MainWindow::saveHostingerIntegration() {
     const int detected = doc.object().value(QStringLiteral("detected_count")).toInt();
     setStatus(QStringLiteral("%1 caixa(s) identificada(s) e conectada(s) automaticamente.")
                   .arg(detected));
+    loadBulkRegisterDomains();
     loadIntegrations();
     loadReadiness();
   });
@@ -3592,6 +3593,7 @@ void MainWindow::loadBulkRegisterDomains() {
     if (!ok) {
       _bulkRegisterDomain->addItem(QStringLiteral("não foi possível carregar"));
       _bulkRegisterDomain->setEnabled(false);
+      _bulkRegisterStatus->setText(QStringLiteral("Falha ao carregar domínios: ") + error);
       return;
     }
     const auto root = doc.object();
@@ -3601,6 +3603,10 @@ void MainWindow::loadBulkRegisterDomains() {
       _bulkRegisterDomain->addItem(QStringLiteral("configure um domínio em Integrações"));
       _bulkRegisterDomain->setEnabled(false);
       _bulkRegisterStart->setEnabled(false);
+      const QString warning = root.value(QStringLiteral("warning")).toString();
+      _bulkRegisterStatus->setText(warning.isEmpty()
+          ? QStringLiteral("Nenhum domínio disponível. Em Integrações, use Identificar e conectar com o token da API Mail da Hostinger; depois clique em Atualizar domínios.")
+          : warning);
       return;
     }
     for (const auto value : domains) {

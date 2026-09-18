@@ -160,6 +160,56 @@ def _registration_domains() -> list[dict[str, str]]:
     return domains
 
 
+def _recover_hostinger_domains() -> list[str]:
+    """Completa perfis antigos sem rotas usando a própria credencial salva."""
+    warnings = []
+    if not any(not p["routes"] for p in hostinger_mail.configured_connections()):
+        return warnings
+    # Serializa com salvar/remover integrações para não restaurar dados antigos.
+    with _INTEGRATION_OPERATION_LOCK:
+        secure = _migrate_legacy_integrations()
+        profiles = _hostinger_profiles(secure.get("hostinger") or {})
+        discovered = {}
+        changed = False
+        recovered = []
+        for profile in profiles:
+            if profile["routes"]:
+                recovered.append(profile)
+                continue
+            token = profile["token"]
+            if token not in discovered:
+                try:
+                    discovered[token] = hostinger_mail.discover_mailboxes(token)
+                except Exception as exc:
+                    discovered[token] = []
+                    warnings.append(_integration_error(exc, "Hostinger"))
+            matches = [mailbox for mailbox in discovered[token]
+                       if not profile["mailbox_id"]
+                       or mailbox["resource_id"] == profile["mailbox_id"]]
+            usable = [mailbox for mailbox in matches if mailbox.get("domain")]
+            if usable:
+                for index, mailbox in enumerate(usable):
+                    recovered.append({
+                        **profile,
+                        "id": profile["id"] if index == 0 else uuid.uuid4().hex,
+                        "mailbox_id": mailbox["resource_id"],
+                        "routes": [mailbox["domain"]],
+                        "name": mailbox.get("address") or profile["name"],
+                    })
+                changed = True
+            else:
+                recovered.append(profile)
+                if not warnings:
+                    warnings.append("A Hostinger não informou o domínio da caixa salva. "
+                                    "Identifique novamente a API em Integrações.")
+        if changed:
+            with _PERSISTENCE_LOCK:
+                secure["hostinger"] = {"profiles": recovered}
+                save_secure_settings(config.INTEGRATIONS_PATH, secure)
+                _apply_hostinger(recovered)
+    return warnings
+
+
 def _preflight_checks(domain: str = "") -> dict[str, Any]:
     """Valida todas as dependências antes de iniciar a criação de contas.
 
@@ -1425,11 +1475,13 @@ def create_app() -> Flask:
     @app.get("/api/accounts/domains")
     def list_account_domains():
         """Domínios disponíveis para o criador de contas (perfis Hostinger)."""
+        warnings = _recover_hostinger_domains()
         domains = _registration_domains()
         return jsonify({
             "domains": domains,
             "webmail_url": "https://webmail.hostinger.com" if domains else "",
             "hostinger_configured": _hostinger_is_configured(),
+            "warning": " ".join(warnings),
         })
 
     @app.get("/api/accounts/bulk-register/preflight")
@@ -1801,7 +1853,7 @@ def create_app() -> Flask:
                 item["name"] for item in profiles
                 if item["token"] == token and item.get("mailbox_id")
             ]
-            if duplicates:
+            if duplicates and all(item["routes"] for item in profiles if item["token"] == token):
                 return jsonify({
                     "error": (
                         "esta API Hostinger já está conectada"

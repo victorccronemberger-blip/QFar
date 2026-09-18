@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+import os
+from contextlib import ExitStack
 from unittest import mock
 
 from moneymin import hostinger_mail
@@ -99,6 +101,88 @@ class HostingerRoutingTests(unittest.TestCase):
             cursor = hostinger_mail.max_uid()
 
         self.assertEqual(cursor, {"alpha": 100, "beta": 4})
+
+
+class HostingerDomainRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.dict(os.environ))
+        self.profile = {"id": "saved", "name": "Caixa antiga",
+                        "token": "fixture-token-00000", "mailbox_id": "box-a", "routes": []}
+        self.secure = {"hostinger": {"profiles": [self.profile]}}
+        for name, value in (("HOSTINGER_MAIL_PROFILES", [self.profile]),
+                            ("HOSTINGER_MAIL_TOKEN", ""), ("HOSTINGER_MAILBOX_ID", "")):
+            self.stack.enter_context(mock.patch.object(server.config, name, value))
+        self.stack.enter_context(mock.patch.object(server, "_migrate_legacy_integrations", return_value=self.secure))
+        self.save = self.stack.enter_context(mock.patch.object(server, "save_secure_settings"))
+        self.discover = self.stack.enter_context(mock.patch.object(hostinger_mail, "discover_mailboxes", return_value=[
+            {"resource_id": "box-a", "address": "codes@alpha.example", "domain": "alpha.example"},
+            {"resource_id": "box-b", "address": "codes@beta.example", "domain": "beta.example"},
+        ]))
+        self.client = server.create_app().test_client()
+
+    def test_saved_token_without_routes_recovers_selected_mailbox_and_persists(self):
+        response = self.client.get("/api/accounts/domains")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([d["domain"] for d in response.json["domains"]], ["alpha.example"])
+        self.assertTrue(response.json["hostinger_configured"])
+        self.assertNotIn(self.profile["token"], response.get_data(as_text=True))
+        self.save.assert_called_once()
+        self.client.get("/api/accounts/domains")
+        self.discover.assert_called_once_with(self.profile["token"])
+
+    def test_legacy_token_without_mailbox_preserves_correct_domain_routing(self):
+        self.profile["mailbox_id"] = ""
+        response = self.client.get("/api/accounts/domains")
+        self.assertEqual(len(response.json["domains"]), 2)
+        profiles = self.secure["hostinger"]["profiles"]
+        self.assertEqual([(p["mailbox_id"], p["routes"]) for p in profiles],
+                         [("box-a", ["alpha.example"]), ("box-b", ["beta.example"])])
+        self.assertEqual(len({p["id"] for p in profiles}), 2)
+
+    def test_network_failure_reports_safe_message_and_allows_retry(self):
+        self.discover.side_effect = hostinger_mail.MailError("network fixture-token-00000")
+        response = self.client.get("/api/accounts/domains")
+        self.assertEqual(response.json["domains"], [])
+        self.assertTrue(response.json["warning"])
+        self.assertNotIn(self.profile["token"], response.get_data(as_text=True))
+        self.save.assert_not_called()
+        self.discover.side_effect = None
+        self.assertEqual(len(self.client.get("/api/accounts/domains").json["domains"]), 1)
+
+    def test_existing_routes_are_not_overwritten_or_queried(self):
+        self.profile["routes"] = ["custom.example"]
+        response = self.client.get("/api/accounts/domains")
+        self.assertEqual(response.json["domains"][0]["domain"], "custom.example")
+        self.discover.assert_not_called()
+        self.save.assert_not_called()
+
+    def test_missing_saved_mailbox_does_not_select_another_mailbox(self):
+        self.profile["mailbox_id"] = "removed-box"
+        response = self.client.get("/api/accounts/domains")
+        self.assertEqual(response.json["domains"], [])
+        self.assertTrue(response.json["warning"])
+        self.save.assert_not_called()
+
+    def test_incomplete_existing_api_can_be_identified_again(self):
+        with mock.patch.object(server, "_integration_snapshot", return_value={}):
+            response = self.client.put("/api/integrations/hostinger", json={
+                "auto_detect": True, "token": self.profile["token"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.secure["hostinger"]["profiles"][0]["id"], "saved")
+
+    def test_fresh_install_lists_domains_immediately_after_connecting(self):
+        self.secure["hostinger"]["profiles"] = []
+        server.config.HOSTINGER_MAIL_PROFILES = []
+        self.assertEqual(self.client.get("/api/accounts/domains").json["domains"], [])
+        with mock.patch.object(server, "_integration_snapshot", return_value={}):
+            response = self.client.put("/api/integrations/hostinger", json={
+                "auto_detect": True, "token": self.profile["token"]})
+        self.assertEqual(response.status_code, 200)
+        domains = self.client.get("/api/accounts/domains").json["domains"]
+        self.assertEqual([d["domain"] for d in domains], ["alpha.example", "beta.example"])
+        self.assertNotIn(self.profile["token"], str(domains))
 
 
 class HostingerProfilesApiTests(unittest.TestCase):
