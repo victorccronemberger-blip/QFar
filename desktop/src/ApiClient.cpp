@@ -33,6 +33,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   QNetworkRequest req(QUrl(_baseUrl + path));
   req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
   req.setRawHeader("Accept", "application/json");
+  if (!_sessionToken.isEmpty()) req.setRawHeader("X-QMoney-Session", _sessionToken);
   // Consultas sem resposta precisam liberar o polling para uma nova tentativa.
   // Operações de escrita podem incluir cadastro remoto e não são repetidas aqui.
   if (method == "GET")

@@ -158,6 +158,7 @@ private:
   bool _probeInFlight{};
   int _backendRestarts{};
   bool _backendReady{};
+  bool _runtimeChecked{};
   bool _closing{};
   bool _restartingBackend{};
 

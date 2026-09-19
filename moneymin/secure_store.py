@@ -22,6 +22,10 @@ _ENTROPY = b"QMoney::integrations::v1"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
+class SecureStoreError(ValueError):
+    """O cofre existente não pode ser aberto com segurança."""
+
+
 class _DataBlob(ctypes.Structure):
     _fields_ = [
         ("cbData", wintypes.DWORD),
@@ -84,18 +88,29 @@ def _crypt(value: bytes, *, protect: bool) -> bytes:
             kernel32.LocalFree(description)
 
 
-def load_secure_settings(path: Path) -> dict[str, Any]:
+def load_secure_settings(path: Path, *, strict: bool = False) -> dict[str, Any]:
     with _LOCK:
         try:
             payload = _crypt(path.read_bytes(), protect=False)
             value = json.loads(payload.decode("utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
+        except FileNotFoundError:
             return {}
-        return value if isinstance(value, dict) else {}
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise SecureStoreError("Não foi possível abrir o cofre de integrações. O arquivo foi preservado; use o usuário Windows original ou restaure um backup válido.") from exc
+            return {}
+        if not isinstance(value, dict):
+            if strict:
+                raise SecureStoreError("O cofre de integrações está inválido. O arquivo foi preservado.")
+            return {}
+        return value
 
 
 def save_secure_settings(path: Path, value: dict[str, Any]) -> None:
     with _LOCK:
+        # Um cofre ilegível não é um cofre vazio. Não apague credenciais
+        # existentes após corrupção ou cópia de outro usuário Windows.
+        load_secure_settings(path, strict=True)
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         save_bytes(path, _crypt(payload.encode("utf-8"), protect=True))
 
@@ -103,7 +118,7 @@ def save_secure_settings(path: Path, value: dict[str, Any]) -> None:
 def update_secure_section(path: Path, section: str,
                           value: dict[str, Any] | None) -> dict[str, Any]:
     with _LOCK:
-        settings = load_secure_settings(path)
+        settings = load_secure_settings(path, strict=True)
         settings["schema"] = 1
         if value:
             settings[section] = value

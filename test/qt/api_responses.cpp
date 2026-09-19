@@ -14,13 +14,18 @@ bool checkResponse(const QByteArray& body, int status, bool expected) {
   QObject::connect(&server, &QTcpServer::newConnection, &server, [&] {
     auto* socket = server.nextPendingConnection();
     QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, body, status] {
-      socket->readAll();
+      const QByteArray request = socket->readAll();
+      if (!request.toLower().contains("x-qmoney-session: fixture-session")) {
+        socket->disconnectFromHost();
+        return;
+      }
       socket->write("HTTP/1.1 " + QByteArray::number(status) + " Test\r\nContent-Type: application/json\r\nContent-Length: "
                     + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
       socket->disconnectFromHost();
     });
   });
   ApiClient api;
+  api.setSessionToken("fixture-session");
   api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
   QEventLoop loop;
   bool passed = false;

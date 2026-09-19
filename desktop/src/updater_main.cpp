@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cwctype>
 
 namespace fs = std::filesystem;
 
@@ -131,7 +132,8 @@ fs::path installedDestination(const fs::path& relative, const fs::path& target) 
 bool backupPackageTargets(const fs::path& source, const fs::path& target,
                           const fs::path& backup) {
   std::error_code ec;
-  fs::remove_all(backup, ec);
+  // Backups anteriores pertencem ao usuário; nunca reutilize/apague um deles.
+  if (fs::exists(backup, ec) || ec) return false;
   fs::create_directories(backup, ec);
   if (ec) return false;
   for (const auto& entry : fs::recursive_directory_iterator(source, ec)) {
@@ -185,11 +187,27 @@ bool rollbackPackage(const fs::path& source, const fs::path& target,
   return !ec;
 }
 
-enum class InstallResult { Installed, BackupFailed, CopyFailed, RollbackFailed };
+enum class InstallResult { Installed, BackupFailed, CopyFailed, RollbackFailed, InvalidPackage };
+
+bool packagePreservesPrivateData(const fs::path& source) {
+  std::error_code ec;
+  for (const auto& entry : fs::recursive_directory_iterator(source, ec)) {
+    if (ec || entry.is_symlink()) return false;
+    const auto relative = entry.path().lexically_relative(source);
+    for (const auto& part : relative) {
+      std::wstring name = part.wstring();
+      for (auto& c : name) c = static_cast<wchar_t>(std::towlower(c));
+      if (name == L"data" || name == L"secrets" || name == L".env" ||
+          name == L".qmoney-rollback" || name == L"..") return false;
+    }
+  }
+  return !ec;
+}
 
 InstallResult installPackage(const fs::path& source, const fs::path& target,
                              const fs::path& backup) {
   // A partial backup must never be used to restore an untouched installation.
+  if (!packagePreservesPrivateData(source)) return InstallResult::InvalidPackage;
   if (!backupPackageTargets(source, target, backup)) return InstallResult::BackupFailed;
   if (copyPackage(source, target)) return InstallResult::Installed;
   return rollbackPackage(source, target, backup) ? InstallResult::CopyFailed
@@ -249,17 +267,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   }
 
   wchar_t tempPath[MAX_PATH]{};
-  GetTempPathW(MAX_PATH, tempPath);
-  const fs::path staging = fs::path(tempPath) / (L"QMoney-" + std::to_wstring(GetCurrentProcessId()));
-  const fs::path marker = fs::path(tempPath) / (L"QMoney-health-" + std::to_wstring(GetCurrentProcessId()));
-  const fs::path backup = target / L".qmoney-rollback";
+  const DWORD tempLength = GetTempPathW(MAX_PATH, tempPath);
+  if (!tempLength || tempLength >= MAX_PATH) return 3;
+  const std::wstring runId = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+  const fs::path staging = fs::path(tempPath) / (L"QMoney-" + runId);
+  const fs::path payload = staging / L"payload";
+  const fs::path marker = staging / L"health-marker";
+  const fs::path backup = target / L".qmoney-rollback" /
+      runId;
   std::error_code ec;
-  fs::remove_all(staging, ec);
-  fs::remove(marker, ec);
-  fs::create_directories(staging, ec);
-  if (ec) return 3;
+  // Não remova diretórios de uma execução anterior, mesmo se o PID foi reutilizado.
+  if (!fs::create_directory(staging, ec) || ec) return 3;
+  if (!fs::create_directory(payload, ec) || ec) return 3;
 
-  const std::wstring extract = L"tar.exe -xf " + quote(package.wstring()) + L" -C " + quote(staging.wstring());
+  const std::wstring extract = L"tar.exe -xf " + quote(package.wstring()) + L" -C " + quote(payload.wstring());
   if (!runProcess(extract)) {
     logLine(target, L"Falha ao extrair o pacote; instalação original preservada.");
     fs::remove_all(staging, ec);
@@ -268,9 +289,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                   L"QMoney", MB_OK | MB_ICONERROR);
     return 4;
   }
-  const auto installation = installPackage(staging, target, backup);
+  const auto installation = installPackage(payload, target, backup);
   if (installation != InstallResult::Installed) {
-    logLine(target, installation == InstallResult::BackupFailed
+    logLine(target, installation == InstallResult::InvalidPackage
+        ? L"Pacote contém caminhos privados; instalação preservada."
+        : installation == InstallResult::BackupFailed
         ? L"Falha no backup; instalação original preservada."
         : installation == InstallResult::RollbackFailed
             ? L"Falha na cópia e na restauração; backup mantido para recuperação."
@@ -286,7 +309,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
   if (!launchAndValidate(target / launch, marker)) {
     logLine(target, L"Nova versão falhou no teste de saúde; iniciando rollback.");
-    if (!rollbackPackage(staging, target, backup)) {
+    if (!rollbackPackage(payload, target, backup)) {
       if (!silent)
         MessageBoxW(nullptr,
                     L"A nova versão não iniciou e a restauração automática falhou. Consulte update.log.",
@@ -305,7 +328,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
   fs::remove(marker, ec);
   fs::remove_all(staging, ec);
-  fs::remove(package, ec);
+  // Preserve o ZIP e todos os backups para recuperação manual.
   logLine(target, L"Atualização instalada e validada com sucesso.");
   return 0;
 }

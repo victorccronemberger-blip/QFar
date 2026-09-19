@@ -82,7 +82,7 @@ from ..atomic_io import load_json, save_json
 from .. import account_transfer, account_bans
 from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
-from ..secure_store import load_secure_settings, save_secure_settings
+from ..secure_store import SecureStoreError, load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
 from .org_migration import OrgMigrationRunner
 from .banned_monitor import BannedMonitor
@@ -605,8 +605,8 @@ def _legacy_aws_credentials() -> dict[str, str]:
             "region": config.EGO4D_AWS_REGION or "",
         }
     profile = config.EGO4D_AWS_PROFILE or "default"
-    candidates = [
-        Path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "")),
+    configured = os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "").strip()
+    candidates = [Path(configured)] if configured else [
         config.EGO4D_LOCAL_AWS_CREDENTIALS,
         Path.home() / ".aws" / "credentials",
     ]
@@ -636,7 +636,7 @@ def _legacy_aws_credentials() -> dict[str, str]:
 def _migrate_legacy_integrations() -> dict[str, Any]:
     """Copia configurações existentes para o DPAPI, sem apagar os originais."""
     with _PERSISTENCE_LOCK:
-        secure = load_secure_settings(config.INTEGRATIONS_PATH)
+        secure = load_secure_settings(config.INTEGRATIONS_PATH, strict=True)
         changed = False
         host = secure.get("hostinger")
         if not isinstance(host, dict) and config.HOSTINGER_MAIL_TOKEN:
@@ -952,18 +952,20 @@ def _list_accounts() -> list[dict[str, Any]]:
     if not isinstance(health, dict):
         health = {}
     org_keys = prefs.get("org_keys", {})
+    if not isinstance(org_keys, dict):
+        org_keys = {}
     removed = _removed_accounts()
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for path in sorted(config.tokens_dir().glob("token_*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(data, dict):
             continue
         email = data.get("email")
-        if not email:
+        if not isinstance(email, str) or not email.strip():
             continue
         if str(email).strip().casefold() in removed:
             continue
@@ -1138,8 +1140,17 @@ def _configured_crowtado_creds() -> dict[str, str]:
 
 def _save_crowtado_cred(email: str, password: str) -> None:
     with _PERSISTENCE_LOCK:
-        stored = load_json(CROWTADO_PW_PATH, {})
-        creds = stored if isinstance(stored, dict) else {}
+        try:
+            stored = json.loads(CROWTADO_PW_PATH.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            stored = {}
+        except (OSError, ValueError) as exc:
+            raise ValueError("Não foi possível ler as credenciais locais. O arquivo foi preservado; confira o armazenamento ou restaure um backup.") from exc
+        if not isinstance(stored, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in stored.items()):
+            raise ValueError("As credenciais locais estão inválidas. O arquivo foi preservado.")
+        creds = stored
         normalized = email.strip().casefold()
         creds = {key: value for key, value in creds.items()
                  if str(key).strip().casefold() != normalized}
@@ -1281,6 +1292,10 @@ def _parse_duration_range(values) -> tuple[float, float]:
 
 
 def create_app() -> Flask:
+    import hmac
+    local_api_token = os.environ.get("QMONEY_LOCAL_API_TOKEN", "")
+    if getattr(sys, "frozen", False) and not local_api_token:
+        raise RuntimeError("Inicie o serviço pela interface QMoney para proteger o acesso local.")
     preflights: dict[str, dict] = {}
     banned_monitor = BannedMonitor()
     RUNNER.on_restriction = lambda email: _ban_accounts([{
@@ -1290,6 +1305,17 @@ def create_app() -> Flask:
     # No QMoney o Flask e apenas o servico local consumido pela interface Qt.
     # Nenhum frontend web e publicado ou usado como fallback.
     app = Flask(__name__, static_folder=None)
+
+    @app.before_request
+    def authenticate_local_client():
+        if local_api_token and not hmac.compare_digest(
+                request.headers.get("X-QMoney-Session", "").encode("utf-8"),
+                local_api_token.encode("utf-8")):
+            return jsonify({"error": "Cliente local não autorizado."}), 401
+
+    @app.errorhandler(SecureStoreError)
+    def invalid_secure_store(exc):
+        return jsonify({"error": str(exc), "code": "local_vault_unreadable"}), 409
 
     @app.before_request
     def validate_json_body():
@@ -1472,11 +1498,12 @@ def create_app() -> Flask:
             login(email, password)
         except (RuntimeError, OSError) as exc:
             return jsonify({"error": str(exc)}), 400
-        _set_account_removed(email, False)
-        # A tela pede a senha da identidade Minute / Crowtado. Antes este
-        # caminho salvava somente o token Minute, então a mesma conta aparecia
-        # em Saldos como se não fosse uma conta Crowtado.
-        _save_crowtado_cred(email, password)
+        try:
+            _save_crowtado_cred(email, password)
+            _set_account_removed(email, False)
+        except (OSError, ValueError):
+            return jsonify({"ok": False, "partial": True,
+                            "error": "O acesso foi validado, mas o salvamento local não foi concluído. Confira o armazenamento e o backup das credenciais antes de tentar novamente."}), 500
         return jsonify({"ok": True, "email": email})
 
     @app.post("/api/accounts/register")
@@ -1794,6 +1821,8 @@ def create_app() -> Flask:
         """Estados e dicas somente; nunca devolve um segredo salvo."""
         try:
             return jsonify(_integration_snapshot())
+        except SecureStoreError:
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
             return jsonify({"error": _integration_error(exc, "configuração local")}), 400
 
@@ -2059,6 +2088,10 @@ def create_app() -> Flask:
                 "app_version": os.environ.get("QMONEY_APP_VERSION", "unknown"),
             },
         })
+
+    @app.get("/api/runtime")
+    def get_runtime_readiness():
+        return jsonify(readiness.runtime_readiness())
 
     @app.get("/api/diagnostics")
     def get_diagnostics():

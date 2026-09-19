@@ -1,3 +1,4 @@
+#include <QUuid>
 #include "MainWindow.hpp"
 #include "ComboBox.hpp"
 
@@ -215,80 +216,6 @@ void configureForm(QFormLayout* form) {
   form->setVerticalSpacing(12);
 }
 
-void copyIfNewer(const QString& source, const QString& destination) {
-  const QFileInfo src(source);
-  if (!src.isFile()) return;
-  const QFileInfo dst(destination);
-  if (dst.exists() && dst.lastModified() >= src.lastModified()) return;
-  QDir().mkpath(QFileInfo(destination).absolutePath());
-  if (dst.exists()) QFile::remove(destination);
-  QFile::copy(source, destination);
-  QFile(destination).setFileTime(src.lastModified(), QFileDevice::FileModificationTime);
-}
-
-QSet<QString> removedAccounts(const QString& userRoot) {
-  QSet<QString> removed;
-  QFile file(userRoot + QStringLiteral("/data/removed_accounts.json"));
-  if (!file.open(QIODevice::ReadOnly)) return removed;
-  const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
-  if (!document.isObject()) return removed;
-  for (const QJsonValue& value : document.object().value(QStringLiteral("emails")).toArray()) {
-    const QString email = value.toString().trimmed().toCaseFolded();
-    if (!email.isEmpty()) removed.insert(email);
-  }
-  return removed;
-}
-
-bool belongsToRemovedAccount(const QString& tokenPath, const QSet<QString>& removed) {
-  if (removed.isEmpty()) return false;
-  const QString name = QFileInfo(tokenPath).fileName();
-  if (!name.startsWith(QStringLiteral("token_")) ||
-      !name.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) return false;
-  QFile file(tokenPath);
-  if (!file.open(QIODevice::ReadOnly)) return false;
-  const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
-  const QString email = document.object().value(QStringLiteral("email"))
-                            .toString().trimmed().toCaseFolded();
-  return !email.isEmpty() && removed.contains(email);
-}
-
-void migrateLegacyState(const QString& legacyRoot, const QString& userRoot) {
-  if (QDir::cleanPath(legacyRoot) == QDir::cleanPath(userRoot)) return;
-  const QDir legacyData(legacyRoot + QStringLiteral("/data"));
-  const QDir userData(userRoot + QStringLiteral("/data"));
-  const QStringList stateFiles = legacyData.entryList(
-      {QStringLiteral("*.json"), QStringLiteral("*.jsonl"), QStringLiteral("*.pkl")},
-      QDir::Files);
-  for (const QString& name : stateFiles) {
-    // É uma decisão do usuário, não conteúdo da biblioteca. Nunca permita que
-    // um estado empacotado/legado mais novo substitua suas exclusões locais.
-    if (name.compare(QStringLiteral("removed_accounts.json"), Qt::CaseInsensitive) == 0)
-      continue;
-    copyIfNewer(legacyData.filePath(name), userData.filePath(name));
-  }
-
-  const QStringList stateDirectories = {QStringLiteral("device_state")};
-  for (const QString& directory : stateDirectories) {
-    const QString sourceRoot = legacyData.filePath(directory);
-    QDirIterator files(sourceRoot, QDir::Files, QDirIterator::Subdirectories);
-    while (files.hasNext()) {
-      const QString source = files.next();
-      const QString relative = QDir(sourceRoot).relativeFilePath(source);
-      copyIfNewer(source, userData.filePath(directory + QLatin1Char('/') + relative));
-    }
-  }
-
-  const QSet<QString> removed = removedAccounts(userRoot);
-  const QDir legacySecrets(legacyRoot + QStringLiteral("/secrets"));
-  const QDir userSecrets(userRoot + QStringLiteral("/secrets"));
-  QDirIterator secretFiles(legacySecrets.absolutePath(), QDir::Files, QDirIterator::Subdirectories);
-  while (secretFiles.hasNext()) {
-    const QString source = secretFiles.next();
-    if (belongsToRemovedAccount(source, removed)) continue;
-    const QString relative = legacySecrets.relativeFilePath(source);
-    copyIfNewer(source, userSecrets.filePath(relative));
-  }
-}
 }  // namespace
 
 MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* parent)
@@ -2066,8 +1993,19 @@ void MainWindow::startBackend() {
       }
     }
     QDir().mkpath(workingDirectory);
-    migrateLegacyState(libraryRoot, workingDirectory);
+    // Contas e segredos pertencem ao usuário Windows, nunca à biblioteca.
+    for (const QString& key : environment.keys()) {
+      if (key.startsWith(QStringLiteral("AWS_"), Qt::CaseInsensitive) ||
+          key.startsWith(QStringLiteral("HOSTINGER_"), Qt::CaseInsensitive) ||
+          key.startsWith(QStringLiteral("MINUTE_"), Qt::CaseInsensitive) ||
+          key.startsWith(QStringLiteral("EGO4D_"), Qt::CaseInsensitive) ||
+          key.startsWith(QStringLiteral("CROWTADO_"), Qt::CaseInsensitive))
+        environment.remove(key);
+    }
     environment.insert(QStringLiteral("QMONEY_USER_ROOT"), workingDirectory);
+    environment.insert(QStringLiteral("AWS_SHARED_CREDENTIALS_FILE"), workingDirectory + QStringLiteral("/secrets/aws/credentials"));
+    environment.insert(QStringLiteral("AWS_CONFIG_FILE"), workingDirectory + QStringLiteral("/secrets/aws/config"));
+    environment.insert(QStringLiteral("AWS_EC2_METADATA_DISABLED"), QStringLiteral("true"));
     environment.insert(QStringLiteral("QMONEY_LIBRARY_ROOT"), libraryRoot);
     environment.insert(QStringLiteral("QMONEY_RUNTIME_ROOT"), appDir + QStringLiteral("/runtime"));
     environment.insert(QStringLiteral("QMONEY_APP_VERSION"),
@@ -2083,6 +2021,10 @@ void MainWindow::startBackend() {
                  QStringLiteral("8876")};
     workingDirectory = root;
   }
+  const QString localApiToken = QUuid::createUuid().toString(QUuid::Id128)
+                                + QUuid::createUuid().toString(QUuid::Id128);
+  environment.insert(QStringLiteral("QMONEY_LOCAL_API_TOKEN"), localApiToken);
+  _api.setSessionToken(localApiToken.toUtf8());
   _backend.setWorkingDirectory(workingDirectory);
   _backend.setProcessEnvironment(environment);
   _backend.setProcessChannelMode(QProcess::MergedChannels);
@@ -2162,6 +2104,17 @@ void MainWindow::probeBackend() {
       _backendRestarts = 0;
       setBackendReady(true);
       refreshCurrentPage();
+      if (!_runtimeChecked && _backend.program().endsWith(QStringLiteral("QMoneyService.exe"), Qt::CaseInsensitive)) {
+        _runtimeChecked = true;
+        _api.get(QStringLiteral("/api/runtime"),
+                 [this, generation](bool checked, const QJsonDocument& result, const QString&) {
+          if (!checked || _closing || generation != _probeGeneration) return;
+          if (!result.object().value(QStringLiteral("ready")).toBool() && !_updates.isBusy()) {
+            setStatus(QStringLiteral("Componentes ausentes detectados. Preparando reparo da instalação…"));
+            _updates.repair();
+          }
+        });
+      }
     } else if (_probeAttempts > 22) {
       _backendProbe.stop();
       setBackendReady(false, QStringLiteral("Serviço indisponível"));

@@ -30,6 +30,14 @@ int main() {
     writeFile(source / "runtime.dll", "new runtime");
     writeFile(target / "app.exe", "old app");
     writeFile(target / "runtime.dll", "old runtime");
+    writeFile(target / "secrets/token_private.json", "private token");
+    writeFile(target / "data/history.json", "private history");
+    writeFile(target / ".env", "private settings");
+    writeFile(target / "custom.txt", "keep this file");
+    writeFile(source / "secrets/token_private.json", "foreign token");
+    require(installPackage(source, target, backup) == InstallResult::InvalidPackage, "private package accepted");
+    require(readFile(target / "secrets/token_private.json") == "private token", "private data overwritten");
+    fs::remove_all(source / "secrets");
     // A blocked backup destination must never trigger a rollback using its
     // incomplete contents (which would delete untouched installed files).
     writeFile(backup, "not a directory");
@@ -44,6 +52,10 @@ int main() {
     require(installPackage(source, target, backup) == InstallResult::Installed, "successful install failed");
     require(readFile(target / "app.exe") == "new app", "new app not installed");
     require(readFile(backup / "app.exe") == "old app", "backup incomplete");
+    require(readFile(target / "data/history.json") == "private history", "history changed");
+    require(readFile(target / ".env") == "private settings", "settings changed");
+    require(readFile(target / "custom.txt") == "keep this file", "custom file removed");
+    require(installPackage(source, target, backup) == InstallResult::BackupFailed, "existing backup reused");
     require(rollbackPackage(source, target, backup), "rollback failed");
     require(readFile(target / "app.exe") == "old app", "rollback did not restore app");
     require(readFile(target / "runtime.dll") == "old runtime", "rollback did not restore runtime");
@@ -52,8 +64,9 @@ int main() {
     HANDLE updaterLock = CreateFileW((target / "QMoneyUpdater.exe").c_str(), GENERIC_READ,
                                      FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     require(updaterLock != INVALID_HANDLE_VALUE, "cannot lock installed updater");
-    const auto installed = installPackage(source, target, backup);
-    const bool restored = installed == InstallResult::Installed && rollbackPackage(source, target, backup);
+    const auto secondBackup = root / "backup-2";
+    const auto installed = installPackage(source, target, secondBackup);
+    const bool restored = installed == InstallResult::Installed && rollbackPackage(source, target, secondBackup);
     CloseHandle(updaterLock);
     require(restored, "rollback tried to overwrite the running updater");
     require(readFile(target / "QMoneyUpdater.exe") == "running updater", "running updater changed");

@@ -30,6 +30,8 @@ def _provider_from_preferences() -> str:
 
 
 def _binary_works(command: str) -> bool:
+    if not isinstance(command, str) or not command.strip():
+        return False
     try:
         result = subprocess.run(
             [command, "-version"],
@@ -63,6 +65,28 @@ def _private_browser_present() -> bool:
         if any(any(root.glob(pattern)) for pattern in patterns):
             return True
     return False
+
+
+def _curl_present() -> bool:
+    try:
+        from curl_cffi import Curl
+        curl = Curl()
+        curl.close()
+        return True
+    except Exception:
+        return False
+
+
+def runtime_readiness() -> dict[str, Any]:
+    """Componentes locais; não lê contas nem consulta serviços externos."""
+    checks = {
+        "ffmpeg": _binary_works(ffmpeg_bin()),
+        "ffprobe": _binary_works(ffprobe_bin()),
+        "browser": _private_browser_present(),
+        "curl": _curl_present(),
+    }
+    return {"ready": all(checks.values()), "components": checks,
+            "missing": [name for name, present in checks.items() if not present]}
 
 
 def _valid_account_tokens() -> tuple[int, int]:
