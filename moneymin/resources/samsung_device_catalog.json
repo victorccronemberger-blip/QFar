@@ -1,0 +1,197 @@
+{
+  "schemaVersion": 1,
+  "updated": "2026-09-18",
+  "regionFocus": "global-B (EU/LATAM/BR — Build.MODEL típico SM-…B)",
+  "notes": [
+    "Catálogo público para o gerador de identidade QMoney. NÃO contém ANDROID_ID reais.",
+    "ANDROID_ID continua determinístico por e-mail (hash). Isso diferencia contas; não prova hardware físico.",
+    "Calibração UW em samsung_uw_calibration.json é referência plausível por modelo (não medição por unidade).",
+    "Fontes: Google Play supported_devices, MobileModels (KHwang9883), SamMobile/OdinRom firmware OS, Android API levels (apilevels.com / developer.android.com), Wikipedia ISOCELL (sensor 4032x3024)."
+  ],
+  "sources": [
+    {
+      "id": "play_devices",
+      "url": "https://storage.googleapis.com/play_public/supported_devices.csv",
+      "provides": ["Build.MODEL", "marketing name", "codename"]
+    },
+    {
+      "id": "mobilemodels",
+      "url": "https://github.com/KHwang9883/MobileModels/blob/master/brands/samsung_global_en.md",
+      "provides": ["SM-… regional variants", "codenames r0s/dm1q/e1s"]
+    },
+    {
+      "id": "sammobile_s22",
+      "url": "https://www.sammobile.com/samsung/galaxy-s22/firmware/",
+      "provides": ["SM-S901B OS up to Android 16"]
+    },
+    {
+      "id": "odinrom_s23",
+      "url": "https://www.odinrom.com/samsung/SM-S911B/",
+      "provides": ["SM-S911B OS 16 builds; CSC ZTO/ZTA Brazil"]
+    },
+    {
+      "id": "api_levels",
+      "url": "https://apilevels.com/",
+      "provides": ["release→SDK_INT: 13→33, 14→34, 15→35, 16→36"]
+    },
+    {
+      "id": "isocell",
+      "url": "https://en.wikipedia.org/wiki/Samsung_ISOCELL",
+      "provides": ["12MP sensors often 4032×3024 (~1/2.55\")"]
+    }
+  ],
+  "apiLevels": {
+    "12": 31,
+    "13": 33,
+    "14": 34,
+    "15": 35,
+    "16": 36
+  },
+  "sensorDefaults": {
+    "ultraWideMegapixels": 12,
+    "referenceWidth": 4032,
+    "referenceHeight": 3024,
+    "formatNote": "Resolução nativa 4:3 comum em UW Samsung 12MP; sidecar reescala para 1440×1080"
+  },
+  "videoDefaults": {
+    "gopMin": 28,
+    "gopMax": 32,
+    "bitrateMbpsMin": 7.4,
+    "bitrateMbpsMax": 8.8,
+    "note": "Faixas observadas em sidecars Android nativos ~30fps H.264"
+  },
+  "models": [
+    {
+      "commercial": "Galaxy S21",
+      "buildModel": "SM-G991B",
+      "codename": "o1s",
+      "chipset": "Exynos 2100",
+      "weight": 7,
+      "osReleases": ["14", "15"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "2"
+    },
+    {
+      "commercial": "Galaxy S21+",
+      "buildModel": "SM-G996B",
+      "codename": "t2s",
+      "chipset": "Exynos 2100",
+      "weight": 5,
+      "osReleases": ["14", "15"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "2"
+    },
+    {
+      "commercial": "Galaxy S21 Ultra",
+      "buildModel": "SM-G998B",
+      "codename": "p3s",
+      "chipset": "Exynos 2100",
+      "weight": 4,
+      "osReleases": ["14", "15"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "2"
+    },
+    {
+      "commercial": "Galaxy S22",
+      "buildModel": "SM-S901B",
+      "codename": "r0s",
+      "chipset": "Exynos 2200",
+      "weight": 8,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO", "ZTA"],
+      "logicalCameraIdDefault": "3"
+    },
+    {
+      "commercial": "Galaxy S22",
+      "buildModel": "SM-S901E",
+      "codename": "r0q",
+      "chipset": "Snapdragon 8 Gen 1",
+      "weight": 6,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["XSP", "XSA", "INS"],
+      "logicalCameraIdDefault": "3",
+      "anchorSerial": "RQCT804KN2N",
+      "note": "Âncora USB real capturada 2026-09-18 (data/device_anchors/galaxy_s22_rqct804kn2n.json)"
+    },
+    {
+      "commercial": "Galaxy S22+",
+      "buildModel": "SM-S906B",
+      "codename": "g0s",
+      "chipset": "Exynos 2200",
+      "weight": 7,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "3"
+    },
+    {
+      "commercial": "Galaxy S22 Ultra",
+      "buildModel": "SM-S908B",
+      "codename": "b0s",
+      "chipset": "Exynos 2200",
+      "weight": 8,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "3"
+    },
+    {
+      "commercial": "Galaxy S23",
+      "buildModel": "SM-S911B",
+      "codename": "dm1q",
+      "chipset": "Snapdragon 8 Gen 2",
+      "weight": 14,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO", "ZTA"],
+      "logicalCameraIdDefault": "4"
+    },
+    {
+      "commercial": "Galaxy S23+",
+      "buildModel": "SM-S916B",
+      "codename": "dm2q",
+      "chipset": "Snapdragon 8 Gen 2",
+      "weight": 9,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "4"
+    },
+    {
+      "commercial": "Galaxy S23 Ultra",
+      "buildModel": "SM-S918B",
+      "codename": "dm3q",
+      "chipset": "Snapdragon 8 Gen 2",
+      "weight": 10,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "4"
+    },
+    {
+      "commercial": "Galaxy S24",
+      "buildModel": "SM-S921B",
+      "codename": "e1s",
+      "chipset": "Exynos 2400 (EU) / regional SoC",
+      "weight": 14,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO", "ZTA"],
+      "logicalCameraIdDefault": "5"
+    },
+    {
+      "commercial": "Galaxy S24+",
+      "buildModel": "SM-S926B",
+      "codename": "e2s",
+      "chipset": "Exynos 2400 (EU) / regional SoC",
+      "weight": 9,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "5"
+    },
+    {
+      "commercial": "Galaxy S24 Ultra",
+      "buildModel": "SM-S928B",
+      "codename": "e3q",
+      "chipset": "Snapdragon 8 Gen 3",
+      "weight": 10,
+      "osReleases": ["14", "15", "16"],
+      "cscHint": ["EUX", "ZTO"],
+      "logicalCameraIdDefault": "5"
+    }
+  ]
+}

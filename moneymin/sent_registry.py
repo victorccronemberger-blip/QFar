@@ -12,8 +12,8 @@ Semântica:
   - Um clipe é "esgotado" para uma campanha quando TODAS as contas da campanha
     já constam na lista dele (`is_sent_to_all`). A seleção automática pula
     esses clipes.
-  - Quando não sobra nenhum clipe novo de um cenário (100% enviado), o chamador
-    reseta o cenário (`reset`) e recomeça do início — ver `campaign.run_campaign`.
+  - Quando não sobra nenhum clipe novo, a campanha informa esgotamento. O
+    histórico só é limpo por uma solicitação explícita de reset.
   - Na primeira leitura, se o arquivo não existe, o registro é SEMEADO a partir
     dos logs de campanha anteriores (`data/campaign_*.json`) — envios antigos
     continuam valendo.
@@ -28,7 +28,7 @@ from . import config
 from .atomic_io import load_json, save_json
 
 FILE_NAME = "sent_videos.json"
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 
 
 def _path() -> Path:
@@ -48,16 +48,24 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
         log = load_json(p, {})
         if not isinstance(log, dict):
             continue
-        for item in log.get("items", []):
+        items = log.get("items", [])
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             uid = item.get("clip_uid")
             task_id = item.get("task_id")
             task_name = item.get("task_name")
             scenario = (f"minute|{task_id}|{task_name}"
                         if task_id and task_name else item.get("task_scenario") or "")
-            if not uid:
+            if not isinstance(uid, str) or not uid or not isinstance(scenario, str):
                 continue
-            for acc in item.get("accounts", []):
-                if acc.get("ok") and acc.get("email"):
+            accounts = item.get("accounts", [])
+            if not isinstance(accounts, list):
+                continue
+            for acc in accounts:
+                if isinstance(acc, dict) and acc.get("ok") is True and isinstance(acc.get("email"), str):
                     entry = data.setdefault(scenario, {}).setdefault(uid, [])
                     if acc["email"] not in entry:
                         entry.append(acc["email"])
@@ -66,13 +74,25 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
 
 def load() -> dict[str, dict[str, list[str]]]:
     """Carrega o registro (semando dos logs de campanha na 1ª vez)."""
+    with _LOCK:
+        return _load_locked()
+
+
+def _load_locked() -> dict[str, dict[str, list[str]]]:
     path = _path()
     if not path.exists():
         data = _seed_from_logs()
         if data:
             _save(data)
         return data
-    raw = load_json(path, {})
+    raw = load_json(path, None)
+    if not isinstance(raw, dict) or any(
+        not isinstance(clips, dict) or any(
+            not isinstance(emails, list) or any(not isinstance(email, str) for email in emails)
+            for emails in clips.values())
+        for clips in raw.values()
+    ):
+        raise ValueError("Registro de envios inválido ou ilegível; restaure o arquivo antes de continuar.")
     # normaliza: garante dict[str, dict[str, list[str]]]
     out: dict[str, dict[str, list[str]]] = {}
     if isinstance(raw, dict):

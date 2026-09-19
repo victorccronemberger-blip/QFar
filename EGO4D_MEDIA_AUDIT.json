@@ -1,0 +1,1449 @@
+{
+  "offline": true,
+  "files_checked": 144,
+  "unreadable_metadata": 0,
+  "duration_mismatches_over_2s": 0,
+  "full_decode_performed": false,
+  "files": [
+    {
+      "file": "008bd464-9f3b-4972-8960-b113dcc1b9a9.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 479.9663411458333,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "0245a6d6-4a81-4c62-abd4-b2b90cf4e1fe.mp4",
+      "readable_metadata": true,
+      "duration_s": 299.968,
+      "expected_duration_s": 299.96666666666647,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "03a8286a-4777-46b4-80f1-afc3135fcc67.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0000000000002,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "05a6d5f7-e1d5-4af3-9ae8-f07d0ac12657.mp4",
+      "readable_metadata": true,
+      "duration_s": 2784.833,
+      "expected_duration_s": 2784.83,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "05ddc19f-8368-4736-bb85-c1071e7b554c.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 479.9666666666667,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "078634f1-0e81-455d-b771-3d35b65a2645.mp4",
+      "readable_metadata": true,
+      "duration_s": 2520.2,
+      "expected_duration_s": 2520.2,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "085ebd5a-e731-43c7-acdb-cf75d17d6b60.mp4",
+      "readable_metadata": true,
+      "duration_s": 479.104,
+      "expected_duration_s": 479.0666666666665,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "09caf8e5-59ba-4283-9e85-960682658fca.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "0a6b9994-77e3-4d27-972f-e2ff26635504.mp4",
+      "readable_metadata": true,
+      "duration_s": 299.968,
+      "expected_duration_s": 299.96666666666664,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "0d421f58-18cc-4bb2-ab69-160fde32aeff.mp4",
+      "readable_metadata": true,
+      "duration_s": 275.2,
+      "expected_duration_s": 275.20000000000005,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "0d56e589-e0c5-48c6-a005-101f1493d9ea.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.989,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "0dedbbb0-d1a4-4231-a980-2b43acc08cb2.mp4",
+      "readable_metadata": true,
+      "duration_s": 834.421,
+      "expected_duration_s": 834.4,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "0e56b0fc-7895-4872-b48c-07ed2ad3b486.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "129c4c5f-a231-4066-910e-b49b1fcd3168.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.032,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "1348c9f9-fc8b-40c7-b1ab-5b6281e5d390.mp4",
+      "readable_metadata": true,
+      "duration_s": 1056.822,
+      "expected_duration_s": 1056.82,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "141ce529-f793-48be-acde-24747af68b07.mp4",
+      "readable_metadata": true,
+      "duration_s": 1504.566,
+      "expected_duration_s": 1504.57,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "15cbaa98-040d-473d-b56f-18264d570a4c.mp4",
+      "readable_metadata": true,
+      "duration_s": 299.989,
+      "expected_duration_s": 299.96666666666647,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "16c0f075-55d7-4ad1-97a2-35c8d6785c05.mp4",
+      "readable_metadata": true,
+      "duration_s": 479.978,
+      "expected_duration_s": 479.9666666666667,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "17cfc7d4-aba7-4288-90a7-34d8ccf9cade.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 480.00000000000006,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "199459dc-d910-427f-b0fd-d8279ee059bf.mp4",
+      "readable_metadata": true,
+      "duration_s": 261.012,
+      "expected_duration_s": 261.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "1a8d0221-6297-486b-875b-e16bab629238.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.533,
+      "expected_duration_s": 479.9999999999999,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "1aa9115a-ed78-43aa-a084-3fa62ec69e14.mp4",
+      "readable_metadata": true,
+      "duration_s": 876.321,
+      "expected_duration_s": 876.3,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "1cf6813d-5bf0-4d5a-b525-6fb88f642ef3.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "1d468eb0-ff35-47a4-a690-68b4368568b2.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "1dcb61b5-41f9-4e07-93d1-8a84caef05ae.mp4",
+      "readable_metadata": true,
+      "duration_s": 253.633,
+      "expected_duration_s": 253.6210285999996,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "1e37a6ff-850b-4f13-9e7e-5ab23013d3d6.mp4",
+      "readable_metadata": true,
+      "duration_s": 479.978,
+      "expected_duration_s": 479.96666666666664,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "200a8f32-c44a-463d-ba39-0190a0bddf7a.mp4",
+      "readable_metadata": true,
+      "duration_s": 2807.094,
+      "expected_duration_s": 2807.09,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "200f21d7-0f65-4643-bd39-3df341692e5a.mp4",
+      "readable_metadata": true,
+      "duration_s": 304.933,
+      "expected_duration_s": 304.9210286458333,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "21a13007-d06c-4239-80f9-a4663ddf7cd1.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "24c89eb7-133c-4088-840c-a6a9e632aa72.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.032,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "256701cd-3317-47ee-b6e3-439dc2ad2bd5.mp4",
+      "readable_metadata": true,
+      "duration_s": 1678.954,
+      "expected_duration_s": 1678.93,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "25958482-25e7-4a9f-bdde-54d6be980118.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "282e18e8-8012-424b-8328-355ba25f5572.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "2970b84a-d6cf-4593-a487-53f853f0418f.mp4",
+      "readable_metadata": true,
+      "duration_s": 3692.335,
+      "expected_duration_s": 3692.34,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "2cc0f596-8c3b-4521-8a47-a920c95ef546.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 479.9666666666667,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "2d248bed-939b-4b42-8a93-59242aca623a.mp4",
+      "readable_metadata": true,
+      "duration_s": 280.0,
+      "expected_duration_s": 280.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "2de56aa1-54d3-4d99-ab0d-6610560f30bc.mp4",
+      "readable_metadata": true,
+      "duration_s": 2707.2,
+      "expected_duration_s": 2707.2,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "2f928978-927f-46f6-87f9-79359d9f9abd.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.032,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "3199c870-0756-4f33-b4e0-69b15d0e94ae.mp4",
+      "readable_metadata": true,
+      "duration_s": 217.666,
+      "expected_duration_s": 217.65102860000002,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "343ff902-f0c0-4931-bca6-872ff9066fec.mp4",
+      "readable_metadata": true,
+      "duration_s": 2472.762,
+      "expected_duration_s": 2472.76,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "36b0edc8-b292-47dc-9a41-f08cc605df73.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "3b02260b-9b6f-4ee0-95e9-3e50f97a7076.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.032,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "3bcc1b2a-d0cf-4f30-bacd-e4c0e2dc9d99.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.968,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "3e7e162a-1cb3-4bdc-b6c2-e14845298360.mp4",
+      "readable_metadata": true,
+      "duration_s": 3378.333,
+      "expected_duration_s": 3378.33,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "44a08410-dfa2-441b-a7ac-260b593f5530.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.032,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "454941f2-732e-4654-977c-6d2432803762.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.968,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "45c4f0a9-83ff-4a8a-86c7-ad322f17de90.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 480.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "46f2ff11-b17b-4f48-a247-acd38265aea5.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "49a535af-4f9d-466d-a89a-19ac6c8be057.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "4a7cdfb4-c398-4b21-96ad-3ea0bcfc9fa5.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.032,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "4c64cec6-a45a-4d38-8ed8-dfb365a9da67.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.989,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "4dc1caff-6353-4a05-9382-92031b25f783.mp4",
+      "readable_metadata": true,
+      "duration_s": 3643.363,
+      "expected_duration_s": 3643.36,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "501d1e55-968d-4c10-9d29-e0f4bee907a0.mp4",
+      "readable_metadata": true,
+      "duration_s": 977.687,
+      "expected_duration_s": 977.67,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "5027f15b-aac9-43f1-a9de-63fa7f1cf793.mp4",
+      "readable_metadata": true,
+      "duration_s": 308.0,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "504315c0-17fd-4259-9d2c-fd2b25fdcbea.mp4",
+      "readable_metadata": true,
+      "duration_s": 1276.487,
+      "expected_duration_s": 1276.48,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "5523bfcb-69c6-4cab-9397-83a3cd5d97bc.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "5751072a-12d4-4de7-bfdb-1dec59b4d242.mp4",
+      "readable_metadata": true,
+      "duration_s": 959.978,
+      "expected_duration_s": 959.4333333333333,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "580ba221-4cdd-48ba-b695-7705c1604e6e.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 480.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "5d28df24-4e2c-49c6-b158-60cfd6b18547.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "5d8ebbea-6371-4be5-b611-751fb49ec294.mp4",
+      "readable_metadata": true,
+      "duration_s": 1943.387,
+      "expected_duration_s": 1943.37,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "5f20b0ff-beb6-47ec-9fc1-cf06b963a3d1.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 479.96666666666715,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "6295eab0-4b12-4789-8664-aac5465ef3e4.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "63f0cd96-bdee-4d1d-9a48-dada40f3cf6b.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "66f93990-3f9e-44a9-a3b2-753319dc4e2b.mp4",
+      "readable_metadata": true,
+      "duration_s": 444.544,
+      "expected_duration_s": 444.55,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "6c03be74-4692-4e3e-8eab-01f9f8e0d3ba.mp4",
+      "readable_metadata": true,
+      "duration_s": 1253.254,
+      "expected_duration_s": 1253.23,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "6c78c9b0-d5cd-4c04-a6f0-14e648e87c40.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "6e7f61fc-8113-4409-9548-464f3ee4208b.mp4",
+      "readable_metadata": true,
+      "duration_s": 479.914,
+      "expected_duration_s": 479.36666666666645,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "70bb4ddc-d071-4842-816a-5c3bd86260ea.mp4",
+      "readable_metadata": true,
+      "duration_s": 479.978,
+      "expected_duration_s": 479.96666666666647,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "72f5f143-1002-4a97-92e2-48d84aa5566f.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "736c7bdd-3a37-42e1-8fd6-46d998cd2370.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "7388c566-f679-4082-9ac7-aae4379d1a72.mp4",
+      "readable_metadata": true,
+      "duration_s": 960.021,
+      "expected_duration_s": 959.9333333333334,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "7409dddf-141f-43a7-a8b6-3656cb97d9cf.mp4",
+      "readable_metadata": true,
+      "duration_s": 294.4,
+      "expected_duration_s": 294.4,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "74f739b0-a996-40b1-a239-275cbcf32be3.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "7b5fafdb-136a-4722-84a4-cffb213a224a.mp4",
+      "readable_metadata": true,
+      "duration_s": 2696.921,
+      "expected_duration_s": 2696.9,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "7d4c6d00-2d07-47fb-9ca3-0abd9ab3041d.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 480.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "8c1b30cd-f67f-479a-b723-7367528ccb8e.mp4",
+      "readable_metadata": true,
+      "duration_s": 1123.121,
+      "expected_duration_s": 1123.1,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "8ef8c0e6-c571-40b6-8b1b-a98b577d0b9d.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.968,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "8f1072a2-d80f-4df9-b501-2dacead5b11b.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "8fb77656-1c16-4434-80d4-1e498e9f7e35.mp4",
+      "readable_metadata": true,
+      "duration_s": 479.978,
+      "expected_duration_s": 479.96666666666664,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "9b49246f-30e9-476f-ab8c-56a1bcb1d936.mp4",
+      "readable_metadata": true,
+      "duration_s": 3553.054,
+      "expected_duration_s": 3553.03,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "9d0f69f2-1328-4625-8cbd-5a55145fbddc.mp4",
+      "readable_metadata": true,
+      "duration_s": 299.989,
+      "expected_duration_s": 299.46666666666664,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "9eafa9d7-3825-41d3-a8c9-c00e97699801.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.989,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "a0d6bd8e-c477-442b-bab3-731775b44b43.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "a33e3cbe-00a8-4a19-91c8-20ebf20e039b.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "a4c4be29-d263-420a-928f-c3bb876fc5fb.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "a74e8558-371d-4058-aff0-f3f815b9f179.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "a96c54b0-7f20-4428-81f1-e68271222ce4.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "a9836c35-e03c-4c1e-93e2-d657b3dc6c89.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.01,
+      "expected_duration_s": 300.00000000000045,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "ab48a036-e22b-4a3b-be4b-a45e62780cf7.mp4",
+      "readable_metadata": true,
+      "duration_s": 959.966,
+      "expected_duration_s": 959.9666666666667,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "af16d9ef-f726-49dc-bf2e-73553dd417fd.mp4",
+      "readable_metadata": true,
+      "duration_s": 3470.166,
+      "expected_duration_s": 3470.17,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b1543ea3-e86b-4545-9195-f1bf83e02b41.mp4",
+      "readable_metadata": true,
+      "duration_s": 4278.687,
+      "expected_duration_s": 4278.67,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b1c09d0e-632f-47eb-a91c-93f49c957a6a.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.01,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b29b29d2-8335-4307-b5d7-976fa2b38f28.mp4",
+      "readable_metadata": true,
+      "duration_s": 2009.661,
+      "expected_duration_s": 2009.66,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b317699c-5c16-41bd-bff7-d35e4a9d669a.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.533,
+      "expected_duration_s": 480.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b35de84e-db8c-4c6d-ab33-ad76fc38e19c.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.989,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b5680ecf-62c3-450d-82bd-70c463758618.mp4",
+      "readable_metadata": true,
+      "duration_s": 164.8,
+      "expected_duration_s": 164.79102864583342,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "b71e334a-e740-40be-8763-8539a91b44c3.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.968,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b7d315bf-0974-4919-aae9-20e2d5b6cbf1.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.989,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "b7f9b277-a5a6-4624-819c-8ab599228a7c.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "bac24a99-07e7-42f0-bba8-4ec3099c73e8.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "bdcfd3bf-e13f-41e1-9127-4419d228eda9.mp4",
+      "readable_metadata": true,
+      "duration_s": 91.69,
+      "expected_duration_s": 91.68772864583336,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "bde4453e-a00b-4841-acdd-f0343eef4592.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.01,
+      "expected_duration_s": 299.9666666666666,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "c05389ca-2d74-4889-a8dd-a0f89d28a4b7.mp4",
+      "readable_metadata": true,
+      "duration_s": 3334.3,
+      "expected_duration_s": 3334.3,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "c396d137-e956-4a7f-ab2e-5a0b29c51afa.mp4",
+      "readable_metadata": true,
+      "duration_s": 1916.166,
+      "expected_duration_s": 1916.17,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "c701db6d-14e6-484b-8d3f-4132a53c8477.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.032,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "c80eb130-cd42-4809-a606-48bfe5a22f0b.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.042,
+      "expected_duration_s": 480.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "c8be43b4-1541-4835-9f54-a87ef09d1dcb.mp4",
+      "readable_metadata": true,
+      "duration_s": 308.0,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "c8e1a3d0-517b-4553-9621-e14776992fde.mp4",
+      "readable_metadata": true,
+      "duration_s": 2460.587,
+      "expected_duration_s": 2460.58,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "cac166bf-48d8-43be-aa39-f2e20b4d015a.mp4",
+      "readable_metadata": true,
+      "duration_s": 3320.221,
+      "expected_duration_s": 3320.2,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "cbfb17be-3f31-49d8-a7cd-eb12215f1f17.mp4",
+      "readable_metadata": true,
+      "duration_s": 960.021,
+      "expected_duration_s": 959.9333333333338,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "ce2cf2f6-24aa-4195-93a6-f82b283815e6.mp4",
+      "readable_metadata": true,
+      "duration_s": 1344.127,
+      "expected_duration_s": 1344.13,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "d0439c3e-10b8-469a-89da-46d3d42ac116.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.01,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "d38f271c-53f3-4771-8c17-a5157e723067.mp4",
+      "readable_metadata": true,
+      "duration_s": 2274.254,
+      "expected_duration_s": 2274.25,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "d44c37cc-4f1e-4924-9d9f-b5fc6ba7cc79.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 480.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "d61b035d-3406-4800-b206-1fff4c36c181.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "d851b431-8551-492b-8332-bd46c3bfdaba.mp4",
+      "readable_metadata": true,
+      "duration_s": 135.0,
+      "expected_duration_s": 134.99102864583324,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "d9941963-10dd-49bc-badc-998c88cf1e18.mp4",
+      "readable_metadata": true,
+      "duration_s": 1926.987,
+      "expected_duration_s": 1926.97,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "d9eb1ae4-acee-457e-a0bf-b0e49b4576ce.mp4",
+      "readable_metadata": true,
+      "duration_s": 1146.12,
+      "expected_duration_s": 1146.12,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "da6fa34f-d1bd-4a73-bfcd-3832f06b3ee9.mp4",
+      "readable_metadata": true,
+      "duration_s": 337.454,
+      "expected_duration_s": 337.43,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "dbee73d4-0d09-438c-9e29-1c33f5beba05.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "ddd35d9d-ca29-40d0-86dd-c1f433337ad3.mp4",
+      "readable_metadata": true,
+      "duration_s": 307.989,
+      "expected_duration_s": 308.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "df01a6a0-2404-4a91-bd95-1ca04a4bcb05.mp4",
+      "readable_metadata": true,
+      "duration_s": 959.233,
+      "expected_duration_s": 959.23,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "e4fa4f19-8b16-4e64-8a91-25fb3932d0d3.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.128,
+      "expected_duration_s": 479.60000000000014,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "e6b7692d-5e35-4524-8d2a-385475b95806.mp4",
+      "readable_metadata": true,
+      "duration_s": 4075.466,
+      "expected_duration_s": 4075.47,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "e6de9f4e-778b-4da9-8c2d-4660d0c6d33d.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 480.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "e77b2d11-d741-4540-8e2f-a4db9536497b.mp4",
+      "readable_metadata": true,
+      "duration_s": 960.0,
+      "expected_duration_s": 960.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "e91bd0fd-abaa-4aa8-90db-21eae97c25f3.mp4",
+      "readable_metadata": true,
+      "duration_s": 1932.454,
+      "expected_duration_s": 1932.43,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "ea58efce-c464-4e33-9361-944940bad29d.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "eaf2e131-14f8-43ee-a956-dbc0360b07b1.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "ed405257-58f3-4655-8155-90fb549152f6.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 299.9999999999999,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "ef84248e-261c-466f-91f6-99f6323a00eb.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.0,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "f18ee9aa-63f0-49e8-b33c-5e12569b9a52.mp4",
+      "readable_metadata": true,
+      "duration_s": 215.4,
+      "expected_duration_s": 215.39999999999998,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "f1911737-8a70-4857-8623-3fa77d9f774d.mp4",
+      "readable_metadata": true,
+      "duration_s": 299.968,
+      "expected_duration_s": 299.96666666666664,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "f22b51c7-e23d-487b-bbb2-42bc5200bf2c.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 299.9999999999999,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "f3a9685f-0238-45a8-b7f5-30660e4d3acf.mp4",
+      "readable_metadata": true,
+      "duration_s": 1239.454,
+      "expected_duration_s": 1239.43,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "f4ac6bfc-053a-4316-8900-7610713d9dca.mp4",
+      "readable_metadata": true,
+      "duration_s": 316.01,
+      "expected_duration_s": 316.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "f576f1bf-5433-488b-8833-8320f087e72b.mp4",
+      "readable_metadata": true,
+      "duration_s": 1305.287,
+      "expected_duration_s": 1305.29,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "f6277269-1c87-439c-b5be-d4a02343018a.mp4",
+      "readable_metadata": true,
+      "duration_s": 1640.421,
+      "expected_duration_s": 1640.4,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "f71b628a-b561-41d9-a41e-c1e505bed2f7.mp4",
+      "readable_metadata": true,
+      "duration_s": 214.633,
+      "expected_duration_s": 214.6300000000001,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "fac31156-8291-4262-ad04-34127a4c874b.mp4",
+      "readable_metadata": true,
+      "duration_s": 479.966,
+      "expected_duration_s": 479.96666666666664,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "fc9a67e6-5c9e-4158-afdf-a482312c6502.mp4",
+      "readable_metadata": true,
+      "duration_s": 480.0,
+      "expected_duration_s": 479.99967447916663,
+      "duration_mismatch": false,
+      "width": 1920,
+      "height": 1440,
+      "fps": 30.0
+    },
+    {
+      "file": "fdd4b199-bbac-43b1-badc-79f07d5d9e89.mp4",
+      "readable_metadata": true,
+      "duration_s": 300.0,
+      "expected_duration_s": 300.0,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "fec1f883-fc5c-4257-985e-26efaec68ddc.mp4",
+      "readable_metadata": true,
+      "duration_s": 2586.533,
+      "expected_duration_s": 2586.53,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    },
+    {
+      "file": "ffb6dfc1-d2f9-45b1-8e25-2c7d0f32d635.mp4",
+      "readable_metadata": true,
+      "duration_s": 1654.3,
+      "expected_duration_s": 1654.3,
+      "duration_mismatch": false,
+      "width": 1440,
+      "height": 1080,
+      "fps": 30.0
+    }
+  ]
+}

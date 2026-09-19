@@ -62,6 +62,7 @@ class CampaignSelectionTests(unittest.TestCase):
                                            min_dur_s=180, max_dur_s=780,
                                            dataset_provider="ego4d")
         self.assertEqual([row["clip_count"] for row in visible], [1, 1])
+        self.assertEqual([row["parent_video_count"] for row in visible], [1, 1])
         events = []
         with patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
              patch.object(campaign, "prepare_clip", side_effect=RuntimeError("test preparation failure")), \
@@ -70,7 +71,8 @@ class CampaignSelectionTests(unittest.TestCase):
         selected = [p["clip_uid"] for k, p in events if k == "clip_prepare_start"]
         self.assertEqual(selected, ["dog-300", "furniture-300"])
         upload.assert_not_called()
-        self.assertEqual(len(result.issues), 2)
+        self.assertEqual(sum(i["kind"] == "clip_prepare_done" for i in result.issues), 2)
+        self.assertEqual(sum(i["kind"] == "task_shortfall" for i in result.issues), 2)
         self.assertEqual(result.status, "error")
 
     def test_empty_selection_is_visible_persisted_and_never_success(self):

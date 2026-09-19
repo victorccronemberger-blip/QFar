@@ -23,6 +23,8 @@ def _provider_from_preferences() -> str:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return "holoassist"
+    if not isinstance(raw, dict):
+        return "holoassist"
     provider = str(raw.get("dataset_provider") or "holoassist").strip().lower()
     return provider if provider in {"holoassist", "ego4d", "all"} else "holoassist"
 
@@ -72,6 +74,8 @@ def _valid_account_tokens() -> tuple[int, int]:
         try:
             token = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
+            continue
+        if not isinstance(token, dict):
             continue
         has_identity = bool(token.get("email"))
         has_auth = bool(

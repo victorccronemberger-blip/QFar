@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,20 @@ from types import SimpleNamespace
 from unittest import mock
 
 from moneymin import ego4d, readiness
+
+
+class ReadinessCorruptionTests(unittest.TestCase):
+    def test_non_object_files_do_not_crash_campaign_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(readiness.config, "DATA_DIR", root), \
+                 mock.patch.object(readiness.config, "SECRETS_DIR", root):
+                for data in (None, [], "invalid", 42):
+                    with self.subTest(data=data):
+                        (root / "webui_prefs.json").write_text(json.dumps(data), encoding="utf-8")
+                        (root / "token_invalid.json").write_text(json.dumps(data), encoding="utf-8")
+                        self.assertEqual(readiness._provider_from_preferences(), "holoassist")
+                        self.assertEqual(readiness._valid_account_tokens(), (0, 1))
 
 
 class ReleaseReadinessTests(unittest.TestCase):

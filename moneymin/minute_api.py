@@ -25,18 +25,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, parse_qs
 
 from . import config, device_profile, transport
 from .atomic_io import save_json
+from .service_policy import RecordingPolicy
 
 # Folga antes do exp do JWT: PUT de blob pode passar de 2 min; 10 min evita
 # mandar um Bearer que morre no meio do upload.
 _REFRESH_SKEW_S = 10 * 60
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
-_WARMED_IDENTITIES: set[str] = set()
-_WARMED_IDENTITIES_GUARD = threading.Lock()
 
 # --- Endpoints Firebase / Google Identity Toolkit ---------------------------
 _SIGNIN_URL = (
@@ -69,7 +68,7 @@ def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False)
     elif status == 401:
         code = "authentication"
     elif status == 403:
-        code = "forbidden"
+        code = _classify_minute_403(body) or "forbidden"
     if firebase and status in (400, 401, 403):
         try:
             payload = json.loads(body)
@@ -161,45 +160,73 @@ def _is_geo_route(path: str) -> bool:
 
 
 # --- Version gate (kill-switch por 403, réplica do maybeLatchVersionGate) -----
+# Hermes: detail.error === 'app_version_too_old' e detail.min_version parseável.
+
+_APP_VERSION_TOO_OLD = "app_version_too_old"
+_BLOCKED_DETAIL_ERRORS = {
+    _APP_VERSION_TOO_OLD: "version",
+    "device": "device",
+    "uber-device": "uber_device",
+}
+
 
 def _version_gate_file() -> Path:
     config.DATA_DIR.mkdir(exist_ok=True, parents=True)
     return config.DATA_DIR / "version-gate.json"
 
 
-def _maybe_latch_version_gate(text: str, *, clear: bool = False) -> None:
-    """Persiste `minVersion` localmente após um 403 de version gate.
+def _parse_blocked_detail(text: str) -> dict[str, Any] | None:
+    """Extrai `detail` de um corpo 403 no formato do app (`blockedDetailSchema`)."""
+    try:
+        body = json.loads(text) if text and str(text).strip() else {}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("detail")
+    return detail if isinstance(detail, dict) else None
 
-    Qualquer 403 pode disparar a trava no app (`maybeLatchVersionGate` →
-    MMKV `version-gate`). Conservador: só trava se o corpo parecer version
-    gate. `clear=True` remove a trava (revert explicit).
+
+def _classify_minute_403(text: str) -> str | None:
+    """Mapeia `detail.error` do Minute para código de diagnóstico."""
+    detail = _parse_blocked_detail(text)
+    if not detail:
+        return None
+    error = detail.get("error")
+    if not isinstance(error, str):
+        return None
+    return _BLOCKED_DETAIL_ERRORS.get(error)
+
+
+def _parse_semver_or_none(value: Any) -> tuple[int, int, int] | None:
+    """Aceita somente os três componentes numéricos do contrato Hermes."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
+        return None
+    try:
+        major, minor, patch = map(int, value.split("."))
+    except ValueError:
+        return None
+    return major, minor, patch
+
+
+def _maybe_latch_version_gate(text: str, *, clear: bool = False) -> None:
+    """Persiste `min_version` só no contrato do APK (`maybeLatchVersionGate`).
+
+    Trava apenas quando `detail.error === app_version_too_old` e
+    `detail.min_version` é um semver parseável. `clear=True` remove a trava.
     """
     if clear:
         _version_gate_file().unlink(missing_ok=True)
         return
-    try:
-        body = json.loads(text) if text and text.strip() else {}
-    except (json.JSONDecodeError, ValueError):
-        body = {}
-    if not isinstance(body, dict):
+    detail = _parse_blocked_detail(text)
+    if not detail or detail.get("error") != _APP_VERSION_TOO_OLD:
         return
-    flat = json.dumps(body, ensure_ascii=False).casefold()
-    if not any(token in flat for token in (
-            "app_version", "minversion", "app_version_too_old", "update",
-            "minimum version", "minimum_app_version")):
+    min_version = detail.get("min_version")
+    if _parse_semver_or_none(min_version) is None:
         return
-    min_version = (
-        body.get("minVersion")
-        or body.get("minimum_app_version")
-        or body.get("app_version_min")
-        or body.get("required_version")
-        or (body.get("detail") or {}).get("minVersion")
-        or (body.get("detail") or {}).get("min_version")
-        or config.APP_VERSION
-    )
     try:
         _version_gate_file().write_text(json.dumps({
-            "minVersion": str(min_version),
+            "minVersion": str(min_version).strip(),
             "appVersion": config.APP_VERSION,
             "latchedAt": int(time.time()),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -209,12 +236,30 @@ def _maybe_latch_version_gate(text: str, *, clear: bool = False) -> None:
 
 def _semver_tuple(value: str) -> tuple[int, int, int]:
     """Compara versões '1.22.0' de forma tolerante a sufixos."""
-    import re as _re
-    parts = [int(p) for p in _re.sub(r"[^0-9.]", "", str(value)).split(".") if p]
-    parts = parts[:3] or [0, 0, 0]
-    while len(parts) < 3:
-        parts.append(0)
-    return (parts[0], parts[1], parts[2])
+    return _parse_semver_or_none(value) or (0, 0, 0)
+
+
+def _version_gate_blocks() -> bool:
+    """True se a trava local exige versão maior que a do cliente."""
+    path = _version_gate_file()
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError, OSError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    minimum = _parse_semver_or_none(data.get("minVersion"))
+    current = _parse_semver_or_none(config.APP_VERSION)
+    return minimum is not None and current is not None and current < minimum
+
+
+def _normalize_camera_model(model: Any) -> str:
+    """`normalizeModel` do APK: trim + lower + colapso de whitespace."""
+    if model is None:
+        return ""
+    return re.sub(r"\s+", " ", str(model).strip().lower())
 
 
 def _request_detailed(
@@ -247,6 +292,26 @@ def _request_detailed(
 
 
 # --- Autenticação ------------------------------------------------------------
+def _validate_token_response(data: Any, token_key: str, refresh_key: str,
+                             expiry_key: str) -> int:
+    """Valida a resposta inteira antes de persistir ou substituir credenciais."""
+    if not isinstance(data, dict) or any(
+        not isinstance(data.get(key), str) or not data[key].strip()
+        for key in (token_key, refresh_key)
+    ):
+        raise AuthError("Resposta de autenticação inválida.", code="invalid_response")
+    value = data.get(expiry_key)
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise AuthError("Validade da sessão inválida.", code="invalid_response")
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise AuthError("Validade da sessão inválida.", code="invalid_response") from exc
+    if seconds <= 0:
+        raise AuthError("Validade da sessão inválida.", code="invalid_response")
+    return seconds
+
+
 def login(email: str, password: str) -> dict[str, Any]:
     """Autentica no Firebase e grava `secrets/token_<email>.json`.
 
@@ -264,10 +329,11 @@ def login(email: str, password: str) -> dict[str, Any]:
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise RuntimeError(f"login devolveu resposta inválida: {body[:300]}") from exc
+        raise AuthError("Login devolveu resposta inválida.", code="invalid_response") from exc
 
+    expires_in = _validate_token_response(data, "idToken", "refreshToken", "expiresIn")
     data["expires_at"] = _expiry_from_token(
-        data.get("idToken"), int(data.get("expiresIn", "3600"))
+        data["idToken"], expires_in
     )
     path = config.token_path(email)
     save_json(path, data)
@@ -424,18 +490,10 @@ def _refresh(token_data: dict[str, Any]) -> dict[str, Any]:
         raise AuthError(
             f"refresh devolveu resposta vazia/não-JSON ({status}).", code="invalid_response",
         ) from exc
-    if not isinstance(resp, dict) or not resp.get("id_token") or not resp.get("refresh_token"):
-        raise AuthError("refresh devolveu resposta vazia/não-JSON.", code="invalid_response")
-    try:
-        expires_in = int(resp.get("expires_in", "3600"))
-    except (TypeError, ValueError) as exc:
-        raise AuthError("refresh devolveu validade inválida.", code="invalid_response") from exc
-    token_data["idToken"] = resp["id_token"]
-    token_data["refreshToken"] = resp["refresh_token"]
-    token_data["expiresIn"] = str(resp.get("expires_in", "3600"))
-    token_data["expires_at"] = _expiry_from_token(
-        resp["id_token"], expires_in
-    )
+    expires_in = _validate_token_response(resp, "id_token", "refresh_token", "expires_in")
+    expires_at = _expiry_from_token(resp["id_token"], expires_in)
+    token_data.update(idToken=resp["id_token"], refreshToken=resp["refresh_token"],
+                      expiresIn=str(expires_in), expires_at=expires_at)
     return token_data
 
 
@@ -455,6 +513,11 @@ class Session:
         # nunca é enviado à API sem troca no Firebase.
         self._live = False
         self._lock = threading.RLock()
+        self.recording_policy: RecordingPolicy | None = None
+        self.initialization_errors: dict[str, str] = {}
+        self._recording_checked_at: float | None = None
+        self._recording_retry_at = 0.0
+        self._quota_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     @classmethod
     def from_file(cls, token_file: str | Path, *, live: bool = True) -> Session:
@@ -497,7 +560,18 @@ class Session:
 
     def with_email(self, email: str) -> Session:
         """Fixa o e-mail da conta (fonte do perfil de aparelho)."""
-        self.email = email
+        with self._lock:
+            if str(self.email or "").casefold() != email.casefold():
+                self.recording_policy = None
+                self.recording_config = {}
+                self.device_camera_allowed = None
+                self.initialization_errors = {}
+                self._recording_checked_at = None
+                self._recording_retry_at = 0.0
+                self._initialization_failures = 0
+                self._quota_cache = {}
+                self._app_opened_published = False
+            self.email = email
         return self
 
     def _who(self) -> str:
@@ -545,6 +619,7 @@ class Session:
 
     # -- chamadas genéricas --------------------------------------------------
     def request(self, method: str, path: str, body: Any = None) -> tuple[int, str]:
+        self._check_write_policy(method, path, body)
         headers: dict[str, str] = {
             "Authorization": f"Bearer {self.id_token}",
             "Accept": "*/*",
@@ -578,6 +653,8 @@ class Session:
             headers["Authorization"] = f"Bearer {self._bearer()}"
             status2, text2 = _request(
                 config.BASE_URL + path, method, headers=headers, body=body)
+            if status2 == 403:
+                _maybe_latch_version_gate(text2)
             if status2 != 401:
                 return status2, text2
             try:
@@ -585,7 +662,10 @@ class Session:
             except AuthError:
                 raise
             headers["Authorization"] = f"Bearer {self._bearer()}"
-            return _request(config.BASE_URL + path, method, headers=headers, body=body)
+            status3, text3 = _request(config.BASE_URL + path, method, headers=headers, body=body)
+            if status3 == 403:
+                _maybe_latch_version_gate(text3)
+            return status3, text3
         finally:
             self._refreshing = False
 
@@ -593,6 +673,7 @@ class Session:
         self, method: str, path: str, body: Any = None,
     ) -> HttpResponse:
         """Como :meth:`request`, incluindo headers e o mesmo refresh de token."""
+        self._check_write_policy(method, path, body)
         headers: dict[str, str] = {
             "Authorization": f"Bearer {self.id_token}",
             "Accept": "*/*",
@@ -620,6 +701,8 @@ class Session:
             headers["Authorization"] = f"Bearer {self._bearer()}"
             refreshed = _request_detailed(
                 config.BASE_URL + path, method, headers=headers, body=body)
+            if refreshed.status == 403:
+                _maybe_latch_version_gate(refreshed.text)
             if refreshed.status != 401:
                 return refreshed
             try:
@@ -627,8 +710,11 @@ class Session:
             except AuthError:
                 raise
             headers["Authorization"] = f"Bearer {self._bearer()}"
-            return _request_detailed(
+            relogged = _request_detailed(
                 config.BASE_URL + path, method, headers=headers, body=body)
+            if relogged.status == 403:
+                _maybe_latch_version_gate(relogged.text)
+            return relogged
         finally:
             self._refreshing = False
 
@@ -640,7 +726,9 @@ class Session:
 
     def json(self, method: str, path: str, body: Any = None) -> Any:
         """Como request(), mas devolve o corpo já parseado (ou {} se não-JSON)."""
-        _, text = self.request(method, path, body)
+        status, text = self.request(method, path, body)
+        if not 200 <= status < 300:
+            return {}
         try:
             return json.loads(text)
         except (json.JSONDecodeError, ValueError):
@@ -663,7 +751,40 @@ class Session:
         return self.json("GET", f"/api/v1/orgs/{org_key}/tasks{query}")
 
     def org_quota(self, org_key: str) -> Any:
-        return self.json("GET", f"/api/v1/orgs/{org_key}/quota")
+        """Quota/geo da org (`getRecordingGeo` do app)."""
+        return self.recording_geo(org_key)
+
+    def recording_geo(self, org_key: str) -> dict[str, Any]:
+        """GET /orgs/{org}/quota — autorização de gravação/geo com cache curto.
+
+        Contrato OpenAPI `QuotaStatusResponse`. Resposta inválida ou HTTP de
+        erro devolve `{}` (estado desconhecido — não autoriza upload).
+        """
+        cached = self._quota_cache.get(org_key)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < 60:
+            return dict(cached[1])
+        status, text = self.get(f"/api/v1/orgs/{org_key}/quota")
+        if status != 200:
+            return {}
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        auth = data.get("recordingAuthorization")
+        can = data.get("canUpload")
+        reason = data.get("blockedReason")
+        if auth not in ("APPROVED", "REQUIRES_LOCATION", "BLOCKED"):
+            return {}
+        if type(can) is not bool or "blockedReason" not in data:
+            return {}
+        if reason is not None and reason not in (
+                "manual", "quota_exceeded", "geo_restricted", "geo_unknown"):
+            return {}
+        self._quota_cache[org_key] = (now, data)
+        return dict(data)
 
     def join_org(self, code: str) -> tuple[int, str]:
         return self.post("/api/v1/organizations/join", {"code": code})
@@ -697,8 +818,13 @@ class Session:
         ``users/{user_key}/quality-scores`` existe, mas a própria OpenAPI a
         restringe a administradores da organização e data overlords.
         """
-        data = self.json(
-            "GET", f"/api/v1/organizations/{org_key}/quality-screen")
+        status, text = self.get(f"/api/v1/organizations/{org_key}/quality-screen")
+        if status != 200:
+            return {}
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return {}
         return data if isinstance(data, dict) else {}
 
     def org_state(self, org_key: str) -> dict[str, Any]:
@@ -712,6 +838,8 @@ class Session:
         on_hold/inactive — uma org desativada entre várias NÃO bloqueia.
         """
         profile = self.me() or {}
+        if not isinstance(profile, dict) or not isinstance(profile.get("organizations"), list):
+            raise AuthError("Não foi possível verificar o perfil da organização.", code="invalid_response")
         org = next(
             (o for o in (profile.get("organizations") or [])
              if isinstance(o, dict) and o.get("resourceKey") == org_key),
@@ -736,38 +864,44 @@ class Session:
         }
 
     def camera_policy(self) -> dict[str, Any]:
-        """GET /devices/native-camera-policy — allowlist remota de dispositivos."""
-        data = self.json("GET", "/api/v1/devices/native-camera-policy")
-        return data if isinstance(data, dict) else {}
+        """GET /devices/native-camera-policy — contrato OpenAPI NativeCameraPolicyResponse."""
+        status, text = self.get("/api/v1/devices/native-camera-policy")
+        if status != 200:
+            return {}
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return {}
+        if (not isinstance(data, dict) or type(data.get("policyVersion")) is not int
+                or data["policyVersion"] < 1):
+            return {}
+        for key in ("iosAllowModels", "iosDeniedModels",
+                    "androidAllowModels", "androidAllowModelPatterns"):
+            if not isinstance(data.get(key), list) or any(not isinstance(item, str) for item in data[key]):
+                return {}
+        normalization = data.get("normalization")
+        if not isinstance(normalization, dict) or any(type(normalization.get(key)) is not bool for key in
+                ("trimWhitespace", "lowercase", "collapseInternalWhitespace")):
+            return {}
+        return data
 
     def camera_model_allowed(self, model: str) -> bool | None:
-        """Decide se um Build.MODEL passa na allowlist nativa (None = sem policy)."""
+        """Réplica de `getNativeCameraDecision` (Android) do app 1.22.0.
+
+        Sempre normaliza o modelo (trim + lower + colapso de espaços), compara
+        com `androidAllowModels` crus e aplica `RegExp(pattern).test(model)`
+        via `re.search`. Não há deny-list Android no contrato OpenAPI/Hermes.
+        """
         policy = self.camera_policy()
         if not policy:
             return None
-
-        def _norm(value: str) -> str:
-            result = str(value or "")
-            norm = (policy.get("normalization") or {})
-            if norm.get("trimWhitespace"):
-                result = result.strip()
-            if norm.get("lowercase"):
-                result = result.lower()
-            if norm.get("collapseInternalWhitespace"):
-                result = re.sub(r"\s+", " ", result)
-            return result
-
-        normalized = _norm(model)
-        denied = {_norm(m) for m in (policy.get("androidDeniedModels") or [])}
-        if normalized in denied:
-            return False
-        allowed = {_norm(m) for m in (policy.get("androidAllowModels") or [])}
+        normalized = _normalize_camera_model(model)
+        allowed = policy.get("androidAllowModels") or []
         if normalized in allowed:
             return True
         for pattern in (policy.get("androidAllowModelPatterns") or []):
             try:
-                if re.search(_norm(pattern), normalized) \
-                        or re.fullmatch(str(pattern), model or ""):
+                if re.search(str(pattern), normalized) is not None:
                     return True
             except re.error:
                 continue
@@ -832,11 +966,12 @@ class Session:
 
         Com `org_key`, replica as travas do app para aquela org:
           - `quality-screen` (userState on_hold/inactive) → conta parada;
-          - version gate latch local (403) → versão travada.
+
+        O latch de versão é aplicado às mutações, preservando esta leitura
+        para diagnóstico.
 
         Levanta AuthError com instrução clara se a conta não autenticar (ex.:
-        refresh token expirado), estiver desativada, em hold, ou com versão
-        bloqueada.
+        refresh token expirado), estiver desativada ou em hold.
         """
         if not self._live:
             self.refresh()
@@ -851,16 +986,7 @@ class Session:
                 ) from exc
             if not isinstance(profile, dict) or not isinstance(profile.get("organizations"), list):
                 raise AuthError("O perfil devolvido pelo serviço está incompleto.", code="invalid_response")
-            # Gate de versão (kill-switch via 403) — independente de org.
-            gate = self.version_gate()
-            if gate and gate.get("minVersion"):
-                if _semver_tuple(config.APP_VERSION) < \
-                        _semver_tuple(str(gate["minVersion"])):
-                    raise AuthError(
-                        f"{email}: versão {config.APP_VERSION} bloqueada pelo "
-                        f"backend (mínimo {gate['minVersion']}). Atualize o "
-                        "QMoney antes de novos envios.", code="version",
-                    )
+            # A autorização de mutações é verificada no write path.
             # Bloqueio POR ORG ALVO (disabled da conta/org + userState). Uma org
             # desativada entre várias NÃO bloqueia a conta inteira — só a org
             # para a qual o envio realmente vai.
@@ -902,11 +1028,9 @@ class Session:
                    opened_at: str | None = None) -> tuple[int, str]:
         """POST /api/v1/app/opened — telemetria de abertura do app.
 
-        O app nativo publica esse evento ao abrir (captura mitm: app_version +
-        device_model + os_version). Sem ele a conta "só existe na hora de
-        subir vídeo" — uma das assinaturas de colusão. `auth_method`:
-        OAUTH_NEW (login novo) ou SESSION_RESUMED (abriu com sessão viva).
-        Sucesso = 202 Accepted (evento na fila para o parceiro).
+        Método legado, não usado na inicialização do cliente Windows.
+        O evento descreve uma abertura do app Android e depende de dados
+        verdadeiros de execução; não deve ser usado para simular atividade.
         """
         if not self.email:
             return -1, "ERRO: sessão sem e-mail (perfil de aparelho ausente)"
@@ -917,88 +1041,137 @@ class Session:
     def fetch_recording_config(self) -> tuple[int, str]:
         """GET /devices/recording-config — o app consulta ao abrir/gravar.
 
-        Resposta real (captura 06/08): {configVersion:2, backlogCapMs:14400000,
-        minDurationMs:60000, maxDurationMs:1800000}. Best-effort: o resultado
-        não afeta o upload.
+        A resposta é validada por RecordingPolicy e mantida nesta sessão.
+        Falhas de consulta impedem o registro de novos uploads até recuperação.
         """
         return self.get("/api/v1/devices/recording-config")
 
-    def warmup(self) -> None:
-        """Replica a abertura do app: telemetria + limites de gravação.
+    def _check_local_restrictions(self) -> None:
+        from . import vpn
+        if vpn.ENFORCE:
+            active = vpn.vpn_active()
+            if active is None:
+                raise AuthError("Não foi possível verificar a política de VPN. Tente novamente.", code="service")
+            if active:
+                raise AuthError("Operação bloqueada pela política de VPN configurada.", code="policy")
+        if config.REQUIRE_CURL and transport.kind() == "urllib":
+            raise AuthError("Transporte obrigatório indisponível.", code="service")
 
-        Best-effort: falha de rede não derruba o upload. Roda uma vez por
-        conta durante esta execução do motor, mesmo que a interface crie
-        várias instâncias de Session ao recarregar telas.
-        """
-        if getattr(self, "_warmed", False):
+    def _check_write_policy(self, method: str, path: str, body: Any) -> None:
+        self._check_local_restrictions()
+        method_u = method.upper()
+        # Latch de versão é app-wide no APK; leituras seguem liberadas p/ diagnóstico.
+        if method_u in ("POST", "PUT", "PATCH", "DELETE") and _version_gate_blocks():
+            raise AuthError("Versão recusada pelo serviço. Atualize antes de enviar.", code="version")
+        route = path.split("?", 1)[0].rstrip("/")
+        if method_u != "POST" or route != "/api/v1/uploads":
             return
-        identity = str(self.email or self.data.get("email") or "").casefold()
-        if identity:
-            with _WARMED_IDENTITIES_GUARD:
-                if identity in _WARMED_IDENTITIES:
-                    self._warmed = True
-                    return
-                _WARMED_IDENTITIES.add(identity)
-        self._warmed = True
-        # VPN: o app nega toda chamada autenticada com VPN ativa (assertNoVpn).
-        # QMoney avisa (padrão) ou trava se MINUTE_VPN_ENFORCE=1.
+        self.warmup()
+        if self.recording_policy is None or "recording_config" in self.initialization_errors:
+            raise AuthError("Não foi possível validar os limites desta sessão. Tente novamente.", code="service")
+        if getattr(self, "device_camera_allowed", None) is not True:
+            code = "policy" if getattr(self, "device_camera_allowed", None) is False else "service"
+            raise AuthError("Política de câmera não autorizada ou não verificada para esta sessão.", code=code)
+        org_key = (parse_qs(urlsplit(path).query).get("org_key") or [""])[0]
+        if not org_key:
+            raise AuthError("Organização ausente no registro de upload.", code="policy")
+        state = self.org_state(org_key)
+        if state["blocked"]:
+            raise AuthError("A organização ou a conta não permite novos envios.", code="restricted")
+        if state["userState"] != "active":
+            raise AuthError("Não foi possível verificar a situação da conta na organização.", code="service")
+        self._check_recording_geo(org_key)
+        meta = body.get("meta") if isinstance(body, dict) else None
+        source = meta.get("source") if isinstance(meta, dict) else None
+        sources = state.get("cameraSources")
+        if not isinstance(sources, list) or not sources:
+            raise AuthError("Origens de gravação permitidas não foram confirmadas.", code="service")
+        if not isinstance(source, str) or source not in sources:
+            raise AuthError("Origem da gravação não permitida pela organização.", code="policy")
         try:
-            from . import vpn as _vpn
-            if _vpn.vpn_active():
-                self.vpn_active = True
-                print("[vpn] " + _vpn.vpn_message(), flush=True)
-                if _vpn.ENFORCE:
-                    raise AuthError(
-                        f"{self._who()}: " + _vpn.vpn_message()
-                    )
-        except AuthError:
-            raise
-        except Exception:  # noqa: BLE001 — checagem best-effort
-            pass
-        # Transporte: OKHttp/Android exige curl_cffi; o fallback urllib tem
-        # fingerprint de Python. Avisa (e trava se MINUTE_REQUIRE_CURL=1).
-        try:
-            if transport.kind() == "urllib":
-                self.transport_weak = True
-                print(
-                    "[transport] curl_cffi indisponível → fallback urllib "
-                    "(fingerprint de Python, não OkHttp). Instale curl_cffi "
-                    "para o perfil Chrome/Android.", flush=True)
-                if config.REQUIRE_CURL:
-                    raise AuthError(
-                        f"{self._who()}: curl_cffi ausente e "
-                        "MINUTE_REQUIRE_CURL=1 — abortando (fingerprint "
-                        "inseguro)."
-                    )
-        except AuthError:
-            raise
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.app_opened(
-                "SESSION_RESUMED",
-                opened_at=device_profile.format_recorded_at(time.time()))
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            status, body = self.fetch_recording_config()
-            if status == 200:
-                parsed = json.loads(body)
-                if isinstance(parsed, dict):
-                    self.recording_config = parsed
-                    # Aplica os limites remotos (min/max/backlog) igual ao app.
-                    config.apply_recording_config(parsed)
-        except Exception:  # noqa: BLE001
-            pass
-        # Allowlist de dispositivos: best-effort, para diagnóstico.
-        try:
-            model = device_profile.get_profile(self.email).device_model \
-                if self.email else ""
-            if model:
-                self.device_camera_allowed = self.camera_model_allowed(model)
-                if self.device_camera_allowed is False:
-                    print(
-                        f"[policy] Build.MODEL {model} NÃO está na allowlist "
-                        "nativa (native-camera-policy).", flush=True)
-        except Exception:  # noqa: BLE001
-            pass
+            self.recording_policy.validate_duration(body.get("duration_ms") if isinstance(body, dict) else None)
+            self.recording_policy.validate_recording_time(body.get("recorded_at"), body["duration_ms"], time.time())
+        except ValueError as exc:
+            raise AuthError(str(exc), code="policy") from exc
+
+    def _check_recording_geo(self, org_key: str) -> None:
+        """Respeita `recordingAuthorization` / `canUpload` do `/orgs/.../quota`."""
+        quota = self.recording_geo(org_key)
+        if not quota:
+            raise AuthError(
+                "Não foi possível verificar a autorização geográfica ou de quota.",
+                code="service",
+            )
+        auth = quota.get("recordingAuthorization")
+        can = quota.get("canUpload")
+        reason = quota.get("blockedReason")
+        if auth == "REQUIRES_LOCATION":
+            raise AuthError(
+                "O serviço exige localização do dispositivo para novos envios.",
+                code="policy",
+            )
+        if auth == "BLOCKED" or can is False or reason in (
+                "geo_restricted", "geo_unknown", "quota_exceeded", "manual"):
+            label = reason or auth or "blocked"
+            raise AuthError(
+                f"Novos envios bloqueados pela autorização de gravação ({label}).",
+                code="policy",
+            )
+        if auth == "APPROVED" and can is True and "blockedReason" in quota and reason is None:
+            return
+        raise AuthError(
+            "Não foi possível confirmar autorização de gravação para esta organização.",
+            code="service",
+        )
+
+    def warmup(self) -> None:
+        """Atualiza políticas de leitura; `app/opened` só com flag explícita.
+
+        Estado e cache pertencem à sessão. Respostas inválidas não são sucesso;
+        uma próxima chamada tenta novamente com espera limitada. Políticas
+        vencidas que não puderam ser renovadas impedem novos registros.
+        Com `MINUTE_PUBLISH_APP_OPENED=1`, publica um `SESSION_RESUMED` após
+        sucesso (uma vez por conta nesta sessão; falha tenta no próximo ciclo).
+        """
+        self._check_local_restrictions()
+        with self._lock:
+            now = time.monotonic()
+            if self._recording_checked_at is not None and now - self._recording_checked_at < 60:
+                return
+            if now < self._recording_retry_at:
+                return
+            self.initialization_errors = {}
+            try:
+                status, body = self.fetch_recording_config()
+                if status != 200:
+                    raise ValueError("Consulta de configuração indisponível.")
+                payload = json.loads(body)
+                self.recording_policy = RecordingPolicy.parse(payload)
+                self.recording_config = payload
+            except Exception:
+                self.initialization_errors["recording_config"] = "Não foi possível validar a configuração de gravação."
+            # Preserva a consulta existente, mas uma negativa deixa de ser aviso.
+            self.device_camera_allowed = None
+            try:
+                model = device_profile.get_profile(self.email).device_model if self.email else ""
+                if model:
+                    self.device_camera_allowed = self.camera_model_allowed(model)
+                if self.device_camera_allowed is None:
+                    raise ValueError("Política não verificada.")
+            except Exception:
+                self.initialization_errors["camera_policy"] = "Não foi possível verificar a política de câmera."
+            if self.initialization_errors:
+                self._recording_checked_at = None
+                failures = min(getattr(self, "_initialization_failures", 0) + 1, 5)
+                self._initialization_failures = failures
+                self._recording_retry_at = time.monotonic() + min(60, 5 * 2 ** (failures - 1))
+            else:
+                self._initialization_failures = 0
+                self._recording_retry_at = 0.0
+                self._recording_checked_at = time.monotonic()
+                if config.PUBLISH_APP_OPENED and not getattr(self, "_app_opened_published", False):
+                    try:
+                        status, _ = self.app_opened("SESSION_RESUMED")
+                        self._app_opened_published = 200 <= status < 300
+                    except Exception:
+                        pass

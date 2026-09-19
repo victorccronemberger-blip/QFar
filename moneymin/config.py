@@ -216,8 +216,30 @@ NATIVE_SIDECAR_SYSTEM_VERSION = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_VER
 ANDROID_IMU_SAMPLE_RATE_HZ = 500
 
 # O fingerprint OkHttp/Android exige curl_cffi; o fallback urllib é Python puro
-# (JA3 próprio) e é o elo mais fraco. Em produção é recomendado exigir curl.
-REQUIRE_CURL = os.environ.get("MINUTE_REQUIRE_CURL", "").strip() == "1"
+# (JA3 próprio) e é o elo mais fraco. Default ON; MINUTE_REQUIRE_CURL=0 desliga.
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+REQUIRE_CURL = _env_enabled("MINUTE_REQUIRE_CURL", True)
+# Publicar POST /app/opened no warmup (opt-in: identidade Windows ≠ abertura Android).
+PUBLISH_APP_OPENED = _env_enabled("MINUTE_PUBLISH_APP_OPENED", False)
+# Propagar novos perfis a partir da âncora USB (família SM-S901E). Default ON se o arquivo existir.
+_DEFAULT_DEVICE_ANCHOR = DATA_DIR / "device_anchors" / "galaxy_s22_rqct804kn2n.json"
+DEVICE_ANCHOR_PATH = Path(os.environ.get(
+    "MINUTE_DEVICE_ANCHOR",
+    str(_DEFAULT_DEVICE_ANCHOR if _DEFAULT_DEVICE_ANCHOR.is_file() else ""),
+) or "")
+# E-mail dono do ID declarado na âncora. Formato não comprova sua origem:
+# permanece anchor_reported, nunca verificado automaticamente pelo cliente.
+DEVICE_ANCHOR_OWNER_EMAIL = (os.environ.get("MINUTE_DEVICE_ANCHOR_OWNER") or "").strip()
+DEVICE_PROPAGATE_FROM_ANCHOR = _env_enabled(
+    "MINUTE_DEVICE_PROPAGATE_FROM_ANCHOR",
+    default=_DEFAULT_DEVICE_ANCHOR.is_file(),
+)
 
 
 # --- Limites efetivos de gravação (default = recording-config real 06/08) ----

@@ -36,7 +36,6 @@ Somente stdlib.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import random
@@ -47,7 +46,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, device_catalog
 
 # Uptime plausível de um Android usado no dia a dia: mínimo 6h (logo após boot)
 # e máximo 21 dias (todo celular reinicia de quando em quando).
@@ -56,22 +55,27 @@ MAX_UPTIME_NS = 21 * 86_400 * 1_000_000_000
 
 _CALIB_PATH = Path(__file__).with_name("samsung_uw_calibration.json")
 
-# Pool de Samsung Galaxy S21–S24 aceitos (S21/S21+/S21 Ultra … S24/S24+/S24 Ultra).
-# (comercial, Build.MODEL, peso, opções (release, sdkInt)).
-DEVICE_POOL: list[tuple[str, str, int, tuple[tuple[str, int], ...]]] = [
-    ("Galaxy S21",        "SM-G991B", 9,  (("13", 33), ("14", 34))),
-    ("Galaxy S21+",       "SM-G996B", 6,  (("13", 33), ("14", 34))),
-    ("Galaxy S21 Ultra",  "SM-G998B", 5,  (("13", 33), ("14", 34))),
-    ("Galaxy S22",        "SM-S901B", 8,  (("14", 34), ("15", 35))),
-    ("Galaxy S22+",       "SM-S906B", 6,  (("14", 34), ("15", 35))),
-    ("Galaxy S22 Ultra",  "SM-S908B", 8,  (("14", 34), ("15", 35))),
-    ("Galaxy S23",        "SM-S911B", 12, (("14", 34), ("15", 35))),
-    ("Galaxy S23+",       "SM-S916B", 8,  (("14", 34), ("15", 35))),
-    ("Galaxy S23 Ultra",  "SM-S918B", 8,  (("14", 34), ("15", 35))),
-    ("Galaxy S24",        "SM-S921B", 12, (("14", 34), ("15", 35))),
-    ("Galaxy S24+",       "SM-S926B", 8,  (("14", 34), ("15", 35))),
-    ("Galaxy S24 Ultra",  "SM-S928B", 8,  (("14", 34), ("15", 35))),
-]
+
+def _device_pool_from_catalog() -> list[tuple[str, str, int, tuple[tuple[str, int], ...]]]:
+    """Vista legada do catálogo público (comercial, MODEL, peso, OS/SDK)."""
+    pool: list[tuple[str, str, int, tuple[tuple[str, int], ...]]] = []
+    for model in device_catalog.catalog_models():
+        releases = tuple(
+            (str(rel), device_catalog.api_level_for_release(str(rel)))
+            for rel in (model.get("osReleases") or ["14"])
+        )
+        pool.append((
+            str(model.get("commercial") or model["buildModel"]),
+            str(model["buildModel"]),
+            max(1, int(model.get("weight") or 1)),
+            releases or (("14", 34),),
+        ))
+    return pool
+
+
+# Pool Samsung S21–S24 (global B) — alimentado por resources/samsung_device_catalog.json.
+DEVICE_POOL: list[tuple[str, str, int, tuple[tuple[str, int], ...]]] = (
+    _device_pool_from_catalog())
 
 _cache: dict[str, DeviceProfile] = {}
 _cache_lock = threading.Lock()
@@ -111,9 +115,10 @@ BACKLOG_CAP_MS = 14_400_000
 _BACKLOG_SLACK_S = 60.0
 
 
-def effective_backlog_cap_ms() -> int:
-    """Backlog em vigor — o remote recording-config pode sobrescrever o default."""
-    return int(config.recording_limits().get("backlog_cap_ms") or BACKLOG_CAP_MS)
+def effective_backlog_cap_ms(limits: dict[str, int] | None = None) -> int:
+    """Backlog em vigor — preferir limites da sessão; senão default local."""
+    source = limits if isinstance(limits, dict) else config.recording_limits()
+    return int(source.get("backlog_cap_ms") or BACKLOG_CAP_MS)
 
 
 def recorded_at_to_wall_ms(recorded_at: str) -> int | None:
@@ -187,13 +192,31 @@ def normalize_recorded_at(
     *,
     duration_s: float | None = None,
     now: float | None = None,
+    adjust: bool = False,
+    backlog_cap_ms: int | None = None,
 ) -> str:
-    """Reemite `recorded_at` no formato nativo; opcionalmente prende ao backlog."""
+    """Reemite `recorded_at` no formato nativo.
+
+    Com `duration_s` e `adjust=False` (padrão), rejeita horários fora do backlog
+    em vez de reescrevê-los. `adjust=True` preserva o clamp legado.
+    """
     wall_ms = recorded_at_to_wall_ms(value)
-    epoch = (wall_ms / 1000.0) if wall_ms is not None else (
-        time.time() if now is None else float(now))
+    if wall_ms is None:
+        raise ValueError(f"recorded_at inválido: {value!r}")
+    epoch = wall_ms / 1000.0
     if duration_s is not None:
-        epoch = clamp_recording_start(epoch, duration_s, now=now)
+        if adjust:
+            epoch = clamp_recording_start(
+                epoch, duration_s, now=now, backlog_cap_ms=backlog_cap_ms)
+        else:
+            now_s = time.time() if now is None else float(now)
+            cap_ms = (BACKLOG_CAP_MS if backlog_cap_ms is None
+                      else int(backlog_cap_ms))
+            start_ms = epoch * 1000.0
+            duration_ms = max(0.0, float(duration_s) * 1000.0)
+            now_ms = now_s * 1000.0
+            if start_ms < now_ms - cap_ms or start_ms + duration_ms > now_ms:
+                raise ValueError("recorded_at fora da janela de backlog permitida")
     return format_recorded_at(epoch)
 
 
@@ -214,6 +237,9 @@ class DeviceProfile:
     frames_gop: int = 30
     video_bitrate_mbps: float = 8.0
     calib: dict[str, Any] = field(default_factory=dict)
+    device_id_source: str = "unknown"
+    from_anchor: bool = False
+    anchor_owner: bool = False
 
     # --- persistência -------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -228,7 +254,7 @@ class DeviceProfile:
             "email", "device_id", "device_model", "sidecar_model", "os_version",
             "sdk_int", "sidecar_system_version", "logical_camera_id",
             "boot_wall_ms", "created_wall_ms", "frames_gop",
-            "video_bitrate_mbps", "calib")
+            "video_bitrate_mbps", "calib", "device_id_source", "from_anchor", "anchor_owner")
                  if f in data and data[f] is not None}
         return cls(**known)
 
@@ -319,12 +345,16 @@ class DeviceProfile:
 
     def opened_payload(self, auth_method: str = "SESSION_RESUMED",
                        opened_at: str | None = None) -> dict[str, Any]:
-        """Corpo do POST /api/v1/app/opened (telemetria de abertura do app)."""
+        """Corpo do POST /api/v1/app/opened (Hermes `buildAppOpenedPayload`).
+
+        `os_version` = `android ${Platform.Version}` → API level (SDK_INT).
+        `opened_at` é opcional na OpenAPI; o APK não envia.
+        """
         body: dict[str, Any] = {
             "auth_method": auth_method,
             "app_version": config.APP_VERSION,
             "device_model": self.device_model,
-            "os_version": f"android {self.os_version}",
+            "os_version": f"android {int(self.sdk_int)}",
         }
         if opened_at:
             body["opened_at"] = opened_at
@@ -425,61 +455,12 @@ def _model_ref(build_model: str) -> dict[str, Any]:
 def _create_profile(email: str, first_use_ms: int | None = None) -> DeviceProfile:
     """Gera um perfil novo — PURE FUNCTION de (e-mail, 1º uso).
 
-    Todo campo é derivado da seed `moneymin.android:<email>` (+ o instante de
-    1º uso, fixo por conta): mesmo perdendo o
-    `data/device_state/<email>.json`, a recriação reproduz idêntico aparelho
-    (mesmo modelo, calibração, boot e idade). O único estado dinâmico é o
-    "reboot" automático de `uptime_ns_at()` após 21d (persistido por dia).
-
-    `first_use_ms`: instante real de registro da conta — o aparelho nasce
-    QUANDO a conta nasceu. Contas sem essa referência caem no 1º lote (18/08).
+    Com âncora USB ativa, propaga a família do S22 (modelo/OS/SDK) e gera
+    SSAID sintético por conta. Sem âncora, usa o catálogo público ponderado.
     """
     seed = f"moneymin.android:{email}"
     rng = random.Random(seed)
-    center = _CALIB_DB.get("reference") or {"cx": 2016.0, "cy": 1512.0,
-                                            "sensorWidth": 4032,
-                                            "sensorHeight": 3024}
-    ref_w = int(center.get("sensorWidth") or 4032)
-    ref_h = int(center.get("sensorHeight") or 3024)
-    center_cx = float(center.get("cx") or ref_w / 2.0)
-    center_cy = float(center.get("cy") or ref_h / 2.0)
-
-    # Aparelho da conta: Samsung Galaxy S21–S24 (pool aceito pelo app),
-    # sorteado com pesos — as contas NÃO são um enxame de SM-S918B idênticos.
-    commercial, build_model, _weight, os_pool = rng.choices(
-        [(m[0], m[1], m[2], m[3]) for m in DEVICE_POOL],
-        weights=[m[2] for m in DEVICE_POOL])[0]
-    os_version, sdk_int = os_pool[rng.randrange(len(os_pool))]
-    ref = _model_ref(build_model)
-
-    # Calibração: referência do modelo + jitter DETERMINÍSTICO POR CONTA
-    # (mesmo chip, montagem/amostra do lote diferente). cx/cy do modelo real
-    # (coletado via scripts/collect_sidecar.py) quando disponíveis.
-    nx = float(ref.get("fx") or 1545.0)
-    ny = float(ref.get("fy") or 1543.0)
-    model_cx = float(ref.get("cx") or center_cx)
-    model_cy = float(ref.get("cy") or center_cy)
-    calib = {
-        "distortion_model": "brown_conrady",
-        "fx": round(nx * (1.0 + rng.uniform(-0.004, 0.004)), 6),
-        "fy": round(ny * (1.0 + rng.uniform(-0.004, 0.004)), 6),
-        "cx": round(model_cx + rng.uniform(-2.0, 2.0), 3),
-        "cy": round(model_cy + rng.uniform(-2.0, 2.0), 3),
-        "referenceWidth": ref_w,
-        "referenceHeight": ref_h,
-        "k1": float(ref.get("k1") or 0.0) * (1.0 + rng.uniform(-0.02, 0.02)),
-        "k2": float(ref.get("k2") or 0.0) * (1.0 + rng.uniform(-0.02, 0.02)),
-        "k3": float(ref.get("k3") or 0.0) * (1.0 + rng.uniform(-0.02, 0.02)),
-        "p1": float(ref.get("p1") or 0.0) + rng.uniform(-0.0004, 0.0004),
-        "p2": float(ref.get("p2") or 0.0) + rng.uniform(-0.0004, 0.0004),
-        "readoutS": round(float(ref.get("readoutS") or 0.0105)
-                          * (1.0 + rng.uniform(-0.05, 0.05)), 6),
-        "logicalCameraId": str(ref.get("logicalCameraId") or "4"),
-    }
-    # ANDROID_ID: 64 bits em hex (Settings.Secure.ANDROID_ID) derivado da conta.
-    digest = hashlib.sha256(f"moneymin.android.id:{email}".encode("utf-8"))
-    android_id = digest.hexdigest()[:16]
-    device_id = f"android.ssaid:{android_id}"
+    identity = device_catalog.generate_identity(email)
 
     # 1º uso virtual: QUANDO a conta nasceu (first_use_ms, ex.: registro/token).
     if first_use_ms is not None:
@@ -491,18 +472,21 @@ def _create_profile(email: str, first_use_ms: int | None = None) -> DeviceProfil
         rng.uniform(MIN_UPTIME_NS / 1e6, 3 * 86_400 * 1_000))
     return DeviceProfile(
         email=email,
-        device_id=device_id,
-        device_model=build_model,
-        sidecar_model=build_model,
-        os_version=os_version,
-        sdk_int=int(sdk_int),
-        sidecar_system_version=os_version,
-        logical_camera_id=str(ref.get("logicalCameraId") or "4"),
+        device_id=str(identity["device_id"]),
+        device_model=str(identity["device_model"]),
+        sidecar_model=str(identity["sidecar_model"]),
+        os_version=str(identity["os_version"]),
+        sdk_int=int(identity["sdk_int"]),
+        sidecar_system_version=str(identity["sidecar_system_version"]),
+        logical_camera_id=str(identity["logical_camera_id"]),
         boot_wall_ms=boot_wall_ms,
         created_wall_ms=created_wall_ms,
-        frames_gop=rng.randint(28, 32),
-        video_bitrate_mbps=round(rng.uniform(7.4, 8.8), 1),
-        calib=calib,
+        frames_gop=int(identity["frames_gop"]),
+        video_bitrate_mbps=float(identity["video_bitrate_mbps"]),
+        calib=dict(identity["calib"]),
+        device_id_source=str(identity.get("device_id_source", "unknown")),
+        from_anchor=identity.get("from_anchor") is True,
+        anchor_owner=identity.get("anchor_owner") is True,
     )
 
 

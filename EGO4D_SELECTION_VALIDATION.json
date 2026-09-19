@@ -1,0 +1,766 @@
+{
+  "source": "portable_seed_not_full_dataset",
+  "preview_size": 12,
+  "tasks": [
+    {
+      "task": "Arrange Patio Furniture",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Bar / Drink Station Setup",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Bathroom Deep Clean",
+      "candidates": 5,
+      "parents": 4,
+      "parents_in_first_12_before": 4,
+      "parents_in_first_12_after": 4,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Bedroom Deep Clean",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Car Wash & Detail",
+      "candidates": 65,
+      "parents": 15,
+      "parents_in_first_12_before": 5,
+      "parents_in_first_12_after": 12,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Change Sheets & Make Bed",
+      "candidates": 2,
+      "parents": 2,
+      "parents_in_first_12_before": 2,
+      "parents_in_first_12_after": 2,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Change a Tire",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Change a tire",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Changing Light Bulbs / Smoke Detectors",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Check & Add Engine Oil",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Check & add engine oil",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Check Tire Pressure & Add Air",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Check tire pressure & add air",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Clean Appliance",
+      "candidates": 2,
+      "parents": 2,
+      "parents_in_first_12_before": 2,
+      "parents_in_first_12_after": 2,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Clean the Bathroom",
+      "candidates": 5,
+      "parents": 4,
+      "parents_in_first_12_before": 4,
+      "parents_in_first_12_after": 4,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Cleaning Car",
+      "candidates": 68,
+      "parents": 15,
+      "parents_in_first_12_before": 5,
+      "parents_in_first_12_after": 12,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Cleaning Out Car",
+      "candidates": 18,
+      "parents": 5,
+      "parents_in_first_12_before": 3,
+      "parents_in_first_12_after": 5,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Collecting Clothes Into a Hamper",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Desk Tidy & Cable Management",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Drill into workpiece",
+      "candidates": 1,
+      "parents": 1,
+      "parents_in_first_12_before": 1,
+      "parents_in_first_12_after": 1,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Drink Station Setup",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Folding Clothes or Putting Them on Hangers",
+      "candidates": 17,
+      "parents": 15,
+      "parents_in_first_12_before": 10,
+      "parents_in_first_12_after": 12,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Full Yard Maintenance",
+      "candidates": 5,
+      "parents": 2,
+      "parents_in_first_12_before": 2,
+      "parents_in_first_12_after": 2,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Furniture Assembly",
+      "candidates": 16,
+      "parents": 3,
+      "parents_in_first_12_before": 3,
+      "parents_in_first_12_after": 3,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Furniture Assembly/ Disassembly",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Gardening",
+      "candidates": 335,
+      "parents": 37,
+      "parents_in_first_12_before": 4,
+      "parents_in_first_12_after": 12,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Gutter Cleaning",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Hand Washing Clothes",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Hang Art & Mirrors",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Hang Curtains",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Hang curtains on a rod (rings/hooks)",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Hanging clothes on hangers",
+      "candidates": 8,
+      "parents": 7,
+      "parents_in_first_12_before": 7,
+      "parents_in_first_12_after": 7,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Holiday Decoration Setup",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Hotel Laundry Operations",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Leaf Raking & Bagging",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Leaf Raking or Blowing",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Loading the Car",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Loading the Laundry Machine",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Mail & Package Sorting",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Organize the Garage",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pack a Room for Moving",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pack or Unpack a Car for a Trip",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pack the Car for a Trip",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Party Cleanup",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Party Setup & Takedown",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Patch & Paint Walls",
+      "candidates": 10,
+      "parents": 4,
+      "parents_in_first_12_before": 4,
+      "parents_in_first_12_after": 4,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Patio / balcony furniture arrangement",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pet Care Routine",
+      "candidates": 5,
+      "parents": 2,
+      "parents_in_first_12_before": 2,
+      "parents_in_first_12_after": 2,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pet Feeding",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pet Feeding & Water Refresh",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pet Grooming & Bath",
+      "candidates": 19,
+      "parents": 7,
+      "parents_in_first_12_before": 4,
+      "parents_in_first_12_after": 7,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Planting or Pulling Weeds",
+      "candidates": 28,
+      "parents": 11,
+      "parents_in_first_12_before": 6,
+      "parents_in_first_12_after": 11,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pool Cleaning",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pool cleaning",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pressure-Wash",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pull weeds by hand",
+      "candidates": 3,
+      "parents": 3,
+      "parents_in_first_12_before": 3,
+      "parents_in_first_12_after": 3,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Pump Gas",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Putting Groceries Away",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Replace Bulbs & Batteries",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Replace Bulbs or Batteries",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Replace Showerhead",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Replace showerhead",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Restock First-Aid & Medicine",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Restock Medicine Cabinet",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Running Industrial Laundry",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Scoop a litter box",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Scoop a litter box (clean litter)",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Shelve books",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Shopping",
+      "candidates": 50,
+      "parents": 19,
+      "parents_in_first_12_before": 5,
+      "parents_in_first_12_after": 12,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Shovel / Spread Mulch",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Shoveling Snow",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Sort Recycling",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Sort hardware into divided tray",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Sort recycling into bins",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Spread Mulch",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Spreading Mulch or Fertilizer",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Stack Firewood",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Stack firewood",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Sweep the Porch",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Sweep the porch",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Taking Out Trash",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Taking Out the Trash",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Tidy the Desk",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Tighten Cabinet & Door Hinges",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Tighten Cabinet or Door Hinges",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Tighten cabinet & door hardware",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Toy or Clothing Pickup",
+      "candidates": 1,
+      "parents": 1,
+      "parents_in_first_12_before": 1,
+      "parents_in_first_12_after": 1,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Trim Hedges and Branches",
+      "candidates": 4,
+      "parents": 2,
+      "parents_in_first_12_before": 2,
+      "parents_in_first_12_after": 2,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Trim a hedge",
+      "candidates": 4,
+      "parents": 2,
+      "parents_in_first_12_before": 2,
+      "parents_in_first_12_after": 2,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Unloading the Laundry Machine",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Unpack & Set Up a Room",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Using the Laundry Machine",
+      "candidates": 0,
+      "parents": 0,
+      "parents_in_first_12_before": 0,
+      "parents_in_first_12_after": 0,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Walk the Dog",
+      "candidates": 32,
+      "parents": 10,
+      "parents_in_first_12_before": 5,
+      "parents_in_first_12_after": 10,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Water Houseplants",
+      "candidates": 7,
+      "parents": 6,
+      "parents_in_first_12_before": 6,
+      "parents_in_first_12_after": 6,
+      "candidate_count_preserved": true
+    },
+    {
+      "task": "Watering Outdoor Plants",
+      "candidates": 13,
+      "parents": 8,
+      "parents_in_first_12_before": 7,
+      "parents_in_first_12_after": 8,
+      "candidate_count_preserved": true
+    }
+  ]
+}

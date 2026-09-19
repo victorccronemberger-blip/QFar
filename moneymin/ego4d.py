@@ -268,6 +268,9 @@ def _s3_get_stdlib(bucket: str, key: str, dest: Path,
     try:
         with tls.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
             shutil.copyfileobj(resp, f, length=1024 * 1024)
+            expected = resp.headers.get("Content-Length")
+            if expected is not None and f.tell() != int(expected):
+                raise OSError("download Ego4D incompleto: tamanho recebido difere do informado")
     except urllib.error.HTTPError as exc:
         new_region = exc.headers.get("x-amz-bucket-region") if exc.headers else None
         if new_region and new_region != region:
@@ -281,7 +284,8 @@ def _s3_get_stdlib(bucket: str, key: str, dest: Path,
 _S3_REGION_CACHE: dict[str, str] = {}
 
 
-def _download_to(bucket: str, key: str, dest: Path) -> Path:
+def _download_to(bucket: str, key: str, dest: Path, *,
+                 validator: Callable[[Path], bool] | None = None) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     # Nunca exponha um download parcial como cache válido. Uma interrupção do
@@ -307,6 +311,8 @@ def _download_to(bucket: str, key: str, dest: Path) -> Path:
                     f"acesso negado ao Ego4D para s3://{bucket}/{key}; "
                     "confirme a licença Ego4D e o perfil AWS") from exc
             raise
+        if validator is not None and not validator(part):
+            raise RuntimeError("arquivo Ego4D recebido não passou na validação de integridade")
         part.replace(dest)
     finally:
         try:
@@ -346,7 +352,7 @@ def _valid_clips_manifest(path: Path) -> bool:
 def _refresh_catalog_file(
     bucket: str, key: str, dest: Path, validator,
 ) -> None:
-    staging = dest.with_name(f".{dest.name}.refresh")
+    staging = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.refresh")
     try:
         _download_to(bucket, key, staging)
         if not validator(staging):
@@ -717,7 +723,9 @@ def _passes_filter(
     min_dur_s: float, max_dur_s: float,
 ) -> bool:
     """Verifica se um clipe passa nos filtros sem construir o dict de resultado."""
-    pv = videos.get(c["parent_video_uid"], {})
+    pv = videos.get(c.get("parent_video_uid"))
+    if not isinstance(pv, dict):
+        return False
     try:
         window = clip_window_s(c)
     except (KeyError, TypeError, ValueError):
@@ -1516,8 +1524,10 @@ def _extract_window(src: Path, start_s: float, dur_s: float, dest: Path) -> Path
     timestamp solicitado. Isso criava uma dessincronização silenciosa.
     """
     import subprocess
+    if not math.isfinite(start_s) or not math.isfinite(dur_s) or start_s < 0 or dur_s <= 0:
+        raise ValueError("janela Ego4D inválida")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.stem + ".cut.tmp.mp4")
+    tmp = dest.with_name(f".{dest.stem}.{uuid.uuid4().hex}.cut.tmp.mp4")
     from .sidecar import ffmpeg_bin
     ff = ffmpeg_bin()
     kwargs: dict[str, Any] = {
@@ -1533,13 +1543,16 @@ def _extract_window(src: Path, start_s: float, dur_s: float, dest: Path) -> Path
         "make_zero", "-reset_timestamps", "1", "-movflags", "+faststart",
         "-f", "mp4", str(tmp),
     ]
-    res = subprocess.run(cmd, **kwargs)
-    if res.returncode != 0:
-        if tmp.exists():
-            tmp.unlink()
-        raise RuntimeError(
-            f"falha ao cortar janela Ego4D: {res.stderr.strip()[:400]}")
-    tmp.replace(dest)
+    try:
+        res = subprocess.run(cmd, **kwargs)
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"falha ao cortar janela Ego4D: {res.stderr.strip()[:400]}")
+        if not _valid_mp4_cache(tmp):
+            raise RuntimeError("janela Ego4D gerada é ilegível ou não contém vídeo")
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
     return dest
 
 
@@ -1549,8 +1562,13 @@ def _valid_mp4_cache(path: Path) -> bool:
             return False
         with path.open("rb") as stream:
             header = stream.read(64)
-        return b"ftyp" in header
-    except OSError:
+        if b"ftyp" not in header:
+            return False
+        from .sidecar import probe_video
+        info = probe_video(path)
+        return (info.get("has_video") is True and info.get("duration_ms", 0) > 0
+                and info.get("width", 0) > 0 and info.get("height", 0) > 0)
+    except (OSError, RuntimeError, ValueError, TypeError):
         return False
 
 
@@ -1575,23 +1593,26 @@ def download_clip(clip: dict[str, Any], dest: Path) -> Path:
     Janelas longas (`needs_cut`): baixa o vídeo-pai uma vez e corta localmente.
     """
     dest = Path(dest)
+    needs_cut = bool(clip.get("needs_cut"))
+    start = float(clip.get("parent_start_sec") or 0)
+    end = float(clip.get("parent_end_sec") or 0)
+    media_offset = float(clip.get("media_time_offset_s") or 0.0)
+    if needs_cut and (not all(math.isfinite(value) for value in (start, end, media_offset))
+                      or start < 0 or end <= start or media_offset < 0 or start < media_offset):
+        raise ValueError("janela Ego4D inválida; o vídeo inteiro não pode substituir o trecho solicitado")
     if _valid_mp4_cache(dest):
         return dest
     s3_path = str(clip["s3_path"]).replace("s3://", "")
     bucket, _, key = s3_path.partition("/")
-    needs_cut = bool(clip.get("needs_cut"))
-    start = float(clip.get("parent_start_sec") or 0)
-    end = float(clip.get("parent_end_sec") or 0)
     if needs_cut and end > start:
         media_uid = str(clip.get("media_uid") or clip.get("parent_video_uid")
                         or "parent")
-        media_offset = float(clip.get("media_time_offset_s") or 0.0)
         parent_path = dest.parent / f"{media_uid}.mp4"
         if not _valid_mp4_cache(parent_path):
-            _download_to(bucket, key, parent_path)
+            _download_to(bucket, key, parent_path, validator=_valid_mp4_cache)
         return _extract_window(
             parent_path, start - media_offset, end - start, dest)
-    _download_to(bucket, key, dest)
+    _download_to(bucket, key, dest, validator=_valid_mp4_cache)
     return dest
 
 
@@ -1604,7 +1625,7 @@ def download_imu(video: dict[str, Any], dest: Path) -> Path | None:
         return dest
     s3_path = imu_meta["s3_path"].replace("s3://", "")
     bucket, _, key = s3_path.partition("/")
-    _download_to(bucket, key, dest)
+    _download_to(bucket, key, dest, validator=_valid_imu_cache)
     return dest
 
 

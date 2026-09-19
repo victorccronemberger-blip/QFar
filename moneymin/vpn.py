@@ -9,8 +9,8 @@ Surfshark, VirtualBox Host-Only, etc.).
 
 Uso:
     from moneymin import vpn
-    if vpn.vpn_active():
-        # warn/hard-block, como o app
+    active = vpn.vpn_active()
+    # True: bloqueado; None: verificação indisponível; False: nenhum detectado.
 
 Resultado cacheado por 60 s (o spawn do PowerShell é caro para N contas).
 """
@@ -36,14 +36,14 @@ _cache_value: bool | None = None
 def _powershell_query() -> str:
     markers = "|".join(_VPN_MARKERS)
     return (
-        "(Get-NetAdapter | Where-Object { "
-        f"$_.InterfaceDescription -match '{markers}' "
+        "$ErrorActionPreference = 'Stop'; (Get-NetAdapter | Where-Object { "
+        f"$_.Status -eq 'Up' -and $_.InterfaceDescription -match '{markers}' "
         "} | Measure-Object).Count"
     )
 
 
-def _detect() -> bool:
-    """Checa adaptadores via PowerShell. False se não der para sondar."""
+def _detect() -> bool | None:
+    """Checa adaptadores ativos; None indica falha de sondagem."""
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -51,18 +51,19 @@ def _detect() -> bool:
             capture_output=True, text=True, timeout=20,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except Exception:  # noqa: BLE001 — sem powershell/erro → assume sem VPN
-        return False
+    except Exception:  # noqa: BLE001 — estado desconhecido não autoriza chamadas
+        return None
     if proc.returncode != 0:
-        return False
+        return None
     try:
-        return int(proc.stdout.strip() or "0") > 0
+        count = int(proc.stdout.strip())
+        return count > 0 if count >= 0 else None
     except ValueError:
-        return False
+        return None
 
 
-def vpn_active() -> bool:
-    """True se algum adaptador de VPN estiver visível (cache de 60 s)."""
+def vpn_active() -> bool | None:
+    """True para adaptador VPN ativo; None se a verificação falhou."""
     global _cache_ts, _cache_value
     now = time.monotonic()
     if _cache_value is not None and now - _cache_ts < _CACHE_SECONDS:
@@ -77,5 +78,12 @@ def vpn_message() -> str:
     return "VPN ativa detectada no Windows (o app Minute bloquearia toda chamada)."
 
 
-# env de força: MINUTE_VPN_ENFORCE=1 replica o hard-block do app.
-ENFORCE = os.environ.get("MINUTE_VPN_ENFORCE", "").strip() == "1"
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+# Default ON (o APK chama assertNoVpn em toda request). MINUTE_VPN_ENFORCE=0 desliga.
+ENFORCE = _env_enabled("MINUTE_VPN_ENFORCE", True)

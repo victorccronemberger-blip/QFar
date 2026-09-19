@@ -39,6 +39,17 @@ class AccountIssueTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
         self.assertEqual(result["detail"], "AuthError · HTTP 401")
 
+    def test_policy_diagnostics_distinguish_vpn_geo_and_generic(self):
+        vpn = account_issue("a@b.c", AuthError("bloqueada pela política de VPN", code="policy"))
+        self.assertIn("VPN", vpn["reason"])
+        geo = account_issue("a@b.c", AuthError(
+            "O serviço exige localização do dispositivo para novos envios.", code="policy"))
+        self.assertIn("localização", geo["reason"])
+        quota = account_issue("a@b.c", AuthError(
+            "Novos envios bloqueados pela autorização de gravação (quota_exceeded).",
+            code="policy"))
+        self.assertIn("quota", quota["reason"].casefold())
+
 
 class AccountDiagnosticEndpointsTests(unittest.TestCase):
     def setUp(self):

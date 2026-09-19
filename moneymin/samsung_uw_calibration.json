@@ -1,6 +1,6 @@
 {
   "deviceModel": "SM-G991B",
-  "note": "Calibração ultra-wide Samsung (lens intrinsics) em coordenadas do sensor nativo 4032x3024. O sidecar re-escala fx/fy/cx/cy para 1440x1080 (proporcional), igual o app Android (buildIntrinsicsMap: fx*scaleX, (cx-cropLeft)*scaleX). Modelo de distorção Brown-Conrady k1 k2 k3 p1 p2. Valores plausíveis para a família S21-S24 (ultra-wide ~1/2.55\", 12MP).",
+  "note": "Calibração ultra-wide Samsung (lens intrinsics) em coordenadas do sensor nativo 4032x3024. O sidecar re-escala fx/fy/cx/cy para 1440x1080 (proporcional), igual o app Android (buildIntrinsicsMap: fx*scaleX, (cx-cropLeft)*scaleX). Modelo de distorção Brown-Conrady k1 k2 k3 p1 p2. Valores plausíveis para a família S21-S24 (ultra-wide ~1/2.55\", 12MP). Não são medições por unidade: datasets públicos (SCGC, 100-Phones, Zenodo smartphone) não cobrem UW SEI deste pipeline; use USB/calibração própria para âncora real.",
   "reference": {
     "sensorWidth": 4032,
     "sensorHeight": 3024,
@@ -35,6 +35,14 @@
       "fx": 1465.0, "fy": 1465.0,
       "k1": -0.22, "k2": 0.11, "k3": -0.03, "p1": 0.0014, "p2": -0.0022,
       "readoutS": 0.0111
+    },
+    "SM-S901E": {
+      "commercial": "Galaxy S22",
+      "logicalCameraId": "3",
+      "fx": 1465.0, "fy": 1465.0,
+      "k1": -0.22, "k2": 0.11, "k3": -0.03, "p1": 0.0014, "p2": -0.0022,
+      "readoutS": 0.0111,
+      "note": "Mesma família UW do SM-S901B até calibração dedicada; âncora USB RQCT804KN2N"
     },
     "SM-S906B": {
       "commercial": "Galaxy S22+",

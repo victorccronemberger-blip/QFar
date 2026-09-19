@@ -16,6 +16,25 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     elif explicit == "version":
         code, reason = "version", "A versão do aplicativo precisa ser atualizada."
         action = "Atualize o QMoney. Este diagnóstico não indica problema com a conta."
+    elif explicit == "device":
+        code, reason = "device", "O serviço bloqueou este dispositivo."
+        action = "Confira o estado do aparelho no Minute. Trocar a senha não remove o bloqueio de dispositivo."
+    elif explicit == "uber_device":
+        code, reason = "uber_device", "O serviço vinculou o acesso ao login Uber neste dispositivo."
+        action = "Conclua o fluxo Uber no aplicativo Minute, se aplicável. Não remova a conta nem altere a senha por este diagnóstico."
+    elif explicit == "policy":
+        if "vpn" in raw:
+            code, reason = "policy", "A operação foi bloqueada porque há VPN ativa neste Windows."
+            action = "Desative a VPN (ou defina MINUTE_VPN_ENFORCE=0 só se souber o risco). Não remova a conta nem altere a senha."
+        elif "localiza" in raw or "requires_location" in raw:
+            code, reason = "policy", "O serviço exige localização do dispositivo para novos envios."
+            action = "Configure coordenadas reais (MINUTE_DEVICE_LAT/LNG) apenas se forem verdadeiras. Não invente GPS."
+        elif "geo_" in raw or "quota_exceeded" in raw or "autorização de gravação" in raw:
+            code, reason = "policy", "A autorização geográfica ou de quota recusou novos envios."
+            action = "Confira quota e elegibilidade no Minute. Não remova a conta nem altere a senha por esse diagnóstico."
+        else:
+            code, reason = "policy", "A operação não atende à política de integração ou gravação."
+            action = "Confira as restrições informadas e a origem da gravação. Não remova a conta nem altere a senha por esse diagnóstico."
     elif explicit == "invalid_response" or any(x in raw for x in ("não-json", "resposta inválida", "perfil incompleto")):
         code, reason = "invalid_response", "O serviço devolveu uma resposta incompleta ou inválida."
         action = "Aguarde e verifique novamente. Não remova a conta nem altere a senha por esta resposta."
@@ -41,8 +60,15 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
         code, reason = "service", "O serviço remoto está temporariamente indisponível."
         action = "Aguarde e verifique novamente. Reautenticar a conta não corrige uma indisponibilidade do serviço."
     elif explicit == "forbidden" or re.search(r"\b403\b|forbidden", raw):
-        code, reason = "forbidden", "O serviço recusou a permissão para esta operação."
-        action = "Confira as permissões no Minute. Um HTTP 403 isolado não confirma conta desativada; não remova a conta por ele."
+        if "app_version_too_old" in raw:
+            code, reason = "version", "A versão do aplicativo precisa ser atualizada."
+            action = "Atualize o QMoney. Este diagnóstico não indica problema com a conta."
+        elif "uber-device" in raw:
+            code, reason = "uber_device", "O serviço vinculou o acesso ao login Uber neste dispositivo."
+            action = "Conclua o fluxo Uber no aplicativo Minute, se aplicável. Não remova a conta nem altere a senha por este diagnóstico."
+        else:
+            code, reason = "forbidden", "O serviço recusou a permissão para esta operação."
+            action = "Confira as permissões no Minute. Um HTTP 403 isolado não confirma conta desativada; não remova a conta por ele."
     elif explicit == "authentication" or re.search(r"\b401\b|invalid_login|invalid_password|invalid_grant|invalid_refresh_token|token_expired", raw):
         code, reason = "authentication", "O serviço não aceitou ou não conseguiu renovar o acesso salvo."
         action = "Em Contas, informe o mesmo e-mail e a senha do Minute e clique em Conectar; depois verifique novamente."

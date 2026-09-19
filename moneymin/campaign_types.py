@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -113,7 +114,7 @@ class CampaignLog:
     def save(self, path: Path | None = None) -> Path:
         destination = path or self._path
         if destination is None:
-            destination = config.DATA_DIR / f"campaign_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            destination = config.DATA_DIR / f"campaign_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}.json"
         self._path = destination
         payload = self.to_dict()
         # Cópia sanitizada: os itens em memória seguem com caminhos absolutos

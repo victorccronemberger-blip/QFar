@@ -10,6 +10,7 @@ houver uma em andamento.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -111,6 +112,30 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             "title": "Categoria ignorada",
             "detail": (f"{payload.get('task_name') or 'Categoria'}: "
                        + friendly_campaign_error(payload.get("error"))),
+        }
+    if kind == "task_exhausted":
+        return {
+            "level": "warning", "stage": "Conteúdo", "title": "Conteúdo elegível já utilizado",
+            "detail": (f"{payload.get('task_name') or 'Categoria'}: todos os trechos elegíveis "
+                       "já foram usados pelas contas selecionadas. O histórico foi preservado; "
+                       "escolha outra categoria ou reveja a faixa de duração."),
+        }
+    if kind in {"task_shortfall", "goal_shortfall"}:
+        return {
+            "level": "warning", "stage": "Com pendências",
+            "title": "Meta não atingida",
+            "detail": (f"{payload.get('task_name') or 'Categoria'}: a quantidade solicitada "
+                       "não foi concluída para todas as contas. Confira os resultados antes de tentar novamente."
+                       if kind == "task_shortfall" else
+                       "A meta de horas não foi atingida para todas as contas. "
+                       "Os envios concluídos foram preservados no histórico."),
+        }
+    if kind == "content_pool":
+        return {
+            "level": "info", "stage": "Conteúdo", "title": "Variedade da seleção",
+            "detail": (f"{payload.get('clips', 0)} trecho(s) de "
+                       f"{payload.get('parent_video_count', 0)} vídeo(s) de origem. "
+                       "A fila alterna vídeos de origem antes de repetir cortes do mesmo vídeo."),
         }
     if kind == "task_empty":
         return {
@@ -274,17 +299,28 @@ class CampaignRunner:
     # --- ciclo de vida ----------------------------------------------------
     @property
     def running(self) -> bool:
-        return self.state in ("running", "stopping")
+        return (self.state in ("running", "stopping")
+                or (self._thread is not None and self._thread.is_alive()))
 
     def start(self, cfg: CampaignConfig) -> None:
         """Inicia a campanha numa thread de fundo. Erro se já houver uma rodando."""
         with self._lock:
             if self.running:
                 raise RuntimeError("já há uma campanha em andamento")
+            # Valide antes de alterar o estado: configuração inválida não pode
+            # deixar um runner sem thread preso em 'running'.
+            try:
+                hours = float(getattr(cfg, "target_hours_per_account", 0) or 0)
+                if not math.isfinite(hours) or not math.isfinite(hours * 3600) or hours < 0:
+                    raise ValueError
+                for task in cfg.tasks:
+                    if type(task.count) is not int or task.count < 1:
+                        raise ValueError
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("Configuração numérica da campanha inválida.") from exc
             self._stop.clear()
             self.state = "running"
             self.events.clear()
-            self._seq = 0
             self.error = None
             self.log_path = None
             self.done_sends = 0
@@ -294,7 +330,6 @@ class CampaignRunner:
             self.current = "iniciando…"
             self.stage = "Início"
             n_acc = max(1, len(cfg.accounts))
-            hours = float(getattr(cfg, "target_hours_per_account", 0) or 0)
             if hours > 0:
                 # estimativa: sessão média ~15 min até a campanha reportar o real
                 per = max(1, int(hours * 3600 / 900 + 0.999))
@@ -336,9 +371,18 @@ class CampaignRunner:
 
     # --- thread de fundo ----------------------------------------------------
     def _run(self, cfg: CampaignConfig) -> None:
+        terminal: tuple[str, dict[str, Any]] | None = None
+
+        def on_progress(kind: str, payload: dict[str, Any]) -> None:
+            nonlocal terminal
+            if kind in {"campaign_done", "campaign_stopped"}:
+                terminal = (kind, dict(payload))
+            else:
+                self._on_event(kind, payload)
+
         try:
-            run_campaign(cfg, progress=self._on_event,
-                         should_stop=self._stop.is_set)
+            result = run_campaign(cfg, progress=on_progress,
+                                  should_stop=self._stop.is_set)
         except Exception as exc:  # noqa: BLE001 — reporta qualquer falha na UI
             with self._lock:
                 self.state = "error"
@@ -347,10 +391,20 @@ class CampaignRunner:
                 self.stage = "Falha"
             self._record("campaign_error", error=exc)
         else:
+            if terminal is not None:
+                self._on_event(*terminal)
+            elif isinstance(result, campaign.CampaignLog):
+                # O relatório retornado continua sendo a fonte de verdade
+                # mesmo se o motor não entregar o evento terminal.
+                kind = "campaign_stopped" if result.status == "stopped" else "campaign_done"
+                self._on_event(kind, {"status": result.status if result.status in {"done", "partial", "error", "stopped"} else "error",
+                                      "log_path": result._path.name if result._path else None})
             # Defesa final: mesmo que uma implementação/customização do motor
             # retorne sem emitir evento terminal, a interface nunca fica presa
             # eternamente em running/stopping.
             with self._lock:
+                if isinstance(result, campaign.CampaignLog) and result._path is not None:
+                    self.log_path = result._path.name
                 if self.state == "running":
                     self.state = "done"
                     self.current = ""

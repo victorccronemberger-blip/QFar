@@ -63,6 +63,7 @@ from typing import Any
 from . import config, transport
 from .atomic_io import load_json, save_bytes, save_json
 from .device_profile import (
+    BACKLOG_CAP_MS,
     DeviceProfile,
     format_recorded_at,
     recorded_at_to_wall_ms,
@@ -180,7 +181,9 @@ def _normalize_recorded_at_sequence(
             transient=False,
         )
     now_ms = int((time.time() if now is None else float(now)) * 1000)
-    if wall_ms[0] < now_ms - config.recording_limits()["backlog_cap_ms"]:
+    backlog_cap_ms = int(
+        config.recording_limits().get("backlog_cap_ms") or BACKLOG_CAP_MS)
+    if wall_ms[0] < now_ms - backlog_cap_ms:
         raise UploadError(
             "recorded_at está fora do backlog de gravação do Minute",
             transient=False,
@@ -640,11 +643,14 @@ def get_upload(session: Any, upload_id: str) -> dict[str, Any]:
     """
     status, text = session.request("GET", f"/api/v1/uploads/{upload_id}")
     if status != 200:
-        raise UploadError(f"GET /uploads/{upload_id} falhou ({status}): {text[:500]}")
+        raise _http_upload_error("GET /uploads", status, text, {})
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise UploadError(f"resposta /uploads/{upload_id} não-JSON: {text[:300]}") from exc
+        raise UploadError("Resposta de consulta do upload inválida.", transient=False) from exc
+    if not isinstance(parsed, dict):
+        raise UploadError("Resposta de consulta do upload inválida.", transient=False)
+    return parsed
 
 
 def complete_upload(
@@ -674,14 +680,6 @@ def complete_upload(
         session, "PATCH", f"/api/v1/uploads/{upload_id}/complete", body)
     if status == 409:
         try:
-            conflict = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            conflict = {}
-        normalized = json.dumps(conflict, ensure_ascii=False).casefold()
-        if any(word in normalized for word in (
-                '"completed"', '"complete"', '"done"')):
-            return conflict if isinstance(conflict, dict) else {}
-        try:
             current = get_upload(session, upload_id)
         except UploadError:
             current = {}
@@ -695,9 +693,11 @@ def complete_upload(
             "PATCH /complete", status, text, response_headers)
     try:
         parsed = json.loads(text) if text.strip() else {}
-    except (json.JSONDecodeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise UploadError("Resposta de conclusão do upload inválida.", transient=False) from exc
+    if not isinstance(parsed, dict):
+        raise UploadError("Resposta de conclusão do upload inválida.", transient=False)
+    return parsed
 
 
 # --- Sidecar persistente + fila (mimica recording.saveBody / pumpUploads) ------
@@ -758,7 +758,7 @@ def list_sidecars(state: str | None = None) -> list[dict[str, Any]]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError):
             continue
-        if state is None or data.get("state") == state:
+        if isinstance(data, dict) and (state is None or data.get("state") == state):
             out.append(data)
     return out
 
@@ -2068,6 +2068,11 @@ def pump_pending(
                    or s.get("state") == STATE_LOSS]
     else:
         pending = list_sidecars(state)
+    session_email = getattr(session, "email", None)
+    if isinstance(session_email, str) and session_email.strip():
+        if account_email is not None and account_email.strip().casefold() != session_email.strip().casefold():
+            raise UploadError("A conta da retomada difere da sessão autenticada.", transient=False)
+        account_email = session_email
     if account_email is not None:
         wanted_email = account_email.strip().casefold()
         pending = [item for item in pending
@@ -2101,6 +2106,10 @@ def pump_pending(
         upload_id = str(sidecar.get("upload_id") or "")
         phase = str(sidecar.get("phase") or "")
         try:
+            if upload_id and sidecar.get("finalize_requested") and phase in {
+                    "awaiting_finalize", "finalize"}:
+                updated.append(sidecar)
+                continue
             # Blob já chegou: não repete vídeo nem cria outro registro.
             if upload_id and phase in {
                     "transport_done", "completing", "complete"}:
@@ -2212,11 +2221,25 @@ def pump_pending(
             continue
         if not journals or not any(item.get("finalize_requested") for item in journals):
             continue
-        expected = max(int(item.get("expected_chunk_count") or 1)
-                       for item in journals)
+        owners = {str(item.get("account_email") or "").strip().casefold()
+                  for item in journals}
+        organizations = {str(item.get("org_key") or "") for item in journals}
+        if len(owners) != 1 or not all(owners) or len(organizations) != 1 or not all(organizations):
+            continue
+        if account_email is not None and owners != {account_email.strip().casefold()}:
+            continue
+        counts = [item.get("expected_chunk_count", 1) for item in journals]
+        if any(type(count) is not int or count < 1 for count in counts) or len(set(counts)) != 1:
+            continue
+        expected = counts[0]
         ready = [item for item in journals if item.get("phase") in {
-            "awaiting_finalize", "finalize", "done"}]
-        if len(ready) < expected:
+            "awaiting_finalize", "finalize", "done"}
+            and item.get("state") in {STATE_COMPLETING, STATE_RETRY_LATE, STATE_DONE}
+            and item.get("upload_id")]
+        indices = [item.get("chunk_index") for item in ready]
+        if (expected < 1 or len(ready) != expected or len(journals) != expected
+                or any(type(index) is not int for index in indices)
+                or set(indices) != set(range(expected))):
             continue
 
         org_key = str(ready[0].get("org_key") or "")

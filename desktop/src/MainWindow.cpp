@@ -2757,7 +2757,7 @@ void MainWindow::loadTasks() {
       const bool available = task.value(QStringLiteral("available_for_duration")).toBool(false);
       QString label = task.value(QStringLiteral("name_pt")).toString();
       if (label.isEmpty()) label = task.value(QStringLiteral("name")).toString();
-      if (available) label += QStringLiteral("  ·  %1 vídeo(s)")
+      if (available) label += QStringLiteral("  ·  %1 trecho(s)")
                                   .arg(task.value(QStringLiteral("clip_count")).toInt());
       if (task.value(QStringLiteral("boosted")).toBool()) label += QStringLiteral("  ·  turbinada");
       if (!available) label += QStringLiteral("  ·  sem clipe compatível");
@@ -2767,6 +2767,13 @@ void MainWindow::loadTasks() {
       item->setData(Qt::UserRole, jsonId(task.value(QStringLiteral("id"))));
       item->setCheckState(available ? Qt::Checked : Qt::Unchecked);
       if (available) ++compatible;
+      if (available && task.contains(QStringLiteral("parent_video_count"))) {
+        item->setToolTip(QStringLiteral("%1 trechos de %2 vídeos de origem identificados no catálogo.\n"
+                                       "A seleção inclui conteúdo ainda não baixado e alterna vídeos de origem.\n"
+                                       "Os totais consideram a categoria, os sensores e a duração escolhida.")
+                             .arg(task.value(QStringLiteral("clip_count")).toInt())
+                             .arg(task.value(QStringLiteral("parent_video_count")).toInt()));
+      }
       if (!available) {
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
         item->setToolTip(task.value(QStringLiteral("unavailable_reason")).toString(

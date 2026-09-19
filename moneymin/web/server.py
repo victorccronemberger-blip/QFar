@@ -854,6 +854,27 @@ def _integration_snapshot() -> dict[str, Any]:
     }
 
 
+def _read_campaign_log(path: Path) -> dict[str, Any]:
+    """Um arquivo danificado não pode derrubar a lista inteira do histórico."""
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("log inválido")
+    for key in ("items", "accounts", "issues"):
+        if not isinstance(data.get(key, []), list):
+            raise ValueError("log inválido")
+    for item in data.get("items", []):
+        if (not isinstance(item, dict) or not isinstance(item.get("accounts", []), list)
+                or any(not isinstance(account, dict) for account in item.get("accounts", []))):
+            raise ValueError("log inválido")
+        try:
+            duration = float(item.get("duration_ms") or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("duração inválida no histórico") from exc
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("duração inválida no histórico")
+    return data
+
+
 def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
     """Resumo operacional legível, sem IDs, caminhos ou respostas de API."""
     configured = [str(email) for email in data.get("accounts", []) if email]
@@ -1276,6 +1297,24 @@ def create_app() -> Flask:
                 and request.get_data(cache=True)):
             if not request.is_json or not isinstance(request.get_json(silent=True), dict):
                 return jsonify({"error": "O corpo da requisição deve ser um objeto JSON válido."}), 400
+        if request.method == "POST" and request.path in ("/api/campaigns", "/api/campaigns/preflight"):
+            body = request.get_json(silent=True) or {}
+            accounts = body.get("accounts", [])
+            tasks = body.get("tasks", [])
+            if (not isinstance(accounts, list)
+                    or any(not isinstance(email, str) or not email.strip() for email in accounts)):
+                return jsonify({"error": "accounts deve ser uma lista de contas válidas."}), 400
+            normalized = [email.strip().casefold() for email in accounts]
+            if len(set(normalized)) != len(normalized):
+                return jsonify({"error": "A seleção contém contas duplicadas."}), 400
+            if not isinstance(tasks, list) or any(not isinstance(task, dict) for task in tasks):
+                return jsonify({"error": "tasks deve ser uma lista de categorias válidas."}), 400
+            try:
+                target = body.get("target_hours", 0)
+                if isinstance(target, bool) or not math.isfinite(float(target)):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                return jsonify({"error": "target_hours deve ser um número finito."}), 400
 
     @app.before_request
     def guard_account_operations():
@@ -2184,7 +2223,10 @@ def create_app() -> Flask:
             blockers.append("selecione ao menos uma conta")
         if not isinstance(raw_tasks, list) or not raw_tasks:
             blockers.append("selecione ao menos uma categoria")
-        known = {account["email"] for account in _list_accounts()}
+        try:
+            known = {account["email"] for account in _list_accounts()}
+        except ValueError:
+            return jsonify({"error": "Registro de contas inválido. Restaure os dados antes de continuar."}), 400
         missing_accounts = [email for email in emails if email not in known]
         accounts: list[AccountSpec] = []
         account_errors: list[str] = []
@@ -2213,6 +2255,8 @@ def create_app() -> Flask:
                     accounts[0].email, accounts[0].org_key,
                     min_dur_s=min_dur_s, max_dur_s=max_dur_s,
                     include_unavailable=True, dataset_provider=provider)
+                if not isinstance(catalog, list) or any(not isinstance(item, dict) for item in catalog):
+                    raise RuntimeError("resposta de categorias inválida")
                 catalog_loaded = True
             except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
                 account_issues.append(account_issue(
@@ -2240,8 +2284,12 @@ def create_app() -> Flask:
                 try:
                     sess = Session.from_email(account.email)
                     sess.ensure_auth()
+                    account_tasks = sess.all_tasks(account.org_key)
+                    if not isinstance(account_tasks, list) or any(
+                            not isinstance(item, dict) for item in account_tasks):
+                        raise RuntimeError("resposta de categorias inválida")
                     account_ids = {
-                        str(item.get("id")) for item in sess.all_tasks(account.org_key)
+                        str(item.get("id")) for item in account_tasks
                         if item.get("id")
                     }
                 except (AuthError, RuntimeError, OSError) as exc:
@@ -2415,6 +2463,8 @@ def create_app() -> Flask:
                 environment = readiness.campaign_readiness(dataset_provider)
             except (ValueError, OSError, RuntimeError) as exc:
                 return jsonify({"error": f"não foi possível validar a prontidão: {exc}"}), 400
+            if environment.get("ready") is False:
+                return jsonify({"error": "ambiente não está pronto; execute o preflight novamente."}), 400
             environment_errors = [
                 item for item in environment.get("checks", [])
                 if item.get("status") == "error"
@@ -2454,6 +2504,8 @@ def create_app() -> Flask:
                     accounts[0].email, accounts[0].org_key,
                     min_dur_s=min_dur_s, max_dur_s=max_dur_s,
                     include_unavailable=True, dataset_provider=dataset_provider)
+                if not isinstance(available, list) or any(not isinstance(item, dict) for item in available):
+                    raise RuntimeError("resposta de categorias inválida")
             except json.JSONDecodeError:
                 return jsonify({
                     "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
@@ -2509,8 +2561,12 @@ def create_app() -> Flask:
             try:
                 sess = Session.from_email(account.email)
                 sess.ensure_auth()
+                account_tasks = sess.all_tasks(account.org_key)
+                if not isinstance(account_tasks, list) or any(
+                        not isinstance(task, dict) for task in account_tasks):
+                    raise RuntimeError("resposta de categorias inválida")
                 account_task_ids = {
-                    str(task.get("id")) for task in sess.all_tasks(account.org_key)
+                    str(task.get("id")) for task in account_tasks
                     if task.get("id")
                 }
             except (AuthError, RuntimeError, OSError) as exc:
@@ -2526,8 +2582,9 @@ def create_app() -> Flask:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 for email, result in pool.map(_preflight, others):
                     if isinstance(result, str):
-                        skipped.append(result)
-                        continue
+                        return jsonify({
+                            "error": result + ". A campanha não foi iniciada.",
+                        }), 400
                     if result:
                         labels = [task.task_label or task.task_name or task.task_id
                                   for task in tasks if task.task_id in result]
@@ -2626,8 +2683,8 @@ def create_app() -> Flask:
         out: list[dict[str, Any]] = []
         for path in campaign.list_campaign_logs():
             try:
-                data = json.loads(path.read_text(encoding="utf-8-sig"))
-            except (OSError, json.JSONDecodeError):
+                data = _read_campaign_log(path)
+            except (OSError, ValueError):
                 continue
             items = data.get("items", [])
             sends = [acc for it in items for acc in it.get("accounts", [])
@@ -2648,9 +2705,9 @@ def create_app() -> Flask:
         if path is None:
             return jsonify({"error": "log não encontrado"}), 404
         try:
-            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            raw = _read_campaign_log(path)
             return jsonify(_campaign_log_view(raw))
-        except json.JSONDecodeError:
+        except (OSError, ValueError):
             return jsonify({"error": "log ilegível (JSON vazio/corrompido)"}), 400
 
     @app.post("/api/logs/<name>/status")
@@ -2659,8 +2716,8 @@ def create_app() -> Flask:
         if path is None:
             return jsonify({"error": "log não encontrado"}), 404
         try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
+            data = _read_campaign_log(path)
+        except (OSError, ValueError):
             return jsonify({"error": "log ilegível (JSON vazio/corrompido)"}), 400
         entries: list[tuple[str, str, str, int]] = []
         for it in data.get("items", []):
@@ -2896,7 +2953,10 @@ def create_app() -> Flask:
     # -- registro de enviados ---------------------------------------------------
     @app.get("/api/sent")
     def get_sent():
-        return jsonify({"sent": sent_registry.summary()})
+        try:
+            return jsonify({"sent": sent_registry.summary()})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
 
     @app.post("/api/sent/reset")
     def reset_sent():
@@ -2906,7 +2966,10 @@ def create_app() -> Flask:
             }), 409
         body = request.get_json(silent=True) or {}
         scenario = body.get("scenario")
-        sent_registry.reset(str(scenario) if scenario else None)
+        try:
+            sent_registry.reset(str(scenario) if scenario else None)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
         return jsonify({"ok": True, "sent": sent_registry.summary()})
 
     return app

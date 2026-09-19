@@ -43,6 +43,20 @@ class RecordedAtTests(unittest.TestCase):
         self.assertRegex(out, _ISO_MS)
         self.assertTrue(out.endswith(".609Z"))
 
+    def test_normalize_rejects_out_of_backlog_without_adjust(self) -> None:
+        now = 1_800_000_000.0
+        old = device_profile.format_recorded_at(now - 100_000)
+        with self.assertRaises(ValueError):
+            device_profile.normalize_recorded_at(
+                old, duration_s=600.0, now=now, adjust=False,
+                backlog_cap_ms=14_400_000)
+        adjusted = device_profile.normalize_recorded_at(
+            old, duration_s=600.0, now=now, adjust=True,
+            backlog_cap_ms=14_400_000)
+        wall = device_profile.recorded_at_to_wall_ms(adjusted)
+        self.assertIsNotNone(wall)
+        self.assertGreaterEqual(wall, int((now - 14_400_000 / 1000.0) * 1000))
+
     def test_start_stays_inside_backlog(self) -> None:
         now = 1_800_000_000.0
         start = device_profile.recording_start_epoch(
@@ -122,7 +136,7 @@ class IdentityConsistencyTests(unittest.TestCase):
         self.assertEqual(headers["X-Device-Id"], "android.ssaid:0123456789abcdef")
         self.assertEqual(opened["app_version"], config.APP_VERSION)
         self.assertEqual(opened["device_model"], "SM-S918B")
-        self.assertEqual(opened["os_version"], "android 14")
+        self.assertEqual(opened["os_version"], "android 34")
         self.assertEqual(
             self.profile.upload_device_meta()["model"], "SM-S918B")
         self.assertEqual(
@@ -181,24 +195,33 @@ class IdentityConsistencyTests(unittest.TestCase):
         self.profile.latitude = 91.0
         self.assertNotIn("X-Device-Location", self.profile.headers())
 
-    def test_warmup_runs_once_per_account_across_sessions(self) -> None:
-        email = "warmup-once@example.com"
-        minute_api._WARMED_IDENTITIES.discard(email)
-        first = minute_api.Session({"idToken": "token", "email": email}, email=email)
-        second = minute_api.Session({"idToken": "token", "email": email}, email=email)
-        try:
-            with (
-                mock.patch.object(
-                    minute_api.Session, "app_opened", return_value=(202, "")) as opened,
-                mock.patch.object(
-                    minute_api.Session, "fetch_recording_config",
-                    return_value=(200, '{"backlogCapMs":14400000}')),
-            ):
-                first.warmup()
-                second.warmup()
-            self.assertEqual(opened.call_count, 1)
-        finally:
-            minute_api._WARMED_IDENTITIES.discard(email)
+    def test_warmup_does_not_publish_simulated_app_opened(self) -> None:
+        sess = minute_api.Session({"idToken": "token", "email": "fixture@example.com"})
+        with (
+            mock.patch.object(config, "PUBLISH_APP_OPENED", False),
+            mock.patch.object(sess, "app_opened") as opened,
+            mock.patch.object(sess, "fetch_recording_config", return_value=(200,
+                '{"configVersion":1,"minDurationMs":60000,"maxDurationMs":1800000,"backlogCapMs":14400000}')),
+            mock.patch.object(sess, "camera_model_allowed", return_value=True),
+        ):
+            sess.warmup()
+            sess.warmup()
+        opened.assert_not_called()
+
+    def test_warmup_publishes_app_opened_once_when_flag_enabled(self) -> None:
+        sess = minute_api.Session({"idToken": "token", "email": "fixture@example.com"})
+        with (
+            mock.patch.object(config, "PUBLISH_APP_OPENED", True),
+            mock.patch.object(sess, "app_opened", return_value=(200, "{}")) as opened,
+            mock.patch.object(sess, "fetch_recording_config", return_value=(200,
+                '{"configVersion":1,"minDurationMs":60000,"maxDurationMs":1800000,"backlogCapMs":14400000}')),
+            mock.patch.object(sess, "camera_model_allowed", return_value=True),
+        ):
+            sess.warmup()
+            sess._recording_checked_at = None
+            sess.warmup()
+        opened.assert_called_once_with("SESSION_RESUMED")
+        self.assertIsNotNone(sess.recording_policy)
 
 
 class ChunkPlanTests(unittest.TestCase):
@@ -238,6 +261,16 @@ class ChunkPlanTests(unittest.TestCase):
         with mock.patch.dict(config._EFFECTIVE_LIMITS, limits, clear=True):
             with self.assertRaises(ValueError):
                 _chunk_plan(90_000)
+
+    def test_chunk_plan_uses_explicit_session_limits(self) -> None:
+        limits = {
+            "min_duration_ms": 60_000,
+            "max_duration_ms": 120_000,
+            "backlog_cap_ms": 14_400_000,
+        }
+        plan = _chunk_plan(200_000, limits=limits)
+        self.assertEqual(sum(dur for _, dur in plan), 200_000)
+        self.assertTrue(all(60_000 <= dur <= 120_000 for _, dur in plan))
 
     def test_imu_slice_rebases_timestamps(self) -> None:
         csv = "t,ax,ay,az,wx,wy,wz\n0,1,0,0,0,0,0\n10000000,1,0,0,0,0,0\n"
@@ -888,16 +921,18 @@ class GatesTests(unittest.TestCase):
         sess = self._session(responder)
         try:
             minute_api._maybe_latch_version_gate(
-                '{"detail":{"code":"app_version_too_old",'
-                '"minVersion":"1.99.0"}}')
+                '{"detail":{"error":"app_version_too_old",'
+                '"min_version":"1.99.0"}}')
             gate = sess.version_gate()
             self.assertIsNotNone(gate)
             self.assertEqual(gate["minVersion"], "1.99.0")
             self.assertLess(
                 minute_api._semver_tuple(config.APP_VERSION),
                 minute_api._semver_tuple("1.99.0"))
-            with self.assertRaises(minute_api.AuthError):
-                sess.ensure_auth(org_key="org")
+            self.assertIsInstance(sess.ensure_auth(org_key="org"), dict)
+            with self.assertRaises(minute_api.AuthError) as caught:
+                sess._check_write_policy("POST", "/api/v1/organizations/join", {})
+            self.assertEqual(caught.exception.account_issue_code, "version")
         finally:
             minute_api._maybe_latch_version_gate("", clear=True)
 
@@ -917,8 +952,8 @@ class GatesTests(unittest.TestCase):
                     minute_api, "_request",
                     return_value=(
                         403,
-                        '{"detail":{"code":"app_version_too_old",'
-                        '"minVersion":"2.0.0"}}')):
+                        '{"detail":{"error":"app_version_too_old",'
+                        '"min_version":"2.0.0"}}')):
                 status, _ = sess.request("GET", "/api/v1/users/me")
             self.assertEqual(status, 403)
             gate = minute_api._version_gate_file()
@@ -929,11 +964,13 @@ class GatesTests(unittest.TestCase):
             minute_api._maybe_latch_version_gate("", clear=True)
 
     def test_camera_policy_allow_and_deny(self) -> None:
+        # Allow list no fio já vem normalizada (como o includes() do Hermes espera).
         policy = json.dumps({
             "policyVersion": 1,
-            "androidAllowModels": ["SM-S918B"],
-            "androidDeniedModels": [],
-            "androidAllowModelPatterns": [],
+            "iosAllowModels": [],
+            "iosDeniedModels": [],
+            "androidAllowModels": ["sm-s918b"],
+            "androidAllowModelPatterns": [r"^sm-g99"],
             "normalization": {
                 "trimWhitespace": True, "lowercase": True,
                 "collapseInternalWhitespace": True,
@@ -946,8 +983,9 @@ class GatesTests(unittest.TestCase):
             raise AssertionError(f"rota inesperada: {path}")
 
         sess = self._session(responder)
-        self.assertIs(sess.camera_model_allowed("  sm-s918b  "), True)
-        self.assertIs(sess.camera_model_allowed("SM-G991B"), False)
+        self.assertIs(sess.camera_model_allowed("  SM-S918B  "), True)
+        self.assertIs(sess.camera_model_allowed("SM-G991B"), True)
+        self.assertIs(sess.camera_model_allowed("Pixel 8"), False)
 
 
 if __name__ == "__main__":

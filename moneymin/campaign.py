@@ -60,6 +60,7 @@ from .campaign_types import (
     TaskSpec,
 )
 from .device_profile import DeviceProfile
+from .content_selection import diverse_order, diversity_summary, parent_key
 from .minute_api import AuthError, Session
 from .sidecar import (
     build_frames_csv,
@@ -711,36 +712,40 @@ def prepare_holoassist_clip(
 
 
 def _new_identity(duration_s: float, email: str,
-                  recorded_at: str | None = None) -> tuple[str, str, str]:
+                  recorded_at: str | None = None,
+                  *,
+                  limits: dict[str, int] | None = None,
+                  ) -> tuple[str, str, str]:
     """Gera session_id/log_id/recorded_at NOVOS (identidade única por conta).
 
-    `recorded_at` é o INÍCIO da gravação, no formato nativo (3 dígitos, UTC)
-    e dentro do backlog de 4h. Sem valor pré-agendado, a gravação termina
-    `gap` (1.5min–1.5h) antes do upload — nunca "agora".
+    `recorded_at` explícito é validado na janela da política (sem reescrita).
+    Sem valor pré-agendado, a gravação termina `gap` (1.5min–1.5h) antes do
+    upload — nunca "agora".
     """
     session_id = str(uuid.uuid4())
+    backlog = device_profile.effective_backlog_cap_ms(limits)
     if recorded_at:
         recorded_at = device_profile.normalize_recorded_at(
-            recorded_at, duration_s=duration_s)
+            recorded_at, duration_s=duration_s, adjust=False,
+            backlog_cap_ms=backlog)
         return session_id, f"{session_id}_0", recorded_at
     rng = random.Random(f"{email}|{session_id}")
     gap_s = rng.uniform(90.0, 5400.0)
-    start = device_profile.recording_start_epoch(duration_s, gap_s=gap_s)
+    start = device_profile.recording_start_epoch(
+        duration_s, gap_s=gap_s, backlog_cap_ms=backlog)
     recorded_at = device_profile.format_recorded_at(start)
     return session_id, f"{session_id}_0", recorded_at
 
 
-def _chunk_plan(duration_ms: int, target_ms: int | None = None
+def _chunk_plan(duration_ms: int, target_ms: int | None = None,
+                limits: dict[str, int] | None = None,
                 ) -> list[tuple[int, int]]:
-    """Janelas (start_ms, dur_ms) respeitando os limites EFETIVOS do
-    recording-config remoto (min/max duração) — sem gerar chunk que o preflight
-    viria a recusar se o servidor apertar o teto.
+    """Janelas (start_ms, dur_ms) respeitando os limites da política da sessão.
 
-    Por padrão, o alvo é o próprio máximo remoto. Assim, um vídeo dentro do
-    intervalo aceito vira exatamente um upload; só há particionamento quando a
-    duração total ultrapassa o teto imposto pelo backend.
+    Sem `limits`, cai nos defaults locais. O alvo padrão é o máximo da política:
+    um vídeo dentro do intervalo vira um upload; só particiona acima do teto.
     """
-    limits = config.recording_limits()
+    limits = dict(limits) if limits is not None else config.recording_limits()
     eff_min = max(1_000, int(limits.get("min_duration_ms") or MIN_DUR_MS))
     eff_max = max(eff_min, int(limits.get("max_duration_ms") or MAX_DUR_MS))
     if target_ms is None:
@@ -1138,7 +1143,7 @@ class _ClipPrefetch:
 
     def shutdown(self) -> None:
         self.cancel()
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        self._pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _prefetch_following(
@@ -1504,9 +1509,13 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             sess._moneymin_pending_pumped = True
             if recovered:
                 result["recovered_uploads"] = len(recovered)
+        policy_limits = (
+            sess.recording_policy.limits()
+            if getattr(sess, "recording_policy", None) is not None
+            else config.recording_limits())
         dur_s = item["duration_ms"] / 1000
         session_id, log_id, recorded_at = _new_identity(
-            dur_s, account.email, recorded_at=recorded_at)
+            dur_s, account.email, recorded_at=recorded_at, limits=policy_limits)
         base_video = Path(item["video_path"])
         if unique_video:
             if on_progress:
@@ -1541,7 +1550,7 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         frames_csv = build_frames_csv_from_video(
             video_path, duration_ms=int(item["duration_ms"]),
             fps=fps, gop=profile.frames_gop, offset_ns=frames_offset)
-        plan = _chunk_plan(int(item["duration_ms"]))
+        plan = _chunk_plan(int(item["duration_ms"]), limits=policy_limits)
         chunk_paths: list[Path] = []
         chunk_zips: list[bytes] = []
         chunk_recorded: list[str] = []
@@ -1577,6 +1586,7 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 duration_ms=dur_ms))
             chunk_paths.append(part)
             chunk_recorded.append(rec_at)
+        result["session_id"] = session_id
         res = upload_session(
             sess, chunk_paths if len(chunk_paths) > 1 else chunk_paths[0],
             account.org_key,
@@ -1626,6 +1636,9 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
     except (AuthError, UploadError) as exc:
         result["error"] = str(exc)
         result["restriction_confirmed"] = getattr(exc, "account_issue_code", None) == "restricted"
+        result["retryable"] = (exc.retryable if isinstance(exc, UploadError) else
+                               getattr(exc, "account_issue_code", None) in {
+                                   "network", "timeout", "service", "rate_limit"})
     return result
 
 
@@ -1654,6 +1667,39 @@ def run_campaign(
     *,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+) -> CampaignLog:
+    """Executa e persiste o ciclo completo, inclusive em falhas inesperadas."""
+    emails = [account.email.strip().casefold() for account in config.accounts]
+    if not emails or any(not email for email in emails) or len(set(emails)) != len(emails):
+        raise ValueError("Selecione contas válidas, sem duplicatas.")
+    if not config.tasks:
+        raise ValueError("Selecione ao menos uma categoria.")
+    log = log or CampaignLog(started_at=_recorded_at_now(),
+                             accounts=[a.email for a in config.accounts])
+    log.save()
+    prefetch = _ClipPrefetch(Path(config.work_dir))
+    try:
+        return _run_campaign(config, log, progress=progress,
+                             should_stop=should_stop, prefetch=prefetch)
+    except Exception as exc:
+        log.status = "error"
+        log.issues.append({"kind": "campaign_error", "error": f"{type(exc).__name__}: {exc}"})
+        try:
+            log.save()
+        except OSError as save_error:
+            exc.add_note(f"Não foi possível salvar a falha da campanha: {save_error}")
+        raise
+    finally:
+        prefetch.shutdown()
+
+
+def _run_campaign(
+    config: CampaignConfig,
+    log: CampaignLog | None = None,
+    *,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    prefetch: _ClipPrefetch,
 ) -> CampaignLog:
     """Executa a campanha: para cada task, escolhe clipes, prepara e envia para
     todas as contas. Devolve o log com os resultados por item.
@@ -1699,7 +1745,7 @@ def run_campaign(
             sends[key] += 1
         elif kind == "campaign_stopped":
             log.status = "stopped"
-        elif (kind in ("task_error", "task_empty")
+        elif (kind in ("task_error", "task_empty", "task_exhausted", "task_shortfall", "goal_shortfall")
               or (kind == "clip_prepare_done" and not payload.get("ok"))):
             log.issues.append({"kind": kind, **payload})
             log.save()
@@ -1728,7 +1774,6 @@ def run_campaign(
                              accounts=[a.email for a in config.accounts])
     work_dir = Path(config.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    prefetch = _ClipPrefetch(work_dir)
     sessions: dict[str, Session] = {}
     banned: set[str] = set()
     account_seconds: dict[str, float] = {}
@@ -1850,27 +1895,29 @@ def run_campaign(
                     # tarefa rotulada, não inferências por texto de narração.
                     shorts = [*strict_holoassist, *shorts]
                 all_clips = shorts
-                fresh = [c for c in all_clips
-                         if not sent_registry.is_sent_to_all(
-                             registry_key, c["clip_uid"], emails)]
+                fresh = []
+                used_parents = set()
+                for candidate in all_clips:
+                    if sent_registry.is_sent_to_all(registry_key, candidate["clip_uid"], emails):
+                        used_parents.add(parent_key(candidate))
+                    else:
+                        fresh.append(candidate)
                 skipped_n = len(all_clips) - len(fresh)
                 if skipped_n:
                     _log(f"  (pulando {skipped_n} clipe(s) já enviado(s) anteriormente)")
                 if not fresh and all_clips:
-                    # 100% do cenário já foi enviado: reseta e recomeça do início
-                    sent_registry.reset(registry_key)
-                    _log(f"  [i] todos os {len(all_clips)} clipe(s) de "
-                         f"'{tsk.scenario}' já foram enviados — registro resetado, "
-                         "recomeçando do início")
-                    _emit("sent_reset", scenario=tsk.scenario,
+                    _log(f"  [i] catálogo elegível esgotado para '{display_name}'; histórico preservado")
+                    _emit("task_exhausted", scenario=tsk.scenario, task_name=display_name,
                           eligible=len(all_clips))
-                    fresh = all_clips
+                    continue
                 hours = sum(float(c.get("dur_s") or 0) for c in fresh) / 3600
                 merged_n = sum(1 for c in fresh if c.get("needs_cut"))
                 _log(f"  pool: {len(shorts)} trechos puros → {len(fresh)} "
                      f"sessões ({merged_n} cortes do vídeo-pai, {hours:.1f}h)")
-                clips = ego4d.prefer_long_clips(
-                    fresh, shuffle=config.shuffle_schedule)
+                clips = diverse_order(ego4d.prefer_long_clips(
+                    fresh, shuffle=config.shuffle_schedule), used_parents=used_parents)
+                _emit("content_pool", task_name=display_name, clips=len(clips),
+                      **diversity_summary(clips))
         except Exception as exc:  # noqa: BLE001 — uma categoria não mata as demais
             error = f"{type(exc).__name__}: {exc}"
             _log(f"  [!] falha ao selecionar clipes: {error}")
@@ -2018,6 +2065,19 @@ def run_campaign(
             item["accounts"] = []
             pending_accounts: list[AccountSpec] = []
             account_results: dict[str, dict[str, Any]] = {}
+            persisted_item: dict[str, Any] | None = None
+
+            def _persist_item_results() -> None:
+                nonlocal persisted_item
+                item["accounts"] = [account_results[a.email] for a in config.accounts
+                                    if a.email in account_results]
+                if persisted_item is None:
+                    persisted_item = {k: v for k, v in item.items()
+                                      if k not in ("imu_csv", "frames_csv", "probe", "_cleanup_paths")}
+                    log.add_item(persisted_item)
+                else:
+                    persisted_item["accounts"] = item["accounts"]
+                log.save()
             for account in task_accounts:
                 if should_stop and should_stop():
                     _log("  [!] campanha interrompida pelo usuário")
@@ -2171,6 +2231,11 @@ def run_campaign(
                     if last_result.get("restriction_confirmed") or _is_disabled_error(last_result.get("error")):
                         # Restrição confirmada não deve provocar novas tentativas.
                         return last_result
+                    # Não recrie uma sessão cujo envio pode ter sido aceito.
+                    # A recuperação desse estado pertence ao journal persistido.
+                    if (last_result.get("retryable") is not True
+                            or last_result.get("session_id") or last_result.get("uploads")):
+                        return last_result
                     if should_stop and should_stop():
                         return last_result
                     if attempt < max_attempts:
@@ -2206,10 +2271,19 @@ def run_campaign(
                 duration_s: float = float(item.get("duration_ms") or 0) / 1000.0,
             ) -> None:
                 results[account.email] = acc_res
+                # Persiste antes de atualizar o índice de deduplicação. Uma falha
+                # no índice não deve apagar do histórico um envio concluído.
+                record_error: Exception | None = None
+                try:
+                    _persist_item_results()
+                except Exception as exc:
+                    record_error = exc
                 ok = acc_res.get("ok")
                 if ok:
-                    sent_registry.mark_sent(sent_key, clip_uid,
-                                            account.email)
+                    try:
+                        sent_registry.mark_sent(sent_key, clip_uid, account.email)
+                    except Exception as exc:
+                        record_error = record_error or exc
                     if not acc_res.get("skipped"):
                         sends[account.email] = sends.get(account.email, 0) + 1
                         account_seconds[account.email] = (
@@ -2223,12 +2297,15 @@ def run_campaign(
                       task=task_scenario, email=account.email, ok=ok,
                       finalized=acc_res.get("finalized"),
                       evaluate=ev, error=acc_res.get("error"),
+                      skipped=bool(acc_res.get("skipped")),
                       session_id=acc_res.get("session_id"))
                 if not ok and (acc_res.get("restriction_confirmed") or _is_disabled_error(acc_res.get("error"))):
                     banned.add(account.email)
                     sessions.pop(account.email, None)
                     acc_res["excluded_from_campaign"] = True
                     _emit("account_excluded", email=account.email)
+                if record_error is not None:
+                    raise record_error
 
             batch_started_at = time.monotonic() if pending_accounts else None
             # Reserva TODAS as contas no mesmo instante, antes de disputar
@@ -2263,6 +2340,7 @@ def run_campaign(
                     futures = {}
                     launched = 0
                     accepting = True
+                    persistence_error: Exception | None = None
                     next_batch_tick = time.monotonic() + 5.0
 
                     def _stagger_launch(launched_count: int) -> bool:
@@ -2286,7 +2364,14 @@ def run_campaign(
                         # só a parada solicitada interrompe as demais contas.
                         for future in [f for f in futures if f.done()]:
                             account = futures.pop(future)
-                            _record_account(account, future.result())
+                            try:
+                                _record_account(account, future.result())
+                            except Exception as exc:
+                                # Pare novos envios, mas recolha resultados de
+                                # workers já ativos antes de encerrar o histórico.
+                                persistence_error = persistence_error or exc
+                                accepting = False
+                                queued.clear()
                         if should_stop and should_stop():
                             accepting = False
                         while accepting and queued and len(futures) < workers:
@@ -2323,6 +2408,9 @@ def run_campaign(
                                   pending_accounts=len(futures),
                                   elapsed_s=int(time.monotonic() - batch_started_at))
                             next_batch_tick = time.monotonic() + 5.0
+                    if persistence_error is not None:
+                        _stop_warm()
+                        raise persistence_error
 
             item["accounts"] = [account_results[a.email] for a in config.accounts
                                 if a.email in account_results]
@@ -2337,12 +2425,7 @@ def run_campaign(
             # Salva inclusive um lote parcial interrompido: os envios que já
             # terminaram não desaparecem do histórico nem da retomada.
             if account_results:
-                log.add_item({k: v for k, v in item.items()
-                              if k not in (
-                                  "imu_csv", "frames_csv", "probe",
-                                  "_cleanup_paths",
-                              )})
-                log.save()  # incremental: não perde a campanha em caso de crash
+                _persist_item_results()
             if should_stop and should_stop():
                 if account_results:
                     _emit("item_done", clip_uid=clip_info["clip_uid"],
@@ -2370,7 +2453,6 @@ def run_campaign(
                 _emit("item_incomplete", clip_uid=clip_info["clip_uid"],
                       task=tsk.scenario,
                       accounts=[r.get("email") for r in failed_accounts])
-                prefetch.shutdown()
                 raise RuntimeError(
                     "lote incompleto após todas as tentativas; "
                     "a campanha não avançou. Contas pendentes: " + details
@@ -2414,6 +2496,12 @@ def run_campaign(
                       task=tsk.scenario, partial=False)
             # (log: sem os blobs/csv brutos — grandes; identity fica por conta)
 
+        if log.status != "stopped" and not quota_s and automatic_selection:
+            remaining = {a.email: tsk.count - task_sends.get(a.email, 0)
+                         for a in config.accounts if task_sends.get(a.email, 0) < tsk.count}
+            if remaining:
+                _emit("task_shortfall", task_name=display_name, task_id=tsk.task_id,
+                      requested_per_account=tsk.count, remaining_sends=remaining)
         if len(banned) == len(config.accounts):
             break
         if quota_s and all(account_seconds.get(a.email, 0) >= quota_s
@@ -2421,8 +2509,12 @@ def run_campaign(
             _log(f"  [i] meta de {quota_s / 3600:.1f}h por conta atingida")
             break
 
-    prefetch.shutdown()
     if log.status != "stopped":
+        if quota_s:
+            remaining = {a.email: max(0.0, quota_s - account_seconds.get(a.email, 0))
+                         for a in config.accounts if account_seconds.get(a.email, 0) < quota_s}
+            if remaining:
+                _emit("goal_shortfall", target_seconds=quota_s, remaining_seconds=remaining)
         log.status = ("error" if not sends["ok"] and not sends["skipped"] else
                       "partial" if log.issues or sends["failed"] else "done")
     log_path = log.save()
@@ -2797,6 +2889,7 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                 "category_label": CATEGORY_PT.get(
                     category_slug, str(category.get("label") or "Outras")),
                 "clip_count": len(clips),
+                **diversity_summary(clips),
                 "clip_sources": source_counts,
                 "dur_range_s": ((min(c["dur_s"] for c in clips),
                                  max(c["dur_s"] for c in clips)) if clips else None),

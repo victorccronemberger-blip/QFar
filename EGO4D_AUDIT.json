@@ -1,0 +1,20 @@
+{
+  "offline": true,
+  "dataset_version": "2.0",
+  "videos": 9611,
+  "unique_video_ids": 9611,
+  "clips": 15133,
+  "videos_with_imu_flag": 2288,
+  "issues": {
+    "missing_parent": 1
+  },
+  "examples": {
+    "missing_parent": [
+      "ef29f87d-3594-48fc-99db-0de55842e866"
+    ]
+  },
+  "limits": [
+    "Metadata checks do not verify video content, full decoding, IMU continuity or remote availability.",
+    "Scenario labels and narrations are evidence, not proof of continuous activity."
+  ]
+}

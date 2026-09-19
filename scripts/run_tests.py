@@ -13,7 +13,9 @@ def main() -> int:
     arguments = sys.argv[1:] or ["discover", "-s", "test", "-q"]
     with tempfile.TemporaryDirectory(prefix="qmoney-tests-") as root:
         environment = os.environ.copy()
-        environment.update(QMONEY_USER_ROOT=root, QMONEY_LIBRARY_ROOT=root)
+        environment.update(QMONEY_USER_ROOT=root, QMONEY_LIBRARY_ROOT=root,
+                           MINUTE_VPN_ENFORCE="0", MINUTE_REQUIRE_CURL="0",
+                           MINUTE_PUBLISH_APP_OPENED="0")
         return subprocess.run(
             [sys.executable, "-m", "unittest", *arguments],
             cwd=project, env=environment,
