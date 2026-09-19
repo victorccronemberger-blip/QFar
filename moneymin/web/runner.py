@@ -42,6 +42,12 @@ def friendly_campaign_error(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return "O QMoney não conseguiu concluir esta etapa. Tente novamente."
+    if "origem da gravação não permitida" in text:
+        return "A organização não permite a origem de câmera declarada neste envio. Confira a política da organização; repetir o envio não resolve essa restrição."
+    if "origens de gravação permitidas não foram confirmadas" in text:
+        return "Não foi possível consultar as origens de câmera permitidas pela organização. Tente novamente após verificar a conexão."
+    if "origem da câmera" in text and "metadados" in text:
+        return "Os metadados do envio não informam uma origem de câmera válida. O envio foi bloqueado antes do registro."
     if "memoryerror" in text or "cannot allocate memory" in text or "not enough memory" in text:
         return "Este computador ficou sem memória durante a preparação. O QMoney liberou a etapa e seguirá com outro vídeo."
     if "cobertura imu insuficiente" in text or "sem amostras válidas de imu" in text:

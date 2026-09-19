@@ -1082,11 +1082,21 @@ class Session:
             raise AuthError("Não foi possível verificar a situação da conta na organização.", code="service")
         self._check_recording_geo(org_key)
         meta = body.get("meta") if isinstance(body, dict) else None
-        source = meta.get("source") if isinstance(meta, dict) else None
         sources = state.get("cameraSources")
         if not isinstance(sources, list) or not sources:
             raise AuthError("Origens de gravação permitidas não foram confirmadas.", code="service")
-        if not isinstance(source, str) or source not in sources:
+        # meta.source descreve o formato (ego), não a origem da câmera.
+        # A origem declarada de cada câmera está em meta.cameras[].source.
+        cameras = meta.get("cameras") if isinstance(meta, dict) else None
+        if not isinstance(cameras, list) or not cameras:
+            raise AuthError("Origem da câmera ausente nos metadados do envio.", code="policy")
+        camera_sources = []
+        for camera in cameras:
+            source = camera.get("source") if isinstance(camera, dict) else None
+            if source not in ("builtin", "built-in", "external"):
+                raise AuthError("Origem da câmera inválida nos metadados do envio.", code="policy")
+            camera_sources.append("built-in" if source == "builtin" else source)
+        if any(source not in sources for source in camera_sources):
             raise AuthError("Origem da gravação não permitida pela organização.", code="policy")
         try:
             self.recording_policy.validate_duration(body.get("duration_ms") if isinstance(body, dict) else None)

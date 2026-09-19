@@ -1,5 +1,30 @@
 # Revisão da campanha — 18/09/2026
 
+## Incidente da versão 1.0.46: origem de câmera
+
+O histórico local da campanha iniciada em 18/09 às 23:20 revelou 62 resultados
+com `Origem da gravação não permitida pela organização.` O erro era levantado
+pelo controle local antes do registro de upload, mas a interface mostrava uma
+mensagem genérica recomendando validar a conta.
+
+Causa: o controle comparava `meta.source=ego` com `cameraSources` da organização.
+Esses campos têm domínios diferentes. O primeiro descreve o formato dos
+metadados; a organização usa `built-in`/`external` para origens de câmera.
+Os testes antigos usavam `native` em ambos os lados e mascaravam a divergência.
+
+Correção local posterior à release: validar todas as origens declaradas em
+`meta.cameras[].source`, normalizando apenas `builtin` para `built-in`.
+Origem ausente, desconhecida ou não permitida continua bloqueada. Nenhuma
+origem é substituída para obter autorização, e o payload não é alterado.
+A interface agora distingue a restrição de origem de uma falha de autenticação.
+As entradas dos testes refletem a estrutura efetiva dos metadados e os valores
+do OpenAPI, incluindo câmeras mistas e negativas explícitas.
+
+Validação da correção para 1.0.47: 412 testes Python aprovados.
+
+Esta mudança não comprova a origem física do conteúdo e não altera perfis,
+sensores ou permissões remotas. Nenhum novo envio foi iniciado para diagnosticá-la.
+
 ## Rodada mais recente: validação ampliada da Campanha
 
 Resultado local: **410 testes Python aprovados**, incluindo 25 testes de

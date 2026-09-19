@@ -60,14 +60,14 @@ class SessionPolicyTests(unittest.TestCase):
         self.camera = self.stack.enter_context(self.camera_patch)
         self.stack.enter_context(patch.object(self.session, "version_gate", return_value=None))
         self.state = self.stack.enter_context(patch.object(self.session, "org_state", return_value={
-            "blocked": False, "userState": "active", "cameraSources": ["native"]}))
+            "blocked": False, "userState": "active", "cameraSources": ["built-in"]}))
         self.geo = self.stack.enter_context(patch.object(self.session, "recording_geo", return_value={
             "recordingAuthorization": "APPROVED", "canUpload": True, "blockedReason": None}))
         self.opened = self.stack.enter_context(patch.object(self.session, "app_opened"))
 
     def check(self, body=None):
         self.session._check_write_policy("POST", "/api/v1/uploads?org_key=fixture",
-                                         body or {"duration_ms": 2000, "meta": {"source": "native"},
+                                         body or {"duration_ms": 2000, "meta": {"source": "ego", "cameras": [{"source": "builtin"}]},
                                                   "recorded_at": (datetime.now(timezone.utc) - timedelta(seconds=3)).isoformat()})
 
     def test_success_is_cached_and_no_analytics_is_published(self):
@@ -178,11 +178,32 @@ class SessionPolicyTests(unittest.TestCase):
     def test_bad_duration_blocked(self):
         for duration in (True, "2000", 999, 10001):
             with self.subTest(duration=duration), self.assertRaises(AuthError):
-                self.check({"duration_ms": duration, "meta": {"source": "native"}})
+                self.check({"duration_ms": duration, "meta": {"source": "ego", "cameras": [{"source": "builtin"}]}})
+
+    def test_ego_format_and_camera_origin_are_separate_contracts(self):
+        # Forma do metadata.json usado em produção, com os valores do OpenAPI.
+        self.check()
+        for cameras in (None, [], [None], [{"source": "ego"}],
+                        [{"source": "external"}],
+                        [{"source": "builtin"}, {"source": "external"}]):
+            with self.subTest(cameras=cameras), self.assertRaises(AuthError):
+                self.check({"duration_ms": 2000,
+                            "recorded_at": (datetime.now(timezone.utc) - timedelta(seconds=3)).isoformat(),
+                            "meta": {"source": "ego", "cameras": cameras}})
+        self.state.return_value = {"blocked": False, "userState": "active", "cameraSources": ["external"]}
+        self.check({"duration_ms": 2000,
+                    "recorded_at": (datetime.now(timezone.utc) - timedelta(seconds=3)).isoformat(),
+                    "meta": {"source": "ego", "cameras": [{"source": "external"}]}})
+
+    def test_source_policy_failure_has_actionable_public_message(self):
+        from moneymin.web.runner import friendly_campaign_error
+        message = friendly_campaign_error("Origem da gravação não permitida pela organização.")
+        self.assertIn("origem de câmera", message)
+        self.assertNotIn("Valide a conta", message)
 
     def test_org_restrictions_and_sources_are_enforced(self):
-        for state in ({"blocked": True, "userState": "on_hold", "cameraSources": ["native"]},
-                      {"blocked": False, "userState": "unknown", "cameraSources": ["native"]},
+        for state in ({"blocked": True, "userState": "on_hold", "cameraSources": ["built-in"]},
+                      {"blocked": False, "userState": "unknown", "cameraSources": ["built-in"]},
                       {"blocked": False, "userState": "active", "cameraSources": []},
                       {"blocked": False, "userState": "active", "cameraSources": ["external"]}):
             with self.subTest(state=state):
