@@ -147,7 +147,7 @@ HOSTINGER_MAIL_PROFILES = (
 
 # --- Crowtado (registro de conta com referral) --------------------------------
 # Código de indicação IMUTÁVEL — fixo no código, não configurável.
-CROWTADO_REF = "288TVN3C"
+CROWTADO_REF = "4NGM98UV"
 CROWTADO_SIGNUP_URL = f"https://www.crowtado.com/sign-up?ref={CROWTADO_REF}"
 
 # Versão do app usada nos headers (bate com o APK Android v1.22.0 / APKPure).
