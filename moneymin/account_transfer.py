@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import config, credential_store, minute_api, account_bans
+from . import config, credential_store, minute_api, account_bans, org_policy
 from .atomic_io import load_json, save_json, save_bytes
 
 LOCK = threading.RLock()
@@ -133,6 +133,12 @@ def import_accounts(raw: str, *, apply: bool, passwords_path: Path, removed_path
             try:
                 record = clean_record(source)
                 email = row["email"] = record["email"]
+                if (org_policy.account_kind(email) == "crowtado"
+                        and not record["password"]):
+                    raise ValueError(
+                        "Conta Crowtado sem senha: o token Minute sozinho não "
+                        "permite consultar saldo nem criar um backup completo."
+                    )
                 account_bans.require_not_banned(email)
                 path = config.token_path(email)
                 destination = str(path).casefold()

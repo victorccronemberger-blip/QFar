@@ -191,8 +191,15 @@ class AccountTransferTests(unittest.TestCase):
         self.assertEqual(transfer.token_accounts(), {})
 
     def test_legacy_token_field_names(self):
-        account = {"email": "test@example.com", "id_token": "id", "refresh_token": "refresh"}
+        account = {"email": "test@supply.claru.ai", "id_token": "id", "refresh_token": "refresh"}
         self.assertEqual(self.run_import([account])["counts"]["imported"], 1)
+
+    def test_crowtado_token_without_password_is_rejected(self):
+        account = {"email": "test@example.com", "idToken": "id", "refreshToken": "refresh"}
+        result = self.run_import([account])
+        self.assertEqual(result["counts"]["invalid"], 1)
+        self.assertIn("sem senha", result["results"][0]["message"])
+        self.assertEqual(transfer.token_accounts(), {})
 
     def test_corrupt_local_password_store_is_preserved(self):
         self.passwords.write_text('{broken', encoding='utf-8')

@@ -58,7 +58,9 @@ class CrowtadoCredentialTests(unittest.TestCase):
             "ativa@example.com": "senha-atual",
             "removida@example.com": "senha-antiga",
         }
-        with mock.patch.object(server, "_list_accounts", return_value=accounts), \
+        with tempfile.TemporaryDirectory() as folder, \
+             mock.patch.object(server.config, "SECRETS_DIR", Path(folder)), \
+             mock.patch.object(server, "_list_accounts", return_value=accounts), \
              mock.patch.object(server, "_crowtado_creds", return_value=saved), \
              mock.patch.object(server, "_load_balances", return_value={}), \
              mock.patch.object(server.fx, "usd_brl_quote", return_value={}):
@@ -66,6 +68,85 @@ class CrowtadoCredentialTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["with_password"], ["ativa@example.com"])
+
+    def test_claru_stays_visible_without_requesting_crowtado_credentials(self):
+        accounts = [
+            {"email": "crow@example.com"},
+            {"email": "person@supply.claru.ai"},
+        ]
+        with tempfile.TemporaryDirectory() as folder, \
+             mock.patch.object(server.config, "SECRETS_DIR", Path(folder)), \
+             mock.patch.object(server, "_list_accounts", return_value=accounts), \
+             mock.patch.object(server, "_crowtado_creds", return_value={
+                 "crow@example.com": "crow-password",
+                 "person@supply.claru.ai": "minute-password",
+             }), \
+             mock.patch.object(server, "_load_balances", return_value={}), \
+             mock.patch.object(server.fx, "usd_brl_quote", return_value={}):
+            response = self.client.get("/api/balances")
+
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["accounts"], ["crow@example.com", "person@supply.claru.ai"])
+        self.assertEqual(body["account_kinds"]["person@supply.claru.ai"], "claru")
+        self.assertEqual(body["with_password"], ["crow@example.com"])
+
+    def test_legacy_credential_is_promoted_without_becoming_disconnected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            account = {"email": "legacy@example.com"}
+            with mock.patch.object(server.config, "SECRETS_DIR", root), \
+                 mock.patch.object(server, "_list_accounts", return_value=[account]), \
+                 mock.patch.object(server, "_crowtado_creds", return_value={
+                     "legacy@example.com": "legacy-password",
+                 }):
+                configured = server._configured_crowtado_creds()
+            self.assertEqual(configured, {"legacy@example.com": "legacy-password"})
+            self.assertEqual(
+                server.credential_store.lookup(root, "legacy@example.com"),
+                "legacy-password",
+            )
+
+    def test_failed_legacy_promotion_keeps_credential_available(self):
+        account = {"email": "legacy@example.com"}
+        with tempfile.TemporaryDirectory() as folder, \
+             mock.patch.object(server.config, "SECRETS_DIR", Path(folder)), \
+             mock.patch.object(server, "_list_accounts", return_value=[account]), \
+             mock.patch.object(server, "_crowtado_creds", return_value={
+                 "legacy@example.com": "legacy-password",
+             }), \
+             mock.patch.object(server.credential_store, "save", side_effect=OSError("disk")):
+            self.assertEqual(server._configured_crowtado_creds(), {
+                "legacy@example.com": "legacy-password",
+            })
+
+    def test_balance_refresh_never_sends_claru_to_crowtado_runner(self):
+        accounts = [
+            {"email": "crow@example.com"},
+            {"email": "person@supply.claru.ai"},
+        ]
+        with mock.patch.object(server, "_list_accounts", return_value=accounts), \
+             mock.patch.object(server, "_configured_crowtado_creds", return_value={
+                 "crow@example.com": "crow-password",
+             }), \
+             mock.patch.object(server.BALANCES_RUNNER, "start") as start:
+            response = self.client.post("/api/balances/refresh", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(start.call_args.args[0], {
+            "crow@example.com": "crow-password",
+        })
+
+    def test_claru_only_refresh_does_not_request_password(self):
+        accounts = [{"email": "person@supply.claru.ai"}]
+        with mock.patch.object(server, "_list_accounts", return_value=accounts), \
+             mock.patch.object(server, "_configured_crowtado_creds", return_value={}), \
+             mock.patch.object(server.BALANCES_RUNNER, "start") as start:
+            response = self.client.post("/api/balances/refresh", json={
+                "emails": ["person@supply.claru.ai"],
+            })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("não se aplica", response.get_json()["error"])
+        start.assert_not_called()
 
     def test_certificate_failure_is_translated_to_repair_action(self):
         opener = mock.Mock()
@@ -83,6 +164,7 @@ class CrowtadoCredentialTests(unittest.TestCase):
                 {'email': ' NEW@Example.com ', 'senha': ' kept spaces '},
                 {'email': 'removed@example.com', 'senha': 'old'}, None]), encoding='utf-8')
             with mock.patch.object(server.config, 'DATA_DIR', root), \
+                 mock.patch.object(server.config, 'SECRETS_DIR', root), \
                  mock.patch.object(server, 'CROWTADO_PW_PATH', root / 'passwords.json'), \
                  mock.patch.object(server, '_list_accounts', return_value=[{'email': 'New@example.com'}]):
                 self.assertEqual(server._configured_crowtado_creds(), {'New@example.com': ' kept spaces '})

@@ -3834,6 +3834,7 @@ void MainWindow::loadBalances() {
     const auto root = doc.object();
     const auto accounts = root.value(QStringLiteral("accounts")).toArray();
     const auto balances = root.value(QStringLiteral("balances")).toObject();
+    const auto accountKinds = root.value(QStringLiteral("account_kinds")).toObject();
     const auto withPassword = root.value(QStringLiteral("with_password")).toArray();
     const auto runner = root.value(QStringLiteral("runner")).toObject();
     const auto exchange = root.value(QStringLiteral("exchange")).toObject();
@@ -3845,6 +3846,7 @@ void MainWindow::loadBalances() {
     int row = 0;
     for (const auto value : accounts) {
       const QString email = value.toString();
+      const bool isClaru = accountKinds.value(email).toString() == QStringLiteral("claru");
       const auto balance = balances.value(email).toObject();
       _balancesTable->setItem(row, 0, cell(email));
       const bool hasAvailable = balance.value(QStringLiteral("availableCents")).isDouble();
@@ -3853,21 +3855,30 @@ void MainWindow::loadBalances() {
           ? static_cast<qint64>(balance.value(QStringLiteral("availableCents")).toDouble()) : 0;
       const qint64 pendingCents = hasPending
           ? static_cast<qint64>(balance.value(QStringLiteral("pendingCents")).toDouble()) : 0;
-      if (hasAvailable) approvedTotal += availableCents;
-      if (hasPending) pendingTotal += pendingCents;
-      QString available = hasAvailable
+      if (!isClaru && hasAvailable) approvedTotal += availableCents;
+      if (!isClaru && hasPending) pendingTotal += pendingCents;
+      QString available = isClaru
+          ? QStringLiteral("não se aplica")
+          : hasAvailable
           ? usdMoney(availableCents)
           : QStringLiteral("—");
-      QString pending = hasPending
+      QString pending = isClaru
+          ? QStringLiteral("não se aplica")
+          : hasPending
           ? usdMoney(pendingCents)
           : QStringLiteral("—");
-      if (!balance.value(QStringLiteral("error")).toString().isEmpty()) {
+      if (!isClaru && !balance.value(QStringLiteral("error")).toString().isEmpty()) {
         available = hasAvailable ? available + QStringLiteral(" *") : QStringLiteral("não confirmado");
         pending = hasPending ? pending + QStringLiteral(" *") : QStringLiteral("não confirmado");
       }
       auto* availableItem = cell(available);
       auto* pendingItem = cell(pending);
-      if (!balance.value(QStringLiteral("error")).toString().isEmpty()) {
+      if (isClaru) {
+        const QString hint = QStringLiteral(
+            "Conta Claru preservada. A plataforma Crowtado não fornece saldo para esta identidade.");
+        availableItem->setToolTip(hint);
+        pendingItem->setToolTip(hint);
+      } else if (!balance.value(QStringLiteral("error")).toString().isEmpty()) {
         const QString hint = QStringLiteral("Consulta inconclusiva. * indica o último saldo salvo, não um saldo atualizado.\n")
                              + balance.value(QStringLiteral("error")).toString();
         availableItem->setToolTip(hint);
@@ -3885,17 +3896,20 @@ void MainWindow::loadBalances() {
       actionsLayout->setContentsMargins(5, 5, 5, 5);
       actionsLayout->setSpacing(7);
       auto* credentials = new QPushButton(
-          hasPassword ? QStringLiteral("Alterar acesso")
+          isClaru ? QStringLiteral("Claru · preservada")
+          : hasPassword ? QStringLiteral("Alterar acesso")
                       : QStringLiteral("Conectar Crowtado"));
       credentials->setMinimumHeight(32);
-      credentials->setToolTip(QStringLiteral(
-          "Informa e valida a senha desta identidade diretamente no Crowtado."));
+      credentials->setEnabled(!isClaru);
+      credentials->setToolTip(isClaru
+          ? QStringLiteral("A conta Claru continua ativa; saldo Crowtado não se aplica.")
+          : QStringLiteral("Informa e valida a senha desta identidade diretamente no Crowtado."));
       connect(credentials, &QPushButton::clicked, this,
               [this, email] { configureCrowtadoAccess(email); });
       actionsLayout->addWidget(credentials);
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);
-      withdraw->setEnabled(hasPassword && !hasBalanceError);
+      withdraw->setEnabled(!isClaru && hasPassword && !hasBalanceError);
       connect(withdraw, &QPushButton::clicked, this, [this, email, withdraw] {
         withdraw->setEnabled(false);
         _api.post(QStringLiteral("/api/balances/withdraw"), {{QStringLiteral("email"), email}},
@@ -3935,10 +3949,15 @@ void MainWindow::loadBalances() {
     }
     const bool running = runner.value(QStringLiteral("state")).toString() == QStringLiteral("running");
     _balancesRefresh->setEnabled(!running);
+    int claruCount = 0;
+    for (const auto value : accounts) {
+      if (accountKinds.value(value.toString()).toString() == QStringLiteral("claru"))
+        ++claruCount;
+    }
     _balancesState->setText(running
         ? runner.value(QStringLiteral("current")).toString(QStringLiteral("Consultando contas…"))
-        : QStringLiteral("%1 identidade(s) · Crowtado conectado em %2")
-              .arg(accounts.size()).arg(passwordAccounts.size()));
+        : QStringLiteral("%1 identidade(s) · %2 Crowtado conectado(s) · %3 Claru preservada(s)")
+              .arg(accounts.size()).arg(passwordAccounts.size()).arg(claruCount));
     if (running) _balancePoll.start(); else _balancePoll.stop();
   });
 }

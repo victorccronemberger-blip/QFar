@@ -1153,11 +1153,19 @@ def _crowtado_creds() -> dict[str, str]:
 
 
 def _configured_crowtado_creds() -> dict[str, str]:
-    """Mantém a grafia da conta ativa e não recupera identidades removidas."""
+    """Resolve somente acessos Crowtado ativos e promove cópias legadas.
+
+    Contas Claru continuam cadastradas no QMoney, mas não possuem saldo
+    Crowtado. Credenciais legadas válidas são copiadas para o registro
+    individual atômico sem deixar uma falha de migração interromper a consulta
+    que ainda pode usar a cópia antiga.
+    """
     saved = {str(e).strip().casefold(): p for e, p in _crowtado_creds().items()}
     configured: dict[str, str] = {}
     for account in _list_accounts():
         email = str(account["email"])
+        if org_policy.account_kind(email) != "crowtado":
+            continue
         key = email.strip().casefold()
         try:
             individual = credential_store.lookup(config.SECRETS_DIR, key, strict=True)
@@ -1168,6 +1176,14 @@ def _configured_crowtado_creds() -> dict[str, str]:
         password = individual or saved.get(key)
         if password:
             configured[email] = password
+            if individual is None:
+                try:
+                    with _PERSISTENCE_LOCK:
+                        credential_store.save(config.SECRETS_DIR, key, password)
+                except (OSError, ValueError):
+                    # A cópia legada permanece utilizável. A promoção será
+                    # tentada novamente sem transformar a conta em desconectada.
+                    pass
     return configured
 
 
@@ -2968,7 +2984,8 @@ def create_app() -> Flask:
     # -- saldos (crowtado) -----------------------------------------------------
     @app.get("/api/balances")
     def get_balances():
-        configured = sorted(a["email"] for a in _list_accounts())
+        account_rows = _list_accounts()
+        configured = sorted(a["email"] for a in account_rows)
         configured_set = set(configured)
         # O cofre pode conservar credenciais de identidades removidas. Elas não
         # pertencem mais à operação atual e não devem inflar a contagem exibida
@@ -2979,6 +2996,10 @@ def create_app() -> Flask:
         return jsonify({
             "balances": _load_balances(),
             "accounts": configured,
+            "account_kinds": {
+                str(account["email"]): org_policy.account_kind(str(account["email"]))
+                for account in account_rows
+            },
             "with_password": with_password,
             "runner": BALANCES_RUNNER.snapshot(),
             "exchange": fx.usd_brl_quote(),
@@ -2987,11 +3008,23 @@ def create_app() -> Flask:
     @app.post("/api/balances/refresh")
     def refresh_balances():
         body = request.get_json(silent=True) or {}
-        configured = {a["email"] for a in _list_accounts()}
+        configured = {
+            a["email"] for a in _list_accounts()
+            if org_policy.account_kind(str(a["email"])) == "crowtado"
+        }
         creds = {e: p for e, p in _configured_crowtado_creds().items() if e in configured}
         emails = [str(e).strip() for e in body.get("emails", []) if str(e).strip()]
         if emails:
-            creds = {e: creds[e] for e in emails if e in creds}
+            selected = {e for e in emails if e in configured}
+            if not selected:
+                return jsonify({
+                    "error": "saldo Crowtado não se aplica às contas selecionadas",
+                }), 400
+            creds = {e: creds[e] for e in selected if e in creds}
+        elif not configured:
+            return jsonify({
+                "error": "não há conta Crowtado cadastrada para consultar saldo",
+            }), 400
         if not creds:
             return jsonify({
                 "error": (
@@ -3016,6 +3049,8 @@ def create_app() -> Flask:
         configured = {a["email"] for a in _list_accounts()}
         if email not in configured:
             return jsonify({"error": "conta não está configurada"}), 404
+        if org_policy.account_kind(email) == "claru":
+            return jsonify({"error": "saldo Crowtado não se aplica a contas Claru"}), 400
         password = _configured_crowtado_creds().get(email)
         if not password:
             return jsonify({"error": "salve a senha do crowtado primeiro"}), 400
@@ -3066,6 +3101,8 @@ def create_app() -> Flask:
         configured = {a["email"] for a in _list_accounts()}
         if email not in configured:
             return jsonify({"error": "essa identidade não está conectada ao QMoney"}), 404
+        if org_policy.account_kind(email) == "claru":
+            return jsonify({"error": "contas Claru não precisam de acesso Crowtado"}), 400
         try:
             crowtado.login(email, password)
         except (crowtado.CrowtadoError, RuntimeError, OSError) as exc:
