@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit, parse_qs
 
-from . import config, device_profile, transport
+from . import config, credential_store, device_profile, transport
 from .atomic_io import save_json
 from .service_policy import RecordingPolicy
 
@@ -439,6 +439,14 @@ def _lookup_password(email: str | None) -> str | None:
     """Senha salva da conta (contas.jsonl + crowtado_passwords.json)."""
     if not email or "@" not in email:
         return None
+    try:
+        saved = credential_store.lookup(config.SECRETS_DIR, email, strict=True)
+    except ValueError:
+        # Um registro individual existe, mas perdeu integridade. Não use uma
+        # cópia legada potencialmente antiga para autenticar silenciosamente.
+        return None
+    if saved:
+        return saved
     found: str | None = None
     contas = config.DATA_DIR / "contas.jsonl"
     try:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import config
+from . import config, credential_store
 from .atomic_io import save_json
 
 
@@ -48,6 +48,8 @@ def _scrub(value, emails):
 
 def purge_local_records(emails: set[str]) -> None:
     """Purga registros e backups geridos pelo app; mantém apenas banlist/tombstones."""
+    for email in emails:
+        credential_store.delete(config.SECRETS_DIR, email)
     roots = {config.ROOT, config.LIBRARY_ROOT}
     paths = set()
     for root in roots:

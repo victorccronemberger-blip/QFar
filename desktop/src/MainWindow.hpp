@@ -96,6 +96,7 @@ private:
   void loadAccelerator();
   void startAccelerator();
   void loadAccounts();
+  void removeAccount(const QString& email, std::function<void()> onRemoved = {});
   void checkAllAccounts();
   void addAccount(bool registerNew);
   void importAccounts();

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch, PropertyMock
 
-from moneymin import account_transfer as transfer
+from moneymin import account_transfer as transfer, credential_store
 from moneymin.atomic_io import save_json, load_json
 from moneymin.web import server
 
@@ -95,6 +95,22 @@ class AccountTransferTests(unittest.TestCase):
         self.assertEqual(result["counts"]["error"], 1)
         self.assertEqual(self.passwords.read_bytes(), original)
         self.assertEqual(transfer.token_accounts(), {})
+
+    def test_credential_checkpoint_failure_rolls_back_every_local_file(self):
+        email = "test@example.com"
+        real_save = credential_store.save
+
+        def save_then_fail(secrets_dir, saved_email, password):
+            real_save(secrets_dir, saved_email, password)
+            raise OSError("verification failed")
+
+        with patch.object(transfer.credential_store, "save", side_effect=save_then_fail):
+            result = self.run_import([self.account(email)])
+        self.assertEqual(result["counts"]["error"], 1)
+        self.assertEqual(transfer.token_accounts(), {})
+        self.assertFalse(self.passwords.exists())
+        self.assertFalse(self.removed.exists())
+        self.assertFalse(credential_store.record_path(self.root, email).exists())
 
     def test_removed_account_can_be_restored_explicitly(self):
         save_json(self.removed, {"emails": ["test@example.com"]})

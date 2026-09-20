@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from moneymin.minute_api import AuthError
+from moneymin import credential_store
 from moneymin.web import server
 
 
@@ -105,6 +106,8 @@ class PreflightContinuationTests(unittest.TestCase):
         (data / 'novas_contas_test.json').write_text(json.dumps(records))
         (data / 'contas.jsonl').write_text('\n'.join(json.dumps(r) for r in records))
         (data / 'account_health.json').write_text(json.dumps({r['email']: {'status': 'active'} for r in records}))
+        credential_store.save(self.secrets, 'bad@example.com', 'new-bad-password')
+        credential_store.save(self.secrets, 'good@example.com', 'new-good-password')
         recovery = self.root / 'recovery'
         recovery.mkdir()
         (recovery / 'old-backup.json').write_text(json.dumps({'accounts': records}))
@@ -113,6 +116,11 @@ class PreflightContinuationTests(unittest.TestCase):
                      data / 'account_health.json', recovery / 'old-backup.json']:
             self.assertNotIn('bad@example.com', path.read_text())
             self.assertIn('good@example.com', path.read_text())
+        self.assertIsNone(credential_store.lookup(self.secrets, 'bad@example.com'))
+        self.assertEqual(
+            credential_store.lookup(self.secrets, 'good@example.com'),
+            'new-good-password',
+        )
 
     def test_runtime_restriction_calls_permanent_removal_handler(self):
         from moneymin.web.runner import CampaignRunner

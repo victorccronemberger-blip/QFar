@@ -12,7 +12,7 @@ class RegistrationValidationTests(unittest.TestCase):
         self.addCleanup(self.context.close)
         self.identity = {"birth_month": 1, "birth_year": 1990, "gender": "male"}
         self.context.enter_context(patch.object(server.account_bans, "require_not_banned"))
-        self.context.enter_context(patch.object(server, "_set_account_removed"))
+        self.activate = self.context.enter_context(patch.object(server, "_set_account_removed"))
         self.context.enter_context(patch.object(server, "_save_crowtado_cred"))
         self.signup = self.context.enter_context(patch.object(server.crowtado, "criar_conta"))
         self.crowtado_login = self.context.enter_context(patch.object(server.crowtado, "login"))
@@ -50,6 +50,13 @@ class RegistrationValidationTests(unittest.TestCase):
                 self.crowtado_login.assert_not_called()
                 self.register.assert_not_called()
 
+    def test_failed_signup_never_reactivates_a_removed_account(self):
+        self.signup.side_effect = RuntimeError("browser already closed")
+        with patch.object(server.time, "sleep"):
+            result = self.run_registration()
+        self.assertIsNotNone(result["error"])
+        self.activate.assert_not_called()
+
     def test_explicit_clerk_duplicate_can_resume(self):
         for message in ("form_identifier_exists", "This email address is taken.",
                         "Este endereço de e-mail já está em uso."):
@@ -77,11 +84,24 @@ class RegistrationValidationTests(unittest.TestCase):
     def test_save_failure_returns_partial_steps_and_stops_external_work(self):
         with patch.object(server, "_save_crowtado_cred", side_effect=OSError("sensitive path")):
             result = self.run_registration()
-        self.assertTrue(result["partial"])
+        self.assertFalse(result["partial"])
         self.assertEqual(result["steps"]["save_partial"]["status"], "fail")
         self.assertNotIn("sensitive path", str(result))
         self.demographics.assert_not_called()
         self.register.assert_not_called()
+
+    def test_success_reactivates_only_after_remote_validation(self):
+        result = self.run_registration()
+        self.assertIsNone(result["error"])
+        self.activate.assert_called_once_with("review@example.invalid", False)
+        self.assertEqual(result["steps"]["validate"]["status"], "ok")
+
+    def test_local_activation_failure_is_reported_as_partial(self):
+        self.activate.side_effect = OSError("disk failure")
+        result = self.run_registration()
+        self.assertTrue(result["partial"])
+        self.assertIn("ativação local", result["error"])
+        self.assertEqual(result["steps"]["validate"]["status"], "fail")
 
     def test_manual_save_failure_returns_json_and_completed_steps(self):
         with patch.object(server, "_save_crowtado_cred", side_effect=OSError("disk failure")), \
@@ -92,8 +112,8 @@ class RegistrationValidationTests(unittest.TestCase):
                 "email": "review@example.invalid", "password": "test-only"})
         self.assertEqual(response.status_code, 400)
         self.assertTrue(response.is_json)
-        self.assertEqual(response.get_json()["steps"]["crowtado_signup"]["status"], "ok")
         self.assertEqual(response.get_json()["steps"]["save_partial"]["status"], "fail")
+        self.assertNotIn("crowtado_signup", response.get_json()["steps"])
 
     def test_invalid_invite_is_not_treated_as_duplicate(self):
         self.register.side_effect = RuntimeError("registro falhou (400): invalid invite code")

@@ -9,6 +9,16 @@ from moneymin.atomic_io import load_json, save_bytes, save_json
 
 
 class AtomicIOTests(unittest.TestCase):
+    def test_disk_flush_failure_preserves_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_bytes(b"original")
+            with patch("moneymin.atomic_io.os.fsync", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    save_json(path, {"new": True})
+            self.assertEqual(path.read_bytes(), b"original")
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
     def test_invalid_encoding_returns_default_without_overwriting_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"

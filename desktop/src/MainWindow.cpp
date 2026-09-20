@@ -1,4 +1,5 @@
 #include <QUuid>
+#include <utility>
 #include "MainWindow.hpp"
 #include "ComboBox.hpp"
 
@@ -1369,22 +1370,24 @@ QWidget* MainWindow::buildAccountsPage() {
   _bulkRegisterProgress->setTextVisible(true);
   _bulkRegisterProgress->setFormat(QStringLiteral("%v/%m"));
   bulkForm->addRow(QStringLiteral("Progresso"), _bulkRegisterProgress);
-  _bulkRegisterTable = new QTableWidget(0, 5);
+  _bulkRegisterTable = new QTableWidget(0, 6);
   configureTable(_bulkRegisterTable);
   _bulkRegisterTable->setMinimumHeight(160);
   _bulkRegisterTable->setHorizontalHeaderLabels({
       QStringLiteral("Email"), QStringLiteral("Nome"), QStringLiteral("Sobrenome"),
-      QStringLiteral("Gênero"), QStringLiteral("Resultado"),
+      QStringLiteral("Gênero"), QStringLiteral("Resultado"), QStringLiteral("Ação"),
   });
   _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
   _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
   _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
   _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Interactive);
+  _bulkRegisterTable->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Fixed);
   _bulkRegisterTable->setColumnWidth(1, 140);
   _bulkRegisterTable->setColumnWidth(2, 140);
   _bulkRegisterTable->setColumnWidth(3, 90);
   _bulkRegisterTable->setColumnWidth(4, 180);
+  _bulkRegisterTable->setColumnWidth(5, 108);
   _bulkRegisterTable->setSelectionBehavior(QAbstractItemView::SelectRows);
   _bulkRegisterTable->setSelectionMode(QAbstractItemView::NoSelection);
   bulkForm->addRow(quietLabel(QStringLiteral("Resultados")));
@@ -3418,23 +3421,7 @@ void MainWindow::loadAccounts() {
       auto* remove = new QPushButton(QStringLiteral("Remover"));
       remove->setMinimumSize(86, 32);
       connect(remove, &QPushButton::clicked, this, [this, email] {
-        if (QMessageBox::question(this, QStringLiteral("Remover conta"),
-              QStringLiteral("Remover definitivamente %1 deste QMoney?\n\n"
-                             "Falhas de verificação, saldo ou envio não comprovam que a conta está inválida. "
-                             "Para corrigir o acesso, verifique novamente ou conecte a mesma conta com a senha.\n\n"
-                             "O acesso salvo será apagado e não voltará ao reiniciar. "
-                             "O histórico de campanhas será preservado.").arg(email),
-              QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
-            != QMessageBox::Yes) return;
-        _api.remove(QStringLiteral("/api/accounts/") + encoded(email),
-                    [this, email](bool ok, const QJsonDocument&, const QString& error) {
-          if (!ok) showError(QStringLiteral("Conta não removida"), error);
-          else {
-            _accountChecks.remove(email);
-            setStatus(QStringLiteral("%1 removida definitivamente deste QMoney.").arg(email));
-            loadAccounts();
-          }
-        });
+        removeAccount(email);
       });
       actionsLayout->addWidget(check);
       actionsLayout->addWidget(remove);
@@ -3444,6 +3431,26 @@ void MainWindow::loadAccounts() {
     setAccountTransferBusy(_accountTransferBusy);
     if (_accountsCheckAll) _accountsCheckAll->setEnabled(!accounts.isEmpty() && !_accountTransferBusy && !_orgMigrationRunning);
     setStatus(QStringLiteral("%1 conta(s) cadastrada(s).").arg(accounts.size()));
+  });
+}
+
+void MainWindow::removeAccount(const QString& email, std::function<void()> onRemoved) {
+  if (QMessageBox::question(this, QStringLiteral("Remover conta"),
+        QStringLiteral("Remover definitivamente %1 deste QMoney?\n\n"
+                       "Falhas de verificação, saldo ou envio não comprovam que a conta está inválida. "
+                       "Para corrigir o acesso, verifique novamente ou conecte a mesma conta com a senha.\n\n"
+                       "O acesso salvo será apagado e não voltará ao reiniciar. "
+                       "O histórico de campanhas será preservado.").arg(email),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
+      != QMessageBox::Yes) return;
+  _api.remove(QStringLiteral("/api/accounts/") + encoded(email),
+              [this, email, onRemoved = std::move(onRemoved)](
+                  bool ok, const QJsonDocument&, const QString& error) mutable {
+    if (!ok) return showError(QStringLiteral("Conta não removida"), error);
+    _accountChecks.remove(email);
+    setStatus(QStringLiteral("%1 removida definitivamente deste QMoney.").arg(email));
+    loadAccounts();
+    if (onRemoved) onRemoved();
   });
 }
 
@@ -3511,12 +3518,12 @@ void MainWindow::addAccount(bool registerNew) {
       const auto steps = doc.object().value(QStringLiteral("steps")).toObject();
       QStringList summary;
       const QStringList stepNames = {
-          QStringLiteral("Crowtado"), QStringLiteral("Credenciais"),
+          QStringLiteral("Credenciais"), QStringLiteral("Crowtado"),
           QStringLiteral("Demografia"), QStringLiteral("Minute"),
           QStringLiteral("Vínculo"), QStringLiteral("Validação"),
       };
       const QStringList stepKeys = {
-          QStringLiteral("crowtado_signup"), QStringLiteral("save_partial"),
+          QStringLiteral("save_partial"), QStringLiteral("crowtado_signup"),
           QStringLiteral("demographics"), QStringLiteral("minute_register"),
           QStringLiteral("link_minute"), QStringLiteral("validate"),
       };
@@ -3711,6 +3718,7 @@ void MainWindow::pollBulkRegister() {
     _bulkRegisterProgress->setRange(0, qMax(1, total));
     _bulkRegisterProgress->setValue(completed);
     const auto results = root.value(QStringLiteral("results")).toArray();
+    const bool terminal = state == QStringLiteral("done") || state == QStringLiteral("failed");
     _bulkRegisterTable->setRowCount(results.size());
     for (int row = 0; row < results.size(); ++row) {
       const auto item = results.at(row).toObject();
@@ -3723,14 +3731,14 @@ void MainWindow::pollBulkRegister() {
       QStringList stepLines;
       const auto steps = item.value(QStringLiteral("steps")).toObject();
       const QStringList stepKeys = {
-          QStringLiteral("ban_check"), QStringLiteral("crowtado_signup"),
-          QStringLiteral("save_partial"), QStringLiteral("demographics"),
+          QStringLiteral("ban_check"), QStringLiteral("save_partial"),
+          QStringLiteral("crowtado_signup"), QStringLiteral("demographics"),
           QStringLiteral("minute_register"), QStringLiteral("link_minute"),
           QStringLiteral("validate"),
       };
       const QStringList stepNames = {
-          QStringLiteral("Verificação"), QStringLiteral("Crowtado"),
-          QStringLiteral("Credenciais"), QStringLiteral("Demografia"),
+          QStringLiteral("Verificação"), QStringLiteral("Credenciais"),
+          QStringLiteral("Crowtado"), QStringLiteral("Demografia"),
           QStringLiteral("Minute"), QStringLiteral("Vínculo"),
           QStringLiteral("Validação"),
       };
@@ -3750,8 +3758,11 @@ void MainWindow::pollBulkRegister() {
       }
       emailItem->setToolTip(stepLines.join(QStringLiteral("\n")));
       const QString errorText = item.value(QStringLiteral("error")).toString();
+      const bool removed = item.value(QStringLiteral("removed")).toBool(false);
       QString outcome;
-      if (errorText.isEmpty()) {
+      if (removed) {
+        outcome = QStringLiteral("Removida deste QMoney");
+      } else if (errorText.isEmpty()) {
         outcome = QStringLiteral("✓ completa");
       } else {
         // Descobrir em qual etapa falhou
@@ -3770,8 +3781,23 @@ void MainWindow::pollBulkRegister() {
       auto* outcomeItem = cell(outcome);
       outcomeItem->setToolTip(stepLines.join(QStringLiteral("\n")));
       _bulkRegisterTable->setItem(row, 4, outcomeItem);
+      auto* remove = new QPushButton(QStringLiteral("Remover"));
+      remove->setMinimumSize(88, 32);
+      const bool removable = item.value(QStringLiteral("removable"))
+                                 .toBool(item.value(QStringLiteral("created")).toBool(false));
+      remove->setEnabled(terminal && removable && !removed);
+      if (removed)
+        remove->setToolTip(QStringLiteral("Esta conta já foi removida deste QMoney."));
+      else if (!terminal)
+        remove->setToolTip(QStringLiteral("Aguarde o cadastro em lote terminar."));
+      else if (!removable)
+        remove->setToolTip(QStringLiteral("Nenhum acesso local foi criado para esta tentativa."));
+      connect(remove, &QPushButton::clicked, this, [this, email = item.value(QStringLiteral("email")).toString()] {
+        removeAccount(email, [this] { pollBulkRegister(); });
+      });
+      _bulkRegisterTable->setCellWidget(row, 5, remove);
     }
-    if (state == QStringLiteral("done") || state == QStringLiteral("failed")) {
+    if (terminal) {
       _bulkRegisterPoll.stop();
       _bulkRegisterPolling = false;
       _bulkRegisterStart->setEnabled(true);

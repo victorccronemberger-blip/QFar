@@ -8,6 +8,7 @@ JSON truncado quando o processo ou o Windows é encerrado durante uma gravação
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -37,6 +38,8 @@ def save_bytes(path: Path, value: bytes) -> None:
                                          suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
             stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
         for attempt in range(5):
             try:
                 temporary.replace(path)

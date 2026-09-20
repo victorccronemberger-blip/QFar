@@ -76,7 +76,7 @@ from flask import Flask, g, jsonify, request
 
 from .. import (
     campaign, config, crowtado, ego4d, fx, holo_accelerator, holoassist,
-    hostinger_mail, identity, org_policy, readiness, sent_registry,
+    hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store,
 )
 from ..atomic_io import load_json, save_json
 from .. import account_transfer, account_bans
@@ -110,18 +110,29 @@ _WITHDRAW_COOLDOWN_S = 60.0
 _STEP_LABELS = {
     "ban_check": "verificação de ban",
     "crowtado_signup": "criação Crowtado",
-    "save_partial": "salvar credenciais parciais",
+    "save_partial": "proteger credencial local",
     "demographics": "demografia Crowtado",
     "minute_register": "registro Minute",
     "link_minute": "vincular Minute na Crowtado",
     "validate": "validação pós-criação",
 }
 _STEP_ORDER = [
-    "ban_check", "crowtado_signup", "save_partial",
+    "ban_check", "save_partial", "crowtado_signup",
     "demographics", "minute_register", "link_minute", "validate",
 ]
 _CROWTADO_SIGNUP_RETRIES = 2
 _CROWTADO_SIGNUP_RETRY_DELAY_S = 5.0
+
+
+def _mark_bulk_account_removed(email: str) -> None:
+    """Mantém o histórico do lote, mas torna sua ação de remoção idempotente."""
+    normalized = email.strip().casefold()
+    with _BULK_REGISTER_LOCK:
+        for result in _BULK_REGISTER_STATE.get("results", []):
+            if (isinstance(result, dict)
+                    and str(result.get("email") or "").strip().casefold() == normalized):
+                result["removed"] = True
+                result["removable"] = False
 
 
 def _step_ok(detail: str = "") -> dict[str, str]:
@@ -314,7 +325,7 @@ def _full_register_account(
 
     Diferente da versão anterior:
     - Crowtado signup tem retry (Turnstile pode falhar transitoriamente)
-    - Credenciais são salvas LOGO após o signup Crowtado (save parcial)
+    - Credenciais são confirmadas localmente antes da primeira chamada remota
     - Validação pós-criação confirma que tudo realmente funciona
     """
     import logging
@@ -350,6 +361,17 @@ def _full_register_account(
     except ValueError as exc:
         _record_step("ban_check", _step_fail(str(exc)))
         return {"steps": steps, "error": f"ban: {exc}"}
+
+    # O checkpoint local vem antes de qualquer operação remota. Sem uma senha
+    # exportável e relida, nenhuma conta nova será iniciada.
+    _notify("save_partial")
+    try:
+        _save_crowtado_cred(email, password)
+    except Exception:
+        detail = "Não foi possível confirmar o acesso no armazenamento local. Nenhuma criação remota foi iniciada; confira o armazenamento antes de tentar novamente."
+        _record_step("save_partial", _step_fail(detail))
+        return {"steps": steps, "error": detail, "partial": False}
+    _record_step("save_partial", _step_ok("credenciais salvas"))
 
     # Step 1: Crowtado signup (Chrome + Turnstile + email OTP) — com retry
     _notify("crowtado_signup")
@@ -395,18 +417,6 @@ def _full_register_account(
     if not crowtado_signup_ok:
         _record_step("crowtado_signup", _step_fail(f"{last_error} (após {_CROWTADO_SIGNUP_RETRIES} tentativas)"))
         return {"steps": steps, "error": f"crowtado: {last_error}"}
-
-    # Step 2: Salvar credenciais PARCIAIS — mesmo que as próximas etapas falhem,
-    # a conta existe no Crowtado e a senha está salva para recuperação manual.
-    _notify("save_partial")
-    try:
-        _save_crowtado_cred(email, password)
-        _set_account_removed(email, False)
-    except Exception:
-        detail = "A conta Crowtado existe, mas não foi possível salvar o acesso local. Guarde as credenciais e confira o armazenamento antes de tentar novamente."
-        _record_step("save_partial", _step_fail(detail))
-        return {"steps": steps, "error": detail, "partial": True}
-    _record_step("save_partial", _step_ok("credenciais salvas"))
 
     # Step 3: Demographics (gate obrigatório desde 26/08)
     _notify("demographics")
@@ -492,7 +502,15 @@ def _full_register_account(
         logger.warning("[register] %s — validação parcial: %s", email, detail)
         # Não é fatal — a conta foi criada, mas algo não confere
         return {"steps": steps, "error": f"validação: {detail}", "partial": True}
-    _record_step("validate", _step_ok("tudo confirmado"))
+    try:
+        # O tombstone só é removido quando todo o fluxo remoto foi confirmado.
+        # Assim uma tentativa falha nunca ressuscita uma conta excluida.
+        _set_account_removed(email, False)
+    except (OSError, ValueError):
+        detail = "conta criada e validada, mas a ativação local não pôde ser salva"
+        _record_step("validate", _step_fail(detail))
+        return {"steps": steps, "error": f"validação: {detail}", "partial": True}
+    _record_step("validate", _step_ok("tudo confirmado e acesso local ativado"))
     logger.info("[register] %s — fluxo completo com sucesso", email)
 
     return {"steps": steps, "error": None}
@@ -1128,39 +1146,67 @@ def _crowtado_creds() -> dict[str, str]:
         creds.update({str(email).strip().casefold(): password
                       for email, password in stored.items()
                       if isinstance(password, str) and password})
+    # Registros individuais são a fonte primária para credenciais novas. Eles
+    # não competem entre contas durante uma gravação e vencem dados legados.
+    creds.update(credential_store.load_all(config.SECRETS_DIR))
     return creds
 
 
 def _configured_crowtado_creds() -> dict[str, str]:
     """Mantém a grafia da conta ativa e não recupera identidades removidas."""
     saved = {str(e).strip().casefold(): p for e, p in _crowtado_creds().items()}
-    return {a["email"]: saved[str(a["email"]).strip().casefold()]
-            for a in _list_accounts() if str(a["email"]).strip().casefold() in saved}
+    configured: dict[str, str] = {}
+    for account in _list_accounts():
+        email = str(account["email"])
+        key = email.strip().casefold()
+        try:
+            individual = credential_store.lookup(config.SECRETS_DIR, key, strict=True)
+        except ValueError:
+            # Falha fechada: não autentica saldos/saques com fallback antigo
+            # quando a fonte primaria existe, mas perdeu integridade.
+            continue
+        password = individual or saved.get(key)
+        if password:
+            configured[email] = password
+    return configured
 
 
 def _save_crowtado_cred(email: str, password: str) -> None:
     with _PERSISTENCE_LOCK:
+        # O registro individual é obrigatório e é relido antes de continuar.
+        # O JSON compartilhado existe apenas para compatibilidade anterior.
+        credential_store.save(config.SECRETS_DIR, email, password)
         try:
             stored = json.loads(CROWTADO_PW_PATH.read_text(encoding="utf-8-sig"))
         except FileNotFoundError:
             stored = {}
-        except (OSError, ValueError) as exc:
-            raise ValueError("Não foi possível ler as credenciais locais. O arquivo foi preservado; confira o armazenamento ou restaure um backup.") from exc
+        except (OSError, ValueError):
+            # Preserva o arquivo legado inválido: a cópia individual já foi
+            # confirmada e permite exportar a conta normalmente.
+            return
         if not isinstance(stored, dict) or any(
                 not isinstance(key, str) or not isinstance(value, str)
                 for key, value in stored.items()):
-            raise ValueError("As credenciais locais estão inválidas. O arquivo foi preservado.")
+            return
         creds = stored
         normalized = email.strip().casefold()
         creds = {key: value for key, value in creds.items()
                  if str(key).strip().casefold() != normalized}
         creds[normalized] = password
-        save_json(CROWTADO_PW_PATH, creds)
+        try:
+            save_json(CROWTADO_PW_PATH, creds)
+        except OSError:
+            # A fonte primária individual já foi confirmada. O espelho legado
+            # pode estar temporariamente bloqueado sem invalidar a criação.
+            return
 
 
 def _remove_account_data(email: str) -> None:
     """Remove caches editáveis ligados à conta (o cadastro histórico fica intacto)."""
     with _PERSISTENCE_LOCK:
+        # O registro individual é a fonte primária. Remova-o mesmo que o
+        # espelho legado esteja ausente ou corrompido.
+        credential_store.delete(config.SECRETS_DIR, email)
         stored = load_json(CROWTADO_PW_PATH, {})
         creds = stored if isinstance(stored, dict) else {}
         matching_creds = [
@@ -1474,7 +1520,42 @@ def create_app() -> Flask:
             return jsonify({"error": "Seleção de contas inválida."}), 400
         try:
             with _PERSISTENCE_LOCK:
-                result = account_transfer.export_accounts(body.get("emails"), _crowtado_creds(), _removed_accounts())
+                accounts = _list_accounts()
+                selected = ({str(email).strip().casefold() for email in body.get("emails", [])}
+                            if body.get("emails") is not None else
+                            {str(account["email"]).strip().casefold() for account in accounts})
+                credentials = _crowtado_creds()
+                corrupt = []
+                for account in accounts:
+                    account_email = str(account["email"]).strip()
+                    key = account_email.casefold()
+                    if key not in selected or org_policy.account_kind(account_email) == "claru":
+                        continue
+                    try:
+                        individual = credential_store.lookup(
+                            config.SECRETS_DIR, account_email, strict=True)
+                    except ValueError:
+                        corrupt.append(account_email)
+                        continue
+                    if individual:
+                        credentials[key] = individual
+                if corrupt:
+                    return jsonify({
+                        "error": "Exportação cancelada: há credencial local corrompida; os arquivos foram preservados para recuperação.",
+                        "accounts": sorted(corrupt),
+                    }), 409
+                missing = sorted(
+                    str(account["email"]).strip() for account in accounts
+                    if str(account["email"]).strip().casefold() in selected
+                    and org_policy.account_kind(str(account["email"])) != "claru"
+                    and not credentials.get(str(account["email"]).strip().casefold())
+                )
+                if missing:
+                    return jsonify({
+                        "error": "Exportação cancelada: há conta Crowtado sem senha local; nenhum backup incompleto foi criado.",
+                        "accounts": missing,
+                    }), 409
+                result = account_transfer.export_accounts(body.get("emails"), credentials, _removed_accounts())
             response = jsonify(result)
             response.headers["Cache-Control"] = "no-store"
             return response
@@ -1608,7 +1689,7 @@ def create_app() -> Flask:
                 "current_step": "",
             })
 
-        def _run_batch() -> None:
+        def _run_batch() -> bool:
             successes = 0
             failures = 0
             results: list[dict[str, Any]] = []
@@ -1623,7 +1704,7 @@ def create_app() -> Flask:
                     with _BULK_REGISTER_LOCK:
                         _BULK_REGISTER_STATE["state"] = "failed"
                         _BULK_REGISTER_STATE["error"] = str(exc)
-                    return
+                    return False
                 email = identity_data["email"]
                 password = identity_data["senha"]
                 used_emails.add(email.lower())
@@ -1635,6 +1716,10 @@ def create_app() -> Flask:
 
                 result = _full_register_account(email, password, identity_data, on_step=_on_step)
                 ok = result["error"] is None
+                removable = (
+                    config.token_path(email).exists()
+                    or credential_store.record_path(config.SECRETS_DIR, email).exists()
+                )
                 if ok:
                     successes += 1
                 else:
@@ -1647,6 +1732,8 @@ def create_app() -> Flask:
                     "birth_month": identity_data["birth_month"],
                     "birth_year": identity_data["birth_year"],
                     "created": ok,
+                    "removable": removable,
+                    "removed": False,
                     "error": result["error"],
                     "steps": result["steps"],
                 })
@@ -1655,10 +1742,12 @@ def create_app() -> Flask:
                     _BULK_REGISTER_STATE["created"] = successes
                     _BULK_REGISTER_STATE["failed"] = failures
                     _BULK_REGISTER_STATE["results"] = list(results)
+            return True
         def _worker() -> None:
-            terminal = {"state": "done"}
+            terminal = {"state": "failed", "error": "Cadastro interrompido."}
             try:
-                _run_batch()
+                if _run_batch():
+                    terminal = {"state": "done"}
             except Exception:
                 terminal = {
                     "state": "failed",
@@ -1685,8 +1774,13 @@ def create_app() -> Flask:
             return jsonify({"error": "pare a campanha antes de remover uma conta"}), 409
         if BALANCES_RUNNER.running:
             return jsonify({"error": "aguarde a consulta de saldos terminar"}), 409
+        try:
+            normalized = account_transfer.email_key(email)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         path = config.token_path(email)
-        if not path.exists():
+        credential_path = credential_store.record_path(config.SECRETS_DIR, normalized)
+        if not path.exists() and not credential_path.exists():
             return jsonify({"error": f"conta não encontrada: {email}"}), 404
         # Grave primeiro a intenção. Mesmo se o Windows interromper a remoção
         # física, a conta já não reaparece nem volta para uma campanha.
@@ -1710,10 +1804,12 @@ def create_app() -> Flask:
                 _save_prefs(prefs)
             _remove_account_data(email)
         except OSError as exc:
+            _mark_bulk_account_removed(normalized)
             return jsonify({
                 "ok": True,
                 "warning": f"a conta não voltará, mas alguns dados locais aguardam nova tentativa de limpeza: {exc}",
             })
+        _mark_bulk_account_removed(normalized)
         return jsonify({"ok": True})
 
     @app.post("/api/accounts/<email>/check")

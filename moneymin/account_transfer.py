@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import config, minute_api, account_bans
+from . import config, credential_store, minute_api, account_bans
 from .atomic_io import load_json, save_json, save_bytes
 
 LOCK = threading.RLock()
@@ -165,6 +165,10 @@ def import_accounts(raw: str, *, apply: bool, passwords_path: Path, removed_path
 
 def _save_record(record: dict, token_path: Path, passwords_path: Path, removed_path: Path) -> None:
     paths = [token_path, passwords_path, removed_path]
+    if record["password"]:
+        # A credencial individual faz parte da mesma transação dos arquivos
+        # legados. Se qualquer etapa falhar, ela também precisa ser restaurada.
+        paths.append(credential_store.record_path(config.SECRETS_DIR, record["email"]))
     before = {p: p.read_bytes() if p.exists() else None for p in paths}
     try:
         email = record["email"]
@@ -180,6 +184,8 @@ def _save_record(record: dict, token_path: Path, passwords_path: Path, removed_p
         removed["emails"] = [e for e in removed.get("emails", []) if str(e).casefold() != email]
         removed["schema"] = 1
         save_json(removed_path, removed)
+        if record["password"]:
+            credential_store.save(config.SECRETS_DIR, email, record["password"])
     except Exception:
         failed = False
         for path, content in before.items():

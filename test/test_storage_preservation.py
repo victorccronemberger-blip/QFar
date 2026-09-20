@@ -65,14 +65,14 @@ class StoragePreservationTests(unittest.TestCase):
             for name, content in files.items():
                 self.assertEqual((root / name).read_bytes(), content)
 
-    def test_invalid_password_file_is_never_replaced(self):
+    def test_invalid_legacy_password_file_is_preserved_without_losing_new_credential(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "passwords.json"
             for content in (b'{', b'[]', b'null', b'{"user@example.invalid": 123}', b'\xff'):
-                with self.subTest(content=content), patch.object(server, "CROWTADO_PW_PATH", path):
+                with self.subTest(content=content), patch.object(server, "CROWTADO_PW_PATH", path), \
+                     patch.object(server.config, "SECRETS_DIR", Path(folder)):
                     path.write_bytes(content)
-                    with self.assertRaises(ValueError):
-                        server._save_crowtado_cred("fixture@example.invalid", "test-only")
+                    server._save_crowtado_cred("fixture@example.invalid", "test-only")
                     self.assertEqual(path.read_bytes(), content)
 
     def test_unreadable_vault_is_never_replaced(self):

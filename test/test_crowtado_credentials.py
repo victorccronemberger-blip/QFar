@@ -100,6 +100,7 @@ class CrowtadoCredentialTests(unittest.TestCase):
             legacy = root / "contas.jsonl"
             legacy.write_bytes(original)
             with mock.patch.object(server.config, "DATA_DIR", root), \
+                 mock.patch.object(server.config, "SECRETS_DIR", root), \
                  mock.patch.object(server, "CROWTADO_PW_PATH", root / "passwords.json"):
                 self.assertEqual(server._crowtado_creds(), {
                     "first@example.com": "first", "last@example.com": "last"})
@@ -111,7 +112,9 @@ class CrowtadoCredentialTests(unittest.TestCase):
             (root / 'novas_contas_20260916.json').write_text(json.dumps([
                 {'email': 'test@example.com', 'senha': 'outdated'}]), encoding='utf-8')
             pw.write_text(json.dumps({'TEST@example.com': 'current'}), encoding='utf-8')
-            with mock.patch.object(server.config, 'DATA_DIR', root), mock.patch.object(server, 'CROWTADO_PW_PATH', pw):
+            with mock.patch.object(server.config, 'DATA_DIR', root), \
+                 mock.patch.object(server.config, 'SECRETS_DIR', root), \
+                 mock.patch.object(server, 'CROWTADO_PW_PATH', pw):
                 self.assertEqual(server._crowtado_creds()['test@example.com'], 'current')
                 server._save_crowtado_cred(' Test@example.com ', 'replacement')
                 self.assertEqual(json.loads(pw.read_text()), {'test@example.com': 'replacement'})

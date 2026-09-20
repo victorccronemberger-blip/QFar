@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+from moneymin import credential_store
 from moneymin.web import server
 
 
@@ -53,6 +54,33 @@ class AccountRemovalTests(unittest.TestCase):
         self.assertEqual(server._list_accounts(), [])
         state = json.loads((self.data / "removed_accounts.json").read_text(encoding="utf-8"))
         self.assertEqual(state["emails"], [email.casefold()])
+
+    def test_removal_deletes_individual_and_legacy_passwords(self):
+        email = "conta@example.com"
+        self._write_token(email)
+        server._save_crowtado_cred(email, "fixture-password")
+        self.assertEqual(credential_store.lookup(self.secrets, email), "fixture-password")
+
+        response = self.client.delete(f"/api/accounts/{email}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(credential_store.lookup(self.secrets, email))
+        self.assertNotIn(email, server._crowtado_creds())
+
+    def test_creation_result_can_remove_a_credential_even_without_minute_token(self):
+        email = "partial@example.com"
+        server._save_crowtado_cred(email, "fixture-password")
+        state = {
+            "state": "done",
+            "results": [{"email": email, "removable": True, "removed": False}],
+        }
+        with mock.patch.object(server, "_BULK_REGISTER_STATE", state):
+            response = self.client.delete(f"/api/accounts/{email}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(credential_store.lookup(self.secrets, email))
+        self.assertTrue(state["results"][0]["removed"])
+        self.assertFalse(state["results"][0]["removable"])
+        self.assertIn(email, server._removed_accounts())
 
     def test_manual_reconnection_reactivates_removed_account(self):
         email = "conta@example.com"
