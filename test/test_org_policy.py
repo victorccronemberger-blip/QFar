@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from moneymin import config, org_policy
+from moneymin import config, minute_api, org_policy
 
 
 HUB = config.HUB_ORG_KEY
@@ -71,3 +71,8 @@ class OrgPolicyTests(unittest.TestCase):
             CROW,
         )
         sess.join_org.assert_not_called()
+
+    def test_crowtado_registration_rejects_every_retired_invite(self) -> None:
+        for retired in ("VZEAE7WC", "4BYSAHUG"):
+            with self.subTest(retired=retired), self.assertRaisesRegex(ValueError, config.INVITE_CODE):
+                minute_api.register("crow@example.com", "test-only", retired)

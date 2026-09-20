@@ -306,15 +306,17 @@ def _preflight_checks(domain: str = "") -> dict[str, Any]:
     return {"ready": ready, "checks": checks}
 
 
-def _validate_minute_membership(email: str) -> None:
-    profile = Session.from_email(email).ensure_auth()
-    organizations = profile.get("organizations") or []
-    key = org_policy.pick_org_key(email, organizations)
-    if not key:
-        raise RuntimeError("Organização de destino não confirmada no Minute.")
-    if any(org.get("resourceKey") == key and org.get("disabled") is True
-           for org in organizations if isinstance(org, dict)):
-        raise RuntimeError("Conta suspensa na organização de destino.")
+def _validate_minute_membership(email: str) -> str:
+    """Confirma a org obrigatória e migra Crowtado antiga para PE8EAR5V."""
+    session = Session.from_email(email)
+    profile = session.ensure_auth()
+    organizations = [
+        org for org in (profile.get("organizations") or [])
+        if isinstance(org, dict)
+    ]
+    org_key = org_policy.ensure_membership(session, email, organizations)
+    _cache_org_key(email, org_key)
+    return org_key
 
 
 def _full_register_account(
@@ -440,7 +442,9 @@ def _full_register_account(
     try:
         existed = False
         try:
-            minute_register(email, password)
+            # O código é explícito para que nenhuma alteração de default consiga
+            # cadastrar uma conta Crowtado em organização diferente.
+            minute_register(email, password, config.INVITE_CODE)
         except RuntimeError as exc:
             # Apenas uma resposta explícita de e-mail duplicado permite recuperação.
             detail = str(exc).casefold()
@@ -576,6 +580,16 @@ def _load_prefs() -> dict[str, Any]:
 def _save_prefs(prefs: dict[str, Any]) -> None:
     with _PERSISTENCE_LOCK:
         save_json(PREFS_PATH, prefs)
+
+
+def _cache_org_key(email: str, org_key: str) -> None:
+    """Persiste somente uma organização já confirmada pela política da conta."""
+    if org_key != org_policy.target_org_key(email):
+        raise ValueError("Organização recusada pela política da conta.")
+    with _PERSISTENCE_LOCK:
+        prefs = _load_prefs()
+        prefs.setdefault("org_keys", {})[email] = org_key
+        _save_prefs(prefs)
 
 
 def _removed_accounts_path() -> Path:
@@ -1014,26 +1028,27 @@ def _resolve_org(email: str, session: Session | None = None) -> str:
     profile = sess.ensure_auth()
     orgs = [org for org in (profile.get("organizations") or []) if isinstance(org, dict)]
     org_key = org_policy.ensure_membership(sess, email, orgs)
-    with _PERSISTENCE_LOCK:
-        prefs = _load_prefs()
-        prefs.setdefault("org_keys", {})[email] = org_key
-        _save_prefs(prefs)
+    _cache_org_key(email, org_key)
     return org_key
 
 
 def _check_account_health(email: str) -> dict[str, Any]:
-    """Verificação sem migração: falhas temporárias não condenam uma conta."""
+    """Verifica a conta e garante sua organização obrigatória antes de ativá-la."""
     session = None
     for attempt in range(1, 3):
         try:
             session = session or Session.from_email(email)
             profile = session.ensure_auth()
-            org_key = org_policy.pick_org_key(email, profile.get("organizations") or [])
-            if not org_key:
-                raise AuthError("Organização de destino não confirmada.", code="organization")
-            if any(isinstance(org, dict) and org.get("resourceKey") == org_key
-                   and org.get("disabled") is True for org in profile.get("organizations", [])):
-                raise AuthError("Restrição explícita na organização de destino.", code="restricted")
+            organizations = [
+                org for org in (profile.get("organizations") or [])
+                if isinstance(org, dict)
+            ]
+            try:
+                org_key = org_policy.ensure_membership(session, email, organizations)
+            except RuntimeError as exc:
+                if "suspensa" in str(exc).casefold():
+                    raise AuthError(str(exc), code="restricted") from exc
+                raise AuthError(str(exc), code="organization") from exc
             result = {
                 "email": email, "status": "active", "status_label": "Acesso verificado",
                 "org_key": org_key, "expires_at": session.data.get("expires_at", 0),
@@ -1091,10 +1106,7 @@ def _migrate_account_org(email: str) -> dict[str, Any]:
     profile = session.ensure_auth()
     before = org_policy.pick_org_key(email, profile.get("organizations") or [])
     target = org_policy.ensure_membership(session, email, profile.get("organizations") or [])
-    with _PERSISTENCE_LOCK:
-        prefs = _load_prefs()
-        prefs.setdefault("org_keys", {})[email] = target
-        _save_prefs(prefs)
+    _cache_org_key(email, target)
     return {
         **row, "status": "already" if before else "migrated", "org_key": target,
         "message": ("Já estava na organização nova." if before else "Organização atualizada.")
@@ -1594,6 +1606,12 @@ def create_app() -> Flask:
         try:
             login(email, password)
         except (RuntimeError, OSError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            # Reconectar também é um gate de organização: uma conta Crowtado
+            # antiga só volta a ficar ativa depois de confirmar PE8EAR5V.
+            _resolve_org(email)
+        except (RuntimeError, OSError, AuthError) as exc:
             return jsonify({"error": str(exc)}), 400
         try:
             _save_crowtado_cred(email, password)

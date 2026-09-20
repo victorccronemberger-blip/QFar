@@ -39,6 +39,7 @@ class StoragePreservationTests(unittest.TestCase):
 
     def test_login_success_with_local_save_failure_is_partial(self):
         with patch.object(server, "login"), \
+             patch.object(server, "_resolve_org", return_value=server.config.ORG_KEY), \
              patch.object(server, "_save_crowtado_cred", side_effect=ValueError("bad file")), \
              patch.object(server, "_set_account_removed") as restore:
             response = server.create_app().test_client().post("/api/accounts", json={

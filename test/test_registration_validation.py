@@ -14,6 +14,7 @@ class RegistrationValidationTests(unittest.TestCase):
         self.context.enter_context(patch.object(server.account_bans, "require_not_banned"))
         self.activate = self.context.enter_context(patch.object(server, "_set_account_removed"))
         self.context.enter_context(patch.object(server, "_save_crowtado_cred"))
+        self.cache_org = self.context.enter_context(patch.object(server, "_cache_org_key"))
         self.signup = self.context.enter_context(patch.object(server.crowtado, "criar_conta"))
         self.crowtado_login = self.context.enter_context(patch.object(server.crowtado, "login"))
         self.demographics = self.context.enter_context(patch.object(server.crowtado, "preencher_demografia"))
@@ -38,6 +39,9 @@ class RegistrationValidationTests(unittest.TestCase):
     def test_new_account_populates_demographics(self):
         self.assertIsNone(self.run_registration()["error"])
         self.demographics.assert_called_once()
+        self.register.assert_called_once_with(
+            "review@example.invalid", "test-only", server.config.INVITE_CODE,
+        )
 
     def test_unrelated_signup_errors_do_not_trigger_existing_account_login(self):
         for message in ("Executable doesn't exist", "browser already closed",
@@ -122,11 +126,27 @@ class RegistrationValidationTests(unittest.TestCase):
         self.login.assert_not_called()
         self.link.assert_not_called()
 
-    def test_explicit_duplicate_requires_membership(self):
+    def test_explicit_duplicate_migrates_old_membership(self):
         self.register.side_effect = RuntimeError("EMAIL_EXISTS")
-        self.session.ensure_auth.return_value = {"organizations": []}
+        old_profile = {"organizations": [{"resourceKey": server.config.HUB_ORG_KEY}]}
+        new_profile = {"organizations": [{"resourceKey": server.config.ORG_KEY}]}
+        self.session.ensure_auth.side_effect = [old_profile, new_profile]
+        self.session.join_org.return_value = (200, "{}")
+        self.session.me.return_value = new_profile
         result = self.run_registration()
-        self.assertIn("Organização", result["error"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(self.login.call_count, 2)
+        self.session.join_org.assert_called_once_with(server.config.INVITE_CODE)
+        self.link.assert_called_once()
+
+    def test_explicit_duplicate_requires_new_membership_confirmation(self):
+        self.register.side_effect = RuntimeError("EMAIL_EXISTS")
+        old_profile = {"organizations": [{"resourceKey": server.config.HUB_ORG_KEY}]}
+        self.session.ensure_auth.return_value = old_profile
+        self.session.join_org.return_value = (200, "{}")
+        self.session.me.return_value = old_profile
+        result = self.run_registration()
+        self.assertIn(server.config.INVITE_CODE, result["error"])
         self.login.assert_called_once()
         self.link.assert_not_called()
 

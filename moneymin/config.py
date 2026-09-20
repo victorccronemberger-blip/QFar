@@ -117,11 +117,10 @@ FIREBASE_API_KEY = os.environ.get(
     "AIzaSyD1wdhw0mNPRIWA7ZALPnbZu4Lg7Lax5uE",
 )
 
-# Código de convite da org Minute da Crowtado. A Crowtado migrou em
-# 16/09/2026 de VZEAE7WC (Hub - Residential) para PE8EAR5V
-# (Datoric - Residential - Western). Horas no código antigo não são
-# pagas após 19/09/2026. Contas Claru (@supply.claru.ai) NÃO usam este
-# código — ver CLARU_* e moneymin.org_policy.
+# Código único da org Minute para tarefas domésticas da Crowtado. Os códigos
+# antigos VZEAE7WC e 4BYSAHUG nunca devem ser usados para criar, reconectar ou
+# executar uma conta. Contas Claru (@supply.claru.ai) NÃO usam este código —
+# ver CLARU_* e moneymin.org_policy.
 INVITE_CODE = "PE8EAR5V"
 ORG_KEY = "BJdyDTLeV946mlPfYgdfcg"
 HUB_ORG_KEY = "liZUdu2I2KzZBxkTJBx9Hw"

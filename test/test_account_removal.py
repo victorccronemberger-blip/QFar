@@ -92,6 +92,7 @@ class AccountRemovalTests(unittest.TestCase):
             self._write_token(login_email)
 
         with mock.patch.object(server, "login", side_effect=successful_login), \
+             mock.patch.object(server, "_resolve_org", return_value=server.config.ORG_KEY), \
              mock.patch.object(server, "_save_crowtado_cred"):
             response = self.client.post("/api/accounts", json={
                 "email": email,

@@ -33,6 +33,11 @@ cadastradas para Datoric (`PE8EAR5V`). Se elas estiverem em um arquivo, use
 **Importar JSON** primeiro. O progresso aparece na própria tela e **Ver relatório**
 mostra o resultado por conta, com opção de salvar um JSON sem credenciais.
 
+Toda conta Crowtado é tratada como tarefa doméstica e usa exclusivamente
+`PE8EAR5V`. Criação, reconexão, verificação e início de campanha confirmam essa
+organização; uma conta antiga é migrada automaticamente e só fica disponível
+depois que o perfil Minute confirma o novo vínculo.
+
 Contas com domínio `claru.ai` ou seus subdomínios, como `supply.claru.ai`, são
 identificadas como Claru e ignoradas pela migração, sem login nem aplicação de
 convite. As demais contas seguem a política Crowtado. A tabela identifica o tipo
@@ -51,8 +56,9 @@ confirmado. **Reconectar acesso** indica uma pendência de sessão local;
 **Organização pendente** indica vínculo de destino ausente. Somente uma resposta
 explícita de restrição é apresentada como **Restrição confirmada**.
 
-**Verificar todas** não aplica convites nem migra organizações. Use a ação de
-migração para isso. Erros de campanha não substituem a verificação da conta.
+**Verificar todas** também corrige automaticamente uma conta Crowtado que ainda
+esteja somente na organização antiga. Contas Claru não recebem esse convite.
+Erros de campanha não substituem a verificação da conta.
 Em Saldos, um `*` indica o último valor salvo quando a atualização falhou; passe
 o mouse para consultar o diagnóstico. Não remova uma conta para resolver falhas
 temporárias de rede, saldo ou envio.

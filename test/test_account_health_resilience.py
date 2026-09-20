@@ -56,14 +56,27 @@ class HealthResilienceTests(unittest.TestCase):
         saved = json.loads(server.ACCOUNT_HEALTH_PATH.read_text())
         self.assertEqual(saved["a@example.com"]["status"], "inconclusive")
 
-    def test_missing_org_is_not_a_dead_account_and_check_never_joins(self):
+    def test_old_org_is_migrated_and_only_then_marked_active(self):
         sess = mock.Mock(data={})
         sess.ensure_auth.return_value = {"organizations": [{"resourceKey": config.HUB_ORG_KEY}]}
+        sess.join_org.return_value = (200, "{}")
+        sess.me.return_value = {"organizations": [{"resourceKey": config.ORG_KEY}]}
+        with mock.patch.object(server.Session, "from_email", return_value=sess):
+            row = server._check_account_health("a@example.com")
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["org_key"], config.ORG_KEY)
+        sess.join_org.assert_called_once_with(config.INVITE_CODE)
+
+    def test_unconfirmed_migration_is_not_marked_active(self):
+        sess = mock.Mock(data={})
+        old_profile = {"organizations": [{"resourceKey": config.HUB_ORG_KEY}]}
+        sess.ensure_auth.return_value = old_profile
+        sess.join_org.return_value = (200, "{}")
+        sess.me.return_value = old_profile
         with mock.patch.object(server.Session, "from_email", return_value=sess):
             row = server._check_account_health("a@example.com")
         self.assertEqual(row["status"], "needs_org")
         self.assertFalse(row["issue"]["restriction_confirmed"])
-        sess.join_org.assert_not_called()
 
     def test_restriction_requires_explicit_evidence_and_is_not_retried(self):
         with mock.patch.object(server.Session, "from_email", side_effect=AuthError("disabled", code="restricted")) as auth:

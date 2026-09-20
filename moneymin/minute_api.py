@@ -340,7 +340,7 @@ def login(email: str, password: str) -> dict[str, Any]:
     return data
 
 
-def register(email: str, password: str, code: str = config.INVITE_CODE) -> dict[str, Any]:
+def register(email: str, password: str, code: str | None = None) -> dict[str, Any]:
     """Registra uma nova conta via /auth/web-register e já faz login.
 
     O endpoint cria o usuário no Firebase, grava no banco e entra na org do
@@ -352,10 +352,19 @@ def register(email: str, password: str, code: str = config.INVITE_CODE) -> dict[
     schema WebRegisterRequest da spec tem o campo dedicado e a conta nasce
     associada a UM aparelho.
 
-    Devolve o dict do token. Levanta RuntimeError se o registro falhar.
+    O código é validado contra a política da conta; Crowtado aceita somente o
+    convite doméstico atual e Claru mantém seu convite próprio. Devolve o dict
+    do token. Levanta RuntimeError se o registro remoto falhar.
     """
     from .account_bans import require_not_banned
+    from .org_policy import target_invite
     require_not_banned(email)
+    expected_code = target_invite(email)
+    effective_code = str(code or expected_code).strip().upper()
+    if effective_code != expected_code:
+        raise ValueError(
+            f"Código Minute recusado para esta conta; use somente {expected_code}."
+        )
     profile = device_profile.get_profile(email)
     headers = profile.headers(include_location=False)
     status, body = _request(
@@ -365,7 +374,7 @@ def register(email: str, password: str, code: str = config.INVITE_CODE) -> dict[
         body={
             "email": email,
             "password": password,
-            "code": code,
+            "code": effective_code,
             "device_id": profile.device_id,
         },
     )

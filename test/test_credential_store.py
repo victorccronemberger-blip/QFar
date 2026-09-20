@@ -25,7 +25,8 @@ class CredentialStoreTests(unittest.TestCase):
                 self.assertEqual((saved_email, saved_password), (email, password))
                 self.assertEqual(credential_store.lookup(root, email), password)
 
-            def register(saved_email, saved_password):
+            def register(saved_email, saved_password, invite_code):
+                self.assertEqual(invite_code, server.config.INVITE_CODE)
                 account_transfer.save_json(account_transfer.config.token_path(saved_email), {
                     "email": saved_email, "idToken": "fixture-id",
                     "refreshToken": "fixture-refresh", "expires_at": 0,
@@ -36,6 +37,7 @@ class CredentialStoreTests(unittest.TestCase):
                  patch.object(server, "CROWTADO_PW_PATH", root / "crowtado_passwords.json"), \
                  patch.object(server.account_bans, "require_not_banned"), \
                  patch.object(server, "_set_account_removed"), \
+                 patch.object(server, "_cache_org_key"), \
                  patch.object(server.crowtado, "criar_conta", side_effect=signup), \
                  patch.object(server.crowtado, "preencher_demografia"), \
                  patch.object(server.crowtado, "vincular_minute"), \

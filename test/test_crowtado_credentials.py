@@ -17,6 +17,7 @@ class CrowtadoCredentialTests(unittest.TestCase):
 
     def test_connecting_existing_identity_also_keeps_balance_password(self):
         with mock.patch.object(server, "login"), \
+             mock.patch.object(server, "_resolve_org", return_value=server.config.ORG_KEY) as resolve, \
              mock.patch.object(server, "_set_account_removed"), \
              mock.patch.object(server, "_save_crowtado_cred") as save:
             response = self.client.post("/api/accounts", json={
@@ -25,7 +26,20 @@ class CrowtadoCredentialTests(unittest.TestCase):
             })
 
         self.assertEqual(response.status_code, 200)
+        resolve.assert_called_once_with("conta@example.com")
         save.assert_called_once_with("conta@example.com", "senha-segura")
+
+    def test_existing_identity_is_not_saved_when_new_org_is_unconfirmed(self):
+        with mock.patch.object(server, "login"), \
+             mock.patch.object(server, "_resolve_org", side_effect=RuntimeError("PE8EAR5V ausente")), \
+             mock.patch.object(server, "_set_account_removed") as activate, \
+             mock.patch.object(server, "_save_crowtado_cred") as save:
+            response = self.client.post("/api/accounts", json={
+                "email": "conta@example.com", "password": "senha-segura",
+            })
+        self.assertEqual(response.status_code, 400)
+        save.assert_not_called()
+        activate.assert_not_called()
 
     def test_balance_access_is_validated_on_crowtado_before_saving(self):
         account = {"email": "conta@example.com"}

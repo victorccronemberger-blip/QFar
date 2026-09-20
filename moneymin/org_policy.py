@@ -50,6 +50,16 @@ def pick_org_key(email: str, orgs: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _target_disabled(email: str, orgs: list[dict[str, Any]]) -> bool:
+    wanted = target_org_key(email)
+    return any(
+        isinstance(item, dict)
+        and item.get("resourceKey") == wanted
+        and item.get("disabled") is True
+        for item in orgs
+    )
+
+
 def ensure_membership(session: Any, email: str, orgs: list[dict[str, Any]]) -> str:
     """Garante a org certa e devolve o resourceKey.
 
@@ -59,6 +69,8 @@ def ensure_membership(session: Any, email: str, orgs: list[dict[str, Any]]) -> s
     """
     chosen = pick_org_key(email, orgs)
     if chosen:
+        if _target_disabled(email, orgs):
+            raise RuntimeError("Conta suspensa na organização de destino.")
         return chosen
     if account_kind(email) == "claru":
         raise RuntimeError(
@@ -74,8 +86,11 @@ def ensure_membership(session: Any, email: str, orgs: list[dict[str, Any]]) -> s
         )
     me = session.me() if hasattr(session, "me") else {}
     after = me.get("organizations") if isinstance(me, dict) else []
-    chosen = pick_org_key(email, after if isinstance(after, list) else [])
+    after_orgs = after if isinstance(after, list) else []
+    chosen = pick_org_key(email, after_orgs)
     if chosen:
+        if _target_disabled(email, after_orgs):
+            raise RuntimeError("Conta suspensa na organização de destino.")
         return chosen
     raise RuntimeError(
         f"{email}: join {invite} não deixou a org {wanted} no perfil"
