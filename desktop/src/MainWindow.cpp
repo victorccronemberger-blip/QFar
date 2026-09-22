@@ -1562,6 +1562,31 @@ QWidget* MainWindow::buildBalancesPage() {
     });
   });
   headerLayout->addWidget(_balancesRefresh);
+  _balancesWithdrawAll = new QPushButton(QStringLiteral("Sacar tudo"));
+  _balancesWithdrawAll->setEnabled(false);
+  _balancesWithdrawAll->setToolTip(QStringLiteral(
+      "Solicita links de saque para todas as contas Crowtado conectadas com saldo disponível confirmado."));
+  connect(_balancesWithdrawAll, &QPushButton::clicked, this, [this] {
+    const int eligible = _balancesWithdrawAll->property("eligibleCount").toInt();
+    const auto answer = QMessageBox::question(this, QStringLiteral("Sacar tudo"),
+        QStringLiteral("Solicitar links de saque para %1 conta(s) Crowtado elegíveis? "
+                       "Cada saque ainda precisa ser concluído pelo link e pelo 2FA da própria conta.").arg(eligible),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes) return;
+    _balancesWithdrawAll->setEnabled(false);
+    _api.post(QStringLiteral("/api/balances/withdraw-all"), {},
+              [this](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (!ok) {
+        loadBalances();
+        return showError(QStringLiteral("Saque em lote não iniciado"), error);
+      }
+      _bulkWithdrawAwaitingResult = true;
+      _balancePoll.start();
+      setStatus(QStringLiteral("Solicitando links de saque para %1 conta(s)…")
+          .arg(doc.object().value(QStringLiteral("total")).toInt()));
+    });
+  });
+  headerLayout->addWidget(_balancesWithdrawAll);
   layout->addWidget(card(QStringLiteral("Disponibilidade"), header));
 
   _balancesTable = new QTableWidget(0, 5);
@@ -3959,6 +3984,7 @@ void MainWindow::loadBalances() {
     const auto accountKinds = root.value(QStringLiteral("account_kinds")).toObject();
     const auto withPassword = root.value(QStringLiteral("with_password")).toArray();
     const auto runner = root.value(QStringLiteral("runner")).toObject();
+    const auto bulk = root.value(QStringLiteral("withdraw_bulk")).toObject();
     const auto exchange = root.value(QStringLiteral("exchange")).toObject();
     QStringList passwordAccounts;
     for (const auto value : withPassword) passwordAccounts << value.toString();
@@ -3977,6 +4003,7 @@ void MainWindow::loadBalances() {
     _balancesTable->setRowCount(orderedAccounts.size());
     qint64 approvedTotal = 0;
     qint64 pendingTotal = 0;
+    int eligibleWithdrawals = 0;
     int row = 0;
     for (const QString& email : orderedAccounts) {
       const bool isClaru = accountKinds.value(email).toString() == QStringLiteral("claru");
@@ -4024,6 +4051,8 @@ void MainWindow::loadBalances() {
       _balancesTable->setItem(row, 3, cell(friendlyDate(balance.value(QStringLiteral("updated_at")).toString())));
       const bool hasPassword = passwordAccounts.contains(email);
       const bool hasBalanceError = !balance.value(QStringLiteral("error")).toString().isEmpty();
+      if (!isClaru && hasPassword && !hasBalanceError && hasAvailable && availableCents > 0)
+        ++eligibleWithdrawals;
       auto* actions = new QWidget;
       auto* actionsLayout = new QHBoxLayout(actions);
       actionsLayout->setContentsMargins(5, 5, 5, 5);
@@ -4082,16 +4111,42 @@ void MainWindow::loadBalances() {
     }
     const bool running = runner.value(QStringLiteral("state")).toString() == QStringLiteral("running");
     _balancesRefresh->setEnabled(!running);
+    const bool bulkRunning = bulk.value(QStringLiteral("state")).toString() == QStringLiteral("running");
+    _balancesWithdrawAll->setProperty("eligibleCount", eligibleWithdrawals);
+    _balancesWithdrawAll->setEnabled(!running && !bulkRunning && eligibleWithdrawals > 0);
+    if (_bulkWithdrawAwaitingResult && !bulkRunning
+        && bulk.value(QStringLiteral("state")).toString() == QStringLiteral("done")) {
+      _bulkWithdrawAwaitingResult = false;
+      QStringList details;
+      int sent = 0;
+      for (const auto value : bulk.value(QStringLiteral("results")).toArray()) {
+        const auto result = value.toObject();
+        if (result.value(QStringLiteral("ok")).toBool()) ++sent;
+        details << QStringLiteral("%1: %2")
+            .arg(result.value(QStringLiteral("email")).toString(),
+                 result.value(QStringLiteral("message")).toString());
+      }
+      QMessageBox report(QMessageBox::Information, QStringLiteral("Saque em lote"),
+          QStringLiteral("Links solicitados para %1 de %2 conta(s). Confira cada link e conclua o 2FA.")
+              .arg(sent).arg(bulk.value(QStringLiteral("total")).toInt()),
+          QMessageBox::Ok, this);
+      report.setDetailedText(details.join('\n'));
+      report.exec();
+    }
     int claruCount = 0;
     for (const auto value : accounts) {
       if (accountKinds.value(value.toString()).toString() == QStringLiteral("claru"))
         ++claruCount;
     }
-    _balancesState->setText(running
+    _balancesState->setText(bulkRunning
+        ? QStringLiteral("Solicitando saques: %1 de %2 conta(s)…")
+              .arg(bulk.value(QStringLiteral("done")).toInt())
+              .arg(bulk.value(QStringLiteral("total")).toInt())
+        : running
         ? runner.value(QStringLiteral("current")).toString(QStringLiteral("Consultando contas…"))
         : QStringLiteral("%1 identidade(s) · %2 Crowtado conectado(s) · %3 Claru preservada(s)")
               .arg(accounts.size()).arg(passwordAccounts.size()).arg(claruCount));
-    if (running) _balancePoll.start(); else _balancePoll.stop();
+    if (running || bulkRunning) _balancePoll.start(); else _balancePoll.stop();
   });
 }
 

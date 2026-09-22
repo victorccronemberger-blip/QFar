@@ -264,6 +264,8 @@ private:
   QTableWidget* _balancesTable{};
   QLabel* _balancesState{};
   QPushButton* _balancesRefresh{};
+  QPushButton* _balancesWithdrawAll{};
+  bool _bulkWithdrawAwaitingResult{};
   QLabel* _balancesApprovedUsd{};
   QLabel* _balancesApprovedBrl{};
   QLabel* _balancesPendingUsd{};
