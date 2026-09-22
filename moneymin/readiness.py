@@ -237,6 +237,34 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
             "ok" if aws_ok else "error",
             "perfil AWS encontrado" if aws_ok else "perfil AWS autorizado não encontrado",
         ))
+        if catalog_ok:
+            from . import ego_accelerator
+            from .campaign import _load_rank_cache
+            # Medir o reservatório recalcula o ranking na primeira vez. O
+            # diagnóstico não deve disparar esse trabalho; a aba Acelerador sim.
+            if _load_rank_cache() is None:
+                checks.append(_check(
+                    "Acelerador Ego4D",
+                    "warning",
+                    "abra a aba Acelerador para medir e preparar o cache",
+                ))
+            else:
+                try:
+                    cache = ego_accelerator.cache_status()
+                except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                    checks.append(_check(
+                        "Acelerador Ego4D",
+                        "warning",
+                        f"cache ainda não pôde ser medido: {exc}",
+                    ))
+                else:
+                    ready = int(cache.get("ready") or 0)
+                    total = int(cache.get("total") or 0)
+                    checks.append(_check(
+                        "Acelerador Ego4D",
+                        "ok" if ready else "warning",
+                        f"{ready}/{total} clipe(s) prontos; os demais são preparados sob demanda",
+                    ))
 
     free_gib = shutil.disk_usage(config.ROOT).free / (1024 ** 3)
     checks.append(_check(

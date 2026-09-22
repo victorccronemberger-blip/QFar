@@ -30,8 +30,9 @@ Endpoints JSON consumidos exclusivamente pelo aplicativo desktop:
     GET    /api/campaigns/current?since=N  estado + eventos novos (polling)
     POST   /api/campaigns/stop           parada cooperativa
 
-  Acelerador HoloAssist (pré-cache retomável)
+  Acelerador (pré-cache retomável de HoloAssist ou Ego4D)
     GET    /api/holo-cache               cobertura local + estado do runner
+                                         ?provider=holoassist|ego4d
     POST   /api/holo-cache/start         inicia download/normalização em 2º plano
     POST   /api/holo-cache/stop          para depois do clipe atual
 
@@ -75,7 +76,7 @@ from typing import Any
 from flask import Flask, g, jsonify, request
 
 from .. import (
-    campaign, config, crowtado, ego4d, fx, holo_accelerator, holoassist,
+    campaign, config, crowtado, ego4d, ego_accelerator, fx, holo_accelerator, holoassist,
     hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store,
 )
 from ..atomic_io import load_json, save_json
@@ -2263,23 +2264,71 @@ def create_app() -> Flask:
             "history": {"campaign_logs": len(campaign.list_campaign_logs())},
         })
 
-    # -- acelerador HoloAssist -------------------------------------------------
+    # -- acelerador (HoloAssist ou Ego4D) --------------------------------------
+    def _accelerator_provider(value: Any) -> str | None:
+        provider = str(value or "holoassist").strip().lower()
+        if provider not in {"holoassist", "ego4d"}:
+            return None
+        return provider
+
+    def _accelerator_tasks(provider: str) -> list[str]:
+        if provider == "ego4d":
+            return ego_accelerator.task_names()
+        return sorted(holoassist.MINUTE_TASK_TYPES)
+
+    def _accelerator_module(provider: str):
+        return ego_accelerator if provider == "ego4d" else holo_accelerator
+
+    def _accelerator_budget_gb(provider: str, raw: Any, *, default: int | None) -> int | None:
+        if provider != "ego4d":
+            return None
+        if raw in (None, ""):
+            raw = default
+        if raw in (None, ""):
+            return None
+        try:
+            ego_accelerator.budget_bytes(raw)
+            budget_gb = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError
+        if not 0 <= budget_gb <= ego_accelerator.MAX_BUDGET_GB:
+            raise ValueError
+        return budget_gb
+
     @app.get("/api/holo-cache")
     def holo_cache_status():
-        task = str(request.args.get("task") or holo_accelerator.DEFAULT_TASK)
-        if task not in holoassist.MINUTE_TASK_TYPES:
-            return jsonify({"error": "tarefa HoloAssist inválida"}), 400
+        provider = _accelerator_provider(request.args.get("provider"))
+        if provider is None:
+            return jsonify({"error": "provedor inválido (holoassist|ego4d)"}), 400
+        module = _accelerator_module(provider)
+        tasks = _accelerator_tasks(provider)
+        task = str(request.args.get("task") or module.DEFAULT_TASK)
+        if task not in tasks:
+            return jsonify({"error": "tarefa inválida para o provedor"}), 400
         raw_limit = request.args.get("limit")
         try:
             limit = None if raw_limit in (None, "", "0") else int(raw_limit)
             if limit is not None and not 1 <= limit <= 1000:
                 raise ValueError
+            budget_gb = _accelerator_budget_gb(
+                provider, request.args.get("budget_gb"),
+                default=ego_accelerator.configured_budget_gb(ego_accelerator.DEFAULT_BUDGET_GB))
+            min_free_gb = float(request.args.get("min_free_gb", 50))
+            if not math.isfinite(min_free_gb) or not 5 <= min_free_gb <= 1000:
+                raise ValueError
         except (TypeError, ValueError):
-            return jsonify({"error": "limit deve estar entre 1 e 1000"}), 400
+            return jsonify({
+                "error": "use cache em GB inteiros (0 para desativar), limite de 1 a 1000 e reserva de 5 a 1000 GiB",
+            }), 400
         try:
-            cache = holo_accelerator.cache_status(task, limit=limit)
+            if provider == "ego4d":
+                cache = module.cache_status(task, limit=limit, budget_gb=budget_gb,
+                                            min_free_gb=min_free_gb)
+            else:
+                cache = module.cache_status(task, limit=limit)
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             cache = {
+                "provider": provider,
                 "task": task,
                 "total": 0,
                 "ready": 0,
@@ -2288,18 +2337,31 @@ def create_app() -> Flask:
                 "last_run": {},
                 "catalog_error": str(exc),
             }
+            if budget_gb is not None:
+                try:
+                    cache.update(ego_accelerator.storage_limits(
+                        budget_gb, min_free_gb=min_free_gb))
+                except OSError:
+                    cache.update({"budget_gb": 0, "max_budget_gb": 0})
         return jsonify({
+            "provider": provider,
+            "default_task": module.DEFAULT_TASK,
             "cache": cache,
             "runner": HOLO_CACHE_RUNNER.snapshot(),
-            "tasks": sorted(holoassist.MINUTE_TASK_TYPES),
+            "tasks": tasks,
         })
 
     @app.post("/api/holo-cache/start")
     def holo_cache_start():
         body = request.get_json(silent=True) or {}
-        task = str(body.get("task") or holo_accelerator.DEFAULT_TASK)
-        if task not in holoassist.MINUTE_TASK_TYPES:
-            return jsonify({"error": "tarefa HoloAssist inválida"}), 400
+        provider = _accelerator_provider(body.get("provider"))
+        if provider is None:
+            return jsonify({"error": "provedor inválido (holoassist|ego4d)"}), 400
+        module = _accelerator_module(provider)
+        tasks = _accelerator_tasks(provider)
+        task = str(body.get("task") or module.DEFAULT_TASK)
+        if task not in tasks:
+            return jsonify({"error": "tarefa inválida para o provedor"}), 400
         try:
             raw_limit = body.get("limit")
             limit = None if raw_limit in (None, "", 0, "0") else int(raw_limit)
@@ -2308,22 +2370,43 @@ def create_app() -> Flask:
             min_free_gb = float(body.get("min_free_gb", 50))
             if not math.isfinite(min_free_gb) or not 5 <= min_free_gb <= 1000:
                 raise ValueError
+            budget_gb = _accelerator_budget_gb(
+                provider, body.get("budget_gb"), default=ego_accelerator.DEFAULT_BUDGET_GB)
         except (TypeError, ValueError):
             return jsonify({
-                "error": "use limite entre 1 e 1000 e reserva de disco entre 5 e 1000 GiB",
+                "error": "use limite entre 1 e 1000, reserva entre 5 e 1000 GiB e cache em GB inteiros (0 para desativar)",
             }), 400
 
-        # Falhe antes de abrir a thread quando os metadados ainda não foram
-        # instalados. A mensagem original explica qual comando deve ser usado.
+        if provider == "ego4d" and budget_gb == 0:
+            with _HEAVY_RUNNER_LOCK:
+                if HOLO_CACHE_RUNNER.running:
+                    return jsonify({
+                        "error": "pare o acelerador antes de desligar o cache",
+                    }), 409
+                ego_accelerator.remember_budget(0)
+            return jsonify({
+                "ok": True,
+                "cache_disabled": True,
+                "runner": HOLO_CACHE_RUNNER.snapshot(),
+            })
+
+        # Falhe antes de abrir a thread quando o catálogo ainda não existe.
         try:
-            catalog = holo_accelerator.cache_status(task, limit=limit)
+            if provider == "ego4d":
+                catalog = module.cache_status(task, limit=limit, budget_gb=budget_gb,
+                                              min_free_gb=min_free_gb)
+                budget_gb = catalog["budget_gb"]
+                if budget_gb == 0:
+                    return jsonify({"error": "não há espaço disponível para cache acima da reserva de disco"}), 400
+            else:
+                catalog = module.cache_status(task, limit=limit)
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             return jsonify({"error": str(exc)}), 400
 
         with _HEAVY_RUNNER_LOCK:
             if RUNNER.running:
                 return jsonify({
-                    "error": "pare a campanha antes de iniciar o acelerador HoloAssist",
+                    "error": "pare a campanha antes de iniciar o acelerador",
                 }), 409
             if HOLO_CACHE_RUNNER.running:
                 return jsonify({
@@ -2333,14 +2416,17 @@ def create_app() -> Flask:
                 })
             try:
                 HOLO_CACHE_RUNNER.start(
+                    provider=provider,
                     task=task,
                     limit=limit,
+                    budget_gb=budget_gb,
                     min_free_gb=min_free_gb,
                 )
             except RuntimeError as exc:
                 return jsonify({"error": str(exc)}), 409
         return jsonify({
             "ok": True,
+            "provider": provider,
             "cache": catalog,
             "runner": HOLO_CACHE_RUNNER.snapshot(),
         })
@@ -2371,7 +2457,7 @@ def create_app() -> Flask:
         if RUNNER.running:
             blockers.append("já existe uma campanha em andamento")
         if HOLO_CACHE_RUNNER.running:
-            blockers.append("o acelerador HoloAssist está em execução")
+            blockers.append("o acelerador está em execução")
         try:
             provider = campaign.normalize_dataset_provider(body.get("dataset"))
             min_dur_s, max_dur_s = _parse_duration_range(body)
@@ -2547,7 +2633,7 @@ def create_app() -> Flask:
             })
         if HOLO_CACHE_RUNNER.running:
             return jsonify({
-                "error": "pare o acelerador HoloAssist antes de iniciar a campanha",
+                "error": "pare o acelerador antes de iniciar a campanha",
             }), 409
         body = request.get_json(silent=True) or {}
         receipt = None
@@ -2789,7 +2875,7 @@ def create_app() -> Flask:
         with _HEAVY_RUNNER_LOCK:
             if HOLO_CACHE_RUNNER.running:
                 return jsonify({
-                    "error": "pare o acelerador HoloAssist antes de iniciar a campanha",
+                    "error": "pare o acelerador antes de iniciar a campanha",
                 }), 409
             if receipt and receipt["issues"]:
                 if BALANCES_RUNNER.running:

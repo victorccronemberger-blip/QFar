@@ -1230,9 +1230,54 @@ QWidget* MainWindow::buildAcceleratorPage() {
   auto* form = new QFormLayout(config);
   configureForm(form);
   form->setContentsMargins(0, 0, 0, 0);
+  _cacheProvider = new ComboBox;
+  configureCombo(_cacheProvider, 620);
+  _cacheProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
+  _cacheProvider->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
+  connect(_cacheProvider, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, form] {
+    _cacheTask->blockSignals(true);
+    _cacheTask->clear();
+    _cacheTask->blockSignals(false);
+    const bool ego = _cacheProvider->currentData().toString() == QStringLiteral("ego4d");
+    if (_cacheTaskLabel) {
+      _cacheTaskLabel->setText(ego ? QStringLiteral("Prioridade Ego4D")
+                                   : QStringLiteral("Tarefa HoloAssist"));
+    }
+    if (_cacheBudget) form->setRowVisible(_cacheBudget, ego);
+    if (_cacheStart) {
+      const bool off = ego && _cacheBudget && _cacheBudget->value() == 0;
+      _cacheStart->setText(off ? QStringLiteral("Usar só o provedor")
+                               : QStringLiteral("Preparar cache"));
+    }
+    loadAccelerator();
+  });
+  form->addRow(QStringLiteral("Provedor"), _cacheProvider);
   _cacheTask = new ComboBox;
   configureCombo(_cacheTask, 620);
-  form->addRow(QStringLiteral("Tarefa HoloAssist"), _cacheTask);
+  connect(_cacheTask, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+    loadAccelerator();
+  });
+  _cacheTaskLabel = new QLabel(QStringLiteral("Tarefa HoloAssist"));
+  form->addRow(_cacheTaskLabel, _cacheTask);
+  _cacheBudgetLabel = new QLabel(QStringLiteral("Cache Ego4D"));
+  _cacheBudget = new QSpinBox;
+  _cacheBudget->setRange(0, 2147483647);
+  _cacheBudget->setKeyboardTracking(false);
+  _cacheBudget->setSpecialValueText(QStringLiteral("Sem cache"));
+  _cacheBudget->setValue(400);
+  _cacheBudget->setSuffix(QStringLiteral(" GB"));
+  connect(_cacheBudget, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
+    const bool off = _cacheBudget->value() == 0;
+    _cacheBudget->setSuffix(off ? QString() : QStringLiteral(" GB"));
+    if (_cacheStart && _cacheProvider
+        && _cacheProvider->currentData().toString() == QStringLiteral("ego4d")) {
+      _cacheStart->setText(off ? QStringLiteral("Usar só o provedor")
+                               : QStringLiteral("Preparar cache"));
+    }
+    loadAccelerator();
+  });
+  form->addRow(_cacheBudgetLabel, _cacheBudget);
+  form->setRowVisible(_cacheBudget, false);
   _cacheLimit = new QSpinBox;
   _cacheLimit->setRange(0, 1000);
   _cacheLimit->setSpecialValueText(QStringLiteral("Todos"));
@@ -1241,6 +1286,10 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheReserve->setRange(5, 1000);
   _cacheReserve->setValue(50);
   _cacheReserve->setSuffix(QStringLiteral(" GiB livres"));
+  _cacheReserve->setKeyboardTracking(false);
+  connect(_cacheReserve, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
+    loadAccelerator();
+  });
   form->addRow(QStringLiteral("Reserva de disco"), _cacheReserve);
   auto* actions = new QWidget;
   auto* actionLayout = new QHBoxLayout(actions);
@@ -1276,7 +1325,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   layout->addStretch();
 
   return pageShell(QStringLiteral("Acelerador"),
-                   QStringLiteral("Antecipe downloads e normalização para campanhas mais previsíveis."), body);
+                   QStringLiteral("Escolha o tamanho do cache Ego4D em GB, limitado ao espaço disponível no disco e à reserva livre."), body);
 }
 
 QWidget* MainWindow::buildAccountsPage() {
@@ -3075,18 +3124,65 @@ void MainWindow::pollCampaignPreviews() {
 }
 
 void MainWindow::loadAccelerator() {
-  QString path = QStringLiteral("/api/holo-cache");
-  if (_cacheTask->count()) {
-    path += QStringLiteral("?task=%1&limit=%2").arg(encoded(_cacheTask->currentText())).arg(_cacheLimit->value());
+  const QString provider = _cacheProvider && !_cacheProvider->currentData().toString().isEmpty()
+      ? _cacheProvider->currentData().toString() : QStringLiteral("holoassist");
+  const QString requestedTask = _cacheTask->count() ? _cacheTask->currentText() : QString();
+  QString path = QStringLiteral("/api/holo-cache?provider=%1").arg(encoded(provider));
+  if (!requestedTask.isEmpty()) {
+    path += QStringLiteral("&task=%1&limit=%2").arg(encoded(requestedTask)).arg(_cacheLimit->value());
   }
-  _api.get(path, [this](bool ok, const QJsonDocument& doc, const QString& error) {
+  if (provider == QStringLiteral("ego4d") && _cacheBudget) {
+    if (_cacheBudgetLoaded)
+      path += QStringLiteral("&budget_gb=%1").arg(_cacheBudget->value());
+    path += QStringLiteral("&min_free_gb=%1").arg(_cacheReserve->value());
+  }
+  if (_cacheRequestKey != path) {
+    _cacheRequestKey = path;
+    ++_cacheRequestId;
+  }
+  const auto requestId = _cacheRequestId;
+  _api.get(path, [this, provider, requestedTask, requestId](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (requestId != _cacheRequestId) return;
     if (!ok) return setStatus(error);
+    if (_cacheProvider && _cacheProvider->currentData().toString() != provider) return;
+    if (!requestedTask.isEmpty() && _cacheTask->currentText() != requestedTask) return;
     const auto root = doc.object();
     if (_cacheTask->count() == 0) {
-      for (const auto task : root.value(QStringLiteral("tasks")).toArray()) _cacheTask->addItem(task.toString());
-      if (_cacheTask->count()) _cacheTask->setCurrentIndex(0);
+      const QString preferred = root.value(QStringLiteral("default_task")).toString();
+      _cacheTask->blockSignals(true);
+      int select = 0;
+      int index = 0;
+      for (const auto task : root.value(QStringLiteral("tasks")).toArray()) {
+        const QString name = task.toString();
+        _cacheTask->addItem(name);
+        if (name == preferred) select = index;
+        ++index;
+      }
+      if (_cacheTask->count()) _cacheTask->setCurrentIndex(select);
+      _cacheTask->blockSignals(false);
+      const QString served = root.value(QStringLiteral("cache")).toObject()
+          .value(QStringLiteral("task")).toString();
+      if (_cacheTask->count() && !served.isEmpty() && _cacheTask->currentText() != served) {
+        loadAccelerator();
+        return;
+      }
     }
     const auto cache = root.value(QStringLiteral("cache")).toObject();
+    if (provider == QStringLiteral("ego4d") && cache.contains(QStringLiteral("max_budget_gb"))) {
+      _cacheBudget->blockSignals(true);
+      _cacheBudget->setMaximum(cache.value(QStringLiteral("max_budget_gb")).toInt());
+      if (!_cacheBudgetLoaded) {
+        _cacheBudget->setValue(cache.value(QStringLiteral("budget_gb")).toInt());
+        _cacheBudgetLoaded = true;
+      }
+      _cacheBudget->setSuffix(_cacheBudget->value() == 0 ? QString() : QStringLiteral(" GB"));
+      _cacheBudget->setToolTip(QStringLiteral("Máximo neste disco: %1 GB · livres: %2 GiB · reserva: %3 GiB")
+          .arg(_cacheBudget->maximum()).arg(cache.value(QStringLiteral("free_gb")).toDouble())
+          .arg(_cacheReserve->value()));
+      _cacheBudget->blockSignals(false);
+      _cacheStart->setText(_cacheBudget->value() == 0 ? QStringLiteral("Usar só o provedor")
+                                                    : QStringLiteral("Preparar cache"));
+    }
     const auto runner = root.value(QStringLiteral("runner")).toObject();
     const int total = cache.value(QStringLiteral("total")).toInt();
     const int ready = cache.value(QStringLiteral("ready")).toInt();
@@ -3094,12 +3190,32 @@ void MainWindow::loadAccelerator() {
     const int pending = cache.value(QStringLiteral("pending")).toInt();
     const QString state = runner.value(QStringLiteral("state")).toString();
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
-    _cacheState->setText(running ? runner.value(QStringLiteral("current")).toString()
-                                 : QStringLiteral("Reservatório medido"));
-    _cacheNumbers->setText(QStringLiteral("%1 prontos · %2 parciais · %3 pendentes")
-                               .arg(ready).arg(partial).arg(pending));
-    _cacheProgress->setValue(total > 0 ? ready * 100 / total : 0);
-    _cacheStart->setEnabled(!running && cache.value(QStringLiteral("catalog_error")).toString().isEmpty());
+    const QString catalogError = cache.value(QStringLiteral("catalog_error")).toString();
+    if (!catalogError.isEmpty() && !running)
+      _cacheState->setText(catalogError);
+    else
+      _cacheState->setText(running ? runner.value(QStringLiteral("current")).toString()
+                                   : QStringLiteral("Reservatório medido"));
+    const int budgetGb = cache.value(QStringLiteral("budget_gb")).toInt();
+    const double usedGb = cache.value(QStringLiteral("used_gb")).toDouble();
+    if (budgetGb > 0) {
+      _cacheNumbers->setText(QStringLiteral("%1 GB de %2 GB · máximo no disco: %3 GB · %4 prontos · %5 pendentes")
+                                 .arg(qRound(usedGb)).arg(budgetGb)
+                                 .arg(cache.value(QStringLiteral("max_budget_gb")).toInt()).arg(ready).arg(pending));
+      _cacheProgress->setValue(qBound(0, qRound(usedGb * 100.0 / budgetGb), 100));
+    } else {
+      _cacheNumbers->setText(QStringLiteral("%1 prontos · %2 parciais · %3 pendentes")
+                                 .arg(ready).arg(partial).arg(pending));
+      _cacheProgress->setValue(total > 0 ? ready * 100 / total : 0);
+    }
+    if (!running && catalogError.isEmpty()
+        && cache.value(QStringLiteral("cache_mode")).toString() == QStringLiteral("provider"))
+      _cacheState->setText(QStringLiteral("Campanha usa só o provedor"));
+    else if (!running && runner.value(QStringLiteral("state")).toString() == QStringLiteral("budget"))
+      _cacheState->setText(QStringLiteral("Cache atingiu o tamanho escolhido"));
+    const bool disablingCache = provider == QStringLiteral("ego4d")
+        && _cacheBudget && _cacheBudget->value() == 0;
+    _cacheStart->setEnabled(!running && (catalogError.isEmpty() || disablingCache));
     _cacheStop->setEnabled(running && state != QStringLiteral("stopping"));
     if (running) _cachePoll.start(); else _cachePoll.stop();
   });
@@ -3107,10 +3223,15 @@ void MainWindow::loadAccelerator() {
 
 void MainWindow::startAccelerator() {
   if (_cacheTask->currentText().isEmpty()) return;
-  QJsonObject body{{QStringLiteral("task"), _cacheTask->currentText()},
+  const QString provider = _cacheProvider && !_cacheProvider->currentData().toString().isEmpty()
+      ? _cacheProvider->currentData().toString() : QStringLiteral("holoassist");
+  QJsonObject body{{QStringLiteral("provider"), provider},
+                   {QStringLiteral("task"), _cacheTask->currentText()},
                    {QStringLiteral("min_free_gb"), _cacheReserve->value()}};
   if (_cacheLimit->value() > 0) body.insert(QStringLiteral("limit"), _cacheLimit->value());
   else body.insert(QStringLiteral("limit"), QJsonValue::Null);
+  if (provider == QStringLiteral("ego4d") && _cacheBudget)
+    body.insert(QStringLiteral("budget_gb"), _cacheBudget->value());
   _cacheStart->setEnabled(false);
   _api.post(QStringLiteral("/api/holo-cache/start"), body,
             [this](bool ok, const QJsonDocument&, const QString& error) {

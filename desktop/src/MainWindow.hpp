@@ -238,8 +238,15 @@ private:
   bool _previewCheckActive{};
   bool _campaignActive{};
 
+  QComboBox* _cacheProvider{};
+  quint64 _cacheRequestId{};
+  QString _cacheRequestKey;
+  bool _cacheBudgetLoaded{};
+  QLabel* _cacheTaskLabel{};
   QComboBox* _cacheTask{};
   QSpinBox* _cacheLimit{};
+  QLabel* _cacheBudgetLabel{};
+  QSpinBox* _cacheBudget{};
   QSpinBox* _cacheReserve{};
   QLabel* _cacheState{};
   QLabel* _cacheNumbers{};

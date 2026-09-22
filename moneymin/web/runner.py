@@ -17,7 +17,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from .. import campaign, holo_accelerator
+from .. import campaign, ego_accelerator, holo_accelerator
 from ..campaign import CampaignConfig, run_campaign
 
 _MAX_EVENTS = 2000
@@ -703,7 +703,7 @@ BALANCES_RUNNER = BalancesRunner()
 
 
 class HoloCacheRunner:
-    """Pré-cache HoloAssist retomável em uma thread de fundo."""
+    """Pré-cache retomável de HoloAssist ou Ego4D em uma thread de fundo."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -718,6 +718,7 @@ class HoloCacheRunner:
         self.failed = 0
         self.error: str | None = None
         self.result: dict[str, Any] | None = None
+        self.provider = "holoassist"
 
     @property
     def running(self) -> bool:
@@ -727,16 +728,19 @@ class HoloCacheRunner:
         self,
         *,
         task: str,
+        provider: str = "holoassist",
         min_dur_s: float = 60,
         max_dur_s: float = 1800,
         limit: int | None = None,
+        budget_gb: int | None = None,
         min_free_gb: float = 50,
     ) -> None:
         with self._lock:
             if self.running:
-                raise RuntimeError("o acelerador HoloAssist já está em andamento")
+                raise RuntimeError("o acelerador já está em andamento")
             self._stop.clear()
             self.state = "running"
+            self.provider = provider
             self.current = "preparando catálogo…"
             self.phase = "catalog"
             self.index = 0
@@ -746,10 +750,12 @@ class HoloCacheRunner:
             self.error = None
             self.result = None
             kwargs = {
+                "provider": provider,
                 "task": task,
                 "min_dur_s": min_dur_s,
                 "max_dur_s": max_dur_s,
                 "limit": limit,
+                "budget_gb": budget_gb,
                 "min_free_gb": min_free_gb,
             }
             try:
@@ -776,8 +782,13 @@ class HoloCacheRunner:
                 self._stop.set()
 
     def _run(self, **kwargs: Any) -> None:
+        provider = str(kwargs.pop("provider", "holoassist"))
+        if provider != "ego4d":
+            kwargs.pop("budget_gb", None)
+        warm = (ego_accelerator.warm_cache if provider == "ego4d"
+                else holo_accelerator.warm_cache)
         try:
-            result = holo_accelerator.warm_cache(
+            result = warm(
                 **kwargs,
                 progress=self._on_event,
                 should_stop=self._stop.is_set,
@@ -795,6 +806,8 @@ class HoloCacheRunner:
             "complete": "done",
             "stopped": "stopped",
             "disk_limit": "disk_limit",
+            "budget": "budget",
+            "provider": "provider",
         }
         with self._lock:
             self.result = dict(result)
@@ -818,6 +831,7 @@ class HoloCacheRunner:
             "imu_download": "baixando sensores",
             "imu_cached": "sensores já estavam no cache",
             "imu_ready": "sensores prontos",
+            "imu_preflight": "validando sensores",
             "encode": "normalizando vídeo",
             "encode_ready": "vídeo normalizado",
             "sidecar": "preparando sensores",
@@ -855,6 +869,7 @@ class HoloCacheRunner:
         with self._lock:
             return {
                 "state": self.state,
+                "provider": self.provider,
                 "current": self.current,
                 "phase": self.phase,
                 "index": self.index,

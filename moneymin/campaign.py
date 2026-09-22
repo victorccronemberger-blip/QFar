@@ -307,17 +307,7 @@ def _normalize_video(src: Path, out_dir: Path, *,
     out = out_dir / f"{stem or src.stem}_native.mp4"
     marker = out.with_name(out.name + ".source.json")
     try:
-        source_stat = src.stat()
-        cache_key = {
-            "version": 4,
-            "source_size": source_stat.st_size,
-            "source_mtime_ns": source_stat.st_mtime_ns,
-            "start_s": None if start_s is None else round(float(start_s), 6),
-            "dur_s": None if dur_s is None else round(float(dur_s), 6),
-            "width": 1440,
-            "height": 1080,
-            "fps": 30,
-        }
+        cache_key = _native_cache_key(src, start_s, dur_s)
     except OSError as exc:
         raise RuntimeError(f"fonte Ego4D inacessível: {src}: {exc}") from exc
     if out.exists():
@@ -491,6 +481,103 @@ def _ego_clip_inputs(
     return ego4d.find_clip(str(clip_info.get("clip_uid") or ""))
 
 
+_NATIVE_CACHE_VERSION = 4
+
+
+def _native_cache_key(
+    src: Path, start_s: float | None, dur_s: float | None,
+) -> dict[str, Any]:
+    """Identidade do `_native.mp4`: mesma janela e mesma fonte do encode."""
+    source_stat = src.stat()
+    return {
+        "version": _NATIVE_CACHE_VERSION,
+        "source_size": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
+        "start_s": None if start_s is None else round(float(start_s), 6),
+        "dur_s": None if dur_s is None else round(float(dur_s), 6),
+        "width": 1440,
+        "height": 1080,
+        "fps": 30,
+    }
+
+
+def _ego_prepare_plan(clip: dict[str, Any]) -> dict[str, Any]:
+    """Janela e caminhos que `prepare_clip` grava em disco.
+
+    O acelerador usa este plano para reconhecer um cache já pronto sem
+    reencode. Qualquer mudança de corte tem de passar por aqui.
+    """
+    clip_uid = clip["exported_clip_uid"]
+    orig_start, orig_end = ego4d.clip_window_s(clip)
+    start_s, end_s = ego4d.humanize_window(orig_start, orig_end, clip_uid)
+    parent_uid = str(clip.get("parent_video_uid") or clip_uid)
+    needs_cut = bool(clip.get("needs_cut"))
+    if needs_cut:
+        media_uid = str(clip.get("media_uid") or parent_uid)
+        media_offset = float(clip.get("media_time_offset_s") or 0.0)
+        source_name = f"{media_uid}.mp4"
+        norm_start = start_s - media_offset
+    else:
+        source_name = f"{clip_uid}.mp4"
+        rel = start_s - orig_start
+        norm_start = rel if rel > 0.02 else None
+    return {
+        "clip_uid": clip_uid,
+        "parent_uid": parent_uid,
+        "start_s": start_s,
+        "end_s": end_s,
+        "dur_s": end_s - start_s,
+        "window_s": (start_s, end_s),
+        "needs_cut": needs_cut,
+        "source_name": source_name,
+        "norm_start": norm_start,
+        "imu_name": f"{parent_uid}_imu.csv",
+        "native_name": f"{clip_uid}_native.mp4",
+    }
+
+
+def ego_clip_cache_state(
+    clip_info: dict[str, Any], work_dir: Path,
+) -> str:
+    """`ready`, `partial`, `pending` ou `unresolved` para o reservatório Ego4D.
+
+    `ready` exige a mesma fonte, o mesmo marcador de encode e o IMU que
+    `prepare_clip` reaproveita. Não sonda o MP4: a campanha ainda valida a
+    duração quando for usar o arquivo.
+    """
+    try:
+        row, video = _ego_clip_inputs(clip_info)
+        if row is None or video is None:
+            return "unresolved"
+        plan = _ego_prepare_plan(row)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return "unresolved"
+    work = Path(work_dir)
+    source = work / plan["source_name"]
+    native = work / plan["native_name"]
+    imu = work / plan["imu_name"]
+    try:
+        source_ok = source.is_file() and source.stat().st_size > 1024 * 1024
+        imu_ok = ego4d._valid_imu_cache(imu)
+        native_ok = False
+        if source_ok and native.is_file() and native.stat().st_size > 1024 * 1024:
+            marker = native.with_name(native.name + ".source.json")
+            saved = json.loads(marker.read_text(encoding="utf-8"))
+            native_ok = saved == _native_cache_key(
+                source, plan["norm_start"], plan["dur_s"])
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        source_ok = imu_ok = native_ok = False
+    try:
+        touched = source.exists() or native.exists() or imu.exists()
+    except OSError:
+        touched = False
+    if source_ok and imu_ok and native_ok:
+        return "ready"
+    if touched:
+        return "partial"
+    return "pending"
+
+
 def prepare_clip(
     clip: dict[str, Any],
     video: dict[str, Any],
@@ -501,11 +588,10 @@ def prepare_clip(
     """Baixa clipe + IMU real, normaliza o vídeo e monta o sidecar. (sem upload)"""
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    clip_uid = clip["exported_clip_uid"]
-    orig_start, orig_end = ego4d.clip_window_s(clip)
-    start_s, end_s = ego4d.humanize_window(orig_start, orig_end, clip_uid)
-    window_s = (start_s, end_s)
-    dur_s = end_s - start_s
+    plan = _ego_prepare_plan(clip)
+    clip_uid = plan["clip_uid"]
+    window_s = plan["window_s"]
+    dur_s = plan["dur_s"]
     dur_ms = int(round(dur_s * 1000))
     if not (MIN_DUR_MS <= dur_ms <= MAX_DUR_MS):
         raise RuntimeError(f"clipe {clip_uid} fora da janela de duração ({dur_ms}ms)")
@@ -513,7 +599,7 @@ def prepare_clip(
         raise RuntimeError(
             f"clipe {clip_uid} atravessa trecho sem cobertura contínua de IMU")
 
-    parent_uid = str(clip.get("parent_video_uid") or clip_uid)
+    parent_uid = plan["parent_uid"]
 
     def _progress(phase: str, **payload: Any) -> None:
         if progress:
@@ -535,32 +621,20 @@ def prepare_clip(
     _progress("imu_ready")
 
     _progress("video_lookup")
-    if clip.get("needs_cut"):
+    source_video_path = work_dir / plan["source_name"]
+    if plan["needs_cut"]:
         # Prefere o clip oficial CRF 18 quando ele contém a janela; o IMU
         # continua no relógio absoluto do vídeo canônico.
-        media_uid = str(clip.get("media_uid") or parent_uid)
-        media_offset = float(clip.get("media_time_offset_s") or 0.0)
-        parent_path = work_dir / f"{media_uid}.mp4"
-        if not ego4d._valid_mp4_cache(parent_path):
+        if not ego4d._valid_mp4_cache(source_video_path):
             source = dict(clip)
             source["needs_cut"] = False
-            ego4d.download_clip(source, parent_path)
-        source_video_path = parent_path
-        _progress("encode")
-        native = _normalize_video(
-            parent_path, work_dir,
-            start_s=start_s - media_offset, dur_s=dur_s, stem=clip_uid)
+            ego4d.download_clip(source, source_video_path)
     else:
-        clip_path = work_dir / f"{clip_uid}.mp4"
-        ego4d.download_clip(clip, clip_path)
-        source_video_path = clip_path
-        # O mp4 oficial começa em orig_start; o corte humano é relativo a ele.
-        rel = start_s - orig_start
-        _progress("encode")
-        native = _normalize_video(
-            clip_path, work_dir,
-            start_s=rel if rel > 0.02 else None,
-            dur_s=dur_s, stem=clip_uid)
+        ego4d.download_clip(clip, source_video_path)
+    _progress("encode")
+    native = _normalize_video(
+        source_video_path, work_dir,
+        start_s=plan["norm_start"], dur_s=dur_s, stem=clip_uid)
     _progress("video_ready", bytes=native.stat().st_size)
     probe = probe_video(native)
     if not probe.get("duration_ms"):
@@ -1874,9 +1948,12 @@ def _run_campaign(
                     if tsk.task_name and task_matching.rule_for(tsk.task_name):
                         # A mesma seleção usada pela tela inclui o índice
                         # portátil mesmo quando há narrações locais parciais.
-                        shorts = list(_compatible_task_clips(
-                            tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
-                            max_dur_s=tsk.max_dur_s))
+                        shorts = _with_cached_expansion(
+                            list(_compatible_task_clips(
+                                tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
+                                max_dur_s=tsk.max_dur_s)),
+                            tsk.task_name, min_dur_s=tsk.min_dur_s,
+                            max_dur_s=tsk.max_dur_s, work_dir=work_dir)
                     else:
                         shorts = ego4d.list_clips(
                             scenario=tsk.scenario,
@@ -1914,8 +1991,9 @@ def _run_campaign(
                 merged_n = sum(1 for c in fresh if c.get("needs_cut"))
                 _log(f"  pool: {len(shorts)} trechos puros → {len(fresh)} "
                      f"sessões ({merged_n} cortes do vídeo-pai, {hours:.1f}h)")
-                clips = diverse_order(ego4d.prefer_long_clips(
-                    fresh, shuffle=config.shuffle_schedule), used_parents=used_parents)
+                clips = _prefer_cached_clips(diverse_order(ego4d.prefer_long_clips(
+                    fresh, shuffle=config.shuffle_schedule), used_parents=used_parents),
+                    work_dir)
                 _emit("content_pool", task_name=display_name, clips=len(clips),
                       **diversity_summary(clips))
         except Exception as exc:  # noqa: BLE001 — uma categoria não mata as demais
@@ -2826,6 +2904,55 @@ def _compatible_task_clips(
     return (*holo_clips, *ego_clips)
 
 
+def _with_cached_expansion(
+    clips: list[dict[str, Any]],
+    task_name: str,
+    *,
+    min_dur_s: float,
+    max_dur_s: float,
+    work_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Acrescenta cenário já gravado pelo acelerador, sem buscar mídia nova."""
+    from .ego_accelerator import ready_scenario_clips
+
+    merged = list(clips)
+    seen = {str(clip.get("clip_uid") or "") for clip in merged}
+    for extra in ready_scenario_clips(
+            task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s, work_dir=work_dir):
+        uid = str(extra.get("clip_uid") or "")
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        merged.append(extra)
+    return merged
+
+
+def _clip_is_cached(clip: dict[str, Any], work_dir: Path) -> bool:
+    if str(clip.get("source") or "") == "holoassist":
+        from .holo_accelerator import clip_ready
+        return clip_ready(clip, work_dir)
+    return ego_clip_cache_state(clip, work_dir) == "ready"
+
+
+def _prefer_cached_clips(
+    clips: list[dict[str, Any]], work_dir: Path,
+) -> list[dict[str, Any]]:
+    """Com cache ligado, esgota o disco e depois o provedor. Sem cache, a ordem é a do provedor."""
+    from .ego_accelerator import configured_budget_gb
+
+    ordered = list(clips)
+    if configured_budget_gb() < 1:
+        return ordered
+    ready: list[dict[str, Any]] = []
+    later: list[dict[str, Any]] = []
+    for clip in ordered:
+        if _clip_is_cached(clip, work_dir):
+            ready.append(clip)
+        else:
+            later.append(clip)
+    return ready + later
+
+
 def warm_task_catalog() -> None:
     """Preenche o cache de clipes rankeados. Sem isso o 1º GET /api/tasks leva ~1 min."""
     _ranked_pools()
@@ -2869,6 +2996,11 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                      if 60 <= c["dur_s"] <= 1800]
         clips = list(_compatible_task_clips(
             name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
+        if normalize_dataset_provider(dataset_provider) in ("all", "ego4d"):
+            all_clips = _with_cached_expansion(
+                all_clips, name, min_dur_s=60, max_dur_s=1800)
+            clips = _with_cached_expansion(
+                clips, name, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
         if clips or include_unavailable:
             source_counts: dict[str, int] = {}
             for clip in clips:
