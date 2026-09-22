@@ -1241,30 +1241,50 @@ QWidget* MainWindow::buildAcceleratorPage() {
     _cacheTask->blockSignals(false);
     const bool ego = _cacheProvider->currentData().toString() == QStringLiteral("ego4d");
     if (_cacheTaskLabel) {
-      _cacheTaskLabel->setText(ego ? QStringLiteral("Prioridade Ego4D")
-                                   : QStringLiteral("Tarefa HoloAssist"));
+      _cacheTaskLabel->setText(ego ? QStringLiteral("Começar pela tarefa")
+                                   : QStringLiteral("Tarefa a preparar"));
     }
     if (_cacheBudget) form->setRowVisible(_cacheBudget, ego);
+    if (_cacheBudgetHelp) form->setRowVisible(_cacheBudgetHelp, ego);
+    if (_cacheProviderHelp) _cacheProviderHelp->setText(ego
+        ? QStringLiteral("Ego4D: prepara vídeos e sensores antecipadamente. A campanha usa primeiro os arquivos prontos.")
+        : QStringLiteral("HoloAssist: prepara os clipes da tarefa escolhida para uso posterior na campanha."));
+    if (_cacheTaskHelp) _cacheTaskHelp->setText(ego
+        ? QStringLiteral("Esta tarefa entra primeiro na fila; se houver espaço, outras tarefas também entram.")
+        : QStringLiteral("Somente a tarefa escolhida entra nesta preparação."));
+    if (_cacheDiskHelp) _cacheDiskHelp->setText(ego
+        ? QStringLiteral("O QMoney preserva o espaço livre indicado e ajusta o limite ao disco disponível.")
+        : QStringLiteral("A preparação para quando o espaço livre cair abaixo da reserva."));
+    if (_cacheLimitHelp) _cacheLimitHelp->setText(ego
+        ? QStringLiteral("Todos usa o espaço escolhido; um número menor limita somente esta execução.")
+        : QStringLiteral("Todos prepara todos os clipes disponíveis da tarefa escolhida."));
     if (_cacheStart) {
       const bool off = ego && _cacheBudget && _cacheBudget->value() == 0;
-      _cacheStart->setText(off ? QStringLiteral("Usar só o provedor")
+      _cacheStart->setText(off ? QStringLiteral("Desativar pré-cache")
                                : QStringLiteral("Preparar cache"));
     }
     loadAccelerator();
   });
   form->addRow(QStringLiteral("Provedor"), _cacheProvider);
+  _cacheProviderHelp = quietLabel(QStringLiteral(
+      "HoloAssist: prepara os clipes da tarefa escolhida para uso posterior na campanha."));
+  _cacheProviderHelp->setWordWrap(true);
+  form->addRow(QString(), _cacheProviderHelp);
   _cacheTask = new ComboBox;
   configureCombo(_cacheTask, 620);
   connect(_cacheTask, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
     loadAccelerator();
   });
-  _cacheTaskLabel = new QLabel(QStringLiteral("Tarefa HoloAssist"));
+  _cacheTaskLabel = new QLabel(QStringLiteral("Tarefa a preparar"));
   form->addRow(_cacheTaskLabel, _cacheTask);
-  _cacheBudgetLabel = new QLabel(QStringLiteral("Cache Ego4D"));
+  _cacheTaskHelp = quietLabel(QStringLiteral("Somente a tarefa escolhida entra nesta preparação."));
+  _cacheTaskHelp->setWordWrap(true);
+  form->addRow(QString(), _cacheTaskHelp);
+  _cacheBudgetLabel = new QLabel(QStringLiteral("Espaço para o cache"));
   _cacheBudget = new QSpinBox;
   _cacheBudget->setRange(0, 2147483647);
   _cacheBudget->setKeyboardTracking(false);
-  _cacheBudget->setSpecialValueText(QStringLiteral("Sem cache"));
+  _cacheBudget->setSpecialValueText(QStringLiteral("0 GB · desativado"));
   _cacheBudget->setValue(400);
   _cacheBudget->setSuffix(QStringLiteral(" GB"));
   connect(_cacheBudget, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
@@ -1272,17 +1292,30 @@ QWidget* MainWindow::buildAcceleratorPage() {
     _cacheBudget->setSuffix(off ? QString() : QStringLiteral(" GB"));
     if (_cacheStart && _cacheProvider
         && _cacheProvider->currentData().toString() == QStringLiteral("ego4d")) {
-      _cacheStart->setText(off ? QStringLiteral("Usar só o provedor")
+      _cacheStart->setText(off ? QStringLiteral("Desativar pré-cache")
                                : QStringLiteral("Preparar cache"));
     }
     loadAccelerator();
   });
   form->addRow(_cacheBudgetLabel, _cacheBudget);
+  _cacheBudgetHelp = quietLabel(QStringLiteral(
+      "Limite total para arquivos Ego4D neste computador. 0 GB desativa a preparação antecipada; a campanha ainda pode buscar vídeos quando precisar."));
+  _cacheBudgetHelp->setWordWrap(true);
+  form->addRow(QString(), _cacheBudgetHelp);
   form->setRowVisible(_cacheBudget, false);
+  form->setRowVisible(_cacheBudgetHelp, false);
   _cacheLimit = new QSpinBox;
   _cacheLimit->setRange(0, 1000);
   _cacheLimit->setSpecialValueText(QStringLiteral("Todos"));
-  form->addRow(QStringLiteral("Limite de clipes"), _cacheLimit);
+  _cacheLimit->setToolTip(QStringLiteral("0 prepara todos os clipes que couberem no espaço escolhido. Outro valor limita apenas esta execução."));
+  connect(_cacheLimit, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
+    loadAccelerator();
+  });
+  form->addRow(QStringLiteral("Clipes nesta execução"), _cacheLimit);
+  _cacheLimitHelp = quietLabel(QStringLiteral(
+      "Todos prepara todos os clipes disponíveis da tarefa escolhida."));
+  _cacheLimitHelp->setWordWrap(true);
+  form->addRow(QString(), _cacheLimitHelp);
   _cacheReserve = new QSpinBox;
   _cacheReserve->setRange(5, 1000);
   _cacheReserve->setValue(50);
@@ -1291,7 +1324,10 @@ QWidget* MainWindow::buildAcceleratorPage() {
   connect(_cacheReserve, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
     loadAccelerator();
   });
-  form->addRow(QStringLiteral("Reserva de disco"), _cacheReserve);
+  form->addRow(QStringLiteral("Manter livre no disco"), _cacheReserve);
+  _cacheDiskHelp = quietLabel(QStringLiteral("A preparação para quando o espaço livre cair abaixo da reserva."));
+  _cacheDiskHelp->setWordWrap(true);
+  form->addRow(QString(), _cacheDiskHelp);
   auto* actions = new QWidget;
   auto* actionLayout = new QHBoxLayout(actions);
   actionLayout->setContentsMargins(0, 0, 0, 0);
@@ -1322,11 +1358,11 @@ QWidget* MainWindow::buildAcceleratorPage() {
   connect(_cacheStart, &QPushButton::clicked, this, &MainWindow::startAccelerator);
   actionLayout->addWidget(_cacheStart);
   form->addRow(QString(), actions);
-  layout->addWidget(card(QStringLiteral("Preparação"), config));
+  layout->addWidget(card(QStringLiteral("O que preparar"), config));
   layout->addStretch();
 
   return pageShell(QStringLiteral("Acelerador"),
-                   QStringLiteral("Escolha o tamanho do cache Ego4D em GB, limitado ao espaço disponível no disco e à reserva livre."), body);
+                   QStringLiteral("Prepare mídia antes da campanha e acompanhe quanto já está pronto no disco."), body);
 }
 
 QWidget* MainWindow::buildAccountsPage() {
@@ -3198,7 +3234,7 @@ void MainWindow::loadAccelerator() {
       _cacheBudget->blockSignals(true);
       _cacheBudget->setMaximum(cache.value(QStringLiteral("max_budget_gb")).toInt());
       if (!_cacheBudgetLoaded) {
-        _cacheBudget->setValue(cache.value(QStringLiteral("budget_gb")).toInt());
+        _cacheBudget->setValue(cache.value(QStringLiteral("requested_budget_gb")).toInt());
         _cacheBudgetLoaded = true;
       }
       _cacheBudget->setSuffix(_cacheBudget->value() == 0 ? QString() : QStringLiteral(" GB"));
@@ -3206,8 +3242,13 @@ void MainWindow::loadAccelerator() {
           .arg(_cacheBudget->maximum()).arg(cache.value(QStringLiteral("free_gb")).toDouble())
           .arg(_cacheReserve->value()));
       _cacheBudget->blockSignals(false);
-      _cacheStart->setText(_cacheBudget->value() == 0 ? QStringLiteral("Usar só o provedor")
+      _cacheStart->setText(_cacheBudget->value() == 0 ? QStringLiteral("Desativar pré-cache")
                                                     : QStringLiteral("Preparar cache"));
+      _cacheBudgetHelp->setText(_cacheBudget->maximum() > 0
+          ? QStringLiteral("Até %1 GB neste disco, mantendo %2 GiB livres. 0 GB desativa o pré-cache; a campanha ainda pode buscar vídeos sob demanda.")
+                .arg(_cacheBudget->maximum()).arg(_cacheReserve->value())
+          : QStringLiteral("Sem espaço para novo cache acima da reserva de %1 GiB. Reduza a reserva ou libere espaço no disco.")
+                .arg(_cacheReserve->value()));
     }
     const auto runner = root.value(QStringLiteral("runner")).toObject();
     const int total = cache.value(QStringLiteral("total")).toInt();
@@ -3234,9 +3275,11 @@ void MainWindow::loadAccelerator() {
                                  .arg(ready).arg(partial).arg(pending));
       _cacheProgress->setValue(total > 0 ? ready * 100 / total : 0);
     }
-    if (!running && catalogError.isEmpty()
-        && cache.value(QStringLiteral("cache_mode")).toString() == QStringLiteral("provider"))
-      _cacheState->setText(QStringLiteral("Campanha usa só o provedor"));
+    if (!running && catalogError.isEmpty() && provider == QStringLiteral("ego4d")
+        && _cacheBudget->value() == 0)
+      _cacheState->setText(root.value(QStringLiteral("configured_budget_gb")).toInt() == 0
+          ? QStringLiteral("Pré-cache Ego4D desativado")
+          : QStringLiteral("0 GB selecionado · clique para desativar o pré-cache"));
     else if (!running && runner.value(QStringLiteral("state")).toString() == QStringLiteral("budget"))
       _cacheState->setText(QStringLiteral("Cache atingiu o tamanho escolhido"));
     const bool disablingCache = provider == QStringLiteral("ego4d")

@@ -243,6 +243,11 @@ private:
   QString _cacheRequestKey;
   bool _cacheBudgetLoaded{};
   QLabel* _cacheTaskLabel{};
+  QLabel* _cacheProviderHelp{};
+  QLabel* _cacheTaskHelp{};
+  QLabel* _cacheBudgetHelp{};
+  QLabel* _cacheDiskHelp{};
+  QLabel* _cacheLimitHelp{};
   QComboBox* _cacheTask{};
   QSpinBox* _cacheLimit{};
   QLabel* _cacheBudgetLabel{};

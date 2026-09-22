@@ -2397,6 +2397,7 @@ def create_app() -> Flask:
         return jsonify({
             "provider": provider,
             "default_task": module.DEFAULT_TASK,
+            "configured_budget_gb": ego_accelerator.configured_budget_gb() if provider == "ego4d" else None,
             "cache": cache,
             "runner": HOLO_CACHE_RUNNER.snapshot(),
             "tasks": tasks,
