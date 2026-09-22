@@ -1,4 +1,5 @@
 #include <QUuid>
+#include <algorithm>
 #include <utility>
 #include "MainWindow.hpp"
 #include "ComboBox.hpp"
@@ -3961,12 +3962,23 @@ void MainWindow::loadBalances() {
     const auto exchange = root.value(QStringLiteral("exchange")).toObject();
     QStringList passwordAccounts;
     for (const auto value : withPassword) passwordAccounts << value.toString();
-    _balancesTable->setRowCount(accounts.size());
+    QStringList orderedAccounts;
+    for (const auto value : accounts) orderedAccounts << value.toString();
+    std::sort(orderedAccounts.begin(), orderedAccounts.end(), [&balances](const QString& left, const QString& right) {
+      const auto leftValue = balances.value(left).toObject().value(QStringLiteral("availableCents"));
+      const auto rightValue = balances.value(right).toObject().value(QStringLiteral("availableCents"));
+      const bool leftKnown = leftValue.isDouble();
+      const bool rightKnown = rightValue.isDouble();
+      if (leftKnown != rightKnown) return leftKnown;
+      if (leftKnown && leftValue.toDouble() != rightValue.toDouble())
+        return leftValue.toDouble() > rightValue.toDouble();
+      return left.compare(right, Qt::CaseInsensitive) < 0;
+    });
+    _balancesTable->setRowCount(orderedAccounts.size());
     qint64 approvedTotal = 0;
     qint64 pendingTotal = 0;
     int row = 0;
-    for (const auto value : accounts) {
-      const QString email = value.toString();
+    for (const QString& email : orderedAccounts) {
       const bool isClaru = accountKinds.value(email).toString() == QStringLiteral("claru");
       const auto balance = balances.value(email).toObject();
       _balancesTable->setItem(row, 0, cell(email));
