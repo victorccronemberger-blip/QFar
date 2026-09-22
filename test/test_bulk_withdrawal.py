@@ -9,7 +9,15 @@ from moneymin.web import server
 class BulkWithdrawalTests(unittest.TestCase):
     def setUp(self):
         self.client = server.create_app().test_client()
+        self._previous_balance_state = server.BALANCES_RUNNER.state
         server.BALANCES_RUNNER.state = "idle"
+        server._WITHDRAW_LAST_REQUEST.clear()
+        server._WITHDRAW_IN_FLIGHT.clear()
+        with server._WITHDRAW_BULK_LOCK:
+            server._WITHDRAW_BULK_STATE.update(state="idle", total=0, done=0, results=[])
+
+    def tearDown(self):
+        server.BALANCES_RUNNER.state = self._previous_balance_state
         server._WITHDRAW_LAST_REQUEST.clear()
         server._WITHDRAW_IN_FLIGHT.clear()
         with server._WITHDRAW_BULK_LOCK:
