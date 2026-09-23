@@ -258,19 +258,19 @@ def allocation_plan(
     limit: int | None = None,
     budget_gb: int = DEFAULT_BUDGET_GB,
 ) -> list[dict[str, Any]]:
-    """Recorte estrito primeiro, depois cenário, até caber no orçamento em GB."""
+    """Alterna tarefas, priorizando a escolhida e o recorte estrito em cada uma."""
     priority = task_matching.canonical_task_name(task)
     names = [priority, *[name for name in task_names() if name != priority]]
-    ordered: list[dict[str, Any]] = []
+    queues: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
     seen: set[str] = set()
 
-    def add(clip: dict[str, Any]) -> None:
+    def add(name: str, clip: dict[str, Any]) -> None:
         uid = str(clip.get("clip_uid") or "")
         dur = float(clip.get("dur_s") or 0)
         if not uid or uid in seen or not min_dur_s <= dur <= max_dur_s:
             return
         seen.add(uid)
-        ordered.append(clip)
+        queues[name].append(clip)
 
     for name in names:
         try:
@@ -278,11 +278,17 @@ def allocation_plan(
         except ValueError:
             continue
         for clip in batch:
-            add(clip)
+            add(name, clip)
     buckets = scenario_buckets()
     for name in names:
         for clip in buckets.get(name, []):
-            add(clip)
+            add(name, clip)
+
+    ordered: list[dict[str, Any]] = []
+    for index in range(max((len(queue) for queue in queues.values()), default=0)):
+        for name in names:
+            if index < len(queues[name]):
+                ordered.append(queues[name][index])
 
     budget = budget_bytes(budget_gb)
     fitted: list[dict[str, Any]] = []

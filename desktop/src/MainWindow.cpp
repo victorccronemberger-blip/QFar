@@ -1405,7 +1405,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
     _cacheTask->blockSignals(false);
     const bool ego = _cacheProvider->currentData().toString() == QStringLiteral("ego4d");
     if (_cacheTaskLabel) {
-      _cacheTaskLabel->setText(ego ? QStringLiteral("Começar pela tarefa")
+      _cacheTaskLabel->setText(ego ? QStringLiteral("Priorizar categoria")
                                    : QStringLiteral("Tarefa a preparar"));
     }
     if (_cacheBudget) form->setRowVisible(_cacheBudget, ego);
@@ -1414,7 +1414,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
         ? QStringLiteral("Ego4D: prepara vídeos e sensores antecipadamente. A campanha usa primeiro os arquivos prontos.")
         : QStringLiteral("HoloAssist: prepara os clipes da tarefa escolhida para uso posterior na campanha."));
     if (_cacheTaskHelp) _cacheTaskHelp->setText(ego
-        ? QStringLiteral("Esta tarefa entra primeiro na fila; se houver espaço, outras tarefas também entram.")
+        ? QStringLiteral("O cache alterna clipes entre categorias. A escolhida entra primeiro em cada rodada; o limite em GB é compartilhado.")
         : QStringLiteral("Somente a tarefa escolhida entra nesta preparação."));
     if (_cacheDiskHelp) _cacheDiskHelp->setText(ego
         ? QStringLiteral("O QMoney preserva o espaço livre indicado e ajusta o limite ao disco disponível.")

@@ -145,6 +145,20 @@ class EgoWarmTests(unittest.TestCase):
 
 
 class EgoBudgetTests(unittest.TestCase):
+    def test_plan_shares_budget_across_tasks(self):
+        names = ["Cooking", "Gardening", "Cleaning"]
+        batches = {
+            "Cooking": [{"clip_uid": f"c{i}", "dur_s": 120} for i in range(4)],
+            "Gardening": [{"clip_uid": "g", "dur_s": 120}],
+            "Cleaning": [{"clip_uid": "h", "dur_s": 120}],
+        }
+        with patch.object(ego_accelerator, "task_names", return_value=names), \
+             patch.object(ego_accelerator, "eligible_clips", side_effect=lambda name, **_: batches[name]), \
+             patch.object(ego_accelerator, "scenario_buckets", return_value={}), \
+             patch.object(ego_accelerator, "estimate_clip_bytes", return_value=ego_accelerator.budget_bytes(1)):
+            clips = ego_accelerator.allocation_plan("Cooking", budget_gb=3)
+        self.assertEqual([clip["clip_uid"] for clip in clips], ["c0", "g", "h"])
+
     def test_plan_skips_clips_larger_than_budget(self):
         with patch.object(ego_accelerator, "task_names", return_value=[]), \
              patch.object(ego_accelerator, "eligible_clips", return_value=[
