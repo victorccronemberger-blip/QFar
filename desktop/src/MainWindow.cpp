@@ -234,7 +234,7 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
   _taskReload.setInterval(350);
   _taskReload.setSingleShot(true);
   _balancePoll.setInterval(1500);
-  _cachePoll.setInterval(1300);
+  _cachePoll.setInterval(3000);
   connect(&_backendProbe, &QTimer::timeout, this, &MainWindow::probeBackend);
   connect(&_campaignPoll, &QTimer::timeout, this, &MainWindow::pollCampaign);
   connect(&_previewPoll, &QTimer::timeout, this, &MainWindow::pollCampaignPreviews);
@@ -1386,6 +1386,9 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheProgress = new QProgressBar;
   _cacheProgress->setRange(0, 100);
   heroLayout->addWidget(_cacheProgress);
+  _cacheLastRun = quietLabel(QStringLiteral("Nenhuma preparação registrada neste computador."));
+  _cacheLastRun->setWordWrap(true);
+  heroLayout->addWidget(_cacheLastRun);
   layout->addWidget(card(QStringLiteral("Reservatório de campanha"), hero));
 
   auto* config = new QWidget;
@@ -3543,14 +3546,26 @@ void MainWindow::loadAccelerator() {
       path += QStringLiteral("&budget_gb=%1").arg(_cacheBudget->value());
     path += QStringLiteral("&min_free_gb=%1").arg(_cacheReserve->value());
   }
+  const bool live = _cachePoll.isActive()
+      && _cacheCatalogSnapshot.value(QStringLiteral("provider")).toString() == provider
+      && (requestedTask.isEmpty()
+          || _cacheCatalogSnapshot.value(QStringLiteral("task")).toString() == requestedTask);
+  if (live) path += QStringLiteral("&live=1");
+  if (_cacheInFlightKey == path) return;
   if (_cacheRequestKey != path) {
     _cacheRequestKey = path;
     ++_cacheRequestId;
   }
   const auto requestId = _cacheRequestId;
-  _api.get(path, [this, provider, requestedTask, requestId](bool ok, const QJsonDocument& doc, const QString& error) {
+  _cacheInFlightKey = path;
+  _api.get(path, [this, provider, requestedTask, requestId, path, live](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (_cacheInFlightKey == path) _cacheInFlightKey.clear();
     if (requestId != _cacheRequestId) return;
-    if (!ok) return setStatus(error);
+    if (!ok) {
+      _cacheState->setText(QStringLiteral("Não foi possível consultar o acelerador"));
+      _cacheLastRun->setText(error);
+      return setStatus(error);
+    }
     if (_cacheProvider && _cacheProvider->currentData().toString() != provider) return;
     if (!requestedTask.isEmpty() && _cacheTask->currentText() != requestedTask) return;
     const auto root = doc.object();
@@ -3574,8 +3589,16 @@ void MainWindow::loadAccelerator() {
         return;
       }
     }
-    const auto cache = root.value(QStringLiteral("cache")).toObject();
-    if (provider == QStringLiteral("ego4d") && cache.contains(QStringLiteral("max_budget_gb"))) {
+    QJsonObject cache;
+    if (live) {
+      cache = _cacheCatalogSnapshot;
+      cache.insert(QStringLiteral("last_run"), root.value(QStringLiteral("last_run")));
+    } else {
+      cache = root.value(QStringLiteral("cache")).toObject();
+      cache.insert(QStringLiteral("provider"), provider);
+      _cacheCatalogSnapshot = cache;
+    }
+    if (!live && provider == QStringLiteral("ego4d") && cache.contains(QStringLiteral("max_budget_gb"))) {
       _cacheBudget->blockSignals(true);
       _cacheBudget->setMaximum(cache.value(QStringLiteral("max_budget_gb")).toInt());
       if (!_cacheBudgetLoaded) {
@@ -3602,36 +3625,106 @@ void MainWindow::loadAccelerator() {
     const int pending = cache.value(QStringLiteral("pending")).toInt();
     const QString state = runner.value(QStringLiteral("state")).toString();
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
+    const bool runningHere = running && runner.value(QStringLiteral("provider")).toString() == provider;
+    const auto lastRun = cache.value(QStringLiteral("last_run")).toObject();
+    const QString lastStatus = lastRun.value(QStringLiteral("status")).toString();
     const QString catalogError = cache.value(QStringLiteral("catalog_error")).toString();
-    if (!catalogError.isEmpty() && !running)
-      _cacheState->setText(catalogError);
+    const int runTotal = runner.value(QStringLiteral("total")).toInt();
+    const int runReady = runner.value(QStringLiteral("ready")).toInt();
+    const int runFailed = runner.value(QStringLiteral("failed")).toInt();
+    const int processed = qMin(runTotal, runReady + runFailed);
+    if (runningHere)
+      _cacheState->setText(state == QStringLiteral("stopping")
+          ? QStringLiteral("Parando após o clipe atual…")
+          : runner.value(QStringLiteral("current")).toString(QStringLiteral("Preparando catálogo…")));
+    else if (running)
+      _cacheState->setText(QStringLiteral("Outro acelerador está em execução"));
+    else if (state == QStringLiteral("error"))
+      _cacheState->setText(QStringLiteral("Acelerador falhou: %1").arg(runner.value(QStringLiteral("error")).toString()));
+    else if (lastStatus == QStringLiteral("running"))
+      _cacheState->setText(QStringLiteral("Execução anterior interrompida; confira antes de retomar"));
+    else if (!catalogError.isEmpty())
+      _cacheState->setText(QStringLiteral("Catálogo indisponível: %1").arg(catalogError));
+    else if (lastStatus == QStringLiteral("complete"))
+      _cacheState->setText(lastRun.value(QStringLiteral("failed")).toInt() > 0
+          ? QStringLiteral("Última preparação concluída com falhas")
+          : QStringLiteral("Última preparação concluída"));
+    else if (lastStatus == QStringLiteral("budget"))
+      _cacheState->setText(QStringLiteral("Parou no limite de cache escolhido"));
+    else if (lastStatus == QStringLiteral("disk_limit"))
+      _cacheState->setText(QStringLiteral("Parou para preservar espaço livre"));
+    else if (lastStatus == QStringLiteral("stopped"))
+      _cacheState->setText(QStringLiteral("Preparação parada; pode retomar"));
     else
-      _cacheState->setText(running ? runner.value(QStringLiteral("current")).toString()
-                                   : QStringLiteral("Reservatório medido"));
+      _cacheState->setText(QStringLiteral("Nenhuma preparação em andamento"));
     const int budgetGb = cache.value(QStringLiteral("budget_gb")).toInt();
     const double usedGb = cache.value(QStringLiteral("used_gb")).toDouble();
-    if (budgetGb > 0) {
-      _cacheNumbers->setText(QStringLiteral("%1 GB de %2 GB · máximo no disco: %3 GB · %4 prontos · %5 pendentes")
-                                 .arg(qRound(usedGb)).arg(budgetGb)
-                                 .arg(cache.value(QStringLiteral("max_budget_gb")).toInt()).arg(ready).arg(pending));
-      _cacheProgress->setValue(qBound(0, qRound(usedGb * 100.0 / budgetGb), 100));
+    if (runningHere && runTotal <= 0) {
+      _cacheProgress->setRange(0, 0);
+      _cacheProgress->setFormat(QStringLiteral("Montando fila de clipes…"));
+      _cacheNumbers->setText(QStringLiteral("Preparando catálogo e conferindo arquivos locais"));
+    } else if (runningHere) {
+      _cacheProgress->setRange(0, 100);
+      _cacheProgress->setValue(processed * 100 / runTotal);
+      _cacheProgress->setFormat(QStringLiteral("%1 de %2 clipes processados · %p%")
+          .arg(processed).arg(runTotal));
+      _cacheNumbers->setText(QStringLiteral("%1 pronto(s) · %2 falha(s) · clipe %3 de %4")
+          .arg(runReady).arg(runFailed).arg(runner.value(QStringLiteral("index")).toInt()).arg(runTotal));
     } else {
-      _cacheNumbers->setText(QStringLiteral("%1 prontos · %2 parciais · %3 pendentes")
-                                 .arg(ready).arg(partial).arg(pending));
+      _cacheProgress->setRange(0, 100);
       _cacheProgress->setValue(total > 0 ? ready * 100 / total : 0);
+      _cacheProgress->setFormat(total > 0
+          ? QStringLiteral("%1 de %2 clipes prontos · %p%").arg(ready).arg(total)
+          : QStringLiteral("Nenhum clipe planejado"));
+      _cacheNumbers->setText(provider == QStringLiteral("ego4d") && budgetGb > 0
+          ? QStringLiteral("%1 de %2 GB ocupados · %3 prontos · %4 parciais · %5 pendentes")
+                .arg(QLocale().toString(usedGb, 'f', 1)).arg(budgetGb).arg(ready).arg(partial).arg(pending)
+          : QStringLiteral("%1 prontos · %2 parciais · %3 pendentes")
+                .arg(ready).arg(partial).arg(pending));
     }
     if (!running && catalogError.isEmpty() && provider == QStringLiteral("ego4d")
         && _cacheBudget->value() == 0)
       _cacheState->setText(root.value(QStringLiteral("configured_budget_gb")).toInt() == 0
           ? QStringLiteral("Pré-cache Ego4D desativado")
           : QStringLiteral("0 GB selecionado · clique para desativar o pré-cache"));
-    else if (!running && runner.value(QStringLiteral("state")).toString() == QStringLiteral("budget"))
-      _cacheState->setText(QStringLiteral("Cache atingiu o tamanho escolhido"));
+    const double updatedAt = lastRun.value(QStringLiteral("updated_at")).toDouble();
+    const QString when = updatedAt > 0
+        ? QDateTime::fromSecsSinceEpoch(static_cast<qint64>(updatedAt)).toLocalTime()
+              .toString(QStringLiteral("dd/MM/yyyy HH:mm"))
+        : QStringLiteral("horário indisponível");
+    if (lastStatus.isEmpty())
+      _cacheLastRun->setText(QStringLiteral("Nenhuma preparação anterior registrada neste computador."));
+    else {
+      const QHash<QString, QString> statusLabels{
+          {QStringLiteral("running"), QStringLiteral("em andamento")},
+          {QStringLiteral("complete"), QStringLiteral("concluída")},
+          {QStringLiteral("stopped"), QStringLiteral("parada pelo usuário")},
+          {QStringLiteral("budget"), QStringLiteral("limite de cache atingido")},
+          {QStringLiteral("disk_limit"), QStringLiteral("limite de espaço livre")},
+          {QStringLiteral("provider"), QStringLiteral("pré-cache desativado")},
+      };
+      _cacheLastRun->setText(QStringLiteral("Última execução (%1): %2 · %3 de %4 prontos · %5 falhas · registro em %6")
+          .arg(lastRun.value(QStringLiteral("task")).toString(QStringLiteral("tarefa não registrada")))
+          .arg(lastStatus == QStringLiteral("running") && !runningHere
+                   ? QStringLiteral("interrompida") : statusLabels.value(lastStatus, lastStatus),
+               QString::number(lastRun.value(QStringLiteral("ready")).toInt()),
+               QString::number(lastRun.value(QStringLiteral("total")).toInt()),
+               QString::number(lastRun.value(QStringLiteral("failed")).toInt()), when));
+      const auto errors = lastRun.value(QStringLiteral("errors")).toArray();
+      if (!errors.isEmpty())
+        _cacheLastRun->setText(_cacheLastRun->text() + QStringLiteral("\nÚltima falha: ")
+            + errors.last().toObject().value(QStringLiteral("error")).toString());
+    }
     const bool disablingCache = provider == QStringLiteral("ego4d")
         && _cacheBudget && _cacheBudget->value() == 0;
     _cacheStart->setEnabled(!running && (catalogError.isEmpty() || disablingCache));
+    if (!disablingCache && provider == QStringLiteral("ego4d")
+        && (lastStatus == QStringLiteral("running") || lastStatus == QStringLiteral("stopped")
+            || lastStatus == QStringLiteral("disk_limit") || lastStatus == QStringLiteral("budget")))
+      _cacheStart->setText(QStringLiteral("Retomar preparação"));
     _cacheStop->setEnabled(running && state != QStringLiteral("stopping"));
     if (running) _cachePoll.start(); else _cachePoll.stop();
+    if (live && !running) QTimer::singleShot(0, this, &MainWindow::loadAccelerator);
   });
 }
 

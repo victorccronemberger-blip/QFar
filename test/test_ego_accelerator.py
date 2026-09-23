@@ -353,6 +353,18 @@ class EgoCacheApiTests(unittest.TestCase):
                     "provider": "ego4d", "budget_gb": value})
                 self.assertEqual(response.status_code, 400)
 
+    def test_live_status_does_not_rebuild_catalog(self):
+        with patch.object(ego_accelerator, "cache_status") as expensive, \
+             patch.object(self.server, "load_json", return_value={"status": "running", "index": 3}), \
+             patch.object(self.server, "HOLO_CACHE_RUNNER") as runner:
+            runner.snapshot.return_value = {"state": "running", "provider": "ego4d", "index": 3}
+            response = self.client.get(
+                "/api/holo-cache?provider=ego4d&task=Furniture%20Assembly&budget_gb=400&live=1")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json["live"])
+        self.assertEqual(response.json["last_run"]["index"], 3)
+        expensive.assert_not_called()
+
     def test_start_forwards_disk_capped_budget(self):
         with patch.object(ego_accelerator, "cache_status", return_value={"budget_gb": 250}) as status, \
              patch.object(self.server, "HOLO_CACHE_RUNNER", Mock(running=False)) as runner, \

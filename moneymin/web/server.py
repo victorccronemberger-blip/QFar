@@ -2495,6 +2495,15 @@ def create_app() -> Flask:
             return jsonify({
                 "error": "use cache em GB inteiros (0 para desativar), limite de 1 a 1000 e reserva de 5 a 1000 GiB",
             }), 400
+        if request.args.get("live") == "1":
+            # O plano completo percorre o catálogo e verifica cada arquivo.
+            # Durante a execução basta consultar o runner e o estado salvo.
+            return jsonify({
+                "provider": provider,
+                "live": True,
+                "runner": HOLO_CACHE_RUNNER.snapshot(),
+                "last_run": load_json(module.state_path(), {}),
+            })
         try:
             if provider == "ego4d":
                 cache = module.cache_status(task, limit=limit, budget_gb=budget_gb,

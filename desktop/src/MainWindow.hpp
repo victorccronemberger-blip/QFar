@@ -264,6 +264,8 @@ private:
   QComboBox* _cacheProvider{};
   quint64 _cacheRequestId{};
   QString _cacheRequestKey;
+  QString _cacheInFlightKey;
+  QJsonObject _cacheCatalogSnapshot;
   bool _cacheBudgetLoaded{};
   QLabel* _cacheTaskLabel{};
   QLabel* _cacheProviderHelp{};
@@ -278,6 +280,7 @@ private:
   QSpinBox* _cacheReserve{};
   QLabel* _cacheState{};
   QLabel* _cacheNumbers{};
+  QLabel* _cacheLastRun{};
   QProgressBar* _cacheProgress{};
   QPushButton* _cacheStart{};
   QPushButton* _cacheStop{};

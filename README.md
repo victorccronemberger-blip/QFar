@@ -26,6 +26,17 @@ são validados antes de salvar, e os valores ficam criptografados pelo DPAPI do
 Windows em `%LOCALAPPDATA%\QMoney\secrets\integrations.dat`, acessível somente
 ao mesmo usuário do Windows.
 
+## Acelerador Ego4D
+
+Na aba **Acelerador**, a barra mostra clipes processados durante a preparação e
+clipes prontos quando a operação está parada. O espaço ocupado e o limite de
+cache aparecem separadamente: atingir 400 GB não é o critério de conclusão.
+A tela mostra a fase do clipe atual, falhas e o último resultado salvo com horário.
+Se o serviço foi encerrado durante a preparação, a execução anterior aparece
+como interrompida e **Retomar preparação** reutiliza os clipes já prontos.
+Atualizações durante a execução consultam um estado leve, sem reexaminar o
+catálogo inteiro a cada leitura.
+
 ## Campanhas
 
 Na aba **Nova campanha**, escolha as contas manualmente (com **Todas** e
