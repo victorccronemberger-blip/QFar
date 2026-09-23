@@ -59,6 +59,7 @@ Endpoints JSON consumidos exclusivamente pelo aplicativo desktop:
 from __future__ import annotations
 
 import configparser
+import datetime
 import hashlib
 import json
 import math
@@ -110,20 +111,84 @@ _WITHDRAW_LAST_REQUEST: dict[str, float] = {}
 _WITHDRAW_COOLDOWN_S = 60.0
 _WITHDRAW_BULK_LOCK = threading.Lock()
 _WITHDRAW_BULK_STATE: dict[str, Any] = {"state": "idle", "total": 0, "done": 0, "results": []}
+_WITHDRAW_BULK_LOADED = False
+_WITHDRAW_COOLDOWN_LOADED = False
+
+
+def _withdraw_bulk_path() -> Path:
+    return config.DATA_DIR / "withdraw_bulk_state.json"
+
+
+def _withdraw_cooldown_path() -> Path:
+    return config.DATA_DIR / "withdraw_request_times.json"
+
+
+def _load_withdraw_cooldowns_locked() -> None:
+    global _WITHDRAW_COOLDOWN_LOADED
+    if _WITHDRAW_COOLDOWN_LOADED:
+        return
+    saved = load_json(_withdraw_cooldown_path(), {})
+    if isinstance(saved, dict):
+        now = time.time()
+        for email, value in saved.items():
+            if isinstance(value, (int, float)) and 0 <= now - value < _WITHDRAW_COOLDOWN_S:
+                _WITHDRAW_LAST_REQUEST[str(email)] = float(value)
+    _WITHDRAW_COOLDOWN_LOADED = True
+
+
+def _load_withdraw_bulk_locked() -> None:
+    global _WITHDRAW_BULK_LOADED
+    if _WITHDRAW_BULK_LOADED:
+        return
+    saved = load_json(_withdraw_bulk_path(), {})
+    if isinstance(saved, dict) and isinstance(saved.get("results"), list):
+        try:
+            total = max(0, int(saved.get("total") or 0))
+            done = max(0, int(saved.get("done") or 0))
+        except (TypeError, ValueError):
+            total = done = 0
+        state = {"state": saved.get("state", "idle"),
+                 "total": total, "done": done,
+                 "results": saved["results"],
+                 "current": saved.get("current"),
+                 "started_at": saved.get("started_at")}
+        if state["state"] == "running":
+            state["state"] = "interrupted"
+            state["message"] = (
+                "O aplicativo foi fechado durante o lote. Confira o link da conta em andamento antes de solicitar novamente.")
+            save_json(_withdraw_bulk_path(), state)
+        _WITHDRAW_BULK_STATE.update(state)
+    _WITHDRAW_BULK_LOADED = True
+
+
+def _save_withdraw_bulk_locked() -> None:
+    save_json(_withdraw_bulk_path(), _WITHDRAW_BULK_STATE)
 
 
 def _withdraw_once(email: str, password: str) -> tuple[dict[str, Any], int]:
-    now = time.monotonic()
+    now = time.time()
     with _WITHDRAW_LOCK:
+        _load_withdraw_cooldowns_locked()
+        for key, value in list(_WITHDRAW_LAST_REQUEST.items()):
+            if not 0 <= now - value < _WITHDRAW_COOLDOWN_S:
+                del _WITHDRAW_LAST_REQUEST[key]
         if email in _WITHDRAW_IN_FLIGHT:
             return {"email": email, "ok": False, "error": "já há uma solicitação em andamento"}, 409
         elapsed = now - _WITHDRAW_LAST_REQUEST.get(email, 0.0)
         if elapsed < _WITHDRAW_COOLDOWN_S:
             wait_s = max(1, math.ceil(_WITHDRAW_COOLDOWN_S - elapsed))
             return {"email": email, "ok": False,
-                    "error": f"link já solicitado; aguarde {wait_s}s para repetir"}, 429
+                    "error": f"solicitação recente; aguarde {wait_s}s para repetir"}, 429
+        # Grave a tentativa antes da chamada externa: após uma queda, evite
+        # repetir imediatamente uma solicitação que pode ter sido aceita.
+        _WITHDRAW_LAST_REQUEST[email] = now
+        try:
+            save_json(_withdraw_cooldown_path(), _WITHDRAW_LAST_REQUEST)
+        except OSError:
+            _WITHDRAW_LAST_REQUEST.pop(email, None)
+            return {"email": email, "ok": False,
+                    "error": "não foi possível proteger o histórico de solicitações"}, 503
         _WITHDRAW_IN_FLIGHT.add(email)
-    success = False
     try:
         result = crowtado.solicitar_link_saque(email, password)
         success = result.get("status") in {"ok", "review_required"}
@@ -134,17 +199,24 @@ def _withdraw_once(email: str, password: str) -> tuple[dict[str, Any], int]:
     finally:
         with _WITHDRAW_LOCK:
             _WITHDRAW_IN_FLIGHT.discard(email)
-            if success:
-                _WITHDRAW_LAST_REQUEST[email] = time.monotonic()
 
 
 def _withdraw_bulk_snapshot() -> dict[str, Any]:
     with _WITHDRAW_BULK_LOCK:
+        _load_withdraw_bulk_locked()
         return {**_WITHDRAW_BULK_STATE, "results": list(_WITHDRAW_BULK_STATE["results"])}
 
 
 def _withdraw_bulk_run(creds: dict[str, str]) -> None:
     for email, password in creds.items():
+        with _WITHDRAW_BULK_LOCK:
+            _WITHDRAW_BULK_STATE["current"] = email
+            try:
+                _save_withdraw_bulk_locked()
+            except OSError:
+                _WITHDRAW_BULK_STATE.update(
+                    state="error", message="Não foi possível salvar o progresso; nenhuma nova conta será solicitada.")
+                return
         try:
             result, _ = _withdraw_once(email, password)
         except Exception as exc:  # uma conta não interrompe as demais
@@ -156,8 +228,60 @@ def _withdraw_bulk_run(creds: dict[str, str]) -> None:
                 "message": result.get("message") or result.get("error") or "falha desconhecida",
             })
             _WITHDRAW_BULK_STATE["done"] += 1
+            _WITHDRAW_BULK_STATE["current"] = None
+            try:
+                _save_withdraw_bulk_locked()
+            except OSError:
+                _WITHDRAW_BULK_STATE.update(
+                    state="error", message="O resultado não pôde ser salvo. Confira o link antes de repetir.")
+                return
     with _WITHDRAW_BULK_LOCK:
         _WITHDRAW_BULK_STATE["state"] = "done"
+        try:
+            _save_withdraw_bulk_locked()
+        except OSError:
+            _WITHDRAW_BULK_STATE.update(
+                state="error", message="O resultado final não pôde ser salvo. Confira os resultados exibidos.")
+
+
+def _balance_refresh_needed(
+    accounts: list[dict[str, Any]], balances: dict[str, Any],
+    connected: set[str], *, max_age_s: int = 24 * 3600,
+) -> list[str]:
+    """Contas conectadas sem leitura recente e confirmada de saldo."""
+    now = time.time()
+    needed = []
+    for account in accounts:
+        email = str(account.get("email") or "")
+        if email not in connected or org_policy.account_kind(email) != "crowtado":
+            continue
+        record = balances.get(email)
+        if not isinstance(record, dict) or record.get("error") or record.get("stale"):
+            needed.append(email)
+            continue
+        amount = record.get("availableCents")
+        if (not isinstance(amount, (int, float)) or isinstance(amount, bool)
+                or not math.isfinite(amount)):
+            needed.append(email)
+            continue
+        try:
+            updated = datetime.datetime.fromisoformat(str(record["updated_at"]))
+            age = now - updated.timestamp()
+        except (KeyError, TypeError, ValueError, OverflowError):
+            needed.append(email)
+            continue
+        if age < 0 or age >= max_age_s:
+            needed.append(email)
+    return sorted(needed)
+
+
+def _confirmed_available_balance(record: Any) -> bool:
+    """Only a successful, positive Crowtado reading can trigger a withdrawal."""
+    if not isinstance(record, dict) or record.get("error") or record.get("stale"):
+        return False
+    cents = record.get("availableCents")
+    return (isinstance(cents, (int, float)) and not isinstance(cents, bool)
+            and math.isfinite(cents) and cents > 0)
 
 _STEP_LABELS = {
     "ban_check": "verificação de ban",
@@ -3141,6 +3265,7 @@ def create_app() -> Flask:
     @app.get("/api/balances")
     def get_balances():
         account_rows = _list_accounts()
+        balances = _load_balances()
         configured = sorted(a["email"] for a in account_rows)
         configured_set = set(configured)
         # O cofre pode conservar credenciais de identidades removidas. Elas não
@@ -3150,13 +3275,14 @@ def create_app() -> Flask:
             email for email in _configured_crowtado_creds() if email in configured_set
         )
         return jsonify({
-            "balances": _load_balances(),
+            "balances": balances,
             "accounts": configured,
             "account_kinds": {
                 str(account["email"]): org_policy.account_kind(str(account["email"]))
                 for account in account_rows
             },
             "with_password": with_password,
+            "refresh_needed": _balance_refresh_needed(account_rows, balances, set(with_password)),
             "runner": BALANCES_RUNNER.snapshot(),
             "withdraw_bulk": _withdraw_bulk_snapshot(),
             "exchange": fx.usd_brl_quote(),
@@ -3215,6 +3341,10 @@ def create_app() -> Flask:
             return jsonify({"error": "salve a senha do crowtado primeiro"}), 400
         if BALANCES_RUNNER.running:
             return jsonify({"error": "aguarde a consulta de saldos terminar"}), 409
+        if _withdraw_bulk_snapshot()["state"] == "running":
+            return jsonify({"error": "aguarde o saque em lote terminar"}), 409
+        if not _confirmed_available_balance(_load_balances().get(email)):
+            return jsonify({"error": "atualize o saldo desta conta antes de solicitar saque; é necessário saldo disponível confirmado"}), 400
         result, status = _withdraw_once(email, password)
         return jsonify(result), status
 
@@ -3231,26 +3361,35 @@ def create_app() -> Flask:
             if org_policy.account_kind(email) != "crowtado" or email not in passwords:
                 continue
             balance = balances.get(email) or {}
-            if (not isinstance(balance, dict) or balance.get("error")
-                    or not isinstance(balance.get("availableCents"), (int, float))
-                    or not math.isfinite(balance["availableCents"])
-                    or balance["availableCents"] <= 0):
+            if not _confirmed_available_balance(balance):
                 continue
             eligible[email] = passwords[email]
         if not eligible:
             return jsonify({"error": "não há contas conectadas com saldo disponível confirmado"}), 400
         with _WITHDRAW_BULK_LOCK:
+            _load_withdraw_bulk_locked()
             if _WITHDRAW_BULK_STATE["state"] == "running":
                 return jsonify({"error": "já há um saque em lote em andamento"}), 409
             _WITHDRAW_BULK_STATE.update(
-                state="running", total=len(eligible), done=0, results=[])
+                state="running", total=len(eligible), done=0, results=[],
+                current=None, message="", started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+            try:
+                _save_withdraw_bulk_locked()
+            except OSError:
+                _WITHDRAW_BULK_STATE["state"] = "error"
+                return jsonify({"error": "não foi possível salvar o histórico do lote"}), 503
         thread = threading.Thread(target=_withdraw_bulk_run, args=(eligible,),
                                   daemon=True, name="moneymin-withdraw-bulk")
         try:
             thread.start()
         except RuntimeError:
             with _WITHDRAW_BULK_LOCK:
-                _WITHDRAW_BULK_STATE["state"] = "idle"
+                _WITHDRAW_BULK_STATE.update(state="error", current=None,
+                    message="O processamento não pôde começar; nenhum link foi solicitado.")
+                try:
+                    _save_withdraw_bulk_locked()
+                except OSError:
+                    pass
             return jsonify({"error": "não foi possível iniciar o saque em lote"}), 503
         return jsonify({"ok": True, "total": len(eligible)})
 

@@ -9,11 +9,13 @@
 #include <QJsonObject>
 #include <QMainWindow>
 #include <QProcess>
+#include <QSet>
 #include <QTimer>
 
 class QCheckBox;
 class QComboBox;
 class QLabel;
+class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
 class QProgressBar;
@@ -89,6 +91,10 @@ private:
   void chooseLibrary();
   void exportDiagnostics();
   void loadCampaignData();
+  void updateCampaignAccountCount();
+  void drawCampaignAccounts();
+  void loadCampaignBalances();
+  void saveCampaignDraft();
   void loadTasks();
   void startCampaign();
   void pollCampaign();
@@ -136,6 +142,8 @@ private:
   QPushButton* _accountsExportSelected{};
   void setAccountTransferBusy(bool busy);
   void loadBalances();
+  void applyBalanceFilter();
+  void showWithdrawalReport(const QJsonObject& bulk);
   void configureCrowtadoAccess(const QString& email);
   void loadHistory();
 
@@ -213,7 +221,22 @@ private:
 
   QComboBox* _dataset{};
   QListWidget* _campaignAccounts{};
+  QLineEdit* _campaignAccountSearch{};
+  QComboBox* _campaignAccountMode{};
+  QSpinBox* _campaignAccountCount{};
+  QPushButton* _campaignDrawAccounts{};
+  QLabel* _campaignAccountSelection{};
+  QLabel* _campaignBalanceHint{};
+  QJsonObject _campaignBalances;
+  bool _campaignBalancesLoaded{};
+  int _campaignBalanceRequestId{};
   QListWidget* _campaignTasks{};
+  QSet<QString> _campaignSelectedTaskIds;
+  bool _campaignTaskSelectionTouched{};
+  QSet<QString> _campaignDraftAccounts;
+  bool _campaignDraftLoaded{};
+  int _campaignDraftQuantity{1};
+  QTimer _campaignDraftSave;
   QDoubleSpinBox* _targetHours{};
   QSpinBox* _minDuration{};
   QSpinBox* _maxDuration{};
@@ -269,12 +292,22 @@ private:
   QTableWidget* _balancesTable{};
   QLabel* _balancesState{};
   QPushButton* _balancesRefresh{};
+  QPushButton* _balancesRefreshNeeded{};
+  QLineEdit* _balancesSearch{};
+  QCheckBox* _balancesOnlyAvailable{};
+  QCheckBox* _balancesOnlyPending{};
+  QLabel* _balancesFilterState{};
   QPushButton* _balancesWithdrawAll{};
+  QPushButton* _balancesWithdrawHistory{};
+  QPushButton* _balancesExport{};
+  QJsonObject _balancesSnapshot;
+  QJsonObject _lastWithdrawBulk;
   bool _bulkWithdrawAwaitingResult{};
   QLabel* _balancesApprovedUsd{};
   QLabel* _balancesApprovedBrl{};
   QLabel* _balancesPendingUsd{};
   QLabel* _balancesPendingBrl{};
+  QLabel* _balancesTotalsNote{};
   QLabel* _balancesExchange{};
 
   QTableWidget* _historyTable{};

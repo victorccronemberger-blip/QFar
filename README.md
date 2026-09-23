@@ -26,6 +26,26 @@ são validados antes de salvar, e os valores ficam criptografados pelo DPAPI do
 Windows em `%LOCALAPPDATA%\QMoney\secrets\integrations.dat`, acessível somente
 ao mesmo usuário do Windows.
 
+## Campanhas
+
+Na aba **Nova campanha**, escolha as contas manualmente (com **Todas** e
+**Limpar** para ajustar a lista), use **Sortear contas** ou escolha **Rodízio: menos usadas**
+e informe a quantidade. O rodízio prioriza contas que não entraram nas campanhas
+iniciadas recentemente neste computador; empates são sorteados.
+O contador mostra quantas contas estão selecionadas; **Sortear** refaz a escolha
+aleatória e **Atualizar rodízio** recalcula a prioridade.
+A prévia confirma os e-mails escolhidos antes de iniciar. Ao trocar contas ou
+origem, a seleção manual de categorias compatíveis é preservada. A busca por
+e-mail facilita listas longas, e o rascunho da campanha (contas, categorias e
+parâmetros) é salvo localmente para continuar após fechar o aplicativo.
+
+Também é possível escolher a quantidade de contas pelos saldos **aprovados** ou
+**pendentes**, em ordem crescente ou decrescente. A seleção usa somente contas
+Crowtado conectadas com leitura confirmada nas últimas 24 horas; saldos antigos,
+com erro ou não consultados ficam fora. A prévia mostra o valor usado na escolha.
+Se houver menos contas elegíveis que a quantidade pedida, reduza a quantidade ou
+atualize os saldos na aba **Saldos** antes de iniciar.
+
 ## Migração de contas
 
 Na aba **Contas**, use **Atualizar organização Crowtado** para migrar as contas
@@ -62,6 +82,21 @@ Erros de campanha não substituem a verificação da conta.
 Em Saldos, um `*` indica o último valor salvo quando a atualização falhou; passe
 o mouse para consultar o diagnóstico. Não remova uma conta para resolver falhas
 temporárias de rede, saldo ou envio.
+
+Na mesma aba, **Sacar tudo** solicita links somente para contas Crowtado com
+acesso conectado e saldo disponível confirmado. Cada link ainda exige confirmação
+e 2FA da respectiva conta. **Último lote** conserva o resultado por conta após
+reiniciar o aplicativo; uma solicitação interrompida fica marcada como
+inconclusiva e não é repetida automaticamente. **Exportar CSV** salva os saldos
+exibidos para conferência em uma planilha.
+
+Use **Atualizar pendentes** para consultar apenas contas Crowtado conectadas sem
+saldo confirmado, com falha na última consulta ou com leitura de mais de 24 horas.
+A busca por e-mail e os filtros **Só com saldo disponível** e **Só pendentes de atualização** ajudam a localizar
+contas na tabela; o CSV exporta somente as linhas visíveis. Saldos salvos após
+falha de consulta ficam identificados também no resumo e não liberam saque até
+uma nova confirmação. **Sacar tudo** continua
+incluindo todas as contas elegíveis, mesmo as ocultas pelo filtro.
 
 ## Build e publicação
 
