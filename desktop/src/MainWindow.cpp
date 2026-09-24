@@ -1450,7 +1450,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   });
   form->addRow(QStringLiteral("Provedor"), _cacheProvider);
   _cacheProviderHelp = quietLabel(QStringLiteral(
-      "HoloAssist: prepara os clipes da tarefa escolhida para uso posterior na campanha."));
+      "Ego4D: prepara vídeos e sensores antecipadamente. A campanha usa primeiro os arquivos prontos."));
   _cacheProviderHelp->setWordWrap(true);
   form->addRow(QString(), _cacheProviderHelp);
   _cacheTask = new ComboBox;
@@ -1458,9 +1458,10 @@ QWidget* MainWindow::buildAcceleratorPage() {
   connect(_cacheTask, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
     loadAccelerator();
   });
-  _cacheTaskLabel = new QLabel(QStringLiteral("Tarefa a preparar"));
+  _cacheTaskLabel = new QLabel(QStringLiteral("Priorizar categoria"));
   form->addRow(_cacheTaskLabel, _cacheTask);
-  _cacheTaskHelp = quietLabel(QStringLiteral("Somente a tarefa escolhida entra nesta preparação."));
+  _cacheTaskHelp = quietLabel(QStringLiteral(
+      "O cache alterna clipes entre categorias. A escolhida entra primeiro em cada rodada; o limite em GB é compartilhado."));
   _cacheTaskHelp->setWordWrap(true);
   form->addRow(QString(), _cacheTaskHelp);
   _cacheBudgetLabel = new QLabel(QStringLiteral("Espaço para o cache"));
@@ -1485,8 +1486,9 @@ QWidget* MainWindow::buildAcceleratorPage() {
       "Limite total para arquivos Ego4D neste computador. 0 GB desativa a preparação antecipada; a campanha ainda pode buscar vídeos quando precisar."));
   _cacheBudgetHelp->setWordWrap(true);
   form->addRow(QString(), _cacheBudgetHelp);
-  form->setRowVisible(_cacheBudget, false);
-  form->setRowVisible(_cacheBudgetHelp, false);
+  const bool egoInitiallySelected = _cacheProvider->currentData().toString() == QStringLiteral("ego4d");
+  form->setRowVisible(_cacheBudget, egoInitiallySelected);
+  form->setRowVisible(_cacheBudgetHelp, egoInitiallySelected);
   _cacheLimit = new QSpinBox;
   _cacheLimit->setRange(0, 1000);
   _cacheLimit->setSpecialValueText(QStringLiteral("Todos"));
@@ -1496,7 +1498,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   });
   form->addRow(QStringLiteral("Clipes nesta execução"), _cacheLimit);
   _cacheLimitHelp = quietLabel(QStringLiteral(
-      "Todos prepara todos os clipes disponíveis da tarefa escolhida."));
+      "Todos usa o espaço escolhido; um número menor limita somente esta execução."));
   _cacheLimitHelp->setWordWrap(true);
   form->addRow(QString(), _cacheLimitHelp);
   _cacheReserve = new QSpinBox;
@@ -1508,7 +1510,8 @@ QWidget* MainWindow::buildAcceleratorPage() {
     loadAccelerator();
   });
   form->addRow(QStringLiteral("Manter livre no disco"), _cacheReserve);
-  _cacheDiskHelp = quietLabel(QStringLiteral("A preparação para quando o espaço livre cair abaixo da reserva."));
+  _cacheDiskHelp = quietLabel(QStringLiteral(
+      "O QMoney preserva o espaço livre indicado e ajusta o limite ao disco disponível."));
   _cacheDiskHelp->setWordWrap(true);
   form->addRow(QString(), _cacheDiskHelp);
   auto* actions = new QWidget;
