@@ -303,11 +303,13 @@ private:
   QCheckBox* _balancesOnlyPending{};
   QLabel* _balancesFilterState{};
   QPushButton* _balancesWithdrawAll{};
+  QPushButton* _balancesPayoutMethod{};
   QPushButton* _balancesWithdrawHistory{};
   QPushButton* _balancesExport{};
   QJsonObject _balancesSnapshot;
   QJsonObject _lastWithdrawBulk;
   bool _bulkWithdrawAwaitingResult{};
+  bool _payoutMethodAwaitingResult{};
   QLabel* _balancesApprovedUsd{};
   QLabel* _balancesApprovedBrl{};
   QLabel* _balancesPendingUsd{};

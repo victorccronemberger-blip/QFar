@@ -47,8 +47,9 @@ Endpoints JSON consumidos exclusivamente pelo aplicativo desktop:
   Saldos (crowtado — cache em data/balances.json)
     GET    /api/balances                 saldos cacheados + estado do runner
     POST   /api/balances/refresh         {emails?} -> consulta em 2º plano (409 se ocupado)
-    POST   /api/balances/withdraw        {email} -> solicita link de saque ao Dots
-    POST   /api/balances/withdraw-all    solicita links para contas elegíveis
+    POST   /api/balances/payout-methods/apply-all -> configura método em todas as contas Crowtado
+    POST   /api/balances/withdraw        {email} -> solicita saque pelo método preferido
+    POST   /api/balances/withdraw-all    solicita saques para contas elegíveis
     PUT    /api/balances/credentials     {email, password} -> salva senha do crowtado
                                          (secrets/crowtado_passwords.json)
 
@@ -63,6 +64,7 @@ import datetime
 import hashlib
 import json
 import math
+import re
 import os
 import platform
 import random
@@ -113,6 +115,44 @@ _WITHDRAW_BULK_LOCK = threading.Lock()
 _WITHDRAW_BULK_STATE: dict[str, Any] = {"state": "idle", "total": 0, "done": 0, "results": []}
 _WITHDRAW_BULK_LOADED = False
 _WITHDRAW_COOLDOWN_LOADED = False
+_PAYOUT_METHOD_LOCK = threading.Lock()
+_PAYOUT_METHOD_STATE: dict[str, Any] = {"state": "idle", "total": 0, "done": 0, "results": []}
+
+
+def _payout_method_snapshot() -> dict[str, Any]:
+    with _PAYOUT_METHOD_LOCK:
+        return {**_PAYOUT_METHOD_STATE, "results": list(_PAYOUT_METHOD_STATE["results"])}
+
+
+def _payout_method_run(creds: dict[str, str], method: str,
+                       legal_name: str, destination_email: str) -> None:
+    blocked = False
+    for email, password in creds.items():
+        with _PAYOUT_METHOD_LOCK:
+            _PAYOUT_METHOD_STATE["current"] = email
+        try:
+            crowtado.configurar_metodo_saque(email, password, method,
+                                             legal_name, destination_email)
+            result = {"email": email, "ok": True, "message": "configurado"}
+        except Exception as exc:
+            # Respostas remotas podem repetir os dados enviados: não exponha o destino.
+            reason = str(exc).replace(destination_email, "[e-mail]") if destination_email else str(exc)
+            reason = reason.replace(legal_name, "[nome]") if legal_name else reason
+            result = {"email": email, "ok": False, "message": reason[:300]}
+            if method == "wise" and "already linked to anoth" in reason.lower():
+                blocked = True
+        with _PAYOUT_METHOD_LOCK:
+            _PAYOUT_METHOD_STATE["results"].append(result)
+            _PAYOUT_METHOD_STATE["done"] += 1
+            _PAYOUT_METHOD_STATE["current"] = None
+        if blocked:
+            break
+    with _PAYOUT_METHOD_LOCK:
+        _PAYOUT_METHOD_STATE["state"] = "blocked" if blocked else "done"
+        if blocked:
+            _PAYOUT_METHOD_STATE["message"] = (
+                "A Crowtado não permite vincular este mesmo destino Wise a outra conta. "
+                "As contas restantes não foram alteradas.")
 
 
 def _withdraw_bulk_path() -> Path:
@@ -3501,8 +3541,43 @@ def create_app() -> Flask:
             "refresh_needed": _balance_refresh_needed(account_rows, balances, set(with_password)),
             "runner": BALANCES_RUNNER.snapshot(),
             "withdraw_bulk": _withdraw_bulk_snapshot(),
+            "payout_method_bulk": _payout_method_snapshot(),
             "exchange": fx.usd_brl_quote(),
         })
+
+    @app.post("/api/balances/payout-methods/apply-all")
+    def apply_all_payout_methods():
+        body = request.get_json(silent=True) or {}
+        method = str(body.get("method") or "").strip().lower()
+        legal_name = str(body.get("legal_name") or "").strip()
+        destination_email = str(body.get("destination_email") or "").strip()
+        if method not in {"dots", "paypal", "wise"}:
+            return jsonify({"error": "escolha Dots, PayPal ou Wise"}), 400
+        if method in {"paypal", "wise"}:
+            if len(legal_name) < 2 or len(destination_email) > 254 or not re.fullmatch(
+                    r"[^\s@]+@[^\s@]+\.[^\s@]+", destination_email):
+                return jsonify({"error": "informe nome legal e e-mail válido do destino"}), 400
+        if BALANCES_RUNNER.running or _withdraw_bulk_snapshot()["state"] == "running":
+            return jsonify({"error": "aguarde a operação de saldos terminar"}), 409
+        configured = {a["email"] for a in _list_accounts()
+                      if org_policy.account_kind(str(a["email"])) == "crowtado"}
+        creds = {e: p for e, p in _configured_crowtado_creds().items() if e in configured}
+        if not creds:
+            return jsonify({"error": "não há contas Crowtado conectadas"}), 400
+        with _PAYOUT_METHOD_LOCK:
+            if _PAYOUT_METHOD_STATE["state"] == "running":
+                return jsonify({"error": "configuração em lote já está em andamento"}), 409
+            _PAYOUT_METHOD_STATE.update(state="running", method=method, total=len(creds),
+                                        done=0, results=[], current=None, message="")
+        try:
+            threading.Thread(target=_payout_method_run,
+                             args=(creds, method, legal_name, destination_email),
+                             daemon=True, name="moneymin-payout-methods").start()
+        except RuntimeError:
+            with _PAYOUT_METHOD_LOCK:
+                _PAYOUT_METHOD_STATE["state"] = "error"
+            return jsonify({"error": "não foi possível iniciar a configuração"}), 503
+        return jsonify({"ok": True, "total": len(creds)})
 
     @app.post("/api/balances/refresh")
     def refresh_balances():
@@ -3544,6 +3619,8 @@ def create_app() -> Flask:
     def request_balance_withdraw():
         """Solicita somente o envio do link Dots; conclusão e 2FA são manuais."""
         body = request.get_json(silent=True) or {}
+        if _payout_method_snapshot()["state"] == "running":
+            return jsonify({"error": "aguarde a configuração dos métodos terminar"}), 409
         email = str(body.get("email", "")).strip()
         if not email:
             return jsonify({"error": "informe a conta"}), 400
@@ -3567,6 +3644,8 @@ def create_app() -> Flask:
     @app.post("/api/balances/withdraw-all")
     def request_all_balance_withdrawals():
         """Solicita links para contas elegíveis; cada conclusão no Dots é manual."""
+        if _payout_method_snapshot()["state"] == "running":
+            return jsonify({"error": "aguarde a configuração dos métodos terminar"}), 409
         if BALANCES_RUNNER.running:
             return jsonify({"error": "aguarde a consulta de saldos terminar"}), 409
         configured = {a["email"] for a in _list_accounts()}

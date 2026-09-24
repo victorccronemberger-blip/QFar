@@ -261,16 +261,63 @@ _WITHDRAW_RESULT_FIELDS = {
 }
 
 
-def solicitar_link_saque(email: str, senha: str) -> dict[str, Any]:
-    """Solicita ao Crowtado/Dots o link para sacar todo o saldo disponível.
-
-    Replica o botão da página de ganhos (`payouts.withdraw`, método `dots`).
-    A chamada apenas cria a solicitação e pede o envio do link pelo provedor;
-    confirmação, 2FA e dados de pagamento continuam fora deste cliente.
-    """
+def configurar_metodo_saque(email: str, senha: str, method: str,
+                            legal_name: str = "", destination_email: str = "") -> None:
+    """Salva o destino e a preferência de saque de uma conta Crowtado."""
+    if method not in {"dots", "paypal", "wise"}:
+        raise CrowtadoError("método de saque inválido")
     session = _cached_login(email, senha)
+    available = _site_trpc(session, "payouts.payoutMethods", None, method="GET")
+    if not isinstance(available, list):
+        raise CrowtadoError("não foi possível verificar os métodos disponíveis")
+    remote_method = ("other" if "other" in available else "dots") if method == "dots" else method
+    if remote_method not in available:
+        raise CrowtadoError(f"{method} não está disponível para esta conta")
+    if method in {"paypal", "wise"}:
+        legal_name = legal_name.strip()
+        destination_email = destination_email.strip()
+        if len(legal_name) < 2 or not destination_email or "@" not in destination_email or len(destination_email) > 254:
+            raise CrowtadoError("informe nome legal e e-mail válido do destino")
+        manual_payload = {
+            "method": method, "legalName": legal_name,
+            "paypalReceiverType": "email", "payoutCurrency": "USD",
+            "makePreferred": True,
+        }
+        manual_payload["paypalEmail" if method == "paypal" else "wiseEmail"] = destination_email
+        _site_trpc(session, "kyc.saveManualPayoutMethod", manual_payload)
+    _site_trpc(session, "payouts.savePayoutPreference", {"method": remote_method})
+    summary = _site_trpc(session, "payouts.summary", None, method="GET")
+    if not isinstance(summary, dict) or summary.get("payoutPreference") != remote_method:
+        raise CrowtadoError("o Crowtado não confirmou a preferência salva")
+    if method == "wise" and not summary.get("wiseReady"):
+        raise CrowtadoError("Wise foi salvo, mas ainda não está disponível para saque")
+    if method in {"paypal", "wise"}:
+        destinations = summary.get("manualDestinations") or []
+        if not any(isinstance(item, dict) and item.get("method") == method
+                   and item.get("isPreferred") for item in destinations):
+            raise CrowtadoError("o Crowtado não confirmou o destino preferido")
+
+
+def solicitar_link_saque(email: str, senha: str) -> dict[str, Any]:
+    """Solicita saque com o método preferido salvo no Crowtado."""
+    session = _cached_login(email, senha)
+    summary = _site_trpc(session, "payouts.summary", None, method="GET")
+    if not isinstance(summary, dict):
+        raise CrowtadoError("não foi possível consultar o método de saque")
+    method = summary.get("payoutPreference")
+    if not method:
+        raise CrowtadoError("método de saque não confirmado; configure-o antes de sacar")
+    if method not in {"dots", "other", "bank_transfer", "paypal", "wise"}:
+        raise CrowtadoError("método de saque configurado não é suportado pelo QMoney")
+    if method == "wise" and not summary.get("wiseReady"):
+        raise CrowtadoError("Wise não está disponível para saque nesta conta")
+    if method in {"paypal", "wise"}:
+        destinations = summary.get("manualDestinations") or []
+        if not any(isinstance(item, dict) and item.get("method") == method
+                   and item.get("isPreferred") for item in destinations):
+            raise CrowtadoError("destino preferido não confirmado; saque não solicitado")
     payload = _site_trpc(
-        session, "payouts.withdraw", {"method": "dots"}, method="POST")
+        session, "payouts.withdraw", {"method": method}, method="POST")
     if not isinstance(payload, dict) or not payload.get("status"):
         raise CrowtadoError(
             f"payouts.withdraw devolveu resposta inválida: {str(payload)[:200]}")

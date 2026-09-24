@@ -1847,6 +1847,66 @@ QWidget* MainWindow::buildBalancesPage() {
     });
   });
   headerLayout->addWidget(_balancesWithdrawAll);
+  _balancesPayoutMethod = new QPushButton(QStringLiteral("Método de saque"));
+  _balancesPayoutMethod->setEnabled(false);
+  _balancesPayoutMethod->setToolTip(QStringLiteral("Configura Dots, PayPal ou Wise em todas as contas Crowtado conectadas."));
+  connect(_balancesPayoutMethod, &QPushButton::clicked, this, [this] {
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Método de saque Crowtado"));
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* help = new QLabel(QStringLiteral(
+        "A configuração será aplicada a todas as contas Crowtado conectadas. "
+        "Contas Claru não serão alteradas. Os dados de destino serão enviados à Crowtado."));
+    help->setWordWrap(true);
+    layout->addWidget(help);
+    auto* form = new QFormLayout;
+    auto* method = new QComboBox;
+    method->addItem(QStringLiteral("Dots"), QStringLiteral("dots"));
+    method->addItem(QStringLiteral("PayPal"), QStringLiteral("paypal"));
+    method->addItem(QStringLiteral("Wise"), QStringLiteral("wise"));
+    auto* legalName = new QLineEdit;
+    legalName->setPlaceholderText(QStringLiteral("Nome legal do beneficiário"));
+    auto* destination = new QLineEdit;
+    destination->setPlaceholderText(QStringLiteral("E-mail da conta PayPal ou Wise"));
+    form->addRow(QStringLiteral("Método"), method);
+    form->addRow(QStringLiteral("Nome legal"), legalName);
+    form->addRow(QStringLiteral("E-mail do destino"), destination);
+    layout->addLayout(form);
+    auto toggle = [=] {
+      const bool manual = method->currentData().toString() != QStringLiteral("dots");
+      legalName->setEnabled(manual);
+      destination->setEnabled(manual);
+    };
+    connect(method, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [=](int) { toggle(); });
+    toggle();
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Aplicar em todas"));
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+    const QString selected = method->currentData().toString();
+    const QString name = selected == QStringLiteral("dots") ? QString() : legalName->text().trimmed();
+    const QString email = selected == QStringLiteral("dots") ? QString() : destination->text().trimmed();
+    if (selected != QStringLiteral("dots") &&
+        (name.size() < 2 || !QRegularExpression(QStringLiteral("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"))
+                                  .match(email).hasMatch())) {
+      showError(QStringLiteral("Dados incompletos"), QStringLiteral("Informe o nome legal e um e-mail válido."));
+      return;
+    }
+    _balancesPayoutMethod->setEnabled(false);
+    _api.post(QStringLiteral("/api/balances/payout-methods/apply-all"),
+              {{QStringLiteral("method"), selected}, {QStringLiteral("legal_name"), name},
+               {QStringLiteral("destination_email"), email}},
+              [this](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (!ok) { loadBalances(); return showError(QStringLiteral("Configuração não iniciada"), error); }
+      _payoutMethodAwaitingResult = true;
+      _balancePoll.start();
+      setStatus(QStringLiteral("Configurando método de saque em %1 conta(s)…")
+          .arg(doc.object().value(QStringLiteral("total")).toInt()));
+    });
+  });
+  headerLayout->addWidget(_balancesPayoutMethod);
   _balancesWithdrawHistory = new QPushButton(QStringLiteral("Último lote"));
   _balancesWithdrawHistory->setEnabled(false);
   _balancesWithdrawHistory->setToolTip(QStringLiteral(
@@ -4599,6 +4659,7 @@ void MainWindow::loadBalances() {
     const auto withSavedPassword = root.value(QStringLiteral("with_saved_password")).toArray();
     const auto runner = root.value(QStringLiteral("runner")).toObject();
     const auto bulk = root.value(QStringLiteral("withdraw_bulk")).toObject();
+    const auto payout = root.value(QStringLiteral("payout_method_bulk")).toObject();
     _lastWithdrawBulk = bulk;
     _balancesWithdrawHistory->setEnabled(
         bulk.value(QStringLiteral("state")).toString() != QStringLiteral("idle"));
@@ -4771,11 +4832,32 @@ void MainWindow::loadBalances() {
     const bool running = runner.value(QStringLiteral("state")).toString() == QStringLiteral("running");
     _balancesRefresh->setEnabled(!running);
     const bool bulkRunning = bulk.value(QStringLiteral("state")).toString() == QStringLiteral("running");
+    const bool payoutRunning = payout.value(QStringLiteral("state")).toString() == QStringLiteral("running");
     const int refreshNeeded = root.value(QStringLiteral("refresh_needed")).toArray().size();
     _balancesRefreshNeeded->setText(QStringLiteral("Atualizar pendentes (%1)").arg(refreshNeeded));
     _balancesRefreshNeeded->setEnabled(!running && !bulkRunning && refreshNeeded > 0);
     _balancesWithdrawAll->setProperty("eligibleCount", eligibleWithdrawals);
-    _balancesWithdrawAll->setEnabled(!running && !bulkRunning && eligibleWithdrawals > 0);
+    _balancesWithdrawAll->setEnabled(!running && !bulkRunning && !payoutRunning && eligibleWithdrawals > 0);
+    _balancesPayoutMethod->setEnabled(!running && !bulkRunning && !payoutRunning && !passwordAccounts.isEmpty());
+    if (_payoutMethodAwaitingResult && !payoutRunning &&
+        payout.value(QStringLiteral("state")).toString() != QStringLiteral("idle")) {
+      _payoutMethodAwaitingResult = false;
+      QStringList failures;
+      int successes = 0;
+      for (const auto value : payout.value(QStringLiteral("results")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ok")).toBool()) ++successes;
+        else failures << QStringLiteral("%1: %2").arg(
+            row.value(QStringLiteral("email")).toString(), row.value(QStringLiteral("message")).toString());
+      }
+      QMessageBox::information(this, QStringLiteral("Método de saque"),
+          QStringLiteral("Configurado em %1 de %2 conta(s).%3")
+              .arg(successes).arg(payout.value(QStringLiteral("total")).toInt())
+              .arg((payout.value(QStringLiteral("message")).toString().isEmpty()
+                      ? QString() : QStringLiteral("\n\n") + payout.value(QStringLiteral("message")).toString())
+                   + (failures.isEmpty() ? QString() : QStringLiteral("\n\nFalhas:\n")
+                      + failures.join(QStringLiteral("\n")))));
+    }
     if (_bulkWithdrawAwaitingResult && !bulkRunning
         && bulk.value(QStringLiteral("state")).toString() != QStringLiteral("idle")) {
       _bulkWithdrawAwaitingResult = false;
@@ -4786,7 +4868,11 @@ void MainWindow::loadBalances() {
       if (accountKinds.value(value.toString()).toString() == QStringLiteral("claru"))
         ++claruCount;
     }
-    _balancesState->setText(bulkRunning
+    _balancesState->setText(payoutRunning
+        ? QStringLiteral("Configurando método de saque: %1 de %2 conta(s)…")
+              .arg(payout.value(QStringLiteral("done")).toInt())
+              .arg(payout.value(QStringLiteral("total")).toInt())
+        : bulkRunning
         ? QStringLiteral("Solicitando saques: %1 de %2 conta(s)…")
               .arg(bulk.value(QStringLiteral("done")).toInt())
               .arg(bulk.value(QStringLiteral("total")).toInt())
@@ -4798,7 +4884,7 @@ void MainWindow::loadBalances() {
         ? runner.value(QStringLiteral("current")).toString(QStringLiteral("Consultando contas…"))
         : QStringLiteral("%1 identidade(s) · %2 Crowtado conectado(s) · %3 Claru preservada(s)")
               .arg(accounts.size()).arg(passwordAccounts.size()).arg(claruCount));
-    if (running || bulkRunning) _balancePoll.start(); else _balancePoll.stop();
+    if (running || bulkRunning || payoutRunning) _balancePoll.start(); else _balancePoll.stop();
   });
 }
 
