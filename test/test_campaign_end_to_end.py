@@ -34,6 +34,8 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.stack.enter_context(patch.object(server.Session, "from_email", return_value=session))
         self.stack.enter_context(patch.object(campaign, "_compatible_task_clips", return_value=[{
             "clip_uid": "clip", "dur_s": 300, "source": "ego4d"}]))
+        self.stack.enter_context(patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]))
+        self.stack.enter_context(patch.object(campaign, "_clip_is_cached", return_value=False))
         self.stack.enter_context(patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})))
         self.prepare = self.stack.enter_context(patch.object(campaign, "prepare_clip", side_effect=lambda *a, **k: {
             "duration_ms": 300000, "video_path": str(self.root / "fixture.mp4"), "imu_real": True}))
@@ -101,6 +103,16 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual((snap["state"], log["status"]), ("done", "done"))
         self.cleanup.assert_not_called()
         self.assertEqual(self.prepare.call_count, 1)
+
+    def test_prepared_ego_cache_survives_without_budget_file(self):
+        with patch("moneymin.ego_accelerator.configured_budget_gb", return_value=0), \
+             patch.object(campaign, "_clip_is_cached", return_value=True), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            response = self.client.post("/api/campaigns", json=self.body)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "done"))
+        self.cleanup.assert_not_called()
 
     def test_prepared_holo_cache_survives_without_ego_budget(self):
         holo = {"clip_uid": "holoassist:clip", "video_name": "clip",
@@ -280,6 +292,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         candidates = [{"clip_uid": uid, "parent_video_uid": parent, "dur_s": 300, "source": "ego4d"}
                       for uid, parent in (("a1", "a"), ("a2", "a"), ("b1", "b"))]
         with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \
              patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})) as inputs:
             response = self.client.post("/api/campaigns", json={**self.body, "accounts": self.emails[:1], "count": 3})
             self.assertEqual(response.status_code, 200)

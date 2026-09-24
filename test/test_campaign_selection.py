@@ -24,6 +24,7 @@ class CampaignSelectionTests(unittest.TestCase):
         self.stack.enter_context(patch.object(campaign.ego4d, "has_timed_narrations", return_value=True))
         self.stack.enter_context(patch.object(campaign.ego4d, "rank_all_task_spans", return_value={}))
         self.stack.enter_context(patch.object(campaign, "_task_candidates", return_value=()))
+        self.stack.enter_context(patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]))
         self.stack.enter_context(patch.object(campaign.sent_registry, "is_sent_to_all", return_value=False))
         self.stack.enter_context(patch.object(campaign.sent_registry, "sent_emails", return_value=set()))
         campaign._ranked_pools_cached.cache_clear()
@@ -158,7 +159,8 @@ class CampaignSelectionTests(unittest.TestCase):
         ]
         extra = {"clip_uid": "scenario", "source": "ego4d", "dur_s": 300}
         with patch.object(campaign, "_compatible_task_clips", return_value=strict), \
-             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[extra]), \
+             patch("moneymin.ego_accelerator.configured_budget_gb", return_value=0), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[extra]) as ready_scenario, \
              patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] != "remote"):
             counts = {
                 mode: campaign.available_tasks(
@@ -167,6 +169,7 @@ class CampaignSelectionTests(unittest.TestCase):
                 for mode in ("dataset", "cache", "both")
             }
         self.assertEqual(counts, {"dataset": 2, "cache": 2, "both": 3})
+        self.assertTrue(all(call.kwargs["allow_disabled"] for call in ready_scenario.call_args_list))
 
     def test_explicit_cached_scenario_clip_is_accepted(self):
         cached = {"clip_uid": "cached-scenario", "dur_s": 300,

@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,30 @@ from moneymin.web.runner import HoloCacheRunner
 
 
 class HoloCancelTests(unittest.TestCase):
+    def test_ready_requires_native_marker_for_current_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clip = {"video_name": "fixture"}
+            recording = root / "recordings" / "fixture"
+            recording.mkdir(parents=True)
+            source = recording / "Video_compress.mp4"
+            source.write_bytes(b"s" * (1024 * 1024 + 1))
+            native = holo_accelerator.native_path(clip, root)
+            native.write_bytes(b"n" * (1024 * 1024 + 1))
+            for name in holo_accelerator.SENSOR_NAMES:
+                sensor = recording / "IMU" / name
+                sensor.parent.mkdir(parents=True, exist_ok=True)
+                sensor.write_text("data", encoding="utf-8")
+            with patch.object(holo_accelerator.holoassist, "data_dir", return_value=root):
+                self.assertFalse(holo_accelerator.clip_ready(clip, root))
+                marker = native.with_name(native.name + ".source.json")
+                marker.write_text(json.dumps(campaign._native_cache_key(
+                    source, None, None)), encoding="utf-8")
+                self.assertTrue(holo_accelerator.clip_ready(clip, root))
+                pitchshift = recording / "Video_pitchshift.mp4"
+                pitchshift.write_bytes(b"p" * (1024 * 1024 + 1))
+                self.assertFalse(holo_accelerator.clip_ready(clip, root))
+
     def test_prepared_compressed_video_never_looks_up_remote_pitchshift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

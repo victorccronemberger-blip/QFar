@@ -1920,7 +1920,7 @@ def _run_campaign(
                             compatible_ego, tsk.task_name,
                             min_dur_s=tsk.min_dur_s,
                             max_dur_s=tsk.max_dur_s, work_dir=work_dir,
-                            include_disabled=content_mode == "cache")
+                            include_disabled=True)
                     ego_compatible = {
                         candidate["clip_uid"]: candidate
                         for candidate in compatible_ego
@@ -1991,7 +1991,7 @@ def _run_campaign(
                             shorts = _with_cached_expansion(
                                 shorts, tsk.task_name, min_dur_s=tsk.min_dur_s,
                                 max_dur_s=tsk.max_dur_s, work_dir=work_dir,
-                                include_disabled=content_mode == "cache")
+                                include_disabled=True)
                     else:
                         shorts = ego4d.list_clips(
                             scenario=tsk.scenario,
@@ -2033,8 +2033,7 @@ def _run_campaign(
                      f"sessões ({merged_n} cortes do vídeo-pai, {hours:.1f}h)")
                 clips = _prefer_cached_clips(diverse_order(ego4d.prefer_long_clips(
                     fresh, shuffle=config.shuffle_schedule), used_parents=used_parents),
-                    work_dir, prioritize=content_mode != "dataset",
-                    include_ego_cache=content_mode == "cache")
+                    work_dir, prioritize=content_mode != "dataset")
                 _emit("content_pool", task_name=display_name, clips=len(clips),
                       **diversity_summary(clips))
         except Exception as exc:  # noqa: BLE001 — uma categoria não mata as demais
@@ -2048,13 +2047,9 @@ def _run_campaign(
             if content_mode == "cache":
                 clips = [clip for clip in clips if _clip_is_cached(clip, work_dir)]
             if config.cleanup_after_upload:
-                from .ego_accelerator import configured_budget_gb
-
-                ego_cache_enabled = configured_budget_gb() >= 1 or content_mode == "cache"
                 clips = [
                     {**clip, "_cache_ready_at_selection": True}
-                    if ((ego_cache_enabled or clip.get("source") == "holoassist")
-                        and _clip_is_cached(clip, work_dir)) else clip
+                    if _clip_is_cached(clip, work_dir) else clip
                     for clip in clips
                 ]
         if not clips:
@@ -3004,22 +2999,15 @@ def _clip_is_cached(clip: dict[str, Any], work_dir: Path) -> bool:
 
 def _prefer_cached_clips(
     clips: list[dict[str, Any]], work_dir: Path, *,
-    prioritize: bool = True, include_ego_cache: bool = False,
+    prioritize: bool = True,
 ) -> list[dict[str, Any]]:
-    """Com cache ligado, esgota o disco e depois o provedor. Sem cache, a ordem é a do provedor."""
-    from .ego_accelerator import configured_budget_gb
-
+    """Usa mídia pronta primeiro; orçamento de pre-cache não limita a campanha."""
     ordered = list(clips)
-    ego_cache_enabled = configured_budget_gb() >= 1 or include_ego_cache
-    if not ego_cache_enabled and not any(
-            str(clip.get("source") or "") == "holoassist" for clip in ordered):
-        return ordered
     ready: list[dict[str, Any]] = []
     later: list[dict[str, Any]] = []
     in_original_order: list[dict[str, Any]] = []
     for clip in ordered:
-        if (ego_cache_enabled or str(clip.get("source") or "") == "holoassist") \
-                and _clip_is_cached(clip, work_dir):
+        if _clip_is_cached(clip, work_dir):
             marked = {**clip, "_cache_ready_at_selection": True}
             ready.append(marked)
             in_original_order.append(marked)
@@ -3087,10 +3075,10 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                 and normalize_dataset_provider(dataset_provider) in ("all", "ego4d")):
             all_clips = _with_cached_expansion(
                 all_clips, name, min_dur_s=60, max_dur_s=1800,
-                include_disabled=mode == "cache")
+                include_disabled=True)
             clips = _with_cached_expansion(
                 clips, name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                include_disabled=mode == "cache")
+                include_disabled=True)
         if mode == "cache":
             all_clips = [clip for clip in all_clips if cache_ready(clip)]
             clips = [clip for clip in clips if cache_ready(clip)]

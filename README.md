@@ -47,6 +47,8 @@ preparados neste computador e não baixa mídia; **Catálogo do dataset** manté
 a ordem do catálogo sem priorizar o cache; **Cache + dataset** usa os prontos
 primeiro e completa com o catálogo. Mídia já preparada é preservada após o
 envio mesmo quando a limpeza automática está ligada.
+O limite em GB do acelerador controla novos preparos; a campanha reconhece
+arquivos prontos no disco mesmo se esse limite não estiver mais configurado.
 
 Na aba **Nova campanha**, escolha as contas manualmente (com **Todas** e
 **Limpar** para ajustar a lista), use **Sortear contas** ou escolha **Rodízio: menos usadas**

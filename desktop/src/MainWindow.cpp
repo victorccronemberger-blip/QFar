@@ -3706,8 +3706,8 @@ void MainWindow::loadAccelerator() {
           : QStringLiteral("%1 prontos · %2 parciais · %3 pendentes")
                 .arg(ready).arg(partial).arg(pending));
     }
-    if (!running && catalogError.isEmpty() && provider == QStringLiteral("ego4d")
-        && _cacheBudget->value() == 0)
+    if (!running && catalogError.isEmpty() && lastStatus.isEmpty()
+        && provider == QStringLiteral("ego4d") && _cacheBudget->value() == 0)
       _cacheState->setText(root.value(QStringLiteral("configured_budget_gb")).toInt() == 0
           ? QStringLiteral("Pré-cache Ego4D desativado")
           : QStringLiteral("0 GB selecionado · clique para desativar o pré-cache"));

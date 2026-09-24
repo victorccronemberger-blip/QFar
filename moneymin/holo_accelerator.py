@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import time
 from collections.abc import Callable
@@ -49,13 +50,20 @@ def sensors_ready(clip: dict[str, Any]) -> bool:
 
 
 def clip_ready(clip: dict[str, Any], work_dir: Path | None = None) -> bool:
+    from .campaign import _native_cache_key
+
     source = source_path(clip)
     native = native_path(clip, work_dir)
-    return (
-        source.is_file() and source.stat().st_size > 1024 * 1024
-        and native.is_file() and native.stat().st_size > 1024 * 1024
-        and sensors_ready(clip)
-    )
+    try:
+        if (not source.is_file() or source.stat().st_size <= 1024 * 1024
+                or not native.is_file() or native.stat().st_size <= 1024 * 1024
+                or not sensors_ready(clip)):
+            return False
+        marker = native.with_name(native.name + ".source.json")
+        return json.loads(marker.read_text(encoding="utf-8")) == _native_cache_key(
+            source, None, None)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def eligible_clips(

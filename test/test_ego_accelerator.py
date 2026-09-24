@@ -376,6 +376,17 @@ class CampaignCacheOrderTests(unittest.TestCase):
             ordered = campaign._prefer_cached_clips(clips, Path("."))
         self.assertEqual([clip["clip_uid"] for clip in ordered], ["local", "remote"])
 
+    def test_ego_cache_is_preferred_without_budget_file(self):
+        clips = [
+            {"clip_uid": "remote", "source": "ego4d"},
+            {"clip_uid": "local", "source": "ego4d"},
+        ]
+        with patch.object(ego_accelerator, "configured_budget_gb", return_value=0), \
+             patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] == "local"):
+            ordered = campaign._prefer_cached_clips(clips, Path("."))
+        self.assertEqual([clip["clip_uid"] for clip in ordered], ["local", "remote"])
+        self.assertTrue(ordered[0]["_cache_ready_at_selection"])
+
     def test_zero_budget_gb_does_not_download(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
