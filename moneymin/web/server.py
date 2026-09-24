@@ -283,6 +283,58 @@ def _confirmed_available_balance(record: Any) -> bool:
     return (isinstance(cents, (int, float)) and not isinstance(cents, bool)
             and math.isfinite(cents) and cents > 0)
 
+
+def _banned_withdraw_eligibility(row: dict[str, Any]) -> tuple[bool, str]:
+    """A elegibilidade usa somente a leitura Crowtado, nunca o status Minute."""
+    email = str(row.get("email") or "")
+    if org_policy.account_kind(email) != "crowtado":
+        return False, "Saldo Crowtado não se aplica a esta conta."
+    if not row.get("password"):
+        return False, "A senha Crowtado não está salva no registro de banidas."
+    monitor = row.get("monitor") if isinstance(row.get("monitor"), dict) else {}
+    if monitor.get("withdraw_result_status"):
+        return False, str(monitor.get("withdraw_result_detail") or
+                          "O saque já foi solicitado ou recusado; atualize o saldo antes de tentar novamente.")
+    if monitor.get("balance_status") != "ok" or monitor.get("balance_stale") is not False:
+        return False, "Consulte novamente o saldo Crowtado para confirmar o saque."
+    if not _confirmed_available_balance(monitor.get("balance")):
+        return False, "Não há saldo disponível confirmado na Crowtado."
+    try:
+        checked = datetime.datetime.fromisoformat(str(monitor["balance_updated_at"]))
+        age = (datetime.datetime.now(datetime.timezone.utc) - checked.astimezone(datetime.timezone.utc)).total_seconds()
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, "Consulte novamente o saldo Crowtado para confirmar o saque."
+    if not 0 <= age < 24 * 3600:
+        return False, "A consulta de saldo expirou; atualize antes de solicitar o saque."
+    return True, "Saldo disponível confirmado na Crowtado. O saque será revalidado antes da solicitação."
+
+
+def _remember_banned_withdraw_result(
+    email: str, status: str, detail: str, *, balance: dict[str, Any] | None = None,
+    balance_error: bool = False,
+) -> None:
+    """Atualiza só o estado do saque; a restrição Minute permanece intacta."""
+    with _PERSISTENCE_LOCK:
+        path = config.DATA_DIR / "banned_accounts.json"
+        archive = load_json(path, {"accounts": []})
+        for row in archive.get("accounts", []):
+            if str(row.get("email") or "").strip().casefold() != email:
+                continue
+            monitor = dict(row.get("monitor") or {})
+            monitor["withdraw_result_status"] = status
+            monitor["withdraw_result_detail"] = detail
+            if balance is not None:
+                monitor["balance"] = balance
+                monitor["balance_status"] = "ok"
+                monitor["balance_stale"] = False
+                monitor["balance_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            elif balance_error:
+                monitor["balance_status"] = "error"
+                monitor["balance_stale"] = True
+            row["monitor"] = monitor
+            save_json(path, archive)
+            return
+
 _STEP_LABELS = {
     "ban_check": "verificação de ban",
     "crowtado_signup": "criação Crowtado",
@@ -1664,10 +1716,64 @@ def create_app() -> Flask:
     @app.get("/api/accounts/banned/monitor")
     def banned_monitor_snapshot():
         archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
-        rows = [{"email": row["email"], "banned_at": row.get("banned_at") or row.get("removed_at"),
-                 "has_password": bool(row.get("password")), "monitor": row.get("monitor", {})}
-                for row in archive.get("accounts", [])]
+        rows = []
+        for row in archive.get("accounts", []):
+            eligible, reason = _banned_withdraw_eligibility(row)
+            rows.append({"email": row["email"], "banned_at": row.get("banned_at") or row.get("removed_at"),
+                         "has_password": bool(row.get("password")), "monitor": row.get("monitor", {}),
+                         "withdraw_eligible": eligible, "withdraw_reason": reason})
         return jsonify({"accounts": rows, "runner": banned_monitor.snapshot()})
+
+    @app.post("/api/accounts/banned/withdraw")
+    def request_banned_withdraw():
+        """Solicita saque Crowtado de conta arquivada, sem autenticar no Minute."""
+        body = request.get_json(silent=True) or {}
+        email = str(body.get("email") or "").strip().casefold()
+        if not email:
+            return jsonify({"error": "informe a conta banida"}), 400
+        with _PERSISTENCE_LOCK:
+            archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+            row = next((item for item in archive.get("accounts", [])
+                        if str(item.get("email") or "").strip().casefold() == email), None)
+            row = dict(row) if row is not None else None
+        if row is None:
+            return jsonify({"error": "conta não está no registro de banidas"}), 404
+        eligible, reason = _banned_withdraw_eligibility(row)
+        if not eligible:
+            return jsonify({"error": reason}), 400
+        if banned_monitor.snapshot().get("state") == "running" or BALANCES_RUNNER.running:
+            return jsonify({"error": "aguarde a consulta de saldos terminar"}), 409
+        if _withdraw_bulk_snapshot()["state"] == "running":
+            return jsonify({"error": "aguarde o saque em lote terminar"}), 409
+        try:
+            balance = crowtado.consultar_saldo_api(email, row["password"])
+        except (crowtado.CrowtadoError, OSError, TimeoutError, ValueError) as exc:
+            reason = account_issue(email, exc, stage="Consulta de saldo Crowtado")["reason"]
+            message = f"não foi possível confirmar o saldo na Crowtado: {reason}"
+            try:
+                _remember_banned_withdraw_result(email, "balance_error", message, balance_error=True)
+            except OSError:
+                pass
+            return jsonify({"error": message}), 400
+        if not _confirmed_available_balance(balance):
+            try:
+                _remember_banned_withdraw_result(
+                    email, "no_balance", "Não há saldo disponível para saque na Crowtado.", balance=balance)
+            except OSError:
+                pass
+            return jsonify({"error": "não há saldo disponível para saque na Crowtado"}), 400
+        result, status = _withdraw_once(email, row["password"])
+        provider_status = str((result.get("result") or {}).get("status") or "")
+        if provider_status or not result.get("ok"):
+            try:
+                _remember_banned_withdraw_result(
+                    email, provider_status or "request_failed",
+                    result.get("message") if provider_status else
+                    "Não foi possível solicitar o saque; atualize o saldo antes de tentar novamente.",
+                    balance=balance)
+            except OSError:
+                pass  # A solicitação externa já ocorreu; não a repetir por falha local.
+        return jsonify(result), status
 
     @app.post("/api/accounts/banned/refresh")
     def refresh_banned_monitor():

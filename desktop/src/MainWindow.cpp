@@ -2015,15 +2015,15 @@ QWidget* MainWindow::buildBannedPage() {
   actions->addWidget(_bannedRefresh);
   layout->addLayout(actions);
   auto* help = quietLabel(QStringLiteral(
-      "O status é consultado no Minute e o saldo no Crowtado. Contas desbanidas permanecem fora das campanhas. "
-      "Valores com * são da última consulta de saldo concluída."));
+      "O status é consultado no Minute e o saldo no Crowtado. O saque depende do saldo Crowtado confirmado, "
+      "mesmo quando o Minute está desativado. Valores com * são da última consulta de saldo concluída."));
   help->setWordWrap(true);
   layout->addWidget(help);
-  _bannedTable = new QTableWidget(0, 6);
+  _bannedTable = new QTableWidget(0, 7);
   configureTable(_bannedTable);
   _bannedTable->setHorizontalHeaderLabels({QStringLiteral("E-mail"), QStringLiteral("Status atual"),
       QStringLiteral("Disponível (USD)"), QStringLiteral("Pendente (USD)"),
-      QStringLiteral("Banimento"), QStringLiteral("Última consulta")});
+      QStringLiteral("Banimento"), QStringLiteral("Última consulta"), QStringLiteral("Saque")});
   _bannedTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   _bannedTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   layout->addWidget(_bannedTable, 1);
@@ -2086,6 +2086,26 @@ void MainWindow::loadBanned() {
           item->setToolTip(detail.trimmed());
           _bannedTable->setItem(row, col, item);
         }
+        const QString email = account.value(QStringLiteral("email")).toString();
+        auto* withdraw = new QPushButton(QStringLiteral("Saque"));
+        withdraw->setMinimumHeight(32);
+        withdraw->setEnabled(!running && account.value(QStringLiteral("withdraw_eligible")).toBool());
+        withdraw->setToolTip(account.value(QStringLiteral("withdraw_reason")).toString());
+        connect(withdraw, &QPushButton::clicked, this, [this, withdraw, email] {
+          if (QMessageBox::question(this, QStringLiteral("Solicitar saque"),
+                QStringLiteral("Solicitar à Crowtado o link de saque de %1? A conclusão ocorre no Dots.").arg(email))
+              != QMessageBox::Yes) return;
+          withdraw->setEnabled(false);
+          _api.post(QStringLiteral("/api/accounts/banned/withdraw"),
+                    {{QStringLiteral("email"), email}},
+                    [this](bool ok, const QJsonDocument& doc, const QString& error) {
+            if (!ok) showError(QStringLiteral("Saque não solicitado"), error);
+            else QMessageBox::information(this, QStringLiteral("Solicitação enviada"),
+                                          doc.object().value(QStringLiteral("message")).toString());
+            loadBanned();
+          });
+        });
+        _bannedTable->setCellWidget(row, 6, withdraw);
       }
     });
 }

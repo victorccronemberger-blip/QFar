@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -96,3 +97,57 @@ class BannedMonitorTests(unittest.TestCase):
             runner._run([{'email': 'banned@example.com'}], save)
         save.assert_called_once_with('banned@example.com', {'status': 'unbanned'})
         self.assertEqual(runner.snapshot()['state'], 'completed')
+
+    def test_banned_minute_account_can_request_crowtado_withdrawal(self):
+        email = 'banned@example.com'
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(server.config, 'DATA_DIR', Path(tmp)), \
+             patch.object(server, 'BALANCES_RUNNER', Mock(running=False)), \
+             patch.object(server, '_withdraw_bulk_snapshot', return_value={'state': 'idle'}), \
+             patch.object(server, '_list_accounts', side_effect=AssertionError('active accounts not required')), \
+             patch.object(monitor, 'check_status', side_effect=AssertionError('Minute must not be contacted')), \
+             patch.object(server.crowtado, 'consultar_saldo_api', return_value={'availableCents': 1500}) as balance, \
+             patch.object(server, '_withdraw_once', return_value=({'ok': True, 'message': 'link enviado',
+                 'result': {'status': 'ok'}}, 200)) as withdraw:
+            path = Path(tmp) / 'banned_accounts.json'
+            path.write_text(json.dumps({'schema': 1, 'accounts': [{
+                'email': email, 'password': 'private-password',
+                'monitor': {'status': 'banned', 'status_label': 'Continua banida',
+                            'balance_status': 'ok', 'balance_stale': False,
+                            'balance_updated_at': datetime.now(timezone.utc).isoformat(),
+                            'balance': {'availableCents': 1500}}}]}))
+            client = server.create_app().test_client()
+            snapshot = client.get('/api/accounts/banned/monitor').get_json()
+            self.assertTrue(snapshot['accounts'][0]['withdraw_eligible'])
+            self.assertNotIn('private-password', json.dumps(snapshot))
+            response = client.post('/api/accounts/banned/withdraw', json={'email': email})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            balance.assert_called_once_with(email, 'private-password')
+            withdraw.assert_called_once_with(email, 'private-password')
+            self.assertFalse(client.get('/api/accounts/banned/monitor').get_json()['accounts'][0]['withdraw_eligible'])
+
+    def test_banned_withdrawal_requires_current_positive_crowtado_balance(self):
+        email = 'banned@example.com'
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(server.config, 'DATA_DIR', Path(tmp)), \
+             patch.object(server, 'BALANCES_RUNNER', Mock(running=False)), \
+             patch.object(server, '_withdraw_bulk_snapshot', return_value={'state': 'idle'}), \
+             patch.object(server.crowtado, 'consultar_saldo_api', return_value={'availableCents': 0}), \
+             patch.object(server, '_withdraw_once') as withdraw:
+            path = Path(tmp) / 'banned_accounts.json'
+            row = {'email': email, 'password': 'private-password', 'monitor': {
+                'balance_status': 'ok', 'balance_stale': False,
+                'balance_updated_at': datetime.now(timezone.utc).isoformat(),
+                'balance': {'availableCents': 1500}}}
+            path.write_text(json.dumps({'schema': 1, 'accounts': [row]}))
+            client = server.create_app().test_client()
+            response = client.post('/api/accounts/banned/withdraw', json={'email': email})
+            self.assertEqual(response.status_code, 400)
+            withdraw.assert_not_called()
+            snapshot = client.get('/api/accounts/banned/monitor').get_json()
+            self.assertFalse(snapshot['accounts'][0]['withdraw_eligible'])
+            self.assertEqual(snapshot['accounts'][0]['monitor']['balance']['availableCents'], 0)
+            row['monitor']['balance_stale'] = True
+            path.write_text(json.dumps({'schema': 1, 'accounts': [row]}))
+            self.assertEqual(client.post('/api/accounts/banned/withdraw', json={'email': email}).status_code, 400)
+            withdraw.assert_not_called()
