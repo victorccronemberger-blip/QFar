@@ -345,7 +345,8 @@ class CampaignCacheOrderTests(unittest.TestCase):
             {"clip_uid": "a", "source": "ego4d"},
             {"clip_uid": "b", "source": "ego4d"},
         ]
-        with patch.object(ego_accelerator, "configured_budget_gb", return_value=0):
+        with patch.object(ego_accelerator, "configured_budget_gb", return_value=0), \
+             patch.object(campaign, "_clip_is_cached", return_value=False):
             ordered = campaign._prefer_cached_clips(clips, Path("."))
         self.assertEqual([clip["clip_uid"] for clip in ordered], ["a", "b"])
 

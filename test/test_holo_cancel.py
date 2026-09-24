@@ -31,7 +31,7 @@ class HoloCancelTests(unittest.TestCase):
                     source, None, None)), encoding="utf-8")
                 self.assertTrue(holo_accelerator.clip_ready(clip, root))
                 pitchshift = recording / "Video_pitchshift.mp4"
-                pitchshift.write_bytes(b"p" * (1024 * 1024 + 1))
+                pitchshift.write_bytes(b"p" * (1024 * 1024 + 2))
                 self.assertFalse(holo_accelerator.clip_ready(clip, root))
 
     def test_prepared_compressed_video_never_looks_up_remote_pitchshift(self):
