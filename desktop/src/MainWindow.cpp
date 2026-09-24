@@ -1228,6 +1228,14 @@ QWidget* MainWindow::buildCampaignPage() {
   _minDuration->setFixedWidth(130);
   _maxDuration->setFixedWidth(130);
   form->addRow(QStringLiteral("Duração dos vídeos"), duration);
+  _accountWorkers = new ComboBox;
+  configureCombo(_accountWorkers, 240);
+  for (int workers : {1, 2, 3, 4, 6})
+    _accountWorkers->addItem(QStringLiteral("%1 simultâneo(s)").arg(workers), workers);
+  _accountWorkers->setCurrentIndex(_accountWorkers->findData(6));
+  _accountWorkers->setToolTip(QStringLiteral(
+      "Limite de uploads ao mesmo tempo. Mais conexões não aumentam a velocidade da internet; teste 1, 2 e 6 para comparar."));
+  form->addRow(QStringLiteral("Envios por vez"), _accountWorkers);
   _delayMode = new ComboBox;
   configureCombo(_delayMode, 240);
   _delayMode->addItem(QStringLiteral("Sem intervalo"), QStringLiteral("off"));
@@ -1346,6 +1354,8 @@ QWidget* MainWindow::buildCampaignPage() {
     restoreCombo(_contentMode, draft.value(QStringLiteral("content_mode")).toString());
     restoreCombo(_campaignAccountMode, draft.value(QStringLiteral("mode")).toString());
     restoreCombo(_delayMode, draft.value(QStringLiteral("delay_mode")).toString());
+    const int workerIndex = _accountWorkers->findData(draft.value(QStringLiteral("account_workers")).toInt(6));
+    if (workerIndex >= 0) _accountWorkers->setCurrentIndex(workerIndex);
     _campaignDraftQuantity = qMax(1, draft.value(QStringLiteral("quantity")).toInt(1));
     _targetHours->setValue(draft.value(QStringLiteral("target_hours")).toDouble(8.0));
     _minDuration->setValue(draft.value(QStringLiteral("min_duration")).toInt(1));
@@ -1378,6 +1388,7 @@ QWidget* MainWindow::buildCampaignPage() {
   for (auto* spin : {_minDuration, _maxDuration, _delaySeconds, _hourStart, _hourEnd})
     connect(spin, &QSpinBox::valueChanged, this, scheduleDraft);
   connect(_delayMode, &QComboBox::currentIndexChanged, this, scheduleDraft);
+  connect(_accountWorkers, &QComboBox::currentIndexChanged, this, scheduleDraft);
   connect(_cleanupAfter, &QCheckBox::toggled, this, scheduleDraft);
   connect(_activeHours, &QCheckBox::toggled, this, scheduleDraft);
 
@@ -3263,6 +3274,7 @@ void MainWindow::startCampaign() {
       {QStringLiteral("tasks"), tasks},
       {QStringLiteral("count"), 1},
       {QStringLiteral("target_hours"), _targetHours->value()},
+      {QStringLiteral("account_workers"), _accountWorkers->currentData().toInt()},
       {QStringLiteral("min_dur_s"), _minDuration->value() * 60},
       {QStringLiteral("max_dur_s"), _maxDuration->value() * 60},
       {QStringLiteral("delay_mode"), _delayMode->currentData().toString()},
@@ -3322,11 +3334,12 @@ void MainWindow::startCampaign() {
     const auto accountInfo = result.value(QStringLiteral("accounts")).toObject();
     const auto taskInfo = result.value(QStringLiteral("tasks")).toObject();
     QString preview = QStringLiteral(
-        "%1 conta(s) validada(s)\n%2 categoria(s) compatível(is)\n%3 clipes disponíveis\n%4 envio(s) estimado(s)")
+        "%1 conta(s) validada(s)\n%2 categoria(s) compatível(is)\n%3 clipes disponíveis\n%4 envio(s) estimado(s)\n%5 envio(s) simultâneo(s)")
         .arg(accountInfo.value(QStringLiteral("validated")).toInt())
         .arg(taskInfo.value(QStringLiteral("compatible")).toInt())
         .arg(result.value(QStringLiteral("clips")).toInt())
-        .arg(result.value(QStringLiteral("estimated_sends")).toInt());
+        .arg(result.value(QStringLiteral("estimated_sends")).toInt())
+        .arg(result.value(QStringLiteral("account_workers")).toInt());
     preview += QStringLiteral("\n\nContas escolhidas:\n")
         + selectedAccountNames.mid(0, 12).join(QLatin1Char('\n'));
     if (selectedAccountNames.size() > 12)
@@ -4728,6 +4741,7 @@ void MainWindow::saveCampaignDraft() {
       {QStringLiteral("dataset"), _dataset->currentData().toString()},
       {QStringLiteral("content_mode"), _contentMode->currentData().toString()},
       {QStringLiteral("target_hours"), _targetHours->value()},
+      {QStringLiteral("account_workers"), _accountWorkers->currentData().toInt()},
       {QStringLiteral("min_duration"), _minDuration->value()},
       {QStringLiteral("max_duration"), _maxDuration->value()},
       {QStringLiteral("delay_mode"), _delayMode->currentData().toString()},

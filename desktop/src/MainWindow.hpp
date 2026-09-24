@@ -242,6 +242,7 @@ private:
   QSpinBox* _minDuration{};
   QSpinBox* _maxDuration{};
   QComboBox* _delayMode{};
+  QComboBox* _accountWorkers{};
   QSpinBox* _delaySeconds{};
   QCheckBox* _cleanupAfter{};
   QCheckBox* _activeHours{};

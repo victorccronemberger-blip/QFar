@@ -92,6 +92,64 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("modo de conteúdo inválido", response.get_json()["error"])
 
+    def test_upload_concurrency_is_validated_and_forwarded(self):
+        for invalid in (0, 16, 1.5, True, "3"):
+            with self.subTest(invalid=invalid):
+                body = {**self.body, "account_workers": invalid}
+                self.assertEqual(self.client.post("/api/campaigns/preflight", json=body).status_code, 400)
+                self.assertEqual(self.client.post("/api/campaigns", json=body).status_code, 400)
+        body = {**self.body, "account_workers": 2}
+        preflight = self.client.post("/api/campaigns/preflight", json=body)
+        self.assertEqual(preflight.status_code, 200)
+        self.assertEqual(preflight.get_json()["account_workers"], 2)
+        with patch.object(self.instance, "start") as start:
+            response = self.client.post("/api/campaigns", json=body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(start.call_args.args[0].account_workers, 2)
+
+    def test_upload_waits_when_active_window_closes_before_launch(self):
+        waits = []
+        checks = [3600, 3600]
+
+        def remaining(*_args):
+            return checks.pop(0) if checks else 0
+
+        def wait_for_window(*_args):
+            waits.append(True)
+            return False
+
+        def send(item, account, *args, **kwargs):
+            self.assertGreaterEqual(len(waits), 2)
+            return {"email": account.email, "ok": True, "finalized": True}
+
+        self.send.side_effect = send
+        with patch.object(campaign, "_window_remaining_s", side_effect=remaining), \
+             patch.object(campaign, "_wait_for_window", side_effect=wait_for_window):
+            response = self.client.post(
+                "/api/campaigns", json={**self.body, "active_hours": [7, 18]})
+            self.assertEqual(response.status_code, 200)
+            self.finish()
+        self.assertGreaterEqual(len(waits), 2)
+
+    def test_preflight_checks_other_accounts_concurrently(self):
+        emails = [*self.emails, "c@example.com"]
+        barrier = threading.Barrier(2)
+
+        def session_for(_email):
+            session = Mock()
+            def tasks(_org):
+                barrier.wait(3)
+                return [{"id": "task"}]
+            session.all_tasks.side_effect = tasks
+            return session
+
+        with patch.object(server, "_list_accounts", return_value=[{"email": e} for e in emails]), \
+             patch.object(server.Session, "from_email", side_effect=session_for):
+            response = self.client.post("/api/campaigns/preflight", json={
+                **self.body, "accounts": emails})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["accounts"]["validated"], 3)
+
     def test_prepared_cache_survives_successful_campaign(self):
         with patch("moneymin.ego_accelerator.configured_budget_gb", return_value=400), \
              patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \

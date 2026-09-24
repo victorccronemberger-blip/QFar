@@ -2513,6 +2513,11 @@ def _run_campaign(
                         if should_stop and should_stop():
                             accepting = False
                         while accepting and queued and len(futures) < workers:
+                            # A espera de gravação pode terminar depois que a
+                            # janela fechou; não inicie PUT fora do horário.
+                            if (config.active_hours
+                                    and _window_remaining_s(config.active_hours) > 0):
+                                break
                             if queued[0][0] > time.time():
                                 break
                             if _stagger_launch(launched) or (should_stop and should_stop()):
@@ -2526,6 +2531,10 @@ def _run_campaign(
                         if not futures:
                             if not accepting or not queued:
                                 break
+                            if config.active_hours and _window_remaining_s(config.active_hours) > 0:
+                                if _wait_for_window(config.active_hours, should_stop, _emit):
+                                    accepting = False
+                                continue
                             # Nenhum worker fica dormindo pela gravação. Espera
                             # só até a próxima conta ficar pronta, não a última.
                             wait_s = max(0.0, queued[0][0] - time.time())

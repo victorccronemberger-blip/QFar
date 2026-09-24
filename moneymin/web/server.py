@@ -2667,6 +2667,10 @@ def create_app() -> Flask:
         try:
             provider = _local_dataset_provider(body.get("dataset"))
             content_mode = campaign.normalize_content_mode(body.get("content_mode"))
+            requested_workers = body.get("account_workers", campaign.max_account_workers())
+            if (isinstance(requested_workers, bool) or not isinstance(requested_workers, int)
+                    or not 1 <= requested_workers <= 15):
+                raise ValueError("envios simultâneos devem estar entre 1 e 15")
             min_dur_s, max_dur_s = _parse_duration_range(body)
             count = max(1, min(int(body.get("count", 1)), 200))
             target_hours = max(0.0, min(float(body.get("target_hours") or 0), 12.0))
@@ -2737,7 +2741,7 @@ def create_app() -> Flask:
                 selected.append(item)
 
             selected_ids = {str(item.get("id")) for item in selected}
-            for account in accounts[1:]:
+            def _check_account_tasks(account: AccountSpec) -> tuple[str, set[str] | Exception]:
                 try:
                     sess = Session.from_email(account.email)
                     sess.ensure_auth()
@@ -2750,14 +2754,21 @@ def create_app() -> Flask:
                         if item.get("id")
                     }
                 except (AuthError, RuntimeError, OSError) as exc:
-                    account_issues.append(account_issue(
-                        account.email, exc, stage="Consulta das categorias"))
-                    continue
-                missing = selected_ids - account_ids
-                if missing:
-                    blockers.append(
-                        f"{account.email} não possui {len(missing)} categoria(s) selecionada(s)"
-                    )
+                    return account.email, exc
+                return account.email, selected_ids - account_ids
+
+            others = accounts[1:]
+            with ThreadPoolExecutor(max_workers=max(1, min(4, len(others)))) as pool:
+                checks = pool.map(_check_account_tasks, others)
+                for email, result in checks:
+                    if isinstance(result, Exception):
+                        account_issues.append(account_issue(
+                            email, result, stage="Consulta das categorias"))
+                        continue
+                    if result:
+                        blockers.append(
+                            f"{email} não possui {len(result)} categoria(s) selecionada(s)"
+                        )
 
         if unavailable:
             warnings.append(f"{len(unavailable)} categoria(s) sem clipe na duração escolhida")
@@ -2821,6 +2832,7 @@ def create_app() -> Flask:
             "tasks": {"selected": len(raw_tasks), "compatible": len(selected)},
             "clips": clip_count,
             "estimated_sends": estimated_sends,
+            "account_workers": campaign.clamp_account_workers(requested_workers, len(accounts)),
             "target_hours": target_hours,
             "blockers": blockers,
             "warnings": warnings,
@@ -2867,6 +2879,10 @@ def create_app() -> Flask:
                 body.get("dataset")
             )
             content_mode = campaign.normalize_content_mode(body.get("content_mode"))
+            requested_workers = body.get("account_workers", campaign.max_account_workers())
+            if (isinstance(requested_workers, bool) or not isinstance(requested_workers, int)
+                    or not 1 <= requested_workers <= 15):
+                raise ValueError("envios simultâneos devem estar entre 1 e 15")
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         emails = [str(e).strip() for e in body.get("accounts", []) if str(e).strip()]
@@ -3061,9 +3077,9 @@ def create_app() -> Flask:
                              + "; ".join(skipped),
                 }), 400
 
-        # O MP4 é normalizado uma vez antes do lote. Três PUTs simultâneos
-        # reduzem 11 contas a quatro ondas sem disputar CPU com o ffmpeg.
-        account_workers = min(len(accounts), campaign.max_account_workers())
+        # O MP4 é normalizado uma vez antes do lote; o usuário controla
+        # quantos uploads compartilham o link de saída.
+        account_workers = campaign.clamp_account_workers(requested_workers, len(accounts))
 
         cfg = CampaignConfig(accounts=accounts, tasks=tasks,
                              work_dir=config.MEDIA_DATA_DIR / "ego4d",
