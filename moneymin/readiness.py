@@ -26,6 +26,8 @@ def _provider_from_preferences() -> str:
     if not isinstance(raw, dict):
         return "holoassist"
     provider = str(raw.get("dataset_provider") or "holoassist").strip().lower()
+    if raw.get("holoassist_enabled") is False:
+        return "ego4d"
     return provider if provider in {"holoassist", "ego4d", "all"} else "holoassist"
 
 

@@ -117,7 +117,8 @@ class CampaignEndToEndTests(unittest.TestCase):
     def test_prepared_holo_cache_survives_without_ego_budget(self):
         holo = {"clip_uid": "holoassist:clip", "video_name": "clip",
                 "dur_s": 300, "source": "holoassist"}
-        with patch("moneymin.ego_accelerator.configured_budget_gb", return_value=0), \
+        with patch("moneymin.web.server._load_prefs", return_value={}), \
+             patch("moneymin.ego_accelerator.configured_budget_gb", return_value=0), \
              patch.object(campaign.holoassist, "list_clips", return_value=[holo]), \
              patch.object(campaign, "_clip_is_cached", return_value=True), \
              patch.object(campaign, "prepare_holoassist_clip", return_value={

@@ -758,6 +758,16 @@ def _save_prefs(prefs: dict[str, Any]) -> None:
         save_json(PREFS_PATH, prefs)
 
 
+def _local_dataset_provider(value: Any) -> str:
+    provider = campaign.normalize_dataset_provider(value)
+    if _load_prefs().get("holoassist_enabled") is False:
+        if provider == "holoassist":
+            raise ValueError("HoloAssist está desativado neste PC")
+        if provider == "all":
+            return "ego4d"
+    return provider
+
+
 def _cache_org_key(email: str, org_key: str) -> None:
     """Persiste somente uma organização já confirmada pela política da conta."""
     if org_key != org_policy.target_org_key(email):
@@ -2071,7 +2081,7 @@ def create_app() -> Flask:
         if not email:
             return jsonify({"error": "informe ?email=<conta>"}), 400
         try:
-            dataset_provider = campaign.normalize_dataset_provider(
+            dataset_provider = _local_dataset_provider(
                 request.args.get("dataset")
             )
             content_mode = campaign.normalize_content_mode(
@@ -2377,7 +2387,7 @@ def create_app() -> Flask:
     @app.get("/api/readiness")
     def get_readiness():
         try:
-            provider = campaign.normalize_dataset_provider(
+            provider = _local_dataset_provider(
                 request.args.get("dataset")
             )
             result = readiness.campaign_readiness(provider)
@@ -2547,6 +2557,8 @@ def create_app() -> Flask:
         provider = _accelerator_provider(body.get("provider"))
         if provider is None:
             return jsonify({"error": "provedor inválido (holoassist|ego4d)"}), 400
+        if provider == "holoassist" and _load_prefs().get("holoassist_enabled") is False:
+            return jsonify({"error": "HoloAssist está desativado neste PC"}), 400
         module = _accelerator_module(provider)
         tasks = _accelerator_tasks(provider)
         task = str(body.get("task") or module.DEFAULT_TASK)
@@ -2629,13 +2641,17 @@ def create_app() -> Flask:
     @app.post("/api/storage/cleanup")
     def storage_cleanup():
         """Limpeza manual confinada aos caches de mídia conhecidos."""
+        body = request.get_json(silent=True) or {}
+        provider = str(body.get("provider") or "all").strip().lower()
+        if provider not in {"ego4d", "holoassist", "all"}:
+            return jsonify({"error": "provedor inválido (ego4d|holoassist|all)"}), 400
         with _HEAVY_RUNNER_LOCK:
             if RUNNER.running or HOLO_CACHE_RUNNER.running:
                 return jsonify({
                     "error": "pare a campanha e o acelerador antes de limpar a mídia",
                 }), 409
-            result = campaign.cleanup_media_cache(config.MEDIA_DATA_DIR / "ego4d")
-        return jsonify({"ok": not result["errors"], **result})
+            result = campaign.cleanup_media_cache(config.MEDIA_DATA_DIR / "ego4d", provider=provider)
+        return jsonify({"ok": not result["errors"], "provider": provider, **result})
 
     # -- campanha ---------------------------------------------------------------
     @app.post("/api/campaigns/preflight")
@@ -2649,7 +2665,7 @@ def create_app() -> Flask:
         if HOLO_CACHE_RUNNER.running:
             blockers.append("o acelerador está em execução")
         try:
-            provider = campaign.normalize_dataset_provider(body.get("dataset"))
+            provider = _local_dataset_provider(body.get("dataset"))
             content_mode = campaign.normalize_content_mode(body.get("content_mode"))
             min_dur_s, max_dur_s = _parse_duration_range(body)
             count = max(1, min(int(body.get("count", 1)), 200))
@@ -2847,7 +2863,7 @@ def create_app() -> Flask:
                 "error": "cleanup_after_upload deve ser true ou false",
             }), 400
         try:
-            dataset_provider = campaign.normalize_dataset_provider(
+            dataset_provider = _local_dataset_provider(
                 body.get("dataset")
             )
             content_mode = campaign.normalize_content_mode(body.get("content_mode"))

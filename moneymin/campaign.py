@@ -1520,8 +1520,10 @@ def _cleanup_uploaded_item(
     return result
 
 
-def cleanup_media_cache(work_dir: Path | None = None) -> dict[str, Any]:
+def cleanup_media_cache(work_dir: Path | None = None, *, provider: str = "all") -> dict[str, Any]:
     """Limpa downloads/derivados, preservando catálogos e estado da campanha."""
+    if provider not in {"all", "ego4d", "holoassist"}:
+        raise ValueError("provedor inválido (ego4d|holoassist|all)")
     work = Path(work_dir or config.MEDIA_DATA_DIR / "ego4d")
     candidates: list[Path] = []
     if work.is_dir():
@@ -1529,6 +1531,9 @@ def cleanup_media_cache(work_dir: Path | None = None) -> dict[str, Any]:
             if not path.is_file() and not path.is_symlink():
                 continue
             name = path.name.lower()
+            belongs_to_holo = name.startswith("holoassist_")
+            if provider != "all" and belongs_to_holo != (provider == "holoassist"):
+                continue
             if (
                 path.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm"}
                 or name.endswith((
@@ -1542,7 +1547,7 @@ def cleanup_media_cache(work_dir: Path | None = None) -> dict[str, Any]:
             ):
                 candidates.append(path)
     recordings = holoassist.data_dir() / "recordings"
-    if recordings.is_dir():
+    if provider in {"all", "holoassist"} and recordings.is_dir():
         candidates.extend(
             path for path in recordings.rglob("*")
             if path.is_file() or path.is_symlink()

@@ -988,7 +988,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _dataset->addItem(QStringLiteral("Conteúdo combinado"), QStringLiteral("all"));
   _dataset->addItem(QStringLiteral("Somente Ego4D"), QStringLiteral("ego4d"));
   _dataset->addItem(QStringLiteral("Somente HoloAssist"), QStringLiteral("holoassist"));
-  _dataset->setCurrentIndex(0);
+  _dataset->setCurrentIndex(1);
   connect(_dataset, &QComboBox::currentIndexChanged, this,
           [this] { _taskReload.start(); });
   sourceLayout->addWidget(new QLabel(QStringLiteral("Origem")));
@@ -1416,8 +1416,8 @@ QWidget* MainWindow::buildAcceleratorPage() {
   form->setContentsMargins(0, 0, 0, 0);
   _cacheProvider = new ComboBox;
   configureCombo(_cacheProvider, 620);
-  _cacheProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
   _cacheProvider->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
+  _cacheProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
   connect(_cacheProvider, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, form] {
     _cacheTask->blockSignals(true);
     _cacheTask->clear();
@@ -1514,12 +1514,20 @@ QWidget* MainWindow::buildAcceleratorPage() {
   auto* actions = new QWidget;
   auto* actionLayout = new QHBoxLayout(actions);
   actionLayout->setContentsMargins(0, 0, 0, 0);
-  auto* cleanup = new QPushButton(QStringLiteral("Limpar mídia baixada"));
-  connect(cleanup, &QPushButton::clicked, this, [this] {
+  auto* cleanupProvider = new ComboBox;
+  cleanupProvider->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
+  cleanupProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
+  cleanupProvider->addItem(QStringLiteral("Ambos"), QStringLiteral("all"));
+  cleanupProvider->setToolTip(QStringLiteral("Escolha o cache a apagar"));
+  actionLayout->addWidget(cleanupProvider);
+  auto* cleanup = new QPushButton(QStringLiteral("Apagar cache"));
+  connect(cleanup, &QPushButton::clicked, this, [this, cleanupProvider] {
+    const QString provider = cleanupProvider->currentData().toString();
+    const QString name = cleanupProvider->currentText();
     if (QMessageBox::question(this, QStringLiteral("Limpar mídia"),
-          QStringLiteral("Apagar a mídia e os sensores baixados? Catálogos, contas e histórico serão preservados."))
+          QStringLiteral("Apagar o cache de %1? Catálogos, contas e histórico serão preservados.").arg(name))
         != QMessageBox::Yes) return;
-    _api.post(QStringLiteral("/api/storage/cleanup"), {}, [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _api.post(QStringLiteral("/api/storage/cleanup"), {{QStringLiteral("provider"), provider}}, [this](bool ok, const QJsonDocument& doc, const QString& error) {
       if (!ok) return showError(QStringLiteral("Falha na limpeza"), error);
       const auto result = doc.object();
       setStatus(QStringLiteral("%1 arquivo(s) removido(s).").arg(result.value(QStringLiteral("files")).toInt()));
@@ -2512,6 +2520,18 @@ void MainWindow::probeBackend() {
       _backendProbe.stop();
       _backendRestarts = 0;
       setBackendReady(true);
+      _api.get(QStringLiteral("/api/preferences"), [this, generation](bool loaded, const QJsonDocument& prefs, const QString&) {
+        if (!loaded || _closing || generation != _probeGeneration) return;
+        if (prefs.object().value(QStringLiteral("holoassist_enabled")) != QJsonValue(false)) return;
+        for (QComboBox* combo : {_dataset, _cacheProvider}) {
+          if (!combo) continue;
+          for (int index = combo->count() - 1; index >= 0; --index) {
+            const QString value = combo->itemData(index).toString();
+            if (value == QStringLiteral("holoassist") || value == QStringLiteral("all"))
+              combo->removeItem(index);
+          }
+        }
+      });
       refreshCurrentPage();
       if (!_runtimeChecked && _backend.program().endsWith(QStringLiteral("QMoneyService.exe"), Qt::CaseInsensitive)) {
         _runtimeChecked = true;
