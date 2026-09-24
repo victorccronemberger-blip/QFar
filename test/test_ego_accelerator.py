@@ -261,6 +261,7 @@ class EgoBudgetTests(unittest.TestCase):
                  patch.object(ego_accelerator, "stop_path", return_value=root / "stop"), \
                  patch.object(ego_accelerator, "state_path", return_value=root / "state.json"), \
                  patch.object(ego_accelerator, "used_bytes", return_value=ego_accelerator.budget_bytes(500)), \
+                 patch.object(campaign, "ego_clip_cache_state", return_value="pending"), \
                  patch.object(campaign, "prepare_clip") as prepare:
                 result = ego_accelerator.warm_cache(work_dir=root, budget_gb=500)
             self.assertEqual(result["status"], "budget")
