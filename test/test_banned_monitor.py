@@ -90,6 +90,22 @@ class BannedMonitorTests(unittest.TestCase):
                 self.assertEqual(client.post('/api/accounts/banned/refresh').status_code, 202)
                 self.assertEqual(client.post('/api/accounts/banned/refresh').status_code, 409)
 
+    def test_banned_password_is_revealed_only_for_requested_archived_account(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(server.config, 'DATA_DIR', Path(tmp)), \
+             patch.object(server, 'RUNNER', Mock()), \
+             patch.object(server, 'ORG_MIGRATION', Mock(running=False)):
+            (Path(tmp) / 'banned_accounts.json').write_text(json.dumps({'accounts': [
+                {'email': 'banned@example.com', 'password': 'private-password'}]}))
+            client = server.create_app().test_client()
+            response = client.post('/api/accounts/banned/password', json={'email': 'BANNED@example.com'})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()['password'], 'private-password')
+            self.assertEqual(response.headers['Cache-Control'], 'no-store')
+            self.assertEqual(client.post('/api/accounts/banned/password',
+                                         json={'email': 'other@example.com'}).status_code, 404)
+            self.assertNotIn('private-password', json.dumps(
+                client.get('/api/accounts/banned/monitor').get_json()))
+
     def test_runner_persists_each_result_and_completes(self):
         runner, save = monitor.BannedMonitor(), Mock()
         runner.state = {'state': 'running', 'completed': 0, 'total': 1}

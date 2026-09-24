@@ -1716,13 +1716,36 @@ def create_app() -> Flask:
     @app.get("/api/accounts/banned/monitor")
     def banned_monitor_snapshot():
         archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+        passwords = _crowtado_creds()
         rows = []
         for row in archive.get("accounts", []):
             eligible, reason = _banned_withdraw_eligibility(row)
+            email = str(row.get("email") or "").strip().casefold()
             rows.append({"email": row["email"], "banned_at": row.get("banned_at") or row.get("removed_at"),
-                         "has_password": bool(row.get("password")), "monitor": row.get("monitor", {}),
+                         "has_password": bool(row.get("password") or passwords.get(email)),
+                         "monitor": row.get("monitor", {}),
                          "withdraw_eligible": eligible, "withdraw_reason": reason})
         return jsonify({"accounts": rows, "runner": banned_monitor.snapshot()})
+
+    @app.post("/api/accounts/banned/password")
+    def banned_account_password():
+        """Revela sob demanda a credencial local de uma conta arquivada."""
+        body = request.get_json(silent=True) or {}
+        email = str(body.get("email") or "").strip().casefold()
+        if not email:
+            return jsonify({"error": "informe a conta banida"}), 400
+        with _PERSISTENCE_LOCK:
+            archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+            row = next((item for item in archive.get("accounts", [])
+                        if str(item.get("email") or "").strip().casefold() == email), None)
+            if row is None:
+                return jsonify({"error": "conta não encontrada no registro de banidas"}), 404
+            password = row.get("password") or _crowtado_creds().get(email)
+        if not password:
+            return jsonify({"error": "esta conta não possui senha salva"}), 404
+        response = jsonify({"email": email, "password": password})
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.post("/api/accounts/banned/withdraw")
     def request_banned_withdraw():

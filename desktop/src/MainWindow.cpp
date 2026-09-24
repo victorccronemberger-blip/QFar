@@ -2019,11 +2019,12 @@ QWidget* MainWindow::buildBannedPage() {
       "mesmo quando o Minute está desativado. Valores com * são da última consulta de saldo concluída."));
   help->setWordWrap(true);
   layout->addWidget(help);
-  _bannedTable = new QTableWidget(0, 7);
+  _bannedTable = new QTableWidget(0, 8);
   configureTable(_bannedTable);
   _bannedTable->setHorizontalHeaderLabels({QStringLiteral("E-mail"), QStringLiteral("Status atual"),
       QStringLiteral("Disponível (USD)"), QStringLiteral("Pendente (USD)"),
-      QStringLiteral("Banimento"), QStringLiteral("Última consulta"), QStringLiteral("Saque")});
+      QStringLiteral("Banimento"), QStringLiteral("Última consulta"),
+      QStringLiteral("Senha"), QStringLiteral("Saque")});
   _bannedTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   _bannedTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   layout->addWidget(_bannedTable, 1);
@@ -2087,6 +2088,27 @@ void MainWindow::loadBanned() {
           _bannedTable->setItem(row, col, item);
         }
         const QString email = account.value(QStringLiteral("email")).toString();
+        auto* reveal = new QPushButton(QStringLiteral("Ver senha"));
+        reveal->setMinimumHeight(32);
+        reveal->setEnabled(account.value(QStringLiteral("has_password")).toBool());
+        reveal->setToolTip(reveal->isEnabled()
+            ? QStringLiteral("Mostrar a senha salva para acesso manual.")
+            : QStringLiteral("Esta conta não possui senha salva."));
+        connect(reveal, &QPushButton::clicked, this, [this, email] {
+          _api.post(QStringLiteral("/api/accounts/banned/password"),
+                    {{QStringLiteral("email"), email}},
+                    [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
+            if (!ok) return showError(QStringLiteral("Senha indisponível"), error);
+            QMessageBox dialog(this);
+            dialog.setWindowTitle(QStringLiteral("Senha da conta banida"));
+            dialog.setTextFormat(Qt::PlainText);
+            dialog.setText(QStringLiteral("%1\n\nSenha: %2")
+                .arg(email, doc.object().value(QStringLiteral("password")).toString()));
+            dialog.setTextInteractionFlags(Qt::TextSelectableByMouse);
+            dialog.exec();
+          });
+        });
+        _bannedTable->setCellWidget(row, 6, reveal);
         auto* withdraw = new QPushButton(QStringLiteral("Saque"));
         withdraw->setMinimumHeight(32);
         withdraw->setEnabled(!running && account.value(QStringLiteral("withdraw_eligible")).toBool());
@@ -2105,7 +2127,7 @@ void MainWindow::loadBanned() {
             loadBanned();
           });
         });
-        _bannedTable->setCellWidget(row, 6, withdraw);
+        _bannedTable->setCellWidget(row, 7, withdraw);
       }
     });
 }
