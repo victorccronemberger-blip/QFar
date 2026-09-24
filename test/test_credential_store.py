@@ -9,6 +9,33 @@ from moneymin.web import server
 
 
 class CredentialStoreTests(unittest.TestCase):
+    def test_active_account_password_is_revealed_only_on_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            email = "owner@example.invalid"
+            credential_store.save(root, email, "current-password")
+            with patch.object(server.config, "SECRETS_DIR", root), \
+                 patch.object(server, "CROWTADO_PW_PATH", root / "legacy.json"), \
+                 patch.object(server, "_list_accounts", return_value=[{"email": email}]), \
+                 patch.object(server, "RUNNER", Mock()), \
+                 patch.object(server, "ORG_MIGRATION", Mock(running=False)):
+                client = server.create_app().test_client()
+                listing = client.get("/api/accounts").get_json()["accounts"][0]
+                self.assertTrue(listing["has_password"])
+                self.assertNotIn("current-password", json.dumps(listing))
+                response = client.post("/api/accounts/password", json={"email": email.upper()})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()["password"], "current-password")
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                self.assertEqual(client.post("/api/accounts/password", json={
+                    "email": "other@example.invalid"}).status_code, 404)
+
+                credential_store.record_path(root, email).write_bytes(b"{corrupt")
+                (root / "legacy.json").write_text(json.dumps({email: "old-password"}))
+                self.assertFalse(client.get("/api/accounts").get_json()["accounts"][0]["has_password"])
+                self.assertEqual(client.post("/api/accounts/password", json={
+                    "email": email}).status_code, 404)
+
     def test_registration_checkpoints_password_before_any_remote_signup(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

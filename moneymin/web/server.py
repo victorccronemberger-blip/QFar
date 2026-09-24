@@ -1402,6 +1402,15 @@ def _crowtado_creds() -> dict[str, str]:
     return creds
 
 
+def _saved_account_password(email: str, legacy: dict[str, str]) -> str | None:
+    """Prefere a credencial individual e bloqueia cópias antigas se ela estiver corrompida."""
+    try:
+        individual = credential_store.lookup(config.SECRETS_DIR, email, strict=True)
+    except ValueError:
+        return None
+    return individual or legacy.get(email.strip().casefold())
+
+
 def _configured_crowtado_creds() -> dict[str, str]:
     """Resolve somente acessos Crowtado ativos e promove cópias legadas.
 
@@ -1684,7 +1693,28 @@ def create_app() -> Flask:
     # -- contas ---------------------------------------------------------------
     @app.get("/api/accounts")
     def get_accounts():
-        return jsonify({"accounts": _list_accounts()})
+        accounts = _list_accounts()
+        passwords = _crowtado_creds()
+        for account in accounts:
+            account["has_password"] = bool(_saved_account_password(account["email"], passwords))
+        return jsonify({"accounts": accounts})
+
+    @app.post("/api/accounts/password")
+    def account_password():
+        body = request.get_json(silent=True) or {}
+        email = str(body.get("email") or "").strip().casefold()
+        if not email:
+            return jsonify({"error": "informe a conta"}), 400
+        with _PERSISTENCE_LOCK:
+            if not any(str(account["email"]).strip().casefold() == email
+                       for account in _list_accounts()):
+                return jsonify({"error": "conta não encontrada"}), 404
+            password = _saved_account_password(email, _crowtado_creds())
+        if not password:
+            return jsonify({"error": "esta conta não possui senha salva"}), 404
+        response = jsonify({"email": email, "password": password})
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/api/accounts/migration")
     def get_org_migration():

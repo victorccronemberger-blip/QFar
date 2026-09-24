@@ -1699,7 +1699,7 @@ QWidget* MainWindow::buildAccountsPage() {
   _accountsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
   _accountsTable->setColumnWidth(1, 150);
   _accountsTable->setColumnWidth(2, 175);
-  _accountsTable->setColumnWidth(3, 232);
+  _accountsTable->setColumnWidth(3, 340);
   _accountsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
   _accountsTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
 
@@ -4160,7 +4160,28 @@ void MainWindow::loadAccounts() {
       connect(remove, &QPushButton::clicked, this, [this, email] {
         removeAccount(email);
       });
+      auto* reveal = new QPushButton(QStringLiteral("Ver senha"));
+      reveal->setMinimumSize(100, 32);
+      reveal->setEnabled(account.value(QStringLiteral("has_password")).toBool());
+      reveal->setToolTip(reveal->isEnabled()
+          ? QStringLiteral("Mostrar a senha salva para acesso manual.")
+          : QStringLiteral("Esta conta não possui senha salva."));
+      connect(reveal, &QPushButton::clicked, this, [this, email] {
+        _api.post(QStringLiteral("/api/accounts/password"),
+                  {{QStringLiteral("email"), email}},
+                  [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
+          if (!ok) return showError(QStringLiteral("Senha indisponível"), error);
+          QMessageBox dialog(this);
+          dialog.setWindowTitle(QStringLiteral("Senha da conta"));
+          dialog.setTextFormat(Qt::PlainText);
+          dialog.setText(QStringLiteral("%1\n\nSenha: %2")
+              .arg(email, doc.object().value(QStringLiteral("password")).toString()));
+          dialog.setTextInteractionFlags(Qt::TextSelectableByMouse);
+          dialog.exec();
+        });
+      });
       actionsLayout->addWidget(check);
+      actionsLayout->addWidget(reveal);
       actionsLayout->addWidget(remove);
       _accountsTable->setCellWidget(row, 3, actions);
       ++row;
