@@ -3479,6 +3479,7 @@ def create_app() -> Flask:
         balances = _load_balances()
         configured = sorted(a["email"] for a in account_rows)
         configured_set = set(configured)
+        saved_passwords = _crowtado_creds()
         # O cofre pode conservar credenciais de identidades removidas. Elas não
         # pertencem mais à operação atual e não devem inflar a contagem exibida
         # nem aparecer como contas conectadas no desktop.
@@ -3493,6 +3494,10 @@ def create_app() -> Flask:
                 for account in account_rows
             },
             "with_password": with_password,
+            "with_saved_password": sorted(
+                account["email"] for account in account_rows
+                if _saved_account_password(account["email"], saved_passwords)
+            ),
             "refresh_needed": _balance_refresh_needed(account_rows, balances, set(with_password)),
             "runner": BALANCES_RUNNER.snapshot(),
             "withdraw_bulk": _withdraw_bulk_snapshot(),

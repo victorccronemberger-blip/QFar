@@ -104,6 +104,9 @@ class CrowtadoCredentialTests(unittest.TestCase):
         self.assertEqual(body["accounts"], ["crow@example.com", "person@supply.claru.ai"])
         self.assertEqual(body["account_kinds"]["person@supply.claru.ai"], "claru")
         self.assertEqual(body["with_password"], ["crow@example.com"])
+        self.assertEqual(body["with_saved_password"],
+                         ["crow@example.com", "person@supply.claru.ai"])
+        self.assertNotIn("minute-password", str(body))
 
     def test_legacy_credential_is_promoted_without_becoming_disconnected(self):
         with tempfile.TemporaryDirectory() as folder:

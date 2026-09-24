@@ -1951,7 +1951,7 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesTable->setColumnWidth(1, 126);
   _balancesTable->setColumnWidth(2, 126);
   _balancesTable->setColumnWidth(3, 176);
-  _balancesTable->setColumnWidth(4, 292);
+  _balancesTable->setColumnWidth(4, 365);
   _balancesTable->horizontalHeaderItem(1)->setToolTip(
       QStringLiteral("Valor em dólar liberado para solicitar saque."));
   _balancesTable->horizontalHeaderItem(2)->setToolTip(
@@ -4596,6 +4596,7 @@ void MainWindow::loadBalances() {
     const auto balances = root.value(QStringLiteral("balances")).toObject();
     const auto accountKinds = root.value(QStringLiteral("account_kinds")).toObject();
     const auto withPassword = root.value(QStringLiteral("with_password")).toArray();
+    const auto withSavedPassword = root.value(QStringLiteral("with_saved_password")).toArray();
     const auto runner = root.value(QStringLiteral("runner")).toObject();
     const auto bulk = root.value(QStringLiteral("withdraw_bulk")).toObject();
     _lastWithdrawBulk = bulk;
@@ -4604,6 +4605,8 @@ void MainWindow::loadBalances() {
     const auto exchange = root.value(QStringLiteral("exchange")).toObject();
     QStringList passwordAccounts;
     for (const auto value : withPassword) passwordAccounts << value.toString();
+    QStringList savedPasswordAccounts;
+    for (const auto value : withSavedPassword) savedPasswordAccounts << value.toString();
     QStringList orderedAccounts;
     for (const auto value : accounts) orderedAccounts << value.toString();
     std::sort(orderedAccounts.begin(), orderedAccounts.end(), [&balances](const QString& left, const QString& right) {
@@ -4692,6 +4695,27 @@ void MainWindow::loadBalances() {
       connect(credentials, &QPushButton::clicked, this,
               [this, email] { configureCrowtadoAccess(email); });
       actionsLayout->addWidget(credentials);
+      auto* reveal = new QPushButton(QStringLiteral("Ver senha"));
+      reveal->setMinimumHeight(32);
+      reveal->setEnabled(savedPasswordAccounts.contains(email));
+      reveal->setToolTip(reveal->isEnabled()
+          ? QStringLiteral("Mostrar a senha salva para acesso manual.")
+          : QStringLiteral("Esta conta não possui senha salva."));
+      connect(reveal, &QPushButton::clicked, this, [this, email] {
+        _api.post(QStringLiteral("/api/accounts/password"),
+                  {{QStringLiteral("email"), email}},
+                  [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
+          if (!ok) return showError(QStringLiteral("Senha indisponível"), error);
+          QMessageBox dialog(this);
+          dialog.setWindowTitle(QStringLiteral("Senha da conta"));
+          dialog.setTextFormat(Qt::PlainText);
+          dialog.setText(QStringLiteral("%1\n\nSenha: %2")
+              .arg(email, doc.object().value(QStringLiteral("password")).toString()));
+          dialog.setTextInteractionFlags(Qt::TextSelectableByMouse);
+          dialog.exec();
+        });
+      });
+      actionsLayout->addWidget(reveal);
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);
       withdraw->setEnabled(!isClaru && hasPassword && !hasBalanceError
