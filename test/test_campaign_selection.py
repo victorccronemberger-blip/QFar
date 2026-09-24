@@ -149,6 +149,55 @@ class CampaignSelectionTests(unittest.TestCase):
                 "Furniture Assembly", "holoassist", min_dur_s=180, max_dur_s=780), ())
         holo.assert_called_once_with("Furniture Assembly", min_dur_s=180, max_dur_s=780)
 
+    def test_task_counts_match_cache_dataset_and_combined_modes(self):
+        session = Mock(_live=True)
+        session.all_tasks.return_value = [{"id": "dog", "name": "Walk the Dog"}]
+        strict = [
+            {"clip_uid": "remote", "source": "ego4d", "dur_s": 300},
+            {"clip_uid": "local", "source": "ego4d", "dur_s": 300},
+        ]
+        extra = {"clip_uid": "scenario", "source": "ego4d", "dur_s": 300}
+        with patch.object(campaign, "_compatible_task_clips", return_value=strict), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[extra]), \
+             patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] != "remote"):
+            counts = {
+                mode: campaign.available_tasks(
+                    "user@example.com", "org", session=session,
+                    dataset_provider="ego4d", content_mode=mode)[0]["clip_count"]
+                for mode in ("dataset", "cache", "both")
+            }
+        self.assertEqual(counts, {"dataset": 2, "cache": 2, "both": 3})
+
+    def test_explicit_cached_scenario_clip_is_accepted(self):
+        cached = {"clip_uid": "cached-scenario", "dur_s": 300,
+                  "source": "ego4d", "match_tier": "scenario"}
+        self.cfg.tasks = [TaskSpec("dog", "Walking the dog / pet", 180, 780,
+                                   task_name="Walk the Dog", clip_uids=["cached-scenario"])]
+        events = []
+        with patch.object(campaign, "_compatible_task_clips", return_value=()), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[cached]), \
+             patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
+             patch.object(campaign, "prepare_clip", side_effect=RuntimeError("fixture")):
+            campaign.run_campaign(self.cfg, progress=lambda kind, payload: events.append((kind, payload)))
+        self.assertEqual(
+            [payload["clip_uid"] for kind, payload in events if kind == "clip_prepare_start"],
+            ["cached-scenario"])
+
+    def test_explicit_holo_clip_does_not_open_ego_catalog(self):
+        holo = {"clip_uid": "holoassist:one", "video_name": "one", "dur_s": 300,
+                "source": "holoassist"}
+        self.cfg.dataset_provider = "holoassist"
+        self.cfg.tasks = [TaskSpec("furniture", "assembling furniture", 180, 780,
+                                   task_name="Furniture Assembly", clip_uids=["holoassist:one"])]
+        events = []
+        with patch.object(campaign, "_compatible_task_clips", side_effect=AssertionError("Ego4D consulted")), \
+             patch.object(campaign.holoassist, "list_clips", return_value=[holo]), \
+             patch.object(campaign, "prepare_holoassist_clip", side_effect=RuntimeError("fixture")):
+            campaign.run_campaign(self.cfg, progress=lambda kind, payload: events.append((kind, payload)))
+        self.assertEqual(
+            [payload["clip_uid"] for kind, payload in events if kind == "clip_prepare_start"],
+            ["holoassist:one"])
+
     def test_terminal_events_distinguish_success_partial_and_skips(self):
         for status, successful, skipped, level in (
                 ("done", 48, 0, "success"), ("partial", 24, 0, "warning"),

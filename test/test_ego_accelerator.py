@@ -26,6 +26,21 @@ def _imu(path: Path) -> None:
 
 
 class EgoCacheStateTests(unittest.TestCase):
+    def test_cache_only_rejects_missing_source_without_downloading(self):
+        row = _row()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = {"has_imu": True}
+            with patch.object(campaign.ego4d, "imu_window_is_covered", return_value=True), \
+                 patch.object(campaign.ego4d, "_valid_imu_cache", return_value=True), \
+                 patch.object(campaign.ego4d, "build_imu_csv", return_value=""), \
+                 patch.object(campaign.ego4d, "download_imu") as download_imu, \
+                 patch.object(campaign.ego4d, "download_clip") as download_clip:
+                with self.assertRaisesRegex(RuntimeError, "vídeo local ausente"):
+                    campaign.prepare_clip(row, video, root, allow_download=False)
+            download_imu.assert_not_called()
+            download_clip.assert_not_called()
+
     def test_ready_requires_source_imu_and_matching_marker(self):
         row = _row()
         with tempfile.TemporaryDirectory() as tmp:
@@ -145,6 +160,35 @@ class EgoWarmTests(unittest.TestCase):
 
 
 class EgoBudgetTests(unittest.TestCase):
+    def test_reclaim_removes_only_obsolete_native_derivatives(self):
+        row = _row()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = campaign._ego_prepare_plan(row)
+            source = root / plan["source_name"]
+            native = root / plan["native_name"]
+            marker = native.with_name(native.name + ".source.json")
+            source.write_bytes(b"s" * (1024 * 1024 + 1))
+            native.write_bytes(b"n" * (1024 * 1024 + 1))
+            marker.write_text('{"version": 1}', encoding="utf-8")
+            with patch.object(ego_accelerator, "catalog_installed", return_value=True), \
+                 patch.object(campaign, "_ego_clip_inputs", return_value=(row, {"video_uid": "parent-1"})):
+                reclaimed = ego_accelerator.reclaim_stale_native(root)
+            self.assertEqual(reclaimed["files"], 1)
+            self.assertEqual(reclaimed["bytes"], 1024 * 1024 + 1)
+            self.assertTrue(source.exists())
+            self.assertFalse(native.exists())
+            self.assertFalse(marker.exists())
+
+            native.write_bytes(b"n" * (1024 * 1024 + 1))
+            marker.write_text(json.dumps(campaign._native_cache_key(
+                source, plan["norm_start"], plan["dur_s"])), encoding="utf-8")
+            with patch.object(ego_accelerator, "catalog_installed", return_value=True), \
+                 patch.object(campaign, "_ego_clip_inputs", return_value=(row, {"video_uid": "parent-1"})):
+                kept = ego_accelerator.reclaim_stale_native(root)
+            self.assertEqual(kept["files"], 0)
+            self.assertTrue(native.exists())
+
     def test_full_budget_still_counts_ready_clips(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -272,6 +316,14 @@ class EgoBudgetTests(unittest.TestCase):
              patch.object(ego_accelerator, "scenario_buckets", return_value={"Gardening": [{"clip_uid": "g", "dur_s": 90}]}):
             self.assertEqual(ego_accelerator.ready_scenario_clips("Gardening"), [])
 
+    def test_cache_only_can_use_ready_scenario_when_preparation_is_disabled(self):
+        clip = {"clip_uid": "g", "dur_s": 90}
+        with patch.object(ego_accelerator, "configured_budget_gb", return_value=0), \
+             patch.object(ego_accelerator, "scenario_buckets", return_value={"Gardening": [clip]}), \
+             patch.object(campaign, "ego_clip_cache_state", return_value="ready"):
+            self.assertEqual(ego_accelerator.ready_scenario_clips(
+                "Gardening", allow_disabled=True), [clip])
+
 
 class CampaignCacheOrderTests(unittest.TestCase):
     def test_holo_only_catalog_does_not_include_ego_cache(self):
@@ -313,6 +365,16 @@ class CampaignCacheOrderTests(unittest.TestCase):
         self.assertEqual(
             [clip["clip_uid"] for clip in ordered],
             ["local", "remote", "holo-remote"])
+
+    def test_holo_cache_is_preferred_without_ego_budget(self):
+        clips = [
+            {"clip_uid": "remote", "source": "holoassist"},
+            {"clip_uid": "local", "source": "holoassist"},
+        ]
+        with patch.object(ego_accelerator, "configured_budget_gb", return_value=0), \
+             patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] == "local"):
+            ordered = campaign._prefer_cached_clips(clips, Path("."))
+        self.assertEqual([clip["clip_uid"] for clip in ordered], ["local", "remote"])
 
     def test_zero_budget_gb_does_not_download(self):
         with tempfile.TemporaryDirectory() as tmp:

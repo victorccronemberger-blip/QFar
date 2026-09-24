@@ -82,6 +82,7 @@ class CampaignConfig:
     shuffle_schedule: bool = True
     target_hours_per_account: float = 0.0
     dataset_provider: str = "all"
+    content_mode: str = "both"
     # Evita crescimento contínuo do disco: após TODAS as contas pendentes
     # concluírem o upload, remove mídia/IMU baixadas e derivados locais.
     cleanup_after_upload: bool = True

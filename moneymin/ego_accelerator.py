@@ -7,6 +7,7 @@ estar no disco — a campanha não busca esse extra no Ego4D.
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import time
 from collections.abc import Callable, Iterable
@@ -127,6 +128,42 @@ def used_bytes(work_dir: Path | None = None) -> int:
     return total
 
 
+def reclaim_stale_native(work_dir: Path | None = None) -> dict[str, int]:
+    """Remove somente nativos Ego4D cujo marcador não vale mais para a fonte."""
+    from .campaign import _ego_clip_inputs, _ego_prepare_plan, _native_cache_key
+
+    work = Path(work_dir or data_dir())
+    result = {"files": 0, "bytes": 0}
+    if not work.is_dir() or not catalog_installed():
+        return result
+    for native in work.glob("*_native.mp4"):
+        if native.name.startswith("holoassist_") or not native.is_file():
+            continue
+        uid = native.stem.removesuffix("_native")
+        try:
+            row, video = _ego_clip_inputs({"clip_uid": uid})
+            if row is None or video is None:
+                continue
+            plan = _ego_prepare_plan(row)
+            if native.name != plan["native_name"]:
+                continue
+            source = work / plan["source_name"]
+            if not source.is_file() or source.stat().st_size <= 1024 * 1024:
+                continue
+            marker = native.with_name(native.name + ".source.json")
+            saved = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else None
+            if saved == _native_cache_key(source, plan["norm_start"], plan["dur_s"]):
+                continue
+            size = native.stat().st_size
+            native.unlink()
+            marker.unlink(missing_ok=True)
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            continue
+        result["files"] += 1
+        result["bytes"] += size
+    return result
+
+
 def estimate_clip_bytes(clip: dict[str, Any]) -> int:
     """Ordem de grandeza de fonte + native + IMU, para caber no orçamento."""
     minutes = max(float(clip.get("dur_s") or 0), 1.0) / 60.0
@@ -189,9 +226,10 @@ def ready_scenario_clips(
     min_dur_s: float = 60,
     max_dur_s: float = 1800,
     work_dir: Path | None = None,
+    allow_disabled: bool = False,
 ) -> list[dict[str, Any]]:
     """Clipes de cenário já normalizados. Sem orçamento gravado, a lista é vazia."""
-    if configured_budget_gb() < 1:
+    if not allow_disabled and configured_budget_gb() < 1:
         return []
     from .campaign import ego_clip_cache_state
 
@@ -402,6 +440,7 @@ def warm_cache(
         remember_budget(budget_gb)
     # Limpa apenas a parada da execução anterior, antes do catálogo demorado.
     stop_path().unlink(missing_ok=True)
+    reclaimed = reclaim_stale_native(work) if budget_gb is not None else {"files": 0, "bytes": 0}
     if budget_gb is None:
         clips = eligible_clips(
             task, min_dur_s=min_dur_s, max_dur_s=max_dur_s, limit=limit)
@@ -426,6 +465,8 @@ def warm_cache(
         "started_at": started,
         "updated_at": started,
         "errors": [],
+        "reclaimed_files": reclaimed["files"],
+        "reclaimed_bytes": reclaimed["bytes"],
     }
 
     def emit(kind: str, **payload: Any) -> None:

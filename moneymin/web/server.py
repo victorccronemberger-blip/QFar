@@ -2074,6 +2074,9 @@ def create_app() -> Flask:
             dataset_provider = campaign.normalize_dataset_provider(
                 request.args.get("dataset")
             )
+            content_mode = campaign.normalize_content_mode(
+                request.args.get("content_mode")
+            )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         try:
@@ -2088,6 +2091,7 @@ def create_app() -> Flask:
             tasks = campaign.available_tasks(
                 email, org_key, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
                 include_unavailable=True, dataset_provider=dataset_provider,
+                content_mode=content_mode,
                 session=sess)
         except json.JSONDecodeError:
             return jsonify({
@@ -2103,7 +2107,8 @@ def create_app() -> Flask:
                 msg = "a API devolveu resposta vazia (não-JSON). Tente de novo."
             return jsonify({"error": msg}), 400
         return jsonify({"email": email, "org_key": org_key,
-                        "dataset": dataset_provider, "tasks": tasks,
+                        "dataset": dataset_provider, "content_mode": content_mode,
+                        "tasks": tasks,
                         "scenarios_pt": campaign.SCENARIO_PT})
 
     # -- preferências -------------------------------------------------------------
@@ -2645,6 +2650,7 @@ def create_app() -> Flask:
             blockers.append("o acelerador está em execução")
         try:
             provider = campaign.normalize_dataset_provider(body.get("dataset"))
+            content_mode = campaign.normalize_content_mode(body.get("content_mode"))
             min_dur_s, max_dur_s = _parse_duration_range(body)
             count = max(1, min(int(body.get("count", 1)), 200))
             target_hours = max(0.0, min(float(body.get("target_hours") or 0), 12.0))
@@ -2688,7 +2694,8 @@ def create_app() -> Flask:
                 catalog = campaign.available_tasks(
                     accounts[0].email, accounts[0].org_key,
                     min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                    include_unavailable=True, dataset_provider=provider)
+                    include_unavailable=True, dataset_provider=provider,
+                    content_mode=content_mode)
                 if not isinstance(catalog, list) or any(not isinstance(item, dict) for item in catalog):
                     raise RuntimeError("resposta de categorias inválida")
                 catalog_loaded = True
@@ -2753,7 +2760,7 @@ def create_app() -> Flask:
         else:
             estimated_sends = len(selected) * count * len(accounts)
         try:
-            ready = readiness.campaign_readiness(provider)
+            ready = readiness.campaign_readiness(provider, content_mode=content_mode)
         except Exception as exc:  # noqa: BLE001 — ainda devolve os outros checks
             ready = {"ready": False, "checks": [], "error": str(exc)}
         readiness_errors = [
@@ -2843,6 +2850,7 @@ def create_app() -> Flask:
             dataset_provider = campaign.normalize_dataset_provider(
                 body.get("dataset")
             )
+            content_mode = campaign.normalize_content_mode(body.get("content_mode"))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         emails = [str(e).strip() for e in body.get("accounts", []) if str(e).strip()]
@@ -2894,7 +2902,8 @@ def create_app() -> Flask:
             skipped = []
         else:
             try:
-                environment = readiness.campaign_readiness(dataset_provider)
+                environment = readiness.campaign_readiness(
+                    dataset_provider, content_mode=content_mode)
             except (ValueError, OSError, RuntimeError) as exc:
                 return jsonify({"error": f"não foi possível validar a prontidão: {exc}"}), 400
             if environment.get("ready") is False:
@@ -2937,7 +2946,8 @@ def create_app() -> Flask:
                 available = campaign.available_tasks(
                     accounts[0].email, accounts[0].org_key,
                     min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                    include_unavailable=True, dataset_provider=dataset_provider)
+                    include_unavailable=True, dataset_provider=dataset_provider,
+                    content_mode=content_mode)
                 if not isinstance(available, list) or any(not isinstance(item, dict) for item in available):
                     raise RuntimeError("resposta de categorias inválida")
             except json.JSONDecodeError:
@@ -3054,6 +3064,7 @@ def create_app() -> Flask:
                              allow_new_accounts=False,
                              target_hours_per_account=target_hours,
                              dataset_provider=dataset_provider,
+                             content_mode=content_mode,
                              cleanup_after_upload=cleanup_after_upload,
                              realistic_timeline=True,
                              active_hours=active_hours)

@@ -71,6 +71,18 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertNotIn("scripts", catalog["detail"].casefold())
         self.assertFalse(result["ready"])
 
+    def test_installed_catalog_allows_cache_only_without_aws_credentials(self):
+        ego_dir = self.root / "data" / "ego4d"
+        ego_dir.mkdir(parents=True)
+        (ego_dir / "ego4d.json").write_text("{}", encoding="utf-8")
+        (ego_dir / "clips.csv").write_text("clip_uid\n", encoding="utf-8")
+        with mock.patch.object(readiness, "_aws_credentials_present", return_value=False), \
+             mock.patch("moneymin.campaign._load_rank_cache", return_value=None):
+            result = readiness.campaign_readiness("ego4d", content_mode="cache")
+        check = next(item for item in result["checks"] if item["name"] == "Credenciais Ego4D")
+        self.assertEqual(check["status"], "warning")
+        self.assertTrue(result["ready"])
+
     def test_release_instructions_never_reference_developer_scripts(self):
         with mock.patch.object(readiness, "_aws_credentials_present", return_value=True), \
              mock.patch.object(readiness.holoassist, "annotations_path", return_value=self.root / "missing.json"), \

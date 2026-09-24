@@ -979,8 +979,10 @@ QWidget* MainWindow::buildCampaignPage() {
   layout->setSpacing(14);
 
   auto* sourceBody = new QWidget;
-  auto* sourceLayout = new QHBoxLayout(sourceBody);
-  sourceLayout->setContentsMargins(0, 0, 0, 0);
+  auto* sourceColumn = new QVBoxLayout(sourceBody);
+  sourceColumn->setContentsMargins(0, 0, 0, 0);
+  auto* sourceLayout = new QHBoxLayout;
+  sourceColumn->addLayout(sourceLayout);
   _dataset = new ComboBox;
   configureCombo(_dataset, 180);
   _dataset->addItem(QStringLiteral("Conteúdo combinado"), QStringLiteral("all"));
@@ -991,6 +993,16 @@ QWidget* MainWindow::buildCampaignPage() {
           [this] { _taskReload.start(); });
   sourceLayout->addWidget(new QLabel(QStringLiteral("Origem")));
   sourceLayout->addWidget(_dataset, 1);
+  _contentMode = new ComboBox;
+  configureCombo(_contentMode, 190);
+  _contentMode->addItem(QStringLiteral("Cache + dataset"), QStringLiteral("both"));
+  _contentMode->addItem(QStringLiteral("Somente cache pronto"), QStringLiteral("cache"));
+  _contentMode->addItem(QStringLiteral("Catálogo do dataset"), QStringLiteral("dataset"));
+  _contentMode->setToolTip(QStringLiteral(
+      "Somente cache usa clipes já preparados. Catálogo seleciona clipes elegíveis sem priorizar o cache. "
+      "Cache + dataset começa pelos prontos e completa com o catálogo."));
+  connect(_contentMode, &QComboBox::currentIndexChanged, this,
+          [this] { _taskReload.start(); });
   auto* reloadTasks = new QPushButton(QStringLiteral("Recarregar categorias"));
   connect(reloadTasks, &QPushButton::clicked, this, &MainWindow::loadTasks);
   sourceLayout->addWidget(reloadTasks);
@@ -1020,6 +1032,11 @@ QWidget* MainWindow::buildCampaignPage() {
     });
   });
   sourceLayout->addWidget(_campaignReset);
+  auto* modeLayout = new QHBoxLayout;
+  modeLayout->addWidget(new QLabel(QStringLiteral("Uso da mídia")));
+  modeLayout->addWidget(_contentMode);
+  modeLayout->addStretch();
+  sourceColumn->addLayout(modeLayout);
   layout->addWidget(card(QStringLiteral("Conteúdo da campanha"), sourceBody));
 
   auto* selection = new QWidget;
@@ -1326,6 +1343,7 @@ QWidget* MainWindow::buildCampaignPage() {
       if (index >= 0) { const QSignalBlocker blocker(combo); combo->setCurrentIndex(index); }
     };
     restoreCombo(_dataset, draft.value(QStringLiteral("dataset")).toString());
+    restoreCombo(_contentMode, draft.value(QStringLiteral("content_mode")).toString());
     restoreCombo(_campaignAccountMode, draft.value(QStringLiteral("mode")).toString());
     restoreCombo(_delayMode, draft.value(QStringLiteral("delay_mode")).toString());
     _campaignDraftQuantity = qMax(1, draft.value(QStringLiteral("quantity")).toInt(1));
@@ -1355,6 +1373,7 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_campaignAccountMode, &QComboBox::currentIndexChanged, this, scheduleDraft);
   connect(_campaignAccountCount, &QSpinBox::valueChanged, this, scheduleDraft);
   connect(_dataset, &QComboBox::currentIndexChanged, this, scheduleDraft);
+  connect(_contentMode, &QComboBox::currentIndexChanged, this, scheduleDraft);
   connect(_targetHours, &QDoubleSpinBox::valueChanged, this, scheduleDraft);
   for (auto* spin : {_minDuration, _maxDuration, _delaySeconds, _hourStart, _hourEnd})
     connect(spin, &QSpinBox::valueChanged, this, scheduleDraft);
@@ -3110,10 +3129,11 @@ void MainWindow::loadTasks() {
   }
   _campaignStart->setEnabled(false);
   const QString path = QStringLiteral(
-      "/api/tasks?email=%1&min_dur_s=%2&max_dur_s=%3&dataset=%4")
+      "/api/tasks?email=%1&min_dur_s=%2&max_dur_s=%3&dataset=%4&content_mode=%5")
       .arg(encoded(account)).arg(_minDuration->value() * 60)
       .arg(_maxDuration->value() * 60)
-      .arg(encoded(_dataset->currentData().toString()));
+      .arg(encoded(_dataset->currentData().toString()))
+      .arg(encoded(_contentMode->currentData().toString()));
   _api.get(path, [this, generation](bool ok, const QJsonDocument& doc,
                                    const QString& error) {
     if (generation != _taskLoadGeneration) return;
@@ -3143,11 +3163,14 @@ void MainWindow::loadTasks() {
           || _campaignSelectedTaskIds.contains(taskId)) ? Qt::Checked : Qt::Unchecked);
       if (available) ++compatible;
       if (available && task.contains(QStringLiteral("parent_video_count"))) {
-        item->setToolTip(QStringLiteral("%1 trechos de %2 vídeos de origem identificados no catálogo.\n"
-                                       "A seleção inclui conteúdo ainda não baixado e alterna vídeos de origem.\n"
+        const bool cacheOnly = _contentMode->currentData().toString() == QStringLiteral("cache");
+        item->setToolTip(QStringLiteral("%1 trechos de %2 vídeos de origem.\n%3\n"
                                        "Os totais consideram a categoria, os sensores e a duração escolhida.")
                              .arg(task.value(QStringLiteral("clip_count")).toInt())
-                             .arg(task.value(QStringLiteral("parent_video_count")).toInt()));
+                             .arg(task.value(QStringLiteral("parent_video_count")).toInt())
+                             .arg(cacheOnly
+                                  ? QStringLiteral("Todos já estão preparados neste computador.")
+                                  : QStringLiteral("A seleção pode incluir conteúdo ainda não baixado.")));
       }
       if (!available) {
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
@@ -3213,6 +3236,7 @@ void MainWindow::startCampaign() {
   QJsonObject body{
       {QStringLiteral("accounts"), accounts},
       {QStringLiteral("dataset"), _dataset->currentData().toString()},
+      {QStringLiteral("content_mode"), _contentMode->currentData().toString()},
       {QStringLiteral("tasks"), tasks},
       {QStringLiteral("count"), 1},
       {QStringLiteral("target_hours"), _targetHours->value()},
@@ -3710,6 +3734,13 @@ void MainWindow::loadAccelerator() {
                QString::number(lastRun.value(QStringLiteral("ready")).toInt()),
                QString::number(lastRun.value(QStringLiteral("total")).toInt()),
                QString::number(lastRun.value(QStringLiteral("failed")).toInt()), when));
+      const int reclaimedFiles = lastRun.value(QStringLiteral("reclaimed_files")).toInt();
+      if (reclaimedFiles > 0)
+        _cacheLastRun->setText(_cacheLastRun->text()
+            + QStringLiteral("\nCache obsoleto recuperado: %1 arquivo(s), %2 GB.")
+                  .arg(reclaimedFiles)
+                  .arg(QLocale().toString(
+                      lastRun.value(QStringLiteral("reclaimed_bytes")).toDouble() / (1024.0 * 1024 * 1024), 'f', 1)));
       const auto errors = lastRun.value(QStringLiteral("errors")).toArray();
       if (!errors.isEmpty())
         _cacheLastRun->setText(_cacheLastRun->text() + QStringLiteral("\nÚltima falha: ")
@@ -4672,6 +4703,7 @@ void MainWindow::saveCampaignDraft() {
       {QStringLiteral("mode"), _campaignAccountMode->currentData().toString()},
       {QStringLiteral("quantity"), _campaignAccountCount->value()},
       {QStringLiteral("dataset"), _dataset->currentData().toString()},
+      {QStringLiteral("content_mode"), _contentMode->currentData().toString()},
       {QStringLiteral("target_hours"), _targetHours->value()},
       {QStringLiteral("min_duration"), _minDuration->value()},
       {QStringLiteral("max_duration"), _maxDuration->value()},

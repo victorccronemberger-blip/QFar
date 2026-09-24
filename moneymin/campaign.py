@@ -152,6 +152,7 @@ MIN_DUR_MS, MAX_DUR_MS = 60000, 1800000
 # O sufixo `{session}_{i}` continua existindo apenas para gravações que
 # realmente excedam o teto remoto.
 DATASET_PROVIDERS = frozenset({"all", "ego4d", "holoassist"})
+CONTENT_MODES = frozenset({"both", "cache", "dataset"})
 
 
 # --- meios (helpers) ----------------------------------------------------------
@@ -161,6 +162,13 @@ def normalize_dataset_provider(value: str | None) -> str:
     if provider not in DATASET_PROVIDERS:
         raise ValueError("dataset inválido (all|ego4d|holoassist)")
     return provider
+
+
+def normalize_content_mode(value: str | None) -> str:
+    mode = str(value or "both").strip().lower()
+    if mode not in CONTENT_MODES:
+        raise ValueError("modo de conteúdo inválido (both|cache|dataset)")
+    return mode
 
 def _frames_csv(duration_ms: int, fps: float = 30.0) -> str:
     return build_frames_csv(duration_ms, fps)
@@ -584,6 +592,7 @@ def prepare_clip(
     work_dir: Path,
     *,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
+    allow_download: bool = True,
 ) -> dict[str, Any]:
     """Baixa clipe + IMU real, normaliza o vídeo e monta o sidecar. (sem upload)"""
     work_dir = Path(work_dir)
@@ -610,7 +619,10 @@ def prepare_clip(
     # exemplo, acelerômetro ausente por ~1 s) visíveis somente no CSV. Antes a
     # campanha gastava vários minutos no encode e só então descartava o clipe.
     _progress("imu_lookup")
-    imu_path = ego4d.download_imu(video, work_dir / f"{parent_uid}_imu.csv")
+    local_imu = work_dir / f"{parent_uid}_imu.csv"
+    if not allow_download and not ego4d._valid_imu_cache(local_imu):
+        raise RuntimeError(f"IMU local ausente ou inválida para {clip_uid}")
+    imu_path = ego4d.download_imu(video, local_imu) if allow_download else local_imu
     if imu_path is None:
         raise RuntimeError(
             f"clipe {clip_uid} sem IMU real — não enviar (coerência sensor falharia)."
@@ -622,14 +634,16 @@ def prepare_clip(
 
     _progress("video_lookup")
     source_video_path = work_dir / plan["source_name"]
+    if not allow_download and not ego4d._valid_mp4_cache(source_video_path):
+        raise RuntimeError(f"vídeo local ausente ou inválido para {clip_uid}")
     if plan["needs_cut"]:
         # Prefere o clip oficial CRF 18 quando ele contém a janela; o IMU
         # continua no relógio absoluto do vídeo canônico.
-        if not ego4d._valid_mp4_cache(source_video_path):
+        if allow_download and not ego4d._valid_mp4_cache(source_video_path):
             source = dict(clip)
             source["needs_cut"] = False
             ego4d.download_clip(source, source_video_path)
-    else:
+    elif allow_download:
         ego4d.download_clip(clip, source_video_path)
     _progress("encode")
     native = _normalize_video(
@@ -680,6 +694,7 @@ def prepare_holoassist_clip(
     work_dir: Path,
     *,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
+    allow_download: bool = True,
 ) -> dict[str, Any]:
     """Baixa e prepara uma gravação HoloAssist estritamente elegível.
 
@@ -720,13 +735,20 @@ def prepare_holoassist_clip(
             )
         return holoassist.download_video(video_name, compressed=compressed)
 
-    try:
-        source_video = _download_holo_video()
-    except FileNotFoundError:
-        # Algumas sessões anotadas não existem no TAR pitch-shifted oficial,
-        # mas estão no TAR comprimido. É a mesma gravação e mantém o IMU.
-        _progress("video_fallback", source="Video_compress.mp4")
-        source_video = _download_holo_video(compressed=True)
+    if pitchshift.exists():
+        source_video = pitchshift
+    elif compressed.exists():
+        source_video = compressed
+    else:
+        if not allow_download:
+            raise RuntimeError(f"vídeo HoloAssist local ausente para {video_name}")
+        try:
+            source_video = _download_holo_video()
+        except FileNotFoundError:
+            # Algumas sessões anotadas não existem no TAR pitch-shifted oficial,
+            # mas estão no TAR comprimido. É a mesma gravação e mantém o IMU.
+            _progress("video_fallback", source="Video_compress.mp4")
+            source_video = _download_holo_video(compressed=True)
     _progress("video_ready", bytes=source_video.stat().st_size)
 
     sensor_dir = holoassist.data_dir() / "recordings" / video_name / "IMU"
@@ -735,7 +757,12 @@ def prepare_holoassist_clip(
     )
     sensors_cached = all((sensor_dir / name).exists() for name in sensor_names)
     _progress("imu_cached" if sensors_cached else "imu_lookup")
-    if progress:
+    if not allow_download:
+        sensors = {name: sensor_dir / name for name in sensor_names}
+        if any(not path.is_file() or path.stat().st_size == 0
+               for path in sensors.values()):
+            raise RuntimeError(f"sensores HoloAssist locais ausentes para {video_name}")
+    elif progress:
         sensors = holoassist.download_imu(
             video_name,
             progress=lambda phase, current, total: _progress(
@@ -1843,6 +1870,7 @@ def _run_campaign(
         return out
 
     dataset_provider = normalize_dataset_provider(config.dataset_provider)
+    content_mode = normalize_content_mode(config.content_mode)
 
     log = log or CampaignLog(started_at=_recorded_at_now(),
                              accounts=[a.email for a in config.accounts])
@@ -1856,7 +1884,7 @@ def _run_campaign(
     per_task_cap_s = (quota_s / n_tasks) * 1.3 if quota_s else 0.0
     _emit("campaign_start", accounts=[a.email for a in config.accounts],
           tasks=[t.task_name or t.scenario for t in config.tasks],
-          dataset=dataset_provider,
+          dataset=dataset_provider, content_mode=content_mode,
           cleanup_after_upload=bool(config.cleanup_after_upload))
 
     # Fica True somente depois que um vídeo foi realmente enviado. O intervalo
@@ -1882,12 +1910,20 @@ def _run_campaign(
                 # automática; config antiga/manual não pode furar o matching.
                 clips = []
                 ego_compatible: dict[str, dict[str, Any]] | None = None
-                if tsk.task_name and task_matching.rule_for(tsk.task_name):
+                if (dataset_provider in ("all", "ego4d") and tsk.task_name
+                        and task_matching.rule_for(tsk.task_name)):
+                    compatible_ego = list(_compatible_task_clips(
+                        tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
+                        max_dur_s=tsk.max_dur_s))
+                    if content_mode != "dataset":
+                        compatible_ego = _with_cached_expansion(
+                            compatible_ego, tsk.task_name,
+                            min_dur_s=tsk.min_dur_s,
+                            max_dur_s=tsk.max_dur_s, work_dir=work_dir,
+                            include_disabled=content_mode == "cache")
                     ego_compatible = {
                         candidate["clip_uid"]: candidate
-                        for candidate in _compatible_task_clips(
-                            tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
-                            max_dur_s=tsk.max_dur_s)
+                        for candidate in compatible_ego
                         if tsk.min_dur_s <= float(candidate.get("dur_s") or 0)
                         <= tsk.max_dur_s
                     }
@@ -1948,12 +1984,14 @@ def _run_campaign(
                     if tsk.task_name and task_matching.rule_for(tsk.task_name):
                         # A mesma seleção usada pela tela inclui o índice
                         # portátil mesmo quando há narrações locais parciais.
-                        shorts = _with_cached_expansion(
-                            list(_compatible_task_clips(
-                                tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
-                                max_dur_s=tsk.max_dur_s)),
-                            tsk.task_name, min_dur_s=tsk.min_dur_s,
-                            max_dur_s=tsk.max_dur_s, work_dir=work_dir)
+                        shorts = list(_compatible_task_clips(
+                            tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
+                            max_dur_s=tsk.max_dur_s))
+                        if content_mode != "dataset":
+                            shorts = _with_cached_expansion(
+                                shorts, tsk.task_name, min_dur_s=tsk.min_dur_s,
+                                max_dur_s=tsk.max_dur_s, work_dir=work_dir,
+                                include_disabled=content_mode == "cache")
                     else:
                         shorts = ego4d.list_clips(
                             scenario=tsk.scenario,
@@ -1971,6 +2009,8 @@ def _run_campaign(
                     # Fonte complementar primeiro: são sessões inteiras de uma
                     # tarefa rotulada, não inferências por texto de narração.
                     shorts = [*strict_holoassist, *shorts]
+                if content_mode == "cache":
+                    shorts = [clip for clip in shorts if _clip_is_cached(clip, work_dir)]
                 all_clips = shorts
                 fresh = []
                 used_parents = set()
@@ -1993,7 +2033,8 @@ def _run_campaign(
                      f"sessões ({merged_n} cortes do vídeo-pai, {hours:.1f}h)")
                 clips = _prefer_cached_clips(diverse_order(ego4d.prefer_long_clips(
                     fresh, shuffle=config.shuffle_schedule), used_parents=used_parents),
-                    work_dir)
+                    work_dir, prioritize=content_mode != "dataset",
+                    include_ego_cache=content_mode == "cache")
                 _emit("content_pool", task_name=display_name, clips=len(clips),
                       **diversity_summary(clips))
         except Exception as exc:  # noqa: BLE001 — uma categoria não mata as demais
@@ -2002,14 +2043,26 @@ def _run_campaign(
             _emit("task_error", scenario=tsk.scenario, task_name=display_name,
                   error=error)
             continue
+        if tsk.clip_uids:
+            clips = _maybe_shuffle(clips)
+            if content_mode == "cache":
+                clips = [clip for clip in clips if _clip_is_cached(clip, work_dir)]
+            if config.cleanup_after_upload:
+                from .ego_accelerator import configured_budget_gb
+
+                ego_cache_enabled = configured_budget_gb() >= 1 or content_mode == "cache"
+                clips = [
+                    {**clip, "_cache_ready_at_selection": True}
+                    if ((ego_cache_enabled or clip.get("source") == "holoassist")
+                        and _clip_is_cached(clip, work_dir)) else clip
+                    for clip in clips
+                ]
         if not clips:
             _log(f"  [!] nenhum clipe encontrado p/ cenário '{tsk.scenario}'")
             _emit("task_empty", scenario=tsk.scenario, task_name=display_name,
                   min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
                   dataset=dataset_provider)
             continue
-        if tsk.clip_uids:
-            clips = _maybe_shuffle(clips)
         task_accounts = _maybe_shuffle(list(config.accounts))
         completed_items = 0
         needed_items = (10 ** 9 if quota_s else
@@ -2043,6 +2096,11 @@ def _run_campaign(
                     _emit("account_done", clip_uid=clip_info["clip_uid"],
                           task=tsk.scenario, email=account.email, ok=True,
                           skipped=True)
+                continue
+            if content_mode == "cache" and not _clip_is_cached(clip_info, work_dir):
+                _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
+                      task_name=display_name, ok=False,
+                      error="clipe saiu do cache antes do preparo")
                 continue
             # Intervalo ENTRE VÍDEOS: é devido uma única vez depois de um envio
             # bem-sucedido. Assim, um prepare que falhar após esta espera não faz
@@ -2092,14 +2150,16 @@ def _run_campaign(
 
                 if item is None and clip_info.get("source") == "holoassist":
                     item = prepare_holoassist_clip(
-                        clip_info, work_dir, progress=_prepare_progress
+                        clip_info, work_dir, progress=_prepare_progress,
+                        allow_download=content_mode != "cache",
                     )
                 if item is None:
                     clip, video = _ego_clip_inputs(clip_info)
                     if clip is None or video is None:
                         raise RuntimeError("clipe ou vídeo pai ausente no manifest")
                     item = prepare_clip(
-                        clip, video, work_dir, progress=_prepare_progress)
+                        clip, video, work_dir, progress=_prepare_progress,
+                        allow_download=content_mode != "cache")
                 # A duração real pode diferir das anotações ou de um cache antigo.
                 # Nunca envie um MP4 que ultrapasse o teto escolhido.
                 if float(item["duration_ms"]) > tsk.max_dur_s * 1000:
@@ -2129,7 +2189,7 @@ def _run_campaign(
                 )
             else:
                 should_prefetch = completed_items + 1 < needed_items
-            if should_prefetch:
+            if should_prefetch and content_mode != "cache":
                 _prefetch_following(
                     prefetch,
                     clips,
@@ -2537,7 +2597,13 @@ def _run_campaign(
                 )
             if pending_accounts:
                 completed_items += 1
-                if config.cleanup_after_upload and all_pending_succeeded:
+                if (config.cleanup_after_upload and all_pending_succeeded
+                        and clip_info.get("_cache_ready_at_selection")):
+                    removed, freed = _enforce_account_video_cache(work_dir)
+                    _log("  armazenamento: cache preparado preservado"
+                         + (f"; variantes antigas: {removed} arquivo(s), "
+                            f"{freed / (1024 ** 3):.1f} GB liberados" if removed else ""))
+                elif config.cleanup_after_upload and all_pending_succeeded:
                     cleanup = _cleanup_uploaded_item(
                         item,
                         work_dir,
@@ -2911,6 +2977,7 @@ def _with_cached_expansion(
     min_dur_s: float,
     max_dur_s: float,
     work_dir: Path | None = None,
+    include_disabled: bool = False,
 ) -> list[dict[str, Any]]:
     """Acrescenta cenário já gravado pelo acelerador, sem buscar mídia nova."""
     from .ego_accelerator import ready_scenario_clips
@@ -2918,7 +2985,8 @@ def _with_cached_expansion(
     merged = list(clips)
     seen = {str(clip.get("clip_uid") or "") for clip in merged}
     for extra in ready_scenario_clips(
-            task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s, work_dir=work_dir):
+            task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+            work_dir=work_dir, allow_disabled=include_disabled):
         uid = str(extra.get("clip_uid") or "")
         if not uid or uid in seen:
             continue
@@ -2935,22 +3003,30 @@ def _clip_is_cached(clip: dict[str, Any], work_dir: Path) -> bool:
 
 
 def _prefer_cached_clips(
-    clips: list[dict[str, Any]], work_dir: Path,
+    clips: list[dict[str, Any]], work_dir: Path, *,
+    prioritize: bool = True, include_ego_cache: bool = False,
 ) -> list[dict[str, Any]]:
     """Com cache ligado, esgota o disco e depois o provedor. Sem cache, a ordem é a do provedor."""
     from .ego_accelerator import configured_budget_gb
 
     ordered = list(clips)
-    if configured_budget_gb() < 1:
+    ego_cache_enabled = configured_budget_gb() >= 1 or include_ego_cache
+    if not ego_cache_enabled and not any(
+            str(clip.get("source") or "") == "holoassist" for clip in ordered):
         return ordered
     ready: list[dict[str, Any]] = []
     later: list[dict[str, Any]] = []
+    in_original_order: list[dict[str, Any]] = []
     for clip in ordered:
-        if _clip_is_cached(clip, work_dir):
-            ready.append(clip)
+        if (ego_cache_enabled or str(clip.get("source") or "") == "holoassist") \
+                and _clip_is_cached(clip, work_dir):
+            marked = {**clip, "_cache_ready_at_selection": True}
+            ready.append(marked)
+            in_original_order.append(marked)
         else:
             later.append(clip)
-    return ready + later
+            in_original_order.append(clip)
+    return ready + later if prioritize else in_original_order
 
 
 def warm_task_catalog() -> None:
@@ -2962,6 +3038,7 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                     max_dur_s: float = 1800,
                     include_unavailable: bool = False,
                     dataset_provider: str = "all",
+                    content_mode: str = "both",
                     session: Session | None = None) -> list[dict[str, Any]]:
     """Devolve as tasks do Minute que têm mídia elegível com IMU real.
 
@@ -2978,6 +3055,16 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
     elif not getattr(sess, "_live", False):
         sess.ensure_auth(org_key=org_key)
     tasks = sess.all_tasks(org_key)
+    mode = normalize_content_mode(content_mode)
+    ready_by_uid: dict[str, bool] = {}
+
+    def cache_ready(clip: dict[str, Any]) -> bool:
+        uid = str(clip.get("clip_uid") or "")
+        if uid not in ready_by_uid:
+            ready_by_uid[uid] = _clip_is_cached(
+                clip, config.MEDIA_DATA_DIR / "ego4d")
+        return ready_by_uid[uid]
+
     out = []
     for t in tasks:
         name = (t.get("name") or "").strip()
@@ -2996,11 +3083,17 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                      if 60 <= c["dur_s"] <= 1800]
         clips = list(_compatible_task_clips(
             name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
-        if normalize_dataset_provider(dataset_provider) in ("all", "ego4d"):
+        if (mode != "dataset"
+                and normalize_dataset_provider(dataset_provider) in ("all", "ego4d")):
             all_clips = _with_cached_expansion(
-                all_clips, name, min_dur_s=60, max_dur_s=1800)
+                all_clips, name, min_dur_s=60, max_dur_s=1800,
+                include_disabled=mode == "cache")
             clips = _with_cached_expansion(
-                clips, name, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+                clips, name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                include_disabled=mode == "cache")
+        if mode == "cache":
+            all_clips = [clip for clip in all_clips if cache_ready(clip)]
+            clips = [clip for clip in clips if cache_ready(clip)]
         if clips or include_unavailable:
             source_counts: dict[str, int] = {}
             for clip in clips:

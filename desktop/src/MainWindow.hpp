@@ -220,6 +220,7 @@ private:
   QLabel* _integrationSecurity{};
 
   QComboBox* _dataset{};
+  QComboBox* _contentMode{};
   QListWidget* _campaignAccounts{};
   QLineEdit* _campaignAccountSearch{};
   QComboBox* _campaignAccountMode{};

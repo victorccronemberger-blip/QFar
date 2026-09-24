@@ -137,11 +137,15 @@ def _aws_credentials_present() -> bool:
     return False
 
 
-def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
+def campaign_readiness(
+    provider: str | None = None, *, content_mode: str = "both",
+) -> dict[str, Any]:
     """Retorna checks locais sem autenticar contas nem enviar dados."""
     selected = (provider or _provider_from_preferences()).strip().lower()
     if selected not in {"holoassist", "ego4d", "all"}:
         raise ValueError("provider deve ser holoassist, ego4d ou all")
+    from .campaign import normalize_content_mode
+    mode = normalize_content_mode(content_mode)
 
     checks: list[dict[str, str]] = []
     ffmpeg = ffmpeg_bin()
@@ -234,8 +238,11 @@ def campaign_readiness(provider: str | None = None) -> dict[str, Any]:
         ))
         checks.append(_check(
             "Credenciais Ego4D",
-            "ok" if aws_ok else "error",
-            "perfil AWS encontrado" if aws_ok else "perfil AWS autorizado não encontrado",
+            "ok" if aws_ok else ("warning" if mode == "cache" and catalog_ok else "error"),
+            "perfil AWS encontrado" if aws_ok else (
+                "cache local pode ser usado; downloads Ego4D exigem credenciais"
+                if mode == "cache" and catalog_ok else
+                "perfil AWS autorizado não encontrado"),
         ))
         if catalog_ok:
             from . import ego_accelerator

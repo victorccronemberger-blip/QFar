@@ -9,6 +9,38 @@ from moneymin.web.runner import HoloCacheRunner
 
 
 class HoloCancelTests(unittest.TestCase):
+    def test_prepared_compressed_video_never_looks_up_remote_pitchshift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            recording = root / "recordings" / "fixture"
+            recording.mkdir(parents=True)
+            compressed = recording / "Video_compress.mp4"
+            compressed.write_bytes(b"cached")
+            native = root / "native.mp4"
+            native.write_bytes(b"native")
+            sensors = {
+                name: recording / "IMU" / name
+                for name in ("Accelerometer_sync.txt", "Gyroscope_sync.txt",
+                             "Magnetometer_sync.txt")
+            }
+            for path in sensors.values():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("cached", encoding="utf-8")
+            clip = {"clip_uid": "holoassist:fixture", "video_name": "fixture",
+                    "task_type": "assemble stool", "correct_action_ratio": 1.0}
+            with patch.object(campaign.holoassist, "data_dir", return_value=root), \
+                 patch.object(campaign.holoassist, "download_video") as download, \
+                 patch.object(campaign.holoassist, "download_imu") as download_imu, \
+                 patch.object(campaign.holoassist, "build_imu_csv", return_value="imu"), \
+                 patch.object(campaign, "_normalize_video", return_value=native) as normalize, \
+                 patch.object(campaign, "probe_video", return_value={"duration_ms": 300000, "fps": 30}), \
+                 patch.object(campaign, "_frames_csv", return_value="frames"):
+                result = campaign.prepare_holoassist_clip(clip, root, allow_download=False)
+            download.assert_not_called()
+            download_imu.assert_not_called()
+            self.assertEqual(normalize.call_args.args[0], compressed)
+            self.assertEqual(result["source"], "holoassist")
+
     def test_stop_during_catalog_load_prevents_first_download(self):
         stop = threading.Event()
         with tempfile.TemporaryDirectory() as tmp:

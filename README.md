@@ -34,10 +34,19 @@ cache aparecem separadamente: atingir 400 GB não é o critério de conclusão.
 A tela mostra a fase do clipe atual, falhas e o último resultado salvo com horário.
 Se o serviço foi encerrado durante a preparação, a execução anterior aparece
 como interrompida e **Retomar preparação** reutiliza os clipes já prontos.
+Ao retomar, derivados Ego4D de versões ou janelas antigas que já não podem ser
+usados são removidos para liberar espaço; vídeos-fonte e sensores são mantidos.
 Atualizações durante a execução consultam um estado leve, sem reexaminar o
 catálogo inteiro a cada leitura.
 
 ## Campanhas
+
+Em **Conteúdo da campanha**, escolha a origem (Ego4D, HoloAssist ou as duas)
+e o uso da mídia: **Somente cache pronto** limita a campanha aos clipes já
+preparados neste computador e não baixa mídia; **Catálogo do dataset** mantém
+a ordem do catálogo sem priorizar o cache; **Cache + dataset** usa os prontos
+primeiro e completa com o catálogo. Mídia já preparada é preservada após o
+envio mesmo quando a limpeza automática está ligada.
 
 Na aba **Nova campanha**, escolha as contas manualmente (com **Todas** e
 **Limpar** para ajustar a lista), use **Sortear contas** ou escolha **Rodízio: menos usadas**

@@ -70,6 +70,165 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(self.mark.call_count, 2)
         self.cleanup.assert_called_once()
 
+    def test_task_preview_and_preflight_receive_content_mode(self):
+        with patch.object(campaign, "available_tasks", return_value=[{
+                "id": "task", "name": "Furniture Assembly",
+                "scenario": "assembling furniture", "clip_count": 1,
+                "available_for_duration": True}]) as available:
+            preview = self.client.get(
+                "/api/tasks?email=a%40example.com&dataset=ego4d&content_mode=cache")
+            self.assertEqual(preview.status_code, 200, preview.get_json())
+            self.assertEqual(available.call_args.kwargs["content_mode"], "cache")
+            preflight = self.client.post(
+                "/api/campaigns/preflight", json={**self.body, "content_mode": "cache"})
+            self.assertEqual(preflight.status_code, 200, preflight.get_json())
+            self.assertEqual(available.call_args.kwargs["content_mode"], "cache")
+
+    def test_unknown_content_mode_is_rejected(self):
+        response = self.client.post(
+            "/api/campaigns", json={**self.body, "content_mode": "unknown"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("modo de conteúdo inválido", response.get_json()["error"])
+
+    def test_prepared_cache_survives_successful_campaign(self):
+        with patch("moneymin.ego_accelerator.configured_budget_gb", return_value=400), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \
+             patch.object(campaign, "_clip_is_cached", return_value=True), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            response = self.client.post("/api/campaigns", json=self.body)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "done"))
+        self.cleanup.assert_not_called()
+        self.assertEqual(self.prepare.call_count, 1)
+
+    def test_prepared_holo_cache_survives_without_ego_budget(self):
+        holo = {"clip_uid": "holoassist:clip", "video_name": "clip",
+                "dur_s": 300, "source": "holoassist"}
+        with patch("moneymin.ego_accelerator.configured_budget_gb", return_value=0), \
+             patch.object(campaign.holoassist, "list_clips", return_value=[holo]), \
+             patch.object(campaign, "_clip_is_cached", return_value=True), \
+             patch.object(campaign, "prepare_holoassist_clip", return_value={
+                 "duration_ms": 300000, "video_path": str(self.root / "holo.mp4"),
+                 "imu_real": True}), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            response = self.client.post("/api/campaigns", json={**self.body, "dataset": "holoassist"})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "done"))
+        self.cleanup.assert_not_called()
+        self.prepare.assert_not_called()
+
+    def test_mixed_cache_and_dataset_uses_cache_first_and_cleans_only_download(self):
+        candidates = [
+            {"clip_uid": "remote", "parent_video_uid": "remote-parent",
+             "dur_s": 300, "source": "ego4d"},
+            {"clip_uid": "local", "parent_video_uid": "local-parent",
+             "dur_s": 300, "source": "ego4d"},
+        ]
+        self.prepare.side_effect = lambda row, *_args, **_kwargs: {
+            "clip_uid": row["clip_uid"], "duration_ms": 300000,
+            "video_path": str(self.root / "fixture.mp4"), "imu_real": True}
+        with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch.object(campaign.holoassist, "list_clips", return_value=[]), \
+             patch("moneymin.ego_accelerator.configured_budget_gb", return_value=400), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \
+             patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] == "local"), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            response = self.client.post("/api/campaigns", json={**self.body, "dataset": "all", "count": 2})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "done"))
+        self.assertEqual([item["clip_uid"] for item in log["items"]], ["local", "remote"])
+        self.cleanup.assert_called_once()
+
+    def test_cache_only_never_selects_remote_clip(self):
+        candidates = [
+            {"clip_uid": "remote", "parent_video_uid": "first", "dur_s": 300, "source": "ego4d"},
+            {"clip_uid": "local", "parent_video_uid": "second", "dur_s": 300, "source": "ego4d"},
+        ]
+        self.prepare.side_effect = lambda row, *_args, **_kwargs: {
+            "clip_uid": row["clip_uid"], "duration_ms": 300000,
+            "video_path": str(self.root / "fixture.mp4"), "imu_real": True}
+        with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \
+             patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] == "local"), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            response = self.client.post("/api/campaigns", json={**self.body, "content_mode": "cache"})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "done"))
+        self.assertEqual([item["clip_uid"] for item in log["items"]], ["local"])
+        self.cleanup.assert_not_called()
+        self.assertFalse(self.prepare.call_args.kwargs["allow_download"])
+
+    def test_cache_only_does_not_prefetch_next_clip(self):
+        candidates = [
+            {"clip_uid": "one", "parent_video_uid": "first", "dur_s": 300, "source": "ego4d"},
+            {"clip_uid": "two", "parent_video_uid": "second", "dur_s": 300, "source": "ego4d"},
+        ]
+        self.prepare.side_effect = lambda row, *_args, **_kwargs: {
+            "clip_uid": row["clip_uid"], "duration_ms": 300000,
+            "video_path": str(self.root / "fixture.mp4"), "imu_real": True}
+        with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \
+             patch.object(campaign, "_clip_is_cached", return_value=True), \
+             patch.object(campaign, "_prefetch_following") as prefetch, \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            response = self.client.post("/api/campaigns", json={
+                **self.body, "content_mode": "cache", "count": 2})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "done"))
+        self.assertEqual(len(log["items"]), 2)
+        prefetch.assert_not_called()
+
+    def test_dataset_mode_keeps_catalog_order_without_cache_priority(self):
+        candidates = [
+            {"clip_uid": "remote", "parent_video_uid": "first", "dur_s": 300, "source": "ego4d"},
+            {"clip_uid": "local", "parent_video_uid": "second", "dur_s": 300, "source": "ego4d"},
+        ]
+        self.prepare.side_effect = lambda row, *_args, **_kwargs: {
+            "clip_uid": row["clip_uid"], "duration_ms": 300000,
+            "video_path": str(self.root / "fixture.mp4"), "imu_real": True}
+        with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch("moneymin.ego_accelerator.configured_budget_gb", return_value=400), \
+             patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] == "local"):
+            response = self.client.post("/api/campaigns", json={**self.body, "content_mode": "dataset"})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "done"))
+        self.assertEqual([item["clip_uid"] for item in log["items"]], ["remote"])
+        self.cleanup.assert_called_once()
+
+    def test_invalid_dataset_imu_falls_back_to_next_clip(self):
+        candidates = [
+            {"clip_uid": "invalid", "parent_video_uid": "first",
+             "dur_s": 300, "source": "ego4d"},
+            {"clip_uid": "valid", "parent_video_uid": "second",
+             "dur_s": 300, "source": "ego4d"},
+        ]
+        def prepare(row, *_args, **_kwargs):
+            if row["clip_uid"] == "invalid":
+                raise RuntimeError("cobertura IMU insuficiente")
+            return {"clip_uid": row["clip_uid"], "duration_ms": 300000,
+                    "video_path": str(self.root / "fixture.mp4"), "imu_real": True}
+        self.prepare.side_effect = prepare
+        with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})):
+            response = self.client.post("/api/campaigns", json={**self.body, "count": 1})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual((snap["state"], log["status"]), ("done", "partial"))
+        self.assertTrue(any(issue["kind"] == "clip_prepare_done" for issue in log["issues"]))
+        self.assertEqual([item["clip_uid"] for item in log["items"]], ["valid"])
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(self.send.call_count, 2)
+
     def test_catalog_shortfall_is_partial_not_completed(self):
         response = self.client.post("/api/campaigns", json={**self.body, "count": 3})
         self.assertEqual(response.status_code, 200)
