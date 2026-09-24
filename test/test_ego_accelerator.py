@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from moneymin import campaign, ego_accelerator
+from moneymin import campaign, ego_accelerator, holo_accelerator
 from moneymin.web.runner import HoloCacheRunner
 
 
@@ -145,6 +145,43 @@ class EgoWarmTests(unittest.TestCase):
 
 
 class EgoBudgetTests(unittest.TestCase):
+    def test_full_budget_still_counts_ready_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clips = [{"clip_uid": "ready"}, {"clip_uid": "pending"}]
+            with patch.object(ego_accelerator, "storage_limits", return_value={"budget_gb": 1}), \
+                 patch.object(ego_accelerator, "remember_budget"), \
+                 patch.object(ego_accelerator, "allocation_plan", return_value=clips), \
+                 patch.object(ego_accelerator, "used_bytes", return_value=ego_accelerator.budget_bytes(1)), \
+                 patch.object(ego_accelerator, "stop_path", return_value=root / "stop"), \
+                 patch.object(ego_accelerator, "state_path", return_value=root / "state.json"), \
+                 patch.object(campaign, "ego_clip_cache_state", side_effect=["ready", "pending"]), \
+                 patch.object(campaign, "prepare_clip") as prepare:
+                result = ego_accelerator.warm_cache(work_dir=root, budget_gb=1)
+            self.assertEqual(result["status"], "budget")
+            self.assertEqual(result["ready"], 1)
+            self.assertEqual(result["index"], 2)
+            prepare.assert_not_called()
+
+    def test_status_counts_partial_separately_from_pending(self):
+        clips = [{"clip_uid": str(index)} for index in range(3)]
+        with patch.object(ego_accelerator, "eligible_clips", return_value=clips), \
+             patch.object(ego_accelerator, "_states", return_value=["ready", "partial", "pending"]):
+            status = ego_accelerator.cache_status()
+        self.assertEqual((status["ready"], status["partial"], status["pending"]), (1, 1, 1))
+
+    def test_holo_status_counts_partial_separately_from_pending(self):
+        clips = [{"video_name": str(index)} for index in range(3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "1.mp4").write_bytes(b"partial")
+            with patch.object(holo_accelerator, "eligible_clips", return_value=clips), \
+                 patch.object(holo_accelerator, "clip_ready", side_effect=lambda clip, *_: clip["video_name"] == "0"), \
+                 patch.object(holo_accelerator, "source_path", side_effect=lambda clip: root / f'{clip["video_name"]}.mp4'), \
+                 patch.object(holo_accelerator, "native_path", return_value=root / "missing.mp4"):
+                status = holo_accelerator.cache_status()
+        self.assertEqual((status["ready"], status["partial"], status["pending"]), (1, 1, 1))
+
     def test_plan_shares_budget_across_tasks(self):
         names = ["Cooking", "Gardening", "Cleaning"]
         batches = {

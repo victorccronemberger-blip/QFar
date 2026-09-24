@@ -91,7 +91,7 @@ def cache_status(
         "total": len(clips),
         "ready": ready,
         "partial": partial,
-        "pending": len(clips) - ready,
+        "pending": len(clips) - ready - partial,
         "last_run": previous,
     }
 

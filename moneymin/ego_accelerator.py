@@ -346,7 +346,7 @@ def cache_status(
         "total": len(clips),
         "ready": ready,
         "partial": partial,
-        "pending": len(clips) - ready,
+        "pending": len(clips) - ready - partial,
         "last_run": previous,
     }
     if storage is not None:
@@ -442,10 +442,6 @@ def warm_cache(
             if stop_path().exists() or (should_stop is not None and should_stop()):
                 state["status"] = "stopped"
                 break
-            if budget is not None and used_bytes(work) >= budget:
-                state["status"] = "budget"
-                state["used_bytes"] = used_bytes(work)
-                break
             name = str(clip.get("clip_uid") or clip.get("video_name") or "")
             state["current"] = name
             state["index"] = index
@@ -456,6 +452,12 @@ def warm_cache(
                 emit("cached", index=index, total=len(clips), video_name=name)
                 persist()
                 continue
+            if budget is not None:
+                used = used_bytes(work)
+                if used >= budget:
+                    state["status"] = "budget"
+                    state["used_bytes"] = used
+                    break
             # Não inicie outro clipe se a estimativa já excede o espaço restante.
             # O tamanho final varia com a fonte e com o encode.
             if budget is not None:
