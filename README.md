@@ -6,6 +6,23 @@ o serviço HTTP interno atende exclusivamente ao aplicativo desktop.
 
 ## Para o usuário
 
+Em **Solicitar saque** ou **Sacar tudo**, escolha **Wise**, informe o nome legal e
+o e-mail do destino e confirme. O QMoney processa uma conta por vez: vincula a
+Wise, solicita o saque e remove explicitamente o vínculo Wise, verifica a
+remoção e restaura Dots como padrão. A limpeza é tentada também se o vínculo
+ou o saque falhar, ficar em revisão ou retornar uma resposta inconclusiva. O destino não é
+salvo no relatório nem aplicado previamente a todas as contas.
+
+O lote só avança após confirmar todas essas etapas e o sucesso do saque.
+Respostas pendentes de revisão e erros interrompem o lote para conferência manual.
+Se o saque já foi aceito, uma falha de desvinculação ou de restauração aparece
+como pendência de limpeza: não repita o saque. A Crowtado pode recusar a remoção;
+o aplicativo repete apenas a limpeza uma vez. A pendência é gravada antes de
+vincular a Wise e sobrevive ao reinício do aplicativo. Enquanto houver pendência,
+novos saques ficam bloqueados. **Concluir limpeza Wise** retoma somente a
+desvinculação e a restauração de Dots, sem repetir o saque. O fluxo não é
+considerado concluído enquanto a limpeza não for confirmada e registrada.
+
 1. Baixe `QMoney-windows-x64.zip` na página de Releases.
 2. Extraia a pasta em um local permanente.
 3. Abra somente `QMoney.exe`.

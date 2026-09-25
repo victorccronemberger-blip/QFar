@@ -298,13 +298,64 @@ def configurar_metodo_saque(email: str, senha: str, method: str,
             raise CrowtadoError("o Crowtado não confirmou o destino preferido")
 
 
-def solicitar_link_saque(email: str, senha: str) -> dict[str, Any]:
+def desvincular_wise(email: str, senha: str) -> None:
+    """Remove o destino Wise e confirma que ele deixou de estar vinculado."""
+    session = _cached_login(email, senha)
+    _site_trpc(session, "kyc.removeManualPayoutMethod", {"method": "wise"})
+    summary = _site_trpc(session, "payouts.summary", None, method="GET")
+    if (not isinstance(summary, dict) or summary.get("wiseReady") is not False
+            or not isinstance(summary.get("manualDestinations"), list)
+            or any(item.get("method") == "wise"
+                   for item in summary.get("manualDestinations") or []
+                   if isinstance(item, dict))):
+        raise CrowtadoError("a desvinculação da Wise não foi confirmada")
+
+
+def finalizar_wise(email: str, senha: str) -> dict[str, bool]:
+    """Limpeza idempotente: nunca solicita saque e confirma o estado final remoto."""
+    try:
+        session = _cached_login(email, senha)
+        summary = _site_trpc(session, "payouts.summary", None, method="GET")
+        if not isinstance(summary, dict) or not isinstance(summary.get("manualDestinations"), list):
+            raise CrowtadoError("não foi possível confirmar os destinos")
+        if summary.get("wiseReady") or any(
+                isinstance(item, dict) and item.get("method") == "wise"
+                for item in summary["manualDestinations"]):
+            desvincular_wise(email, senha)
+    except Exception:
+        pass  # Ainda tentamos restaurar Dots; o estado final decide o resultado.
+    try:
+        configurar_metodo_saque(email, senha, "dots")
+    except Exception:
+        pass
+    result = {"wiseDestinationRemoved": False, "payoutPreferenceRestored": False}
+    try:
+        session = _cached_login(email, senha)
+        summary = _site_trpc(session, "payouts.summary", None, method="GET")
+        if isinstance(summary, dict):
+            destinations = summary.get("manualDestinations")
+            result["wiseDestinationRemoved"] = (
+                summary.get("wiseReady") is False and isinstance(destinations, list)
+                and all(isinstance(item, dict) and item.get("method") != "wise"
+                        for item in destinations))
+            result["payoutPreferenceRestored"] = summary.get("payoutPreference") in {"other", "dots"}
+    except Exception:
+        pass
+    return result
+
+
+def solicitar_link_saque(email: str, senha: str, *, expected_method: str | None = None,
+                         cleanup_wise: bool = True) -> dict[str, Any]:
     """Solicita saque com o método preferido salvo no Crowtado."""
     session = _cached_login(email, senha)
     summary = _site_trpc(session, "payouts.summary", None, method="GET")
     if not isinstance(summary, dict):
         raise CrowtadoError("não foi possível consultar o método de saque")
     method = summary.get("payoutPreference")
+    if expected_method and method != expected_method:
+        raise CrowtadoError("o método confirmado não corresponde ao solicitado; saque não enviado")
+    if method == "wise" and expected_method != "wise":
+        raise CrowtadoError("selecione e confirme Wise ao solicitar saque")
     if not method:
         raise CrowtadoError("método de saque não confirmado; configure-o antes de sacar")
     if method not in {"dots", "other", "bank_transfer", "paypal", "wise"}:
@@ -322,8 +373,24 @@ def solicitar_link_saque(email: str, senha: str) -> dict[str, Any]:
         raise CrowtadoError(
             f"payouts.withdraw devolveu resposta inválida: {str(payload)[:200]}")
     # Não repassa links/tokens ou campos novos desconhecidos para a interface.
-    return {key: value for key, value in payload.items()
-            if key in _WITHDRAW_RESULT_FIELDS}
+    result = {key: value for key, value in payload.items()
+              if key in _WITHDRAW_RESULT_FIELDS}
+    if cleanup_wise and method == "wise" and payload["status"] == "ok":
+        # O saque já foi aceito: falhar ao restaurar não pode parecer falha
+        # do saque e induzir uma nova solicitação.
+        try:
+            desvincular_wise(email, senha)
+        except Exception:
+            result["wiseDestinationRemoved"] = False
+        else:
+            result["wiseDestinationRemoved"] = True
+        try:
+            configurar_metodo_saque(email, senha, "dots")
+        except Exception:
+            result["payoutPreferenceRestored"] = False
+        else:
+            result["payoutPreferenceRestored"] = True
+    return result
 
 
 def consultar_saldo_navegador(

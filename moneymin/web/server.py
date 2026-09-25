@@ -108,6 +108,7 @@ _BULK_REGISTER_LOCK = threading.Lock()
 _BULK_REGISTER_STATE: dict[str, Any] = {"state": "idle"}
 _HEAVY_RUNNER_LOCK = threading.Lock()
 _WITHDRAW_LOCK = threading.Lock()
+_PAYOUT_OPERATION_LOCK = threading.Lock()
 _WITHDRAW_IN_FLIGHT: set[str] = set()
 _WITHDRAW_LAST_REQUEST: dict[str, float] = {}
 _WITHDRAW_COOLDOWN_S = 60.0
@@ -131,8 +132,11 @@ def _payout_method_run(creds: dict[str, str], method: str,
         with _PAYOUT_METHOD_LOCK:
             _PAYOUT_METHOD_STATE["current"] = email
         try:
-            crowtado.configurar_metodo_saque(email, password, method,
-                                             legal_name, destination_email)
+            with _PAYOUT_OPERATION_LOCK:
+                if _wise_cleanup_snapshot().get("pending"):
+                    raise ValueError("Conclua a limpeza Wise pendente antes de configurar métodos.")
+                crowtado.configurar_metodo_saque(email, password, method,
+                                                 legal_name, destination_email)
             result = {"email": email, "ok": True, "message": "configurado"}
         except Exception as exc:
             # Respostas remotas podem repetir os dados enviados: não exponha o destino.
@@ -163,6 +167,56 @@ def _withdraw_cooldown_path() -> Path:
     return config.DATA_DIR / "withdraw_request_times.json"
 
 
+def _wise_cleanup_path() -> Path:
+    return config.DATA_DIR / "wise_cleanup_pending.json"
+
+
+def _wise_cleanup_snapshot() -> dict[str, Any]:
+    # Corrupção não pode ser interpretada como ausência de pendência.
+    try:
+        state = json.loads(_wise_cleanup_path().read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or not isinstance(state.get("pending"), bool):
+            raise ValueError("invalid cleanup state")
+        return state
+    except FileNotFoundError:
+        return {"pending": False}
+    except (OSError, ValueError):
+        return {"pending": True, "error": "Não foi possível ler a pendência Wise; saques bloqueados."}
+
+
+def _finish_wise_cleanup(email: str, password: str) -> dict[str, Any]:
+    result = {"wiseDestinationRemoved": False, "payoutPreferenceRestored": False}
+    # Repetimos somente a limpeza, nunca a vinculação ou a solicitação de saque.
+    for _ in range(2):
+        try:
+            result = crowtado.finalizar_wise(email, password)
+        except Exception:
+            continue
+        if result.get("wiseDestinationRemoved") is True and result.get("payoutPreferenceRestored") is True:
+            try:
+                save_json(_wise_cleanup_path(), {"pending": False})
+            except OSError:
+                break  # Pendência permanece: recuperação pode repetir a limpeza idempotente.
+            return {**result, "cleanupPending": False}
+    return {**result, "cleanupPending": True}
+
+
+def _withdraw_wise_flow(email: str, password: str, wise: dict[str, str]) -> dict[str, Any]:
+    # Gravado ANTES de qualquer mutação remota, também cobre falha parcial do vínculo.
+    save_json(_wise_cleanup_path(), {"pending": True, "email": email,
+                                    "started_at": time.time()})
+    result = {"status": "unknown"}
+    try:
+        crowtado.configurar_metodo_saque(email, password, "wise", **wise)
+        result = crowtado.solicitar_link_saque(email, password, expected_method="wise", cleanup_wise=False)
+    except Exception:
+        # A solicitação pode ter sido aceita antes de um timeout. Não a repetimos.
+        pass
+    finally:
+        cleanup = _finish_wise_cleanup(email, password)
+    return {**result, **cleanup}
+
+
 def _load_withdraw_cooldowns_locked() -> None:
     global _WITHDRAW_COOLDOWN_LOADED
     if _WITHDRAW_COOLDOWN_LOADED:
@@ -188,6 +242,7 @@ def _load_withdraw_bulk_locked() -> None:
         except (TypeError, ValueError):
             total = done = 0
         state = {"state": saved.get("state", "idle"),
+                 "method": saved.get("method"), "message": saved.get("message", ""),
                  "total": total, "done": done,
                  "results": saved["results"],
                  "current": saved.get("current"),
@@ -205,7 +260,36 @@ def _save_withdraw_bulk_locked() -> None:
     save_json(_withdraw_bulk_path(), _WITHDRAW_BULK_STATE)
 
 
-def _withdraw_once(email: str, password: str) -> tuple[dict[str, Any], int]:
+def _wise_withdraw_options(body: dict[str, Any]) -> dict[str, str] | None:
+    method = body.get("method")
+    if method is None:
+        return None
+    if method != "wise" or body.get("wise_confirmed") is not True:
+        raise ValueError("confirme Wise antes de solicitar o saque")
+    name = str(body.get("legal_name") or "").strip()
+    destination = str(body.get("destination_email") or "").strip()
+    if (len(name) < 2 or len(name) > 200 or len(destination) > 254
+            or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", destination)):
+        raise ValueError("informe o nome legal e um e-mail válido da Wise")
+    return {"legal_name": name, "destination_email": destination}
+
+
+def _withdraw_once(email: str, password: str,
+                   wise: dict[str, str] | None = None) -> tuple[dict[str, Any], int]:
+    # Inclui vínculo, saque e limpeza na mesma seção exclusiva entre contas.
+    if not _PAYOUT_OPERATION_LOCK.acquire(blocking=False):
+        return {"email": email, "ok": False, "error": "aguarde a operação de saque atual terminar"}, 409
+    try:
+        if _wise_cleanup_snapshot().get("pending"):
+            return {"email": email, "ok": False, "error": (
+                "Há uma limpeza Wise pendente. Use Concluir limpeza Wise antes de qualquer novo saque.")}, 409
+        return _withdraw_once_locked(email, password, wise)
+    finally:
+        _PAYOUT_OPERATION_LOCK.release()
+
+
+def _withdraw_once_locked(email: str, password: str,
+                          wise: dict[str, str] | None = None) -> tuple[dict[str, Any], int]:
     now = time.time()
     with _WITHDRAW_LOCK:
         _load_withdraw_cooldowns_locked()
@@ -230,11 +314,25 @@ def _withdraw_once(email: str, password: str) -> tuple[dict[str, Any], int]:
                     "error": "não foi possível proteger o histórico de solicitações"}, 503
         _WITHDRAW_IN_FLIGHT.add(email)
     try:
-        result = crowtado.solicitar_link_saque(email, password)
+        if wise:
+            result = _withdraw_wise_flow(email, password, wise)
+        else:
+            result = crowtado.solicitar_link_saque(email, password)
         success = result.get("status") in {"ok", "review_required"}
         message = _withdraw_message(email, result)
-        return {"ok": success, "email": email, "message": message, "result": result}, 200 if success else 409
-    except crowtado.CrowtadoError as exc:
+        if wise and result.get("cleanupPending") is False and result.get("status") != "ok":
+            message += "; Wise desvinculada e Dots confirmado. Confira o histórico antes de repetir o saque."
+        response = {"ok": success, "email": email, "message": message, "result": result}
+        if not success:
+            response["error"] = message
+        return response, 200 if success else 409
+    except Exception as exc:
+        if wise:
+            return {"email": email, "ok": False, "error": (
+                "O fluxo Wise não foi concluído. Confira o vínculo e o histórico na Crowtado "
+                "antes de repetir; nenhuma nova tentativa automática será feita.")}, 400
+        if not isinstance(exc, crowtado.CrowtadoError):
+            raise
         return {"email": email, "ok": False, "error": str(exc)}, 400
     finally:
         with _WITHDRAW_LOCK:
@@ -247,7 +345,7 @@ def _withdraw_bulk_snapshot() -> dict[str, Any]:
         return {**_WITHDRAW_BULK_STATE, "results": list(_WITHDRAW_BULK_STATE["results"])}
 
 
-def _withdraw_bulk_run(creds: dict[str, str]) -> None:
+def _withdraw_bulk_run(creds: dict[str, str], wise: dict[str, str] | None = None) -> None:
     for email, password in creds.items():
         with _WITHDRAW_BULK_LOCK:
             _WITHDRAW_BULK_STATE["current"] = email
@@ -258,7 +356,8 @@ def _withdraw_bulk_run(creds: dict[str, str]) -> None:
                     state="error", message="Não foi possível salvar o progresso; nenhuma nova conta será solicitada.")
                 return
         try:
-            result, _ = _withdraw_once(email, password)
+            result, _ = (_withdraw_once(email, password, wise) if wise
+                         else _withdraw_once(email, password))
         except Exception as exc:  # uma conta não interrompe as demais
             result = {"email": email, "ok": False,
                       "error": f"{type(exc).__name__}: {exc}"}
@@ -269,11 +368,23 @@ def _withdraw_bulk_run(creds: dict[str, str]) -> None:
             })
             _WITHDRAW_BULK_STATE["done"] += 1
             _WITHDRAW_BULK_STATE["current"] = None
+            detail = result.get("result") or {}
+            stop_wise = wise and not (
+                result.get("ok") and detail.get("status") == "ok"
+                and detail.get("wiseDestinationRemoved") is True
+                and detail.get("payoutPreferenceRestored") is True
+                and detail.get("cleanupPending") is not True)
+            if stop_wise:
+                _WITHDRAW_BULK_STATE.update(state="error", message=(
+                    "Lote Wise interrompido. Confira a última conta: somente após saque aceito, "
+                    "Wise desvinculada e Dots confirmado a próxima conta pode começar."))
             try:
                 _save_withdraw_bulk_locked()
             except OSError:
                 _WITHDRAW_BULK_STATE.update(
                     state="error", message="O resultado não pôde ser salvo. Confira o link antes de repetir.")
+                return
+            if stop_wise:
                 return
     with _WITHDRAW_BULK_LOCK:
         _WITHDRAW_BULK_STATE["state"] = "done"
@@ -1611,7 +1722,23 @@ def _on_balance_result(email: str, summary: dict | None, erro: str | None) -> No
 def _withdraw_message(email: str, result: dict[str, Any]) -> str:
     """Mensagem curta e segura para o resultado do payouts.withdraw."""
     status = str(result.get("status") or "")
+    if result.get("cleanupPending") is True:
+        outcome = ("saque aceito" if status == "ok" else
+                   "saque enviado para revisão" if status == "review_required" else
+                   "resultado do saque: " + (status or "desconhecido"))
+        return (f"{email}: {outcome}. LIMPEZA WISE PENDENTE: o fluxo não está concluído. "
+                "Novos saques estão bloqueados. Use Concluir limpeza Wise; isso não repete o saque.")
     if status == "ok":
+        if result.get("wiseDestinationRemoved") is False:
+            restored = result.get("payoutPreferenceRestored") is True
+            return (f"saque solicitado com sucesso para {email}; a desvinculação da Wise não foi confirmada. "
+                    + ("Dots está como padrão. " if restored else "A volta para Dots também não foi confirmada. ")
+                    + "Confira a conta na Crowtado sem repetir o saque; o lote não continuará.")
+        if result.get("payoutPreferenceRestored") is False:
+            return (f"saque solicitado com sucesso para {email}; não foi possível confirmar "
+                    "a volta para Dots. Configure Dots novamente, sem repetir o saque.")
+        if result.get("payoutPreferenceRestored") is True:
+            return f"saque solicitado com sucesso para {email}; Wise desvinculada e método padrão restaurado para Dots"
         if result.get("dotsEmailDelivery") == "sent":
             return f"link de saque enviado por email para {email}"
         if result.get("dotsSmsDelivery") == "sent":
@@ -1622,6 +1749,7 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
     if status == "review_required":
         return f"saque de {email} enviado para revisão do Crowtado"
     messages = {
+        "unknown": "resultado do saque inconclusivo; confira o histórico na Crowtado antes de repetir",
         "below_minimum": "saldo abaixo do mínimo para saque",
         "hold": "saques estão temporariamente bloqueados para esta conta",
         "dots_not_ready": "o método Dots ainda não está disponível para esta conta",
@@ -3542,17 +3670,45 @@ def create_app() -> Flask:
             "runner": BALANCES_RUNNER.snapshot(),
             "withdraw_bulk": _withdraw_bulk_snapshot(),
             "payout_method_bulk": _payout_method_snapshot(),
+            "wise_cleanup": _wise_cleanup_snapshot(),
             "exchange": fx.usd_brl_quote(),
         })
 
+    @app.post("/api/balances/wise-cleanup")
+    def finish_pending_wise_cleanup():
+        """Retoma apenas a remoção Wise e a preferência Dots, inclusive após reiniciar."""
+        if not _PAYOUT_OPERATION_LOCK.acquire(blocking=False):
+            return jsonify({"error": "aguarde a operação atual terminar"}), 409
+        try:
+            pending = _wise_cleanup_snapshot()
+            if not pending.get("pending"):
+                return jsonify({"ok": True, "message": "não há limpeza Wise pendente"})
+            if pending.get("error"):
+                return jsonify({"error": pending["error"]}), 409
+            email = pending.get("email")
+            password = _configured_crowtado_creds().get(email)
+            if not email or not password:
+                return jsonify({"error": "reconecte o acesso da conta pendente para concluir a limpeza Wise"}), 409
+            result = _finish_wise_cleanup(email, password)
+            if result["cleanupPending"]:
+                return jsonify({"error": "limpeza ainda não confirmada; saques continuam bloqueados", "result": result}), 409
+            return jsonify({"ok": True, "message": "Wise desvinculada e Dots confirmado. Nenhum saque foi solicitado.",
+                            "result": result})
+        finally:
+            _PAYOUT_OPERATION_LOCK.release()
+
     @app.post("/api/balances/payout-methods/apply-all")
     def apply_all_payout_methods():
+        if _wise_cleanup_snapshot().get("pending"):
+            return jsonify({"error": "conclua a limpeza Wise pendente antes de configurar métodos"}), 409
         body = request.get_json(silent=True) or {}
         method = str(body.get("method") or "").strip().lower()
         legal_name = str(body.get("legal_name") or "").strip()
         destination_email = str(body.get("destination_email") or "").strip()
         if method not in {"dots", "paypal", "wise"}:
             return jsonify({"error": "escolha Dots, PayPal ou Wise"}), 400
+        if method == "wise":
+            return jsonify({"error": "selecione Wise ao solicitar saque; o vínculo é feito uma conta por vez"}), 400
         if method in {"paypal", "wise"}:
             if len(legal_name) < 2 or len(destination_email) > 254 or not re.fullmatch(
                     r"[^\s@]+@[^\s@]+\.[^\s@]+", destination_email):
@@ -3617,8 +3773,14 @@ def create_app() -> Flask:
 
     @app.post("/api/balances/withdraw")
     def request_balance_withdraw():
-        """Solicita somente o envio do link Dots; conclusão e 2FA são manuais."""
+        """Solicita o método salvo ou o fluxo Wise confirmado pelo usuário."""
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": "requisição inválida"}), 400
+        try:
+            wise = _wise_withdraw_options(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if _payout_method_snapshot()["state"] == "running":
             return jsonify({"error": "aguarde a configuração dos métodos terminar"}), 409
         email = str(body.get("email", "")).strip()
@@ -3638,12 +3800,22 @@ def create_app() -> Flask:
             return jsonify({"error": "aguarde o saque em lote terminar"}), 409
         if not _confirmed_available_balance(_load_balances().get(email)):
             return jsonify({"error": "atualize o saldo desta conta antes de solicitar saque; é necessário saldo disponível confirmado"}), 400
-        result, status = _withdraw_once(email, password)
+        result, status = (_withdraw_once(email, password, wise) if wise
+                          else _withdraw_once(email, password))
         return jsonify(result), status
 
     @app.post("/api/balances/withdraw-all")
     def request_all_balance_withdrawals():
-        """Solicita links para contas elegíveis; cada conclusão no Dots é manual."""
+        """Processa contas elegíveis sequencialmente, incluindo a limpeza Wise."""
+        if _wise_cleanup_snapshot().get("pending"):
+            return jsonify({"error": "conclua a limpeza Wise pendente antes de iniciar outro lote"}), 409
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": "requisição inválida"}), 400
+        try:
+            wise = _wise_withdraw_options(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if _payout_method_snapshot()["state"] == "running":
             return jsonify({"error": "aguarde a configuração dos métodos terminar"}), 409
         if BALANCES_RUNNER.running:
@@ -3667,13 +3839,14 @@ def create_app() -> Flask:
                 return jsonify({"error": "já há um saque em lote em andamento"}), 409
             _WITHDRAW_BULK_STATE.update(
                 state="running", total=len(eligible), done=0, results=[],
+                method="wise" if wise else "saved",
                 current=None, message="", started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
             try:
                 _save_withdraw_bulk_locked()
             except OSError:
                 _WITHDRAW_BULK_STATE["state"] = "error"
                 return jsonify({"error": "não foi possível salvar o histórico do lote"}), 503
-        thread = threading.Thread(target=_withdraw_bulk_run, args=(eligible,),
+        thread = threading.Thread(target=_withdraw_bulk_run, args=(eligible, wise) if wise else (eligible,),
                                   daemon=True, name="moneymin-withdraw-bulk")
         try:
             thread.start()

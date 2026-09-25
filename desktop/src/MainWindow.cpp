@@ -76,6 +76,60 @@
 #endif
 
 namespace {
+bool confirmWithdrawal(QWidget* parent, int count, QJsonObject& request) {
+  QDialog dialog(parent);
+  dialog.setWindowTitle(QStringLiteral("Confirmar saque"));
+  auto* layout = new QVBoxLayout(&dialog);
+  auto* help = new QLabel(QStringLiteral("Solicitar saque para %1 conta(s) elegível(is)?").arg(count));
+  help->setWordWrap(true);
+  layout->addWidget(help);
+  auto* form = new QFormLayout;
+  auto* method = new QComboBox;
+  method->addItem(QStringLiteral("Método já configurado"), QStringLiteral("saved"));
+  method->addItem(QStringLiteral("Wise"), QStringLiteral("wise"));
+  auto* name = new QLineEdit;
+  name->setMaxLength(200);
+  auto* email = new QLineEdit;
+  email->setMaxLength(254);
+  form->addRow(QStringLiteral("Método"), method);
+  form->addRow(QStringLiteral("Nome legal na Wise"), name);
+  form->addRow(QStringLiteral("E-mail da Wise"), email);
+  layout->addLayout(form);
+  auto* explanation = new QLabel;
+  explanation->setWordWrap(true);
+  layout->addWidget(explanation);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+  buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Confirmar e solicitar"));
+  auto update = [=] {
+    const bool wise = method->currentData().toString() == QStringLiteral("wise");
+    name->setEnabled(wise);
+    email->setEnabled(wise);
+    explanation->setText(wise
+        ? QStringLiteral("Uma conta por vez: vincular Wise → solicitar saque → desvincular Wise → voltar para Dots. "
+                         "A limpeza é tentada mesmo em caso de erro. Novos saques ficam bloqueados até confirmá-la.")
+        : QStringLiteral("Usa o método salvo na Crowtado. No Dots, conclua pelo link da própria conta."));
+    buttons->button(QDialogButtonBox::Ok)->setEnabled(!wise ||
+        (name->text().trimmed().size() >= 2 && QRegularExpression(
+            QStringLiteral("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"))
+                .match(email->text().trimmed()).hasMatch()));
+  };
+  QObject::connect(method, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [=](int) { update(); });
+  QObject::connect(name, &QLineEdit::textChanged, &dialog, [=](const QString&) { update(); });
+  QObject::connect(email, &QLineEdit::textChanged, &dialog, [=](const QString&) { update(); });
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addWidget(buttons);
+  update();
+  if (dialog.exec() != QDialog::Accepted) return false;
+  if (method->currentData().toString() == QStringLiteral("wise")) {
+    request.insert(QStringLiteral("method"), QStringLiteral("wise"));
+    request.insert(QStringLiteral("wise_confirmed"), true);
+    request.insert(QStringLiteral("legal_name"), name->text().trimmed());
+    request.insert(QStringLiteral("destination_email"), email->text().trimmed());
+  }
+  return true;
+}
+
 QString provisionEmbeddedService() {
 #if defined(Q_OS_WIN) && QMONEY_HAS_EMBEDDED_SERVICE
   HMODULE module = GetModuleHandleW(nullptr);
@@ -1825,16 +1879,13 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesWithdrawAll = new QPushButton(QStringLiteral("Sacar tudo"));
   _balancesWithdrawAll->setEnabled(false);
   _balancesWithdrawAll->setToolTip(QStringLiteral(
-      "Solicita links para todas as contas Crowtado elegíveis, inclusive as ocultas pelo filtro da tabela."));
+      "Solicita saques para todas as contas Crowtado elegíveis, inclusive as ocultas pelo filtro da tabela."));
   connect(_balancesWithdrawAll, &QPushButton::clicked, this, [this] {
     const int eligible = _balancesWithdrawAll->property("eligibleCount").toInt();
-    const auto answer = QMessageBox::question(this, QStringLiteral("Sacar tudo"),
-        QStringLiteral("Solicitar links de saque para %1 conta(s) Crowtado elegíveis, inclusive as ocultas pelo filtro? "
-                       "Cada saque ainda precisa ser concluído pelo link e pelo 2FA da própria conta.").arg(eligible),
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-    if (answer != QMessageBox::Yes) return;
+    QJsonObject request;
+    if (!confirmWithdrawal(this, eligible, request)) return;
     _balancesWithdrawAll->setEnabled(false);
-    _api.post(QStringLiteral("/api/balances/withdraw-all"), {},
+    _api.post(QStringLiteral("/api/balances/withdraw-all"), request,
               [this](bool ok, const QJsonDocument& doc, const QString& error) {
       if (!ok) {
         loadBalances();
@@ -1842,20 +1893,36 @@ QWidget* MainWindow::buildBalancesPage() {
       }
       _bulkWithdrawAwaitingResult = true;
       _balancePoll.start();
-      setStatus(QStringLiteral("Solicitando links de saque para %1 conta(s)…")
+      setStatus(QStringLiteral("Solicitando saques para %1 conta(s)…")
           .arg(doc.object().value(QStringLiteral("total")).toInt()));
     });
   });
   headerLayout->addWidget(_balancesWithdrawAll);
+  _balancesWiseCleanup = new QPushButton(QStringLiteral("Concluir limpeza Wise"));
+  _balancesWiseCleanup->setVisible(false);
+  _balancesWiseCleanup->setToolTip(QStringLiteral("Remove a Wise e restaura Dots na conta pendente, sem solicitar saque."));
+  connect(_balancesWiseCleanup, &QPushButton::clicked, this, [this] {
+    _balancesWiseCleanup->setEnabled(false);
+    _api.post(QStringLiteral("/api/balances/wise-cleanup"), {},
+              [this](bool ok, const QJsonDocument& doc, const QString& error) {
+      _balancesWiseCleanup->setEnabled(true);
+      loadBalances();
+      if (!ok) return showError(QStringLiteral("Limpeza Wise pendente"), error);
+      QMessageBox::information(this, QStringLiteral("Limpeza concluída"),
+                               doc.object().value(QStringLiteral("message")).toString());
+    });
+  });
+  headerLayout->addWidget(_balancesWiseCleanup);
   _balancesPayoutMethod = new QPushButton(QStringLiteral("Método de saque"));
   _balancesPayoutMethod->setEnabled(false);
-  _balancesPayoutMethod->setToolTip(QStringLiteral("Configura Dots, PayPal ou Wise em todas as contas Crowtado conectadas."));
+  _balancesPayoutMethod->setToolTip(QStringLiteral("Configura Dots ou PayPal. Para Wise, escolha o método ao solicitar saque."));
   connect(_balancesPayoutMethod, &QPushButton::clicked, this, [this] {
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("Método de saque Crowtado"));
     auto* layout = new QVBoxLayout(&dialog);
     auto* help = new QLabel(QStringLiteral(
         "A configuração será aplicada a todas as contas Crowtado conectadas. "
+        "Para Wise, escolha o método ao solicitar saque; o vínculo será feito uma conta por vez. "
         "Contas Claru não serão alteradas. Os dados de destino serão enviados à Crowtado."));
     help->setWordWrap(true);
     layout->addWidget(help);
@@ -1863,11 +1930,10 @@ QWidget* MainWindow::buildBalancesPage() {
     auto* method = new QComboBox;
     method->addItem(QStringLiteral("Dots"), QStringLiteral("dots"));
     method->addItem(QStringLiteral("PayPal"), QStringLiteral("paypal"));
-    method->addItem(QStringLiteral("Wise"), QStringLiteral("wise"));
     auto* legalName = new QLineEdit;
     legalName->setPlaceholderText(QStringLiteral("Nome legal do beneficiário"));
     auto* destination = new QLineEdit;
-    destination->setPlaceholderText(QStringLiteral("E-mail da conta PayPal ou Wise"));
+    destination->setPlaceholderText(QStringLiteral("E-mail da conta PayPal"));
     form->addRow(QStringLiteral("Método"), method);
     form->addRow(QStringLiteral("Nome legal"), legalName);
     form->addRow(QStringLiteral("E-mail do destino"), destination);
@@ -4660,6 +4726,9 @@ void MainWindow::loadBalances() {
     const auto runner = root.value(QStringLiteral("runner")).toObject();
     const auto bulk = root.value(QStringLiteral("withdraw_bulk")).toObject();
     const auto payout = root.value(QStringLiteral("payout_method_bulk")).toObject();
+    const auto wiseCleanup = root.value(QStringLiteral("wise_cleanup")).toObject();
+    const bool cleanupPending = wiseCleanup.value(QStringLiteral("pending")).toBool();
+    _balancesWiseCleanup->setVisible(cleanupPending);
     _lastWithdrawBulk = bulk;
     _balancesWithdrawHistory->setEnabled(
         bulk.value(QStringLiteral("state")).toString() != QStringLiteral("idle"));
@@ -4779,19 +4848,22 @@ void MainWindow::loadBalances() {
       actionsLayout->addWidget(reveal);
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);
-      withdraw->setEnabled(!isClaru && hasPassword && !hasBalanceError
+      withdraw->setEnabled(!cleanupPending && !isClaru && hasPassword && !hasBalanceError
                            && hasAvailable && availableCents > 0
                            && runner.value(QStringLiteral("state")).toString() != QStringLiteral("running")
                            && bulk.value(QStringLiteral("state")).toString() != QStringLiteral("running"));
       withdraw->setToolTip(withdraw->isEnabled()
-          ? QStringLiteral("Solicita um link de saque para o saldo disponível confirmado desta conta.")
+          ? QStringLiteral("Escolha o método e confirme o saque do saldo disponível desta conta.")
           : QStringLiteral("Conecte o Crowtado e confirme um saldo disponível positivo antes de solicitar saque."));
       connect(withdraw, &QPushButton::clicked, this, [this, email, withdraw] {
+        QJsonObject request{{QStringLiteral("email"), email}};
+        if (!confirmWithdrawal(this, 1, request)) return;
         withdraw->setEnabled(false);
-        _api.post(QStringLiteral("/api/balances/withdraw"), {{QStringLiteral("email"), email}},
+        _api.post(QStringLiteral("/api/balances/withdraw"), request,
                   [this, withdraw](bool ok, const QJsonDocument& doc, const QString& error) {
           withdraw->setEnabled(true);
-          if (!ok) return showError(QStringLiteral("Saque não solicitado"), error);
+          loadBalances();
+          if (!ok) return showError(QStringLiteral("Solicitação precisa de atenção"), error);
           QMessageBox::information(this, QStringLiteral("Solicitação enviada"),
                                    doc.object().value(QStringLiteral("message")).toString());
         });
@@ -4837,8 +4909,8 @@ void MainWindow::loadBalances() {
     _balancesRefreshNeeded->setText(QStringLiteral("Atualizar pendentes (%1)").arg(refreshNeeded));
     _balancesRefreshNeeded->setEnabled(!running && !bulkRunning && refreshNeeded > 0);
     _balancesWithdrawAll->setProperty("eligibleCount", eligibleWithdrawals);
-    _balancesWithdrawAll->setEnabled(!running && !bulkRunning && !payoutRunning && eligibleWithdrawals > 0);
-    _balancesPayoutMethod->setEnabled(!running && !bulkRunning && !payoutRunning && !passwordAccounts.isEmpty());
+    _balancesWithdrawAll->setEnabled(!cleanupPending && !running && !bulkRunning && !payoutRunning && eligibleWithdrawals > 0);
+    _balancesPayoutMethod->setEnabled(!cleanupPending && !running && !bulkRunning && !payoutRunning && !passwordAccounts.isEmpty());
     if (_payoutMethodAwaitingResult && !payoutRunning &&
         payout.value(QStringLiteral("state")).toString() != QStringLiteral("idle")) {
       _payoutMethodAwaitingResult = false;
@@ -4868,7 +4940,10 @@ void MainWindow::loadBalances() {
       if (accountKinds.value(value.toString()).toString() == QStringLiteral("claru"))
         ++claruCount;
     }
-    _balancesState->setText(payoutRunning
+    _balancesState->setText(cleanupPending
+        ? QStringLiteral("Limpeza Wise pendente em %1 · novos saques bloqueados")
+              .arg(wiseCleanup.value(QStringLiteral("email")).toString())
+        : payoutRunning
         ? QStringLiteral("Configurando método de saque: %1 de %2 conta(s)…")
               .arg(payout.value(QStringLiteral("done")).toInt())
               .arg(payout.value(QStringLiteral("total")).toInt())
@@ -5105,8 +5180,8 @@ void MainWindow::showWithdrawalReport(const QJsonObject& bulk) {
   const QString message = bulk.value(QStringLiteral("message")).toString();
   if (!message.isEmpty()) details << message;
   QMessageBox report(QMessageBox::Information, QStringLiteral("Último lote de saques"),
-      QStringLiteral("%1 de %2 conta(s) processadas; %3 link(s) solicitado(s). "
-                     "Cada saque ainda exige confirmação e 2FA no link da conta.")
+      QStringLiteral("%1 de %2 conta(s) processadas; %3 solicitação(ões) aceita(s). "
+                     "Confira os detalhes por conta. No Dots, conclua pelo link recebido.")
           .arg(done).arg(total).arg(sent), QMessageBox::Ok, this);
   report.setDetailedText(details.join('\n'));
   report.exec();

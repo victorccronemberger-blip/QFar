@@ -303,6 +303,7 @@ private:
   QCheckBox* _balancesOnlyPending{};
   QLabel* _balancesFilterState{};
   QPushButton* _balancesWithdrawAll{};
+  QPushButton* _balancesWiseCleanup{};
   QPushButton* _balancesPayoutMethod{};
   QPushButton* _balancesWithdrawHistory{};
   QPushButton* _balancesExport{};
