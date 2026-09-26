@@ -46,7 +46,14 @@ public:
           return;
         }
         QJsonObject reply; bool failed=false;
-        if(input.startsWith("POST /api/campaigns ")) reply={{"ok",true},{"accounts",QJsonArray{}}};
+        if(input.startsWith("POST /api/campaigns ")) {
+          const int starts=qApp->property("campaignStartRequests").toInt()+1;
+          qApp->setProperty("campaignStartRequests",starts);
+          if(starts!=1){qApp->exit(49);return;}
+          failed=qApp->arguments().contains("--start-uncertain");
+          reply=failed ? QJsonObject{{"error_code","request_outcome_unknown"},{"error","Resposta perdida"}}
+                       : QJsonObject{{"ok",true},{"accounts",QJsonArray{}}};
+        }
         else if(input.startsWith("GET /api/campaigns/current?")) {
           failed=*phase==2;
           reply={{"state",*phase==3?"done":*phase==4?"error":"running"},

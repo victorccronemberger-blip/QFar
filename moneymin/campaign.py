@@ -1579,8 +1579,15 @@ def _acknowledge_campaign_upload(session_id: str) -> None:
 
 
 def _legacy_upload_context(session_id: str, email: str) -> dict[str, Any] | None:
-    """Resolve journals antigos pelo histórico, sem confundir skip com envio."""
+    return _legacy_upload_contexts({(session_id, email)}).get((session_id, email))
+
+
+def _legacy_upload_contexts(wanted: set[tuple[str, str]]) -> dict:
+    """Read each history file once for a batch of legacy journals."""
+    found = {}
     for path in config.DATA_DIR.glob("campaign_*.json"):
+        if len(found) == len(wanted):
+            break
         try:
             history = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1590,14 +1597,20 @@ def _legacy_upload_context(session_id: str, email: str) -> dict[str, Any] | None
         for item in history.get("items") or []:
             if not isinstance(item, dict) or not item.get("clip_uid"):
                 continue
-            if any(isinstance(row, dict) and row.get("session_id") == session_id
-                   and row.get("email") == email for row in item.get("accounts") or []):
+            for row in item.get("accounts") or []:
+                if not isinstance(row, dict):
+                    continue
+                identity = (row.get("session_id"), row.get("email"))
+                if not all(isinstance(value, str) for value in identity):
+                    continue
+                if identity not in wanted or identity in found:
+                    continue
                 key = item.get("registry_key") or (
                     f"minute|{item['task_id']}|{item['task_name']}"
                     if item.get("task_id") and item.get("task_name") else item.get("task_scenario"))
-                return {"registry_key": key, "clip_uid": item["clip_uid"], "task_id": item.get("task_id"),
-                        "history_name": path.name}
-    return None
+                found[identity] = {"registry_key": key, "clip_uid": item["clip_uid"],
+                                   "task_id": item.get("task_id"), "history_name": path.name}
+    return found
 
 
 def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,

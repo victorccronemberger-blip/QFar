@@ -22,10 +22,10 @@ def _groups() -> list[list[dict]]:
         if any(not isinstance(value, str) or not value for value in key):
             raise ValueError("Um registro de envio não identifica a conta, organização ou sessão.")
         try:
-            expected_path = upload._sidecar_path(key[2], row.get("chunk_index"))
+            expected_name = upload._sidecar_filename(key[2], row.get("chunk_index"))
         except upload.UploadError as exc:
             raise ValueError("Um registro de envio tem identidade inválida.") from exc
-        if path.name != expected_path.name:
+        if path.name != expected_name:
             raise ValueError("Um registro de envio não corresponde à sua sessão e parte.")
         if key[2] in owners and owners[key[2]] != key[:2]:
             raise ValueError("Uma sessão de envio tem identidades conflitantes.")
@@ -34,10 +34,11 @@ def _groups() -> list[list[dict]]:
     return [rows for rows in groups.values() if not all(row.get("campaign_reconciled") is True for row in rows)]
 
 
-def _describe(rows: list[dict]) -> dict | None:
+def _describe(rows: list[dict], legacy_contexts: dict | None = None) -> dict | None:
     first = rows[0]
     sid, email = first["session_id"], first["account_email"]
-    context = first.get("campaign_context") or campaign._legacy_upload_context(sid, email)
+    context = first.get("campaign_context") or (legacy_contexts.get((sid, email))
+        if legacy_contexts is not None else campaign._legacy_upload_context(sid, email))
     identified = isinstance(context, dict) and bool(context.get("registry_key") and context.get("clip_uid"))
     if sent_registry.recovery_was_reset(sid, context.get("registry_key", "") if identified else "",
                                          context.get("history_name", "") if identified else ""):
@@ -73,7 +74,11 @@ def _describe(rows: list[dict]) -> dict | None:
 
 
 def snapshot() -> dict:
-    items = [item for rows in _groups() if (item := _describe(rows)) is not None]
+    groups = _groups()
+    missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
+               if not rows[0].get("campaign_context")}
+    contexts = campaign._legacy_upload_contexts(missing) if missing else {}
+    items = [item for rows in groups if (item := _describe(rows, contexts)) is not None]
     return {"items": items, "pending": sum(item["status"] != "confirmed" for item in items),
             "confirmed": sum(item["status"] == "confirmed" for item in items)}
 

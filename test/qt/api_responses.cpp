@@ -58,14 +58,21 @@ int main(int argc, char** argv) {
   QElapsedTimer elapsed;
   elapsed.start();
   bool timedOut = false;
+  bool postTimedOut = false;
+  api.post(QStringLiteral("/api/campaigns"), {},
+           [&](bool ok, const QJsonDocument& doc, const QString& error) {
+    postTimedOut = !ok && !error.isEmpty() && elapsed.elapsed() >= 50000
+        && doc.object().value("error_code").toString() == "request_outcome_unknown";
+    if (timedOut) loop.quit();
+  });
   api.get(QStringLiteral("/api/accounts/bulk-register/status"),
           [&](bool ok, const QJsonDocument&, const QString& error) {
     timedOut = !ok && !error.isEmpty() && elapsed.elapsed() >= 50000;
-    loop.quit();
+    if (postTimedOut) loop.quit();
   });
   QTimer::singleShot(70000, &loop, &QEventLoop::quit);
   loop.exec();
-  if (!timedOut) {
+  if (!timedOut || !postTimedOut) {
     std::cerr << "Stalled GET did not time out\n";
     return 1;
   }

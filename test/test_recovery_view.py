@@ -28,6 +28,28 @@ class RecoveryViewTests(unittest.TestCase):
     def save(self, row=None, name="session1.json"):
         (self.journals / name).write_text(json.dumps(row or self.row), encoding="utf-8")
 
+    def test_large_legacy_batch_reads_history_once_and_resolves_directory_once(self):
+        accounts = []
+        for index in range(100):
+            sid = f"session{index}"
+            row = {**self.row, "session_id": sid}
+            row.pop("campaign_context")
+            self.save(row, name=f"{sid}.json")
+            accounts.append({"session_id": sid, "email": self.row["account_email"]})
+        history = self.root / "campaign_old.json"
+        history.write_text(json.dumps({"items": [{"clip_uid": "clip", "registry_key": "task",
+            "task_id": "task", "accounts": accounts}]}), encoding="utf-8")
+        original = Path.read_text
+        reads = []
+        def read(path, *args, **kwargs):
+            reads.append(path)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "read_text", read), patch.object(upload, "sidecars_dir", return_value=self.journals) as directory:
+            result = recovery.snapshot()
+        self.assertEqual(result["confirmed"], 100)
+        self.assertEqual(reads.count(history), 1)
+        directory.assert_called_once()
+
     def test_snapshot_does_not_export_secrets_or_paths(self):
         self.save({**self.row, "blob_url": "secret-signed-url", "video_path": "C:/private/file",
                    "error": "secret-token"})

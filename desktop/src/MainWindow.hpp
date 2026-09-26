@@ -312,6 +312,7 @@ private:
   bool _previewCheckActive{};
   bool _campaignActive{};
   bool _campaignStartPending{};
+  bool _campaignStartUncertain{};
   bool _campaignPollInFlight{};
   int _campaignPollRevision{};
 

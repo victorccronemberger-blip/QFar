@@ -4245,6 +4245,9 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
 void MainWindow::submitCampaign(QJsonObject body) {
   ++_campaignPollRevision;
   _campaignStartPending = true;
+  _campaignStage->setText(QStringLiteral("Iniciando campanha…"));
+  _campaignCurrent->setText(QStringLiteral("Validando os registros locais e aguardando o serviço."));
+  _campaignProgress->setRange(0, 0);
   _campaignTabs->setCurrentIndex(2);
   setCampaignIndicator(QStringLiteral("Iniciando campanha…"),
                        QStringLiteral("Aguardando confirmação do serviço. Os envios ainda não foram confirmados."), QStringLiteral("starting"), true);
@@ -4258,6 +4261,20 @@ void MainWindow::submitCampaign(QJsonObject body) {
         setCampaignIndicator(QStringLiteral("Não foi possível confirmar o início"), startError, QStringLiteral("error"));
         _campaignStart->setEnabled(!_campaignActive);
         const auto code = startDoc.object().value(QStringLiteral("error_code")).toString();
+        _campaignProgress->setRange(0, 100);
+        if (code == "request_outcome_unknown") {
+          _campaignStartUncertain = true;
+          _campaignStart->setEnabled(false);
+          _campaignStart->setText(QStringLiteral("Início não confirmado"));
+          _campaignStage->setText(QStringLiteral("Resposta do serviço indisponível"));
+          _campaignCurrent->setText(QStringLiteral("A solicitação pode ter sido aceita. Consultando a execução sem solicitar outro início."));
+          setCampaignIndicator(QStringLiteral("Início não confirmado"), _campaignCurrent->text(), QStringLiteral("unknown"));
+          _campaignPoll.start();
+          pollCampaign();
+          return;
+        }
+        _campaignStage->setText(QStringLiteral("Campanha não iniciada"));
+        _campaignCurrent->setText(startError);
         if (code == "preflight_expired" || code == "preflight_missing"
             || code == "preflight_accounts_changed" || code == "preflight_request_changed") {
           auto refreshed = body;
@@ -4346,6 +4363,14 @@ void MainWindow::pollCampaign() {
     const auto snap = doc.object();
     const QString state = snap.value(QStringLiteral("state")).toString();
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
+    if (_campaignStartUncertain && !running) {
+      setCampaignIndicator(QStringLiteral("Início não confirmado"),
+          QStringLiteral("O serviço ainda não confirmou a execução solicitada. A solicitação não será repetida automaticamente. Se persistir, encerre e reabra o aplicativo antes de tentar novamente."), QStringLiteral("unknown"));
+      return;
+    }
+    _campaignStartUncertain = false;
+    _campaignProgress->setRange(0, 100);
+
     _campaignActive = running;
     _campaignStop->setEnabled(running && state != QStringLiteral("stopping"));
     _campaignStart->setEnabled(!running);

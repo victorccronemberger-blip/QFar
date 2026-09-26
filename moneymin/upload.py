@@ -711,11 +711,15 @@ def sidecars_dir() -> Path:
 MAX_CRASH_RESUMES = 3
 
 
-def _sidecar_path(session_id: str, chunk_index: int = 0) -> Path:
+def _sidecar_filename(session_id: str, chunk_index: int = 0) -> str:
     if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", session_id) or type(chunk_index) is not int or chunk_index < 0:
         raise UploadError("identificador de retomada inválido")
     suffix = "" if chunk_index == 0 else f"__{chunk_index}"
-    return sidecars_dir() / f"{session_id}{suffix}.json"
+    return f"{session_id}{suffix}.json"
+
+
+def _sidecar_path(session_id: str, chunk_index: int = 0) -> Path:
+    return sidecars_dir() / _sidecar_filename(session_id, chunk_index)
 
 
 def _sidecar_archive_path(session_id: str, chunk_index: int = 0) -> Path:

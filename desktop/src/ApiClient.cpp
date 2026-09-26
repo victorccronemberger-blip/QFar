@@ -38,6 +38,8 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   // Operações de escrita podem incluir cadastro remoto e não são repetidas aqui.
   if (method == "GET")
     req.setTransferTimeout(path == QStringLiteral("/api/health") ? 3000 : 60000);
+  if (method == "POST" && path == QStringLiteral("/api/campaigns"))
+    req.setTransferTimeout(60000);
 
   QNetworkReply* reply = nullptr;
   const QByteArray payload = body ? QJsonDocument(*body).toJson(QJsonDocument::Compact) : QByteArray();
@@ -49,7 +51,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   connect(reply, &QNetworkReply::finished, this, [reply, callback = std::move(callback)]() {
     const QByteArray bytes = reply->readAll();
     QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
+    QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     const bool ok = reply->error() == QNetworkReply::NoError && status >= 200 && status < 300;
     QString error;
@@ -57,6 +59,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       if (doc.isObject()) error = doc.object().value(QStringLiteral("error")).toString();
       if (error.isEmpty()) error = reply->errorString();
       if (status) error = QStringLiteral("%1 (HTTP %2)").arg(error).arg(status);
+      else doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
     } else if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
       error = QStringLiteral("O serviço retornou uma resposta JSON inválida ou incompleta.");
     }
