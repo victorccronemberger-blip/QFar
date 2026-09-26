@@ -97,6 +97,29 @@ class PreflightContinuationTests(unittest.TestCase):
                 self.assertTrue(server.config.token_path('bad@example.com').exists())
         self.runner.start.assert_not_called()
 
+    def test_background_token_rotation_does_not_invalidate_preflight(self):
+        result = self.preflight()
+        token_path = server.config.token_path('good@example.com')
+        token = json.loads(token_path.read_text())
+        token.update(idToken='renewed-token', refreshToken='rotated-refresh',
+                     expiresIn='3600', expires_at=9999999999)
+        token_path.write_text(json.dumps(token, indent=2))
+        response = self.client.post('/api/campaigns', json={
+            **self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.runner.start.assert_called_once()
+
+    def test_identity_change_still_invalidates_preflight(self):
+        result = self.preflight()
+        token_path = server.config.token_path('good@example.com')
+        token = json.loads(token_path.read_text())
+        token['localId'] = 'another-user'
+        token_path.write_text(json.dumps(token))
+        response = self.client.post('/api/campaigns', json={
+            **self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
+        self.assertEqual(response.status_code, 409)
+        self.runner.start.assert_not_called()
+
     def test_ban_purges_legacy_credentials_backups_and_health_but_preserves_healthy(self):
         from moneymin import account_bans
         data = self.root / 'data'

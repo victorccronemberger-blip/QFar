@@ -1692,10 +1692,34 @@ def _ban_accounts(issues: list[dict]) -> None:
 
 
 def _preflight_fingerprint(emails: list[str]) -> str:
+    """Vincula a prévia à identidade/configuração, não à rotação da sessão."""
     digest = hashlib.sha256()
-    for path in [*[config.token_path(e) for e in sorted(set(emails))], _removed_accounts_path()]:
+    rotating = {"idToken", "id_token", "refreshToken", "refresh_token",
+                "expiresIn", "expires_in", "expires_at"}
+    for email in sorted(set(emails)):
+        path = config.token_path(email)
         digest.update(str(path).encode())
-        digest.update(path.read_bytes() if path.exists() else b"missing")
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            digest.update(b"missing")
+            continue
+        try:
+            token = json.loads(raw)
+            if not isinstance(token, dict):
+                raise ValueError("invalid token record")
+        except (ValueError, UnicodeError):
+            digest.update(b"invalid:" + raw)
+            continue
+        stable = {key: value for key, value in token.items() if key not in rotating}
+        # Remover/revogar as credenciais deve invalidar a prévia; renová-las não.
+        identity = {"record": stable,
+                    "has_id_token": bool(token.get("idToken") or token.get("id_token")),
+                    "has_refresh_token": bool(token.get("refreshToken") or token.get("refresh_token"))}
+        digest.update(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode())
+    removed = _removed_accounts_path()
+    digest.update(str(removed).encode())
+    digest.update(removed.read_bytes() if removed.exists() else b"missing")
     return digest.hexdigest()
 
 
