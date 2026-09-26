@@ -3287,8 +3287,8 @@ void MainWindow::showAccountIssues(const QString& title, const QStringList& bloc
   layout->addWidget(explanation);
   if (continueAction)
     explanation->setText(explanation->text() + QStringLiteral(
-        "\nRemover contas e continuar apaga permanentemente os acessos com restrição confirmada, "
-        "salva o registro em banned_accounts.json e inicia com as contas aprovadas, sem repetir a verificação."));
+        "\nRevise a campanha com as contas aprovadas antes de continuar. Somente após a confirmação final "
+        "os acessos com restrição confirmada serão removidos e registrados no histórico de contas banidas."));
   bool continueRequested = false;
   auto* details = new QPlainTextEdit;
   details->setReadOnly(true);
@@ -3297,7 +3297,7 @@ void MainWindow::showAccountIssues(const QString& title, const QStringList& bloc
   layout->addWidget(details, 1);
   auto* buttons = new QDialogButtonBox;
   if (continueAction) {
-    auto* remove = buttons->addButton(QStringLiteral("Remover contas e continuar"), QDialogButtonBox::ActionRole);
+    auto* remove = buttons->addButton(QStringLiteral("Revisar contas aprovadas"), QDialogButtonBox::ActionRole);
     connect(remove, &QPushButton::clicked, &dialog, [&dialog, &continueRequested] {
       continueRequested = true;
       dialog.accept();
@@ -4157,7 +4157,27 @@ void MainWindow::startCampaign() {
         QJsonObject continuation = body;
         continuation.insert(QStringLiteral("preflight_id"), result.value(QStringLiteral("preflight_id")));
         continuation.insert(QStringLiteral("remove_restricted"), true);
-        continueAction = [this, continuation] { submitCampaign(continuation); };
+        continueAction = [this, continuation, result, selectedAccountNames] {
+          QSet<QString> removed;
+          for (const auto value : result.value("removable_accounts").toArray()) removed.insert(value.toString());
+          QStringList included;
+          const auto requested = continuation.value("accounts").toArray();
+          for (int i = 0; i < requested.size(); ++i)
+            if (!removed.contains(requested[i].toString())) included.append(selectedAccountNames.value(i));
+          auto reviewed = result;
+          auto metrics = reviewed.value("accounts").toObject();
+          const int validated = metrics.value("validated").toInt();
+          metrics.insert("validated", included.size());
+          reviewed.insert("accounts", metrics);
+          reviewed.insert("account_workers", qMin(reviewed.value("account_workers").toInt(), int(included.size())));
+          if (validated > 0)
+            reviewed.insert("estimated_sends", reviewed.value("estimated_sends").toInt() * int(included.size()) / validated);
+          auto warnings = reviewed.value("warnings").toArray();
+          warnings.append(QStringLiteral("Ao confirmar, %1 conta(s) com restrição serão removidas antes de iniciar. Voltar mantém os acessos cadastrados.").arg(removed.size()));
+          reviewed.insert("warnings", warnings);
+          CampaignReviewDialog review(reviewed, included, this, continuation);
+          if (review.exec() == QDialog::Accepted) submitCampaign(continuation);
+        };
       }
       return showAccountIssues(QStringLiteral("Campanha não iniciada — verificação pendente"),
                                blockerLines, issues, continueAction);

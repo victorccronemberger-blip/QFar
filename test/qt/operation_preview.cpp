@@ -5,6 +5,7 @@
 #include "../../desktop/src/CampaignReviewDialog.hpp"
 #include <oclero/qlementine/style/QlementineStyle.hpp>
 #include <QApplication>
+#include <QRegularExpression>
 #include <QComboBox>
 #include <QDir>
 #include <QLabel>
@@ -21,6 +22,71 @@
 
 class OperationPreview {
 public:
+  static void continuationSmoke(MainWindow& window) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(30); return; }
+    auto requests = std::make_shared<int>(0);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, requests] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, requests] {
+        auto input = socket->property("request").toByteArray() + socket->readAll();
+        socket->setProperty("request", input);
+        const int headerEnd=input.indexOf("\r\n\r\n");
+        if (headerEnd<0 || socket->property("answered").toBool()) return;
+        const auto match=QRegularExpression(QStringLiteral("Content-Length: (\\d+)"),QRegularExpression::CaseInsensitiveOption)
+            .match(QString::fromLatin1(input.left(headerEnd)));
+        if(match.hasMatch() && input.size()<headerEnd+4+match.captured(1).toInt()) return;
+        socket->setProperty("answered", true);
+        if(input.startsWith("POST /api/campaigns ") && qApp->arguments().contains("--continuation-accept")) {
+          const auto body=QJsonDocument::fromJson(input.mid(headerEnd+4)).object();
+          const bool correct=*requests==1 && body.value("preflight_id").toString()=="fixture"
+              && body.value("remove_restricted").toBool() && body.value("accounts").toArray().size()==2;
+          qApp->exit(correct?0:34); return;
+        }
+        if (!input.startsWith("POST /api/campaigns/preflight ")) { qApp->exit(31); return; }
+        ++*requests;
+        const QJsonObject result{{"ok",false},{"can_remove_and_continue",true},{"preflight_id","fixture"},
+          {"blockers",QJsonArray{"blocked"}},{"account_errors",QJsonArray{"blocked"}},
+          {"removable_accounts",QJsonArray{"blocked@example.com"}},
+          {"account_issues",QJsonArray{QJsonObject{{"email","blocked@example.com"},{"restriction_confirmed",true}}}},
+          {"accounts",QJsonObject{{"validated",2}}},{"account_workers",2},{"estimated_sends",2}};
+        const auto body=QJsonDocument(result).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(body.size())+"\r\n\r\n"+body);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    {
+      const QSignalBlocker accountsBlocker(window._campaignAccounts), tasksBlocker(window._campaignTasks);
+      for(const auto email:{"ok@example.com","blocked@example.com"}) {
+        auto* item=new QListWidgetItem(QString::fromLatin1(email),window._campaignAccounts);
+        item->setData(Qt::UserRole,QString::fromLatin1(email)); item->setCheckState(Qt::Checked);
+      }
+      auto* task=new QListWidgetItem(QStringLiteral("Fixture"),window._campaignTasks);
+      task->setData(Qt::UserRole,QStringLiteral("fixture-task")); task->setCheckState(Qt::Checked);
+    }
+    window._taskReload.stop();
+    auto* timer=new QTimer(&window);
+    QObject::connect(timer,&QTimer::timeout,&window,[timer,requests] {
+      auto* dialog=qobject_cast<QDialog*>(QApplication::activeModalWidget());
+      if(!dialog) return;
+      if(dialog->windowTitle()==QStringLiteral("Revisar campanha")) {
+        auto* table=dialog->findChild<QTableWidget*>();
+        const bool correct=table && table->rowCount()==1 && table->item(0,0)->text()==QStringLiteral("ok@example.com");
+        timer->stop();
+        if(correct && qApp->arguments().contains("--continuation-accept")) {dialog->accept();return;}
+        dialog->reject();
+        QTimer::singleShot(150,qApp,[requests,correct]{qApp->exit(correct && *requests==1 ? 0:32);});
+        return;
+      }
+      for(auto* button:dialog->findChildren<QPushButton*>())
+        if(button->text()==QStringLiteral("Revisar contas aprovadas")) {button->click();return;}
+    });
+    timer->start(25);
+    QTimer::singleShot(8000,&window,[]{qApp->exit(33);});
+    window.startCampaign();
+  }
   static void smoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(10); return; }
@@ -181,6 +247,10 @@ int main(int argc, char** argv) {
   app.setStyle(style);
   MainWindow window(style, nullptr, false);
   window.resize(app.arguments().contains("--compact") ? QSize(980, 680) : QSize(1586, 992));
+  if (app.arguments().contains("--continuation-smoke")) {
+    QTimer::singleShot(0, &window, [&window]{OperationPreview::continuationSmoke(window);});
+    return app.exec();
+  }
   window.show();
   if (app.arguments().contains("--smoke")) {
     QTimer::singleShot(100,&window,[&window]{OperationPreview::smoke(window);});
