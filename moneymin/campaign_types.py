@@ -91,6 +91,8 @@ class CampaignConfig:
     realistic_timeline: bool = False
     # Server-owned snapshot of the reviewed candidate pool; never client data.
     candidate_plan: dict[str, list[dict[str, Any]]] | None = None
+    # Server-owned reservations: pending delivery is never a confirmed send.
+    recovery_exclusions: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass

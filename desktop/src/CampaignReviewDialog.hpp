@@ -96,7 +96,7 @@ public:
       clipLayout->setContentsMargins(0, 0, 0, 0);
       auto* clipTable = new QTableWidget(clips.size(), 5);
       clipTable->setHorizontalHeaderLabels({QStringLiteral("Clipe"), QStringLiteral("Categoria"),
-          QStringLiteral("Duração"), QStringLiteral("Elegíveis"), QStringLiteral("Já registrados")});
+          QStringLiteral("Duração"), QStringLiteral("Elegíveis"), QStringLiteral("Excluídas")});
       clipTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
       clipTable->verticalHeader()->hide();
       clipTable->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -126,7 +126,9 @@ public:
         for (const auto account : clip.value("eligible_accounts").toArray())
           lines << account.toString() + QStringLiteral(" — elegível; envio sujeito à preparação e aos limites da campanha");
         for (const auto account : clip.value("excluded_accounts").toArray())
-          lines << account.toString() + QStringLiteral(" — excluída: envio anterior registrado na lista local");
+          lines << account.toString() + (clip.value("pending_accounts").toArray().contains(account)
+              ? QStringLiteral(" — clipe reservado: envio anterior pendente; recebimento não confirmado nesta campanha")
+              : QStringLiteral(" — excluída: envio anterior registrado na lista local"));
         detail->setPlainText(lines.join(QLatin1Char('\n')));
       });
       clipLayout->addWidget(clipTable, 1);

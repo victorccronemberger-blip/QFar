@@ -3189,6 +3189,20 @@ def create_app() -> Flask:
 
         removable = {i["email"] for i in account_issues if i.get("restriction_confirmed") is True}
         survivors = [a for a in accounts if a.email not in removable]
+        recovery_exclusions = {}
+        try:
+            unresolved = recovery.snapshot()["items"]
+            selected_recovery = [item for item in unresolved if item["email"] in emails]
+            unidentified = sorted({item["email"] for item in selected_recovery if item.get("blocks_campaign", True)})
+            if unidentified:
+                blockers.append("Pendências sem clipe identificado em: " + ", ".join(unidentified)
+                                + ". Abra Pendências e recuperação para revisar essas sessões.")
+            recovery_exclusions = recovery.campaign_exclusions(selected_recovery)
+            if recovery_exclusions:
+                warnings.append(f"{len(recovery_exclusions)} clipe(s) reservado(s) por envios anteriores. "
+                                "Esses clipes não serão reenviados nem contarão como progresso novo; a campanha usará outros conteúdos.")
+        except (ValueError, OSError):
+            blockers.append("Não foi possível verificar as pendências. Abra Pendências e recuperação.")
         reusable = (bool(survivors) and bool(selected) and catalog_loaded and ready.get("ready") is True
                     and len(blockers) == len(account_errors)
                     and all(i.get("restriction_confirmed") is True for i in account_issues))
@@ -3207,7 +3221,7 @@ def create_app() -> Flask:
             try:
                 candidate_plan, clip_review, sent_fingerprint = campaign_plan.build(CampaignConfig(
                     accounts=survivors, tasks=review_tasks, dataset_provider=provider,
-                    content_mode=content_mode))
+                    content_mode=content_mode, recovery_exclusions=recovery_exclusions))
                 clip_count = len(clip_review)
                 if target_hours > 0:
                     available_seconds = {a.email: 0.0 for a in survivors}
@@ -3540,10 +3554,12 @@ def create_app() -> Flask:
                 unresolved = recovery.snapshot()["items"]
             except (ValueError, OSError):
                 return jsonify({"error": "Revise os registros de recuperação antes de iniciar outra campanha."}), 409
-            affected = sorted({item["email"] for item in unresolved} & {account.email for account in accounts})
+            affected = sorted({item["email"] for item in unresolved if item.get("blocks_campaign", True)}
+                              & {account.email for account in accounts})
             if affected:
-                return jsonify({"error": "Resolva os envios anteriores em Pendências e recuperação antes de iniciar para estas contas.",
-                                "recovery_accounts": affected}), 409
+                return jsonify({"error": "Há sessões sem clipe identificado. Revise Pendências e recuperação para estas contas: " + ", ".join(affected),
+                                "error_code": "recovery_unidentified", "recovery_accounts": affected}), 409
+            cfg.recovery_exclusions = recovery.campaign_exclusions(unresolved)
             if HOLO_CACHE_RUNNER.running:
                 return jsonify({
                     "error": "pare o acelerador antes de iniciar a campanha",

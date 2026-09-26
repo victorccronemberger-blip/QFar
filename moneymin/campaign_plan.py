@@ -24,11 +24,14 @@ def build(config: CampaignConfig) -> tuple[dict, list[dict], str]:
         for clip in candidates:
             uid = clip["clip_uid"]
             recorded = set(registry.get(task.registry_key, {}).get(uid, []))
+            pending = set(config.recovery_exclusions.get(uid, []))
+            excluded = recorded | pending
             review.append({
                 "task_id": task.task_id, "task": task.task_label or task.task_name or task.scenario,
                 "clip_uid": uid, "duration_s": float(clip.get("dur_s") or 0),
-                "eligible_accounts": [a.email for a in config.accounts if a.email not in recorded],
-                "excluded_accounts": [a.email for a in config.accounts if a.email in recorded],
-                "exclusion_reason": "already_recorded",
+                "eligible_accounts": [a.email for a in config.accounts if a.email not in excluded],
+                "excluded_accounts": [a.email for a in config.accounts if a.email in excluded],
+                "pending_accounts": [a.email for a in config.accounts if a.email in pending],
+                "exclusion_reason": "pending_recovery" if pending else "already_recorded",
             })
     return pools, review, fingerprint

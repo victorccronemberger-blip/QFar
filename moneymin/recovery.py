@@ -39,7 +39,11 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None) -> dict | N
     sid, email = first["session_id"], first["account_email"]
     context = first.get("campaign_context") or (legacy_contexts.get((sid, email))
         if legacy_contexts is not None else campaign._legacy_upload_context(sid, email))
-    identified = isinstance(context, dict) and bool(context.get("registry_key") and context.get("clip_uid"))
+    identified = (isinstance(context, dict)
+                  and all(isinstance(context.get(key), str) and context[key] for key in ("registry_key", "clip_uid"))
+                  and (not context.get("task_id") or context["task_id"] == first.get("task_id"))
+                  and all(row.get("campaign_context") == first.get("campaign_context")
+                          and row.get("task_id") == first.get("task_id") for row in rows))
     if sent_registry.recovery_was_reset(sid, context.get("registry_key", "") if identified else "",
                                          context.get("history_name", "") if identified else ""):
         return None
@@ -65,6 +69,7 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None) -> dict | N
         "email": email, "session_id": sid,
         "clip_uid": context.get("clip_uid") if identified else None,
         "status": "confirmed" if confirmed else "pending" if resumable else "needs_review",
+        "blocks_campaign": not identified,
         "can_resume": bool(resumable),
         "chunks_found": len(rows), "chunks_expected": expected if type(expected) is int else None,
         "detail": "Finalização registrada; falta reconciliar a lista local." if confirmed else
@@ -77,10 +82,19 @@ def snapshot() -> dict:
     groups = _groups()
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
                if not rows[0].get("campaign_context")}
-    contexts = campaign._legacy_upload_contexts(missing) if missing else {}
+    contexts = campaign._legacy_upload_contexts(missing, [row for rows in groups for row in rows]) if missing else {}
     items = [item for rows in groups if (item := _describe(rows, contexts)) is not None]
-    return {"items": items, "pending": sum(item["status"] != "confirmed" for item in items),
+    return {"items": items, "pending": sum(item["status"] in {"pending", "needs_review"} for item in items),
             "confirmed": sum(item["status"] == "confirmed" for item in items)}
+
+
+def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
+    """Reserve uncertain clips across categories without claiming delivery."""
+    excluded: dict[str, set[str]] = {}
+    for item in items:
+        if item.get("clip_uid"):
+            excluded.setdefault(item["clip_uid"], set()).add(item["email"])
+    return {uid: sorted(emails) for uid, emails in excluded.items()}
 
 
 def reconcile_confirmed() -> dict:
@@ -88,7 +102,7 @@ def reconcile_confirmed() -> dict:
     groups = _groups(directory)
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
                if not rows[0].get("campaign_context")}
-    contexts = campaign._legacy_upload_contexts(missing) if missing else {}
+    contexts = campaign._legacy_upload_contexts(missing, [row for rows in groups for row in rows]) if missing else {}
     confirmed = []
     deliveries = []
     for rows in groups:

@@ -16,6 +16,7 @@ class RecoveryViewTests(unittest.TestCase):
         self.journals = self.root / "sidecars"
         self.journals.mkdir()
         for mocked in (patch.object(config, "DATA_DIR", self.root),
+                       patch.object(config, "MEDIA_DATA_DIR", self.root),
                        patch.object(upload, "sidecars_dir", return_value=self.journals),
                        patch("socket.socket.connect", side_effect=AssertionError("network forbidden"))):
             mocked.start()
@@ -57,6 +58,38 @@ class RecoveryViewTests(unittest.TestCase):
         self.assertEqual(snapshot["confirmed"], 1)
         self.assertNotIn("secret", json.dumps(snapshot))
         self.assertNotIn("C:/private", json.dumps(snapshot))
+
+    def test_legacy_media_mapping_requires_unique_clip_task_and_account(self):
+        row = {**self.row, "campaign_context": None, "local_video_path": "C:/old/clip_native.mp4"}
+        self.save(row)
+        history = {"items": [{"clip_uid": "clip", "registry_key": "task", "task_id": "task",
+                    "video_path": "clip_native.mp4", "accounts": [{"email": "one@example.com"}]}]}
+        path = self.root / "campaign_legacy.json"
+        path.write_text(json.dumps(history), encoding="utf-8")
+        result = recovery.snapshot()
+        self.assertEqual(result["confirmed"], 1)
+        self.assertFalse(result["items"][0]["blocks_campaign"])
+        history["items"].append({**history["items"][0], "clip_uid": "different"})
+        path.write_text(json.dumps(history), encoding="utf-8")
+        self.assertTrue(recovery.snapshot()["items"][0]["blocks_campaign"])
+        history["items"] = [{**history["items"][0], "task_id": "different-task"}]
+        path.write_text(json.dumps(history), encoding="utf-8")
+        self.assertTrue(recovery.snapshot()["items"][0]["blocks_campaign"])
+
+    def test_uncertain_known_clip_is_reserved_without_marking_sent(self):
+        self.save({**self.row, "state": "failed", "finalized": False})
+        result = recovery.snapshot()
+        self.assertEqual(result["pending"], 1)
+        self.assertFalse(result["items"][0]["blocks_campaign"])
+        self.assertEqual(recovery.campaign_exclusions(result["items"]), {"clip": ["one@example.com"]})
+        self.assertEqual(sent_registry.sent_emails("task", "clip"), set())
+        self.assertEqual(recovery.reconcile_confirmed()["reconciled"], 0)
+
+    def test_conflicting_contexts_keep_account_blocked(self):
+        self.save({**self.row, "expected_chunk_count": 2})
+        self.save({**self.row, "chunk_index": 1, "expected_chunk_count": 2,
+                   "campaign_context": {"registry_key": "task", "clip_uid": "other"}}, "session1__1.json")
+        self.assertTrue(recovery.snapshot()["items"][0]["blocks_campaign"])
 
     def test_batch_reconciliation_writes_sent_index_once_and_retries_failed_ack(self):
         for index in range(100):

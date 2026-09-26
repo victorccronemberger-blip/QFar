@@ -3415,7 +3415,10 @@ void MainWindow::openRecovery() {
       const QStringList values{item.value("email").toString(), item.value("clip_uid").toString(QStringLiteral("Não identificado")), item.value("session_id").toString(), status};
       for (int column = 0; column < values.size(); ++column) {
         auto* value = cell(values[column]);
-        value->setToolTip(values[column] + QStringLiteral("\n") + item.value("detail").toString());
+        value->setToolTip(values[column] + QStringLiteral("\n") + item.value("detail").toString()
+            + (item.value("blocks_campaign").toBool(true)
+               ? QStringLiteral("\nBloqueia novas campanhas nesta conta até identificar o clipe.")
+               : QStringLiteral("\nSomente este clipe fica reservado. A conta pode enviar outros conteúdos.")));
         table->setItem(row, column, value);
       }
     }
@@ -4275,6 +4278,11 @@ void MainWindow::submitCampaign(QJsonObject body) {
         }
         _campaignStage->setText(QStringLiteral("Campanha não iniciada"));
         _campaignCurrent->setText(startError);
+        if (code == "recovery_unidentified") {
+          setStatus(startError);
+          openRecovery();
+          return;
+        }
         if (code == "preflight_expired" || code == "preflight_missing"
             || code == "preflight_accounts_changed" || code == "preflight_request_changed") {
           auto refreshed = body;

@@ -1582,12 +1582,21 @@ def _legacy_upload_context(session_id: str, email: str) -> dict[str, Any] | None
     return _legacy_upload_contexts({(session_id, email)}).get((session_id, email))
 
 
-def _legacy_upload_contexts(wanted: set[tuple[str, str]]) -> dict:
+def _legacy_upload_contexts(wanted: set[tuple[str, str]], journals: list[dict] | None = None) -> dict:
     """Read each history file once for a batch of legacy journals."""
     found = {}
-    for path in config.DATA_DIR.glob("campaign_*.json"):
-        if len(found) == len(wanted):
-            break
+    direct_matches = {}
+    media_matches = {}
+    journal_media = {}
+    for row in journals or []:
+        identity = (row.get("session_id"), row.get("account_email"))
+        name = str(row.get("local_video_path") or "").replace("\\", "/").rsplit("/", 1)[-1]
+        if identity in wanted and name and row.get("task_id"):
+            journal_media.setdefault((name, row["task_id"], identity[1]), set()).add(identity)
+    paths = set(config.DATA_DIR.glob("campaign_*.json"))
+    # Older installations kept campaign history beside the media library.
+    paths.update(config.MEDIA_DATA_DIR.glob("campaign_*.json"))
+    for path in sorted(paths):
         try:
             history = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1595,21 +1604,34 @@ def _legacy_upload_contexts(wanted: set[tuple[str, str]]) -> dict:
         if not isinstance(history, dict):
             continue
         for item in history.get("items") or []:
-            if not isinstance(item, dict) or not item.get("clip_uid"):
+            if not isinstance(item, dict) or not isinstance(item.get("clip_uid"), str) or not item["clip_uid"]:
                 continue
             for row in item.get("accounts") or []:
                 if not isinstance(row, dict):
                     continue
                 identity = (row.get("session_id"), row.get("email"))
-                if not all(isinstance(value, str) for value in identity):
-                    continue
-                if identity not in wanted or identity in found:
+                if not isinstance(identity[1], str):
                     continue
                 key = item.get("registry_key") or (
                     f"minute|{item['task_id']}|{item['task_name']}"
                     if item.get("task_id") and item.get("task_name") else item.get("task_scenario"))
-                found[identity] = {"registry_key": key, "clip_uid": item["clip_uid"],
-                                   "task_id": item.get("task_id"), "history_name": path.name}
+                if not isinstance(key, str) or not key:
+                    continue
+                context = {"registry_key": key, "clip_uid": item["clip_uid"],
+                           "task_id": item.get("task_id"), "history_name": path.name}
+                if identity in wanted:
+                    direct_matches.setdefault(identity, {})[(key, item["clip_uid"])] = context
+                name = str(item.get("video_path") or "").replace("\\", "/").rsplit("/", 1)[-1]
+                for target in journal_media.get((name, item.get("task_id"), row.get("email")), ()):
+                    media_matches.setdefault(target, {})[(key, item["clip_uid"])] = context
+    # A filename alone is not proof. Require the same task and account and a
+    # unique clip/registry mapping across all available histories.
+    for identity, matches in direct_matches.items():
+        if len(matches) == 1:
+            found[identity] = next(iter(matches.values()))
+    for identity, matches in media_matches.items():
+        if identity not in direct_matches and len(matches) == 1:
+            found[identity] = next(iter(matches.values()))
     return found
 
 
@@ -1661,6 +1683,7 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                       session: Session | None = None,
                       session_cache: dict[str, Session] | None = None,
                       recorded_at: str | None = None,
+                      recover_pending: bool = True,
                       **_legacy: Any,
                       ) -> dict[str, Any]:
     """Sobe um item JÁ PREPARADO para uma conta (o MP4 não é refeito).
@@ -1690,7 +1713,7 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             sess.warmup()
         result["org_key"] = account.org_key
         profile = device_profile.get_profile(account.email)
-        if not getattr(sess, "_moneymin_pending_pumped", False):
+        if recover_pending and not getattr(sess, "_moneymin_pending_pumped", False):
             recovered = pump_pending(
                 sess, account_email=account.email, required_org_key=account.org_key,
             )
@@ -1699,8 +1722,8 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 result["recovered_uploads"] = len(recovered)
         else:
             recovered = []
-        journals = [row for row in list_sidecars() if not row.get("campaign_reconciled")]
-        reconciliation = _reconcile_uploads([*recovered, *journals], account, item, task_id)
+        journals = [row for row in list_sidecars() if not row.get("campaign_reconciled")] if recover_pending else []
+        reconciliation = _reconcile_uploads([*recovered, *journals], account, item, task_id) if recover_pending else None
         if reconciliation is not None:
             return reconciliation
         policy_limits = (
@@ -2132,7 +2155,9 @@ def _run_campaign(
                 fresh = []
                 used_parents = set()
                 for candidate in all_clips:
-                    if sent_registry.is_sent_to_all(registry_key, candidate["clip_uid"], emails):
+                    reserved_for = set(config.recovery_exclusions.get(candidate["clip_uid"], []))
+                    unavailable = sent_registry.sent_emails(registry_key, candidate["clip_uid"]) | reserved_for if reserved_for else set()
+                    if sent_registry.is_sent_to_all(registry_key, candidate["clip_uid"], emails) or (reserved_for and all(email in unavailable for email in emails)):
                         used_parents.add(parent_key(candidate))
                     else:
                         fresh.append(candidate)
@@ -2200,15 +2225,16 @@ def _run_campaign(
             # clipe (seleção explícita do wizard ou corrida entre campanhas),
             # pula ANTES do intervalo e de baixar/reencodar.
             sent_to = sent_registry.sent_emails(registry_key, clip_info["clip_uid"])
-            if all(a.email in sent_to for a in config.accounts):
-                _log(f"  clipe {clip_info['clip_uid'][:12]} já enviado a todas as "
-                     f"contas — pulando (sem baixar/reencodar)")
+            reserved = set(config.recovery_exclusions.get(clip_info["clip_uid"], []))
+            if all(a.email in sent_to | reserved for a in config.accounts):
+                _log(f"  clipe {clip_info['clip_uid'][:12]} já enviado ou reservado por pendência "
+                     f"em todas as contas — pulando (sem baixar/reencodar)")
                 # account_done mantém o progresso da UI consistente; o item nem
                 # chega a existir (nada a registrar no log da campanha)
                 for account in config.accounts:
                     _emit("account_done", clip_uid=clip_info["clip_uid"],
-                          task=tsk.scenario, email=account.email, ok=True,
-                          skipped=True)
+                          task=tsk.scenario, email=account.email, ok=account.email not in reserved,
+                          skipped=True, reason="pending_recovery" if account.email in reserved else "already_sent")
                 continue
             if content_mode == "cache" and not _clip_is_cached(clip_info, work_dir):
                 _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
@@ -2368,6 +2394,13 @@ def _run_campaign(
                               task=tsk.scenario, email=account.email, ok=True,
                               skipped=True, error=skip_res["error"])
                         continue
+                if account.email in reserved:
+                    _log(f"      -> {account.email} (clipe reservado por envio anterior pendente)")
+                    account_results[account.email] = {"email": account.email, "org_key": account.org_key,
+                        "ok": False, "skipped": True, "reason": "pending_recovery"}
+                    _emit("account_done", clip_uid=clip_info["clip_uid"], task=tsk.scenario,
+                          email=account.email, ok=False, skipped=True, reason="pending_recovery")
+                    continue
                 # dedup por conta: quem já recebeu este clipe é pulado
                 if account.email in sent_registry.sent_emails(registry_key,
                                                               clip_info["clip_uid"]):
@@ -2447,6 +2480,7 @@ def _run_campaign(
                     on_progress=_account_progress,
                     unique_video=bool(config.unique_video),
                     session_cache=sessions,
+                    recover_pending=not bool(config.recovery_exclusions),
                     recorded_at=scheduled_recorded_at)
 
             def _safe_send_account(upload_idx: int,
@@ -2725,7 +2759,9 @@ def _run_campaign(
                 )
             if pending_accounts:
                 completed_items += 1
-                if (config.cleanup_after_upload and all_pending_succeeded
+                if reserved:
+                    _log("  armazenamento: mídia preservada para a recuperação do envio anterior")
+                elif (config.cleanup_after_upload and all_pending_succeeded
                         and clip_info.get("_cache_ready_at_selection")):
                     removed, freed = _enforce_account_video_cache(work_dir)
                     _log("  armazenamento: cache preparado preservado"

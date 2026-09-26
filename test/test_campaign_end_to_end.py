@@ -16,6 +16,35 @@ REAL_UPLOAD_TO_ACCOUNT = campaign.upload_to_account
 
 
 class CampaignEndToEndTests(unittest.TestCase):
+    def test_known_pending_clip_allows_other_content_without_resending_or_counting_it(self):
+        pending = [{"email": email, "clip_uid": "clip", "blocks_campaign": False}
+                   for email in self.emails]
+        candidates = [{"clip_uid": uid, "dur_s": 300, "source": "ego4d"} for uid in ("clip", "fresh")]
+        with patch.object(server.recovery, "snapshot", return_value={"items": pending}), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch.object(campaign, "_compatible_task_clips", return_value=candidates):
+            review = self.client.post("/api/campaigns/preflight", json={**self.body, "include_clip_plan": True}).get_json()
+            reserved = next(row for row in review["clip_plan"] if row["clip_uid"] == "clip")
+            self.assertEqual(reserved["eligible_accounts"], [])
+            self.assertEqual(reserved["pending_accounts"], self.emails)
+            response = self.client.post("/api/campaigns", json=self.body)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual([call.args[0]["clip_uid"] for call in self.prepare.call_args_list], ["fresh"])
+        self.assertEqual(snap["totals"]["ok_sends"], 2)
+        self.assertEqual(self.mark.call_count, 2)
+        self.assertTrue(all(not call.kwargs["recover_pending"] for call in self.send.call_args_list))
+
+    def test_pending_clip_reservation_is_per_account_and_preserves_media(self):
+        pending = [{"email": self.emails[0], "clip_uid": "clip", "blocks_campaign": False}]
+        with patch.object(server.recovery, "snapshot", return_value={"items": pending}):
+            response = self.client.post("/api/campaigns", json=self.body)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snap, log = self.finish()
+        self.assertEqual([call.args[1].email for call in self.send.call_args_list], self.emails[1:])
+        self.assertEqual(snap["totals"]["ok_sends"], 1)
+        self.cleanup.assert_not_called()
+
     def test_skipped_account_does_not_become_a_confirmed_delivery(self):
         self.send.side_effect = lambda item, account, *a, **k: {
             "email": account.email, "ok": True, "skipped": True, "reason": "account_too_young"}
