@@ -29,6 +29,7 @@ class QSpinBox;
 class QDoubleSpinBox;
 class QStackedWidget;
 class QTableWidget;
+class QTabWidget;
 class QWidget;
 
 namespace oclero::qlementine { class QlementineStyle; }
@@ -111,6 +112,7 @@ private:
   void loadTasks();
   void startCampaign();
   void pollCampaign();
+  void setCampaignIndicator(const QString& title, const QString& detail, const QString& state, bool busy = false);
   void pollCampaignPreviews();
   void loadAccelerator();
   void startAccelerator();
@@ -294,6 +296,11 @@ private:
   QPushButton* _campaignStop{};
   QPushButton* _campaignReset{};
   QProgressBar* _campaignProgress{};
+  QTabWidget* _campaignTabs{};
+  QWidget* _campaignIndicator{};
+  QLabel* _campaignIndicatorTitle{};
+  QLabel* _campaignIndicatorDetail{};
+  QProgressBar* _campaignIndicatorProgress{};
   QLabel* _campaignStage{};
   QLabel* _campaignCurrent{};
   QLabel* _campaignStats{};
@@ -304,6 +311,9 @@ private:
   QString _previewLogName;
   bool _previewCheckActive{};
   bool _campaignActive{};
+  bool _campaignStartPending{};
+  bool _campaignPollInFlight{};
+  int _campaignPollRevision{};
 
   QComboBox* _cacheProvider{};
   quint64 _cacheRequestId{};

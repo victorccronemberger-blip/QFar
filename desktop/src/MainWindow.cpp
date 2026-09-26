@@ -1299,7 +1299,26 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* bodyLayout = new QVBoxLayout(body);
   bodyLayout->setContentsMargins(0, 0, 0, 0);
   bodyLayout->setSpacing(14);
+  _campaignIndicator = new QFrame;
+  _campaignIndicator->setObjectName(QStringLiteral("campaignIndicator"));
+  auto* indicatorLayout = new QVBoxLayout(_campaignIndicator);
+  indicatorLayout->setContentsMargins(18, 14, 18, 14);
+  indicatorLayout->setSpacing(7);
+  _campaignIndicatorTitle = new QLabel;
+  _campaignIndicatorTitle->setObjectName(QStringLiteral("campaignIndicatorTitle"));
+  _campaignIndicatorTitle->setWordWrap(true);
+  _campaignIndicatorDetail = new QLabel;
+  _campaignIndicatorDetail->setWordWrap(true);
+  _campaignIndicatorProgress = new QProgressBar;
+  _campaignIndicatorProgress->setTextVisible(false);
+  indicatorLayout->addWidget(_campaignIndicatorTitle);
+  indicatorLayout->addWidget(_campaignIndicatorDetail);
+  indicatorLayout->addWidget(_campaignIndicatorProgress);
+  bodyLayout->addWidget(_campaignIndicator);
   auto* tabs = new QTabWidget;
+  _campaignTabs = tabs;
+  setCampaignIndicator(QStringLiteral("Nenhuma campanha em andamento"),
+                       QStringLiteral("Revise o conteúdo e as contas para iniciar."), QStringLiteral("idle"));
   bodyLayout->addWidget(tabs, 1);
 
   auto* scroll = new QScrollArea;
@@ -2818,6 +2837,11 @@ void MainWindow::applyStructuralStyle(bool dark) {
   setStyleSheet(QStringLiteral(R"(
     * { font-family: "Segoe UI"; }
     #operationSurface { background: %8; border: 1px solid %6; border-radius: 14px; }
+    #campaignIndicator { background: %2; border: 1px solid %6; border-left: 4px solid #8b90a2; border-radius: 10px; }
+    #campaignIndicator[state="running"], #campaignIndicator[state="starting"] { border-left-color: #754dff; }
+    #campaignIndicator[state="error"], #campaignIndicator[state="unknown"] { border-left-color: #d58b25; }
+    #campaignIndicator[state="done"] { border-left-color: #159a72; }
+    #campaignIndicatorTitle { font-size: 19px; font-weight: 700; }
     #operationInspector { background: #23242c; border: 1px solid #383a48; border-radius: 14px; }
     #walletContext, #libraryContext, #integrationsContext { background: #23242c; border: 1px solid #383a48; border-radius: 14px; }
     #walletContext QLabel, #libraryContext QLabel, #integrationsContext QLabel { color: #f2f3f7; }
@@ -4125,6 +4149,9 @@ void MainWindow::startCampaign() {
 }
 
 void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccountNames) {
+  ++_campaignPollRevision;
+  setCampaignIndicator(QStringLiteral("Verificando campanha"),
+                       QStringLiteral("Validando contas e clipes. Nenhum envio iniciado."), QStringLiteral("starting"), true);
   _campaignStart->setEnabled(false);
   _campaignStart->setText(QStringLiteral("Verificando campanha…"));
   _api.post(QStringLiteral("/api/campaigns/preflight"), body,
@@ -4132,6 +4159,7 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
     if (!ok) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       _campaignStart->setEnabled(true);
+      setCampaignIndicator(QStringLiteral("Verificação não concluída"), error, QStringLiteral("error"));
       return showError(QStringLiteral("Verificação não concluída"), error);
     }
     const auto result = doc.object();
@@ -4139,6 +4167,8 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
     QStringList blockerLines;
     for (const auto& value : blockers) blockerLines << QStringLiteral("• ") + value.toString();
     if (!result.value(QStringLiteral("ok")).toBool() || !blockerLines.isEmpty()) {
+      setCampaignIndicator(QStringLiteral("Campanha não iniciada"),
+                           QStringLiteral("Revise as pendências da verificação."), QStringLiteral("error"));
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       _campaignStart->setEnabled(true);
       const auto issues = result.value(QStringLiteral("account_issues")).toArray();
@@ -4181,7 +4211,10 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
           warnings.append(QStringLiteral("Ao confirmar, %1 conta(s) com restrição serão removidas antes de iniciar. Voltar mantém os acessos cadastrados.").arg(removed.size()));
           reviewed.insert("warnings", warnings);
           CampaignReviewDialog review(reviewed, included, this, continuation);
+          setCampaignIndicator(QStringLiteral("Aguardando sua confirmação"),
+                               QStringLiteral("Confira a prévia antes de iniciar os envios."), QStringLiteral("idle"));
           if (review.exec() == QDialog::Accepted) submitCampaign(continuation);
+          else setCampaignIndicator(QStringLiteral("Campanha não iniciada"), QStringLiteral("A revisão foi cancelada. Nenhum envio iniciado."), QStringLiteral("idle"));
         };
       }
       return showAccountIssues(QStringLiteral("Campanha não iniciada — verificação pendente"),
@@ -4189,7 +4222,10 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
     }
 
     CampaignReviewDialog review(result, selectedAccountNames, this, body);
+    setCampaignIndicator(QStringLiteral("Aguardando sua confirmação"),
+                         QStringLiteral("Confira a prévia antes de iniciar os envios."), QStringLiteral("idle"));
     if (review.exec() != QDialog::Accepted) {
+      setCampaignIndicator(QStringLiteral("Campanha não iniciada"), QStringLiteral("A revisão foi cancelada. Nenhum envio iniciado."), QStringLiteral("idle"));
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       _campaignStart->setEnabled(true);
       return;
@@ -4202,12 +4238,19 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
 }
 
 void MainWindow::submitCampaign(QJsonObject body) {
+  ++_campaignPollRevision;
+  _campaignStartPending = true;
+  _campaignTabs->setCurrentIndex(2);
+  setCampaignIndicator(QStringLiteral("Iniciando campanha…"),
+                       QStringLiteral("Aguardando confirmação do serviço. Os envios ainda não foram confirmados."), QStringLiteral("starting"), true);
   _campaignStart->setEnabled(false);
     _campaignStart->setText(QStringLiteral("Iniciando…"));
     _api.post(QStringLiteral("/api/campaigns"), body,
               [this, body](bool started, const QJsonDocument& startDoc, const QString& startError) {
+      _campaignStartPending = false;
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       if (!started) {
+        setCampaignIndicator(QStringLiteral("Não foi possível confirmar o início"), startError, QStringLiteral("error"));
         _campaignStart->setEnabled(!_campaignActive);
         const auto code = startDoc.object().value(QStringLiteral("error_code")).toString();
         if (code == "preflight_expired" || code == "preflight_missing"
@@ -4224,6 +4267,7 @@ void MainWindow::submitCampaign(QJsonObject body) {
         return showError(QStringLiteral("Campanha não iniciada"), startError);
       }
       if (startDoc.object().value(QStringLiteral("already_running")).toBool()) {
+        setCampaignIndicator(QStringLiteral("Campanha em andamento"), QStringLiteral("Consultando a atividade atual…"), QStringLiteral("running"), true);
         _campaignActive = true;
         _campaignStart->setEnabled(false);
         _campaignReset->setEnabled(false);
@@ -4250,6 +4294,10 @@ void MainWindow::submitCampaign(QJsonObject body) {
       }
       updateCampaignAccountCount();
       _campaignActive = true;
+      _campaignStart->setEnabled(false);
+      _campaignStart->setText(QStringLiteral("Campanha em andamento"));
+      _campaignStop->setEnabled(true);
+      setCampaignIndicator(QStringLiteral("Campanha em andamento"), QStringLiteral("Início confirmado. Preparando os primeiros envios…"), QStringLiteral("running"), true);
       _campaignReset->setEnabled(false);
       _lastCampaignSeq = 0;
       _previewPoll.stop();
@@ -4264,16 +4312,39 @@ void MainWindow::submitCampaign(QJsonObject body) {
   }
 
 
+void MainWindow::setCampaignIndicator(const QString& title, const QString& detail, const QString& state, bool busy) {
+  _campaignIndicatorTitle->setText(title);
+  _campaignIndicatorDetail->setText(detail);
+  _campaignIndicator->setProperty("state", state);
+  _campaignIndicator->style()->unpolish(_campaignIndicator);
+  _campaignIndicator->style()->polish(_campaignIndicator);
+  _campaignIndicatorProgress->setRange(0, busy ? 0 : 100);
+  _campaignIndicatorProgress->setVisible(busy || state == QStringLiteral("running"));
+  if (_campaignTabs && _campaignTabs->count() > 2)
+    _campaignTabs->setTabText(2, state == "running" ? QStringLiteral("Acompanhamento · em andamento") : QStringLiteral("Acompanhamento"));
+}
+
 void MainWindow::pollCampaign() {
+  if (_campaignStartPending || _campaignPollInFlight) return;
+  _campaignPollInFlight = true;
+  const int revision = _campaignPollRevision;
   _api.get(QStringLiteral("/api/campaigns/current?since=%1").arg(_lastCampaignSeq),
-           [this](bool ok, const QJsonDocument& doc, const QString&) {
-    if (!ok) return;
+           [this, revision](bool ok, const QJsonDocument& doc, const QString&) {
+    _campaignPollInFlight = false;
+    if (revision != _campaignPollRevision) return;
+    if (!ok) {
+      setCampaignIndicator(QStringLiteral("Sem atualização do serviço"),
+          QStringLiteral("Não foi possível confirmar o estado atual. Tentando novamente; isso não significa que a campanha parou."), QStringLiteral("unknown"));
+      _campaignPoll.start();
+      return;
+    }
     const auto snap = doc.object();
     const QString state = snap.value(QStringLiteral("state")).toString();
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
     _campaignActive = running;
     _campaignStop->setEnabled(running && state != QStringLiteral("stopping"));
     _campaignStart->setEnabled(!running);
+    _campaignStart->setText(running ? QStringLiteral("Campanha em andamento") : QStringLiteral("Iniciar campanha"));
     _campaignReset->setEnabled(!running);
     const QHash<QString, QString> stateLabels{
         {QStringLiteral("idle"), QStringLiteral("Aguardando")},
@@ -4302,6 +4373,12 @@ void MainWindow::pollCampaign() {
     const int failed = totals.value(QStringLiteral("failed_sends")).toInt();
     const int skipped = totals.value(QStringLiteral("skipped_sends")).toInt();
     const int percent = total > 0 ? qBound(0, done * 100 / total, 100) : 0;
+    const bool paused = snap.value(QStringLiteral("pause_requested")).toBool();
+    const QString headline = state == "running" ? (paused ? QStringLiteral("Pausa solicitada") : QStringLiteral("Campanha em andamento"))
+        : stateLabels.value(state, QStringLiteral("Estado não reconhecido"));
+    const QString progressText = total > 0 ? QStringLiteral("%1 de %2 envios processados · %3%\n").arg(done).arg(total).arg(percent) : QString();
+    setCampaignIndicator(headline, progressText + current, state, running && !paused && total == 0);
+    _campaignIndicatorProgress->setValue(percent);
     _campaignProgress->setValue(percent);
     _campaignProgress->setFormat(total > 0
         ? QStringLiteral("%1 de %2 envios · %p%").arg(done).arg(total)

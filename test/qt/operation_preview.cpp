@@ -22,6 +22,61 @@
 
 class OperationPreview {
 public:
+  static void campaignIndicatorSmoke(MainWindow& window) {
+    page(window,3);
+    window.applyStructuralStyle(qApp->arguments().contains("--dark"));
+    auto* server=new QTcpServer(&window);
+    if(!server->listen(QHostAddress::LocalHost)){qApp->exit(40);return;}
+    auto phase=std::make_shared<int>(0);
+    QObject::connect(server,&QTcpServer::newConnection,server,[server,phase]{
+      auto* socket=server->nextPendingConnection();
+      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,phase]{
+        auto input=socket->property("input").toByteArray()+socket->readAll();
+        socket->setProperty("input",input);
+        if(!input.contains("\r\n\r\n") || socket->property("answered").toBool())return;
+        socket->setProperty("answered",true);
+        QJsonObject reply; bool failed=false;
+        if(input.startsWith("POST /api/campaigns ")) reply={{"ok",true},{"accounts",QJsonArray{}}};
+        else if(input.startsWith("GET /api/campaigns/current?")) {
+          failed=*phase==2;
+          reply={{"state",*phase==3?"done":*phase==4?"error":"running"},
+                 {"current",*phase==0?"Preparando o primeiro clipe":*phase==1?"Enviando clipe para conta de demonstração":"Execução encerrada"},
+                 {"totals",QJsonObject{{"total_sends",*phase==0?0:4},{"done_sends",*phase==0?0:*phase==1?1:4}}}};
+        } else {qApp->exit(41);return;}
+        const auto bytes=QJsonDocument(reply).toJson(QJsonDocument::Compact);
+        socket->write(QByteArray(failed?"HTTP/1.1 503 Unavailable\r\n":"HTTP/1.1 200 OK\r\n")+
+            "Content-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(bytes.size())+"\r\n\r\n"+bytes);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window.submitCampaign({});
+    if(window._campaignTabs->currentIndex()!=2 || window._campaignIndicatorTitle->text()!=QStringLiteral("Iniciando campanha…")) {
+      qApp->exit(42);return;
+    }
+    auto* timer=new QTimer(&window);
+    QObject::connect(timer,&QTimer::timeout,&window,[&window,phase]{
+      const auto title=window._campaignIndicatorTitle->text();
+      if(*phase==0 && window._campaignIndicatorDetail->text().contains("Preparando o primeiro")) {
+        if(!window._campaignIndicator->isVisible() || window._campaignIndicatorProgress->maximum()!=0
+            || !window._campaignStop->isEnabled() || window._campaignStart->isEnabled()){qApp->exit(43);return;}
+        *phase=1;window.pollCampaign();
+      } else if(*phase==1 && window._campaignIndicatorDetail->text().contains("25%")) {
+        if(qApp->arguments().contains("--indicator-proof")) window.grab().save(qApp->arguments().at(1));
+        window._campaignTabs->setCurrentIndex(0);
+        if(!window._campaignIndicator->isVisible() || window._campaignIndicatorProgress->value()!=25){qApp->exit(44);return;}
+        *phase=2;window.pollCampaign();
+      } else if(*phase==2 && title==QStringLiteral("Sem atualização do serviço")) {
+        *phase=3;window.pollCampaign();
+      } else if(*phase==3 && title==QStringLiteral("Concluída")) {
+        if(!window._campaignStart->isEnabled() || window._campaignStop->isEnabled()){qApp->exit(45);return;}
+        *phase=4;window.pollCampaign();
+      } else if(*phase==4 && title==QStringLiteral("Atenção necessária")) qApp->exit(0);
+    });
+    timer->start(25);
+    QTimer::singleShot(8000,&window,[]{qApp->exit(46);});
+  }
   static void continuationSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(30); return; }
@@ -269,6 +324,10 @@ int main(int argc, char** argv) {
     return app.exec();
   }
   window.show();
+  if (app.arguments().contains("--indicator-smoke")) {
+    QTimer::singleShot(100,&window,[&window]{OperationPreview::campaignIndicatorSmoke(window);});
+    return app.exec();
+  }
   if (app.arguments().contains("--smoke")) {
     QTimer::singleShot(100,&window,[&window]{OperationPreview::smoke(window);});
     return app.exec();
