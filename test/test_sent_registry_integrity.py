@@ -9,6 +9,29 @@ from moneymin import config, sent_registry
 
 
 class SentRegistryIntegrityTests(unittest.TestCase):
+    def test_skipped_and_unfinalized_accounts_are_not_reconstructed_as_sent(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(config, "DATA_DIR", Path(directory)):
+            (Path(directory) / "campaign_old.json").write_text(json.dumps({"items": [{
+                "clip_uid": "clip", "registry_key": "original-key", "task_scenario": "translated",
+                "accounts": [{"email": "skipped", "ok": True, "skipped": True},
+                             {"email": "pending", "ok": True, "finalized": False},
+                             {"email": "confirmed", "ok": True, "finalized": True}]}]}))
+            self.assertEqual(sent_registry.sent_emails("original-key", "clip"), {"confirmed"})
+            self.assertFalse(sent_registry.sent_emails("translated", "clip"))
+
+    def test_reset_survives_missing_registry_without_resurrecting_history(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(config, "DATA_DIR", Path(directory)):
+            def history(name, clip):
+                (Path(directory) / name).write_text(json.dumps({"items": [{
+                    "clip_uid": clip, "task_scenario": "task", "accounts": [{"email": "a", "ok": True}]}]}))
+            history("campaign_old.json", "old")
+            self.assertEqual(sent_registry.sent_emails("task", "old"), {"a"})
+            sent_registry.reset()
+            (Path(directory) / sent_registry.FILE_NAME).unlink()
+            history("campaign_new.json", "new")
+            self.assertFalse(sent_registry.sent_emails("task", "old"))
+            self.assertEqual(sent_registry.sent_emails("task", "new"), {"a"})
+
     def test_corrupt_registry_never_becomes_empty_or_overwritten(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(config, "DATA_DIR", Path(directory)):
             path = Path(directory) / sent_registry.FILE_NAME

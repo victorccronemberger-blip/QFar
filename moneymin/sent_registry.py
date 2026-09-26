@@ -40,6 +40,7 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
     """Reconstrói o registro a partir dos logs de campanha (envios com ok=true)."""
     data: dict[str, dict[str, list[str]]] = {}
     data_dir = config.DATA_DIR
+    resets = _reset_history()
     if not data_dir.exists():
         return data
     for p in data_dir.iterdir():
@@ -57,15 +58,19 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
             uid = item.get("clip_uid")
             task_id = item.get("task_id")
             task_name = item.get("task_name")
-            scenario = (f"minute|{task_id}|{task_name}"
+            scenario = item.get("registry_key") or (f"minute|{task_id}|{task_name}"
                         if task_id and task_name else item.get("task_scenario") or "")
             if not isinstance(uid, str) or not uid or not isinstance(scenario, str):
+                continue
+            if p.name in resets.get("all", []) or p.name in resets.get("scenarios", {}).get(scenario, []):
                 continue
             accounts = item.get("accounts", [])
             if not isinstance(accounts, list):
                 continue
             for acc in accounts:
-                if isinstance(acc, dict) and acc.get("ok") is True and isinstance(acc.get("email"), str):
+                if (isinstance(acc, dict) and acc.get("ok") is True
+                        and not acc.get("skipped") and acc.get("finalized") is not False
+                        and isinstance(acc.get("email"), str)):
                     entry = data.setdefault(scenario, {}).setdefault(uid, [])
                     if acc["email"] not in entry:
                         entry.append(acc["email"])
@@ -109,6 +114,27 @@ def _save(data: dict[str, dict[str, list[str]]]) -> None:
     save_json(_path(), data)
 
 
+def _reset_history() -> dict[str, Any]:
+    path = config.DATA_DIR / "sent_reset_history.json"
+    if not path.exists():
+        return {}
+    result = load_json(path, None)
+    if (not isinstance(result, dict) or not isinstance(result.get("all", []), list)
+            or not isinstance(result.get("completed_sessions", []), list)
+            or not isinstance(result.get("scenarios", {}), dict)
+            or any(not isinstance(value, list) for value in result.get("scenarios", {}).values())):
+        raise ValueError("Histórico de reset inválido; restaure o arquivo antes de continuar.")
+    return result
+
+
+def recovery_was_reset(session_id: str, scenario: str, history_name: str = "") -> bool:
+    with _LOCK:
+        resets = _reset_history()
+        return (session_id in resets.get("completed_sessions", [])
+                or bool(history_name) and (history_name in resets.get("all", [])
+                    or history_name in resets.get("scenarios", {}).get(scenario, [])))
+
+
 def mark_sent(scenario: str, clip_uid: str, email: str) -> None:
     """Registra que `clip_uid` foi enviado com sucesso para `email`."""
     with _LOCK:
@@ -145,6 +171,33 @@ def reset(scenario: str | None = None) -> None:
             data = {}
         else:
             data.pop(scenario, None)
+        resets = _reset_history()
+        from .upload import list_sidecars
+        sessions: dict[str, list[dict]] = {}
+        for row in list_sidecars():
+            if row.get("session_id"):
+                sessions.setdefault(row["session_id"], []).append(row)
+        completed = set()
+        for sid, rows in sessions.items():
+            expected = rows[0].get("expected_chunk_count", 1)
+            if (type(expected) is int and expected > 0 and len(rows) == expected
+                    and all(type(row.get("chunk_index")) is int for row in rows)
+                    and {row["chunk_index"] for row in rows} == set(range(expected))
+                    and all(row.get("finalized") is True and row.get("state") == "done"
+                            and row.get("expected_chunk_count", 1) == expected
+                            and (scenario is None or isinstance(row.get("campaign_context"), dict)
+                                 and row["campaign_context"].get("registry_key") == scenario)
+                            for row in rows)):
+                completed.add(sid)
+        resets["completed_sessions"] = sorted(set(resets.get("completed_sessions", [])) | completed)
+        histories = {p.name for p in config.DATA_DIR.glob("campaign_*.json")}
+        if scenario is None:
+            resets["all"] = sorted(set(resets.get("all", [])) | histories)
+        else:
+            scenarios = resets.setdefault("scenarios", {})
+            scenarios[scenario] = sorted(set(scenarios.get(scenario, [])) | histories)
+        # Grave a barreira antes de limpar: logs antigos não podem desfazer o reset.
+        save_json(config.DATA_DIR / "sent_reset_history.json", resets)
         _save(data)
 
 

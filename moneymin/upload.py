@@ -1635,6 +1635,7 @@ def upload_session(
     on_progress: Callable[..., None] | None = None,
     profile: DeviceProfile | None = None,
     chunk_index_start: int = 0,
+    campaign_context: dict[str, Any] | None = None,
 ) -> UploadResult:
     """Executa o upload completo de uma sessão (1+ chunks) ao backend do Minute.
 
@@ -1771,6 +1772,7 @@ def upload_session(
         if persist_sidecar:
             existing = load_sidecar(session_id, idx) or {}
             journal = {
+                "campaign_context": existing.get("campaign_context") or campaign_context,
                 "schema_version": 2,
                 "session_id": session_id,
                 "org_key": org_key,

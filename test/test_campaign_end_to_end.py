@@ -12,8 +12,40 @@ from moneymin import campaign, minute_api
 from moneymin.campaign_types import AccountSpec, CampaignConfig, CampaignLog, TaskSpec
 from moneymin.web import runner, server
 
+REAL_UPLOAD_TO_ACCOUNT = campaign.upload_to_account
+
 
 class CampaignEndToEndTests(unittest.TestCase):
+    def test_skipped_account_does_not_become_a_confirmed_delivery(self):
+        self.send.side_effect = lambda item, account, *a, **k: {
+            "email": account.email, "ok": True, "skipped": True, "reason": "account_too_young"}
+        response = self.client.post("/api/campaigns", json=self.body)
+        self.assertEqual(response.status_code, 200)
+        self.finish()
+        self.mark.assert_not_called()
+
+    def test_recovered_upload_finishes_campaign_without_new_remote_session(self):
+        rows = [{"session_id": f"old-{index}", "chunk_index": 0, "expected_chunk_count": 1,
+                 "account_email": email, "org_key": "org", "task_id": "task",
+                 "state": "done", "phase": "done", "finalized": True,
+                 "campaign_context": {"registry_key": "key", "clip_uid": "clip"}}
+                for index, email in enumerate(self.emails)]
+        self.send.side_effect = REAL_UPLOAD_TO_ACCOUNT
+        with patch.object(campaign.org_policy, "account_kind", return_value="claru"), \
+             patch.object(campaign.device_profile, "get_profile", return_value=Mock()), \
+             patch.object(campaign, "list_sidecars", side_effect=lambda: rows), \
+             patch.object(campaign, "save_sidecar"), \
+             patch.object(campaign, "pump_pending", return_value=[]), \
+             patch.object(campaign, "_new_identity", side_effect=AssertionError("new session forbidden")), \
+             patch.object(campaign, "upload_session", side_effect=AssertionError("network forbidden")) as upload:
+            response = self.client.post("/api/campaigns", json=self.body)
+            self.assertEqual(response.status_code, 200)
+            snapshot, history = self.finish()
+        upload.assert_not_called()
+        self.assertEqual(history["status"], "done")
+        self.assertEqual(snapshot["totals"]["ok_sends"], 2)
+        self.assertTrue(all(account["recovered"] for account in history["items"][0]["accounts"]))
+
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)

@@ -3924,17 +3924,18 @@ def create_app() -> Flask:
 
     @app.post("/api/sent/reset")
     def reset_sent():
-        if RUNNER.running:
-            return jsonify({
-                "error": "aguarde a campanha terminar antes de resetar a lista de vídeos usados",
-            }), 409
-        body = request.get_json(silent=True) or {}
-        scenario = body.get("scenario")
-        try:
-            sent_registry.reset(str(scenario) if scenario else None)
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 409
-        return jsonify({"ok": True, "sent": sent_registry.summary()})
+        with _HEAVY_RUNNER_LOCK:
+            if RUNNER.running:
+                return jsonify({
+                    "error": "aguarde a campanha terminar antes de resetar a lista de vídeos usados",
+                }), 409
+            body = request.get_json(silent=True) or {}
+            scenario = body.get("scenario")
+            try:
+                sent_registry.reset(str(scenario) if scenario else None)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 409
+            return jsonify({"ok": True, "sent": sent_registry.summary()})
 
     return app
 

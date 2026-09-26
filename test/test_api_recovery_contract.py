@@ -109,6 +109,12 @@ class RecoveryContractTests(unittest.TestCase):
                 self.assertTrue(result[0]["finalized"])
                 self.assertEqual(result[0]["state"], upload.STATE_DONE)
 
+    def test_finalize_recovery_preserves_campaign_identity(self):
+        context = {"registry_key": "category", "clip_uid": "clip", "task_id": "task"}
+        result, calls = self.pump([self.journal(campaign_context=context)])
+        self.assertEqual(calls, 1)
+        self.assertEqual(result[0]["campaign_context"], context)
+
     def test_mixed_owners_or_orgs_cannot_finalize_together(self):
         for changes in ({"account_email": "b@example.com"}, {"org_key": "other"}):
             with self.subTest(changes=changes):

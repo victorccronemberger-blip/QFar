@@ -77,7 +77,7 @@ from .task_catalog import (
     TASK_NAME_PT,
     TASK_TO_SCENARIO,
 )
-from .upload import UploadError, pump_pending, upload_session
+from .upload import UploadError, pump_pending, upload_session, list_sidecars, save_sidecar
 
 __all__ = [
     "AccountSpec",
@@ -1571,6 +1571,75 @@ def _all_pending_uploads_succeeded(
 
 # --- envio para uma conta -----------------------------------------------------
 
+def _acknowledge_campaign_upload(session_id: str) -> None:
+    for row in list_sidecars():
+        if row.get("session_id") == session_id:
+            row["campaign_reconciled"] = True
+            save_sidecar(row)
+
+
+def _legacy_upload_context(session_id: str, email: str) -> dict[str, Any] | None:
+    """Resolve journals antigos pelo histórico, sem confundir skip com envio."""
+    for path in config.DATA_DIR.glob("campaign_*.json"):
+        try:
+            history = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(history, dict):
+            continue
+        for item in history.get("items") or []:
+            if not isinstance(item, dict) or not item.get("clip_uid"):
+                continue
+            if any(isinstance(row, dict) and row.get("session_id") == session_id
+                   and row.get("email") == email for row in item.get("accounts") or []):
+                key = item.get("registry_key") or (
+                    f"minute|{item['task_id']}|{item['task_name']}"
+                    if item.get("task_id") and item.get("task_name") else item.get("task_scenario"))
+                return {"registry_key": key, "clip_uid": item["clip_uid"], "task_id": item.get("task_id"),
+                        "history_name": path.name}
+    return None
+
+
+def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
+                       item: dict[str, Any], task_id: str) -> dict[str, Any] | None:
+    groups: dict[str, dict[int, dict[str, Any]]] = {}
+    for row in rows:
+        if (str(row.get("account_email", "")).casefold() != account.email.casefold()
+                or row.get("org_key") != account.org_key or not row.get("session_id")
+                or type(row.get("chunk_index")) is not int):
+            continue
+        groups.setdefault(row["session_id"], {})[row["chunk_index"]] = row
+    matched = None
+    for sid, chunks in groups.items():
+        first = next(iter(chunks.values()))
+        if sent_registry.recovery_was_reset(sid, ""):
+            continue
+        context = first.get("campaign_context") or _legacy_upload_context(sid, account.email)
+        if not isinstance(context, dict) or not context.get("registry_key") or not context.get("clip_uid"):
+            if first.get("task_id") == task_id:
+                matched = {"email": account.email, "ok": False, "session_id": sid,
+                           "error": "Envio anterior sem identificação do clipe; confira a sessão antes de reenviar."}
+            continue
+        same = context["clip_uid"] == item.get("clip_uid") and first.get("task_id") == task_id
+        key = item.get("registry_key") if same else context["registry_key"]
+        expected = first.get("expected_chunk_count", 1)
+        complete = (type(expected) is int and expected > 0 and set(chunks) == set(range(expected))
+                    and all(row.get("finalized") is True and row.get("state") == "done"
+                            and row.get("expected_chunk_count", 1) == expected
+                            and row.get("campaign_context") == first.get("campaign_context")
+                            for row in chunks.values()))
+        if complete and sent_registry.recovery_was_reset(sid, context["registry_key"], context.get("history_name", "")):
+            continue
+        if complete:
+            sent_registry.mark_sent(key or context["registry_key"], context["clip_uid"], account.email)
+            _acknowledge_campaign_upload(sid)
+        if same and (matched is None or not complete):
+            matched = {"email": account.email, "ok": complete, "finalized": complete,
+                       "session_id": sid, "recovered": complete,
+                       "error": None if complete else "Envio anterior ainda pendente; nova sessão não criada."}
+    return matched
+
+
 def upload_to_account(item: dict[str, Any], account: AccountSpec,
                       task_id: str, timeout_blob: int,
                       evaluate: bool, finalize: bool,
@@ -1615,6 +1684,12 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             sess._moneymin_pending_pumped = True
             if recovered:
                 result["recovered_uploads"] = len(recovered)
+        else:
+            recovered = []
+        journals = [row for row in list_sidecars() if not row.get("campaign_reconciled")]
+        reconciliation = _reconcile_uploads([*recovered, *journals], account, item, task_id)
+        if reconciliation is not None:
+            return reconciliation
         policy_limits = (
             sess.recording_policy.limits()
             if getattr(sess, "recording_policy", None) is not None
@@ -1707,6 +1782,8 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             profile=profile,
             suppress_per_chunk_catbear=len(chunk_paths) > 1,
             on_progress=on_progress,
+            campaign_context={"registry_key": item["registry_key"], "clip_uid": item["clip_uid"],
+                              "task_id": task_id} if item.get("registry_key") and item.get("clip_uid") else None,
         )
         result["session_id"] = res.session_id
         result["finalized"] = res.finalized
@@ -1825,8 +1902,8 @@ def _run_campaign(
     - Dedup: a seleção automática pula clipes já enviados a TODAS as contas
       (`data/sent_videos.json`, ver `sent_registry`); no envio, contas que já
       receberam o clipe são puladas (`account_done` com `skipped=True`). Se não
-      sobrar nenhum clipe novo de um cenário (100% enviado), o registro daquele
-      cenário é resetado (evento `sent_reset`) e a seleção recomeça do início.
+      sobrar nenhum clipe novo de um cenário (100% enviado), informa esgotamento;
+      limpar o histórico exige um reset explícito.
     - `config.delay_mode`: aplicado na TROCA de vídeo (nunca entre contas do
       mesmo vídeo): "clip" = espera a duração do vídeo recém-enviado
       (parece gravação real), "fixed" = `delay_s` segundos, "off" = sem espera.
@@ -2197,9 +2274,11 @@ def _run_campaign(
                     [account.email for account in config.accounts],
                     registry_key,
                 )
+            item["clip_uid"] = clip_info["clip_uid"]
             item["task_id"] = tsk.task_id
             item["task_name"] = display_name
             item["task_scenario"] = tsk.scenario
+            item["registry_key"] = registry_key
             item["accounts"] = []
             pending_accounts: list[AccountSpec] = []
             account_results: dict[str, dict[str, Any]] = {}
@@ -2417,9 +2496,11 @@ def _run_campaign(
                 except Exception as exc:
                     record_error = exc
                 ok = acc_res.get("ok")
-                if ok:
+                if ok and not acc_res.get("skipped") and acc_res.get("finalized") is not False:
                     try:
                         sent_registry.mark_sent(sent_key, clip_uid, account.email)
+                        if acc_res.get("session_id"):
+                            _acknowledge_campaign_upload(acc_res["session_id"])
                     except Exception as exc:
                         record_error = record_error or exc
                     if not acc_res.get("skipped"):
