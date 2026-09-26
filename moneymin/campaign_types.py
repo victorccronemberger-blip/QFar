@@ -89,6 +89,8 @@ class CampaignConfig:
     # Interface web: reserva gravações reais por conta e só envia após o fim.
     # False mantém chamadas de biblioteca/testes retrocompatíveis.
     realistic_timeline: bool = False
+    # Server-owned snapshot of the reviewed candidate pool; never client data.
+    candidate_plan: dict[str, list[dict[str, Any]]] | None = None
 
 
 @dataclass

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.73",
+    [string]$Version = "2.0.0",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [switch]$Staging
 )
@@ -55,10 +55,12 @@ New-Item -ItemType Directory -Force "$WorkDir\spec" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller falhou; pacote não será publicado." }
 $env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path "$WorkDir\pyinstaller\QMoneyService.exe").Path
 cmake -S "$ProjectRoot\desktop" -B $BuildDir -G Ninja `
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$QtRoot
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$QtRoot -DQMONEY_BUILD_VISUAL_PREVIEW=ON
 if ($LASTEXITCODE -ne 0) { throw "Configuração CMake falhou." }
 cmake --build $BuildDir --config Release --parallel
 if ($LASTEXITCODE -ne 0) { throw "Compilação CMake falhou." }
+ctest --test-dir $BuildDir --output-on-failure
+if ($LASTEXITCODE -ne 0) { throw "Teste integrado da interface falhou; pacote não será publicado." }
 
 New-Item -ItemType Directory -Force $Package | Out-Null
 New-Item -ItemType Directory -Force "$Package\runtime" | Out-Null
@@ -110,6 +112,12 @@ foreach ($BrowserPart in (Get-QMoneyBrowserParts -ManifestPath $BrowserManifest 
     Copy-Item $BrowserPart.FullName $BrowserTarget -Recurse -Force
 }
 
+& "$ProjectRoot\.venv\Scripts\python.exe" "$ProjectRoot\scripts\verify_packaged_service.py" `
+    "$Package\runtime\QMoneyService.exe" --report "$OutputDir\packaged-service-report.json"
+if ($LASTEXITCODE -ne 0) { throw "Verificação do serviço empacotado falhou." }
+if ((Get-Item "$Package\QMoney.exe").VersionInfo.ProductVersion -ne $Version) {
+    throw "Versão do executável difere da versão solicitada."
+}
 $Zip = Join-Path $OutputDir "QMoney-windows-x64.zip"
 foreach ($OldArtifact in @($Zip, "$Zip.sha256", "$Zip.sig")) {
     Remove-Item -LiteralPath $OldArtifact -Force -ErrorAction SilentlyContinue

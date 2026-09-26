@@ -703,23 +703,23 @@ def complete_upload(
 # --- Sidecar persistente + fila (mimica recording.saveBody / pumpUploads) ------
 
 def sidecars_dir() -> Path:
-    """Diretório onde ficam os sidecars de upload (`data/sidecars/`)."""
-    d = config.MEDIA_DATA_DIR / "sidecars"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """Retomadas pertencem à instalação, não à biblioteca compartilhável."""
+    from .upload_storage import journal_directory
+    return journal_directory()
 
 
 MAX_CRASH_RESUMES = 3
 
 
 def _sidecar_path(session_id: str, chunk_index: int = 0) -> Path:
+    if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", session_id) or type(chunk_index) is not int or chunk_index < 0:
+        raise UploadError("identificador de retomada inválido")
     suffix = "" if chunk_index == 0 else f"__{chunk_index}"
     return sidecars_dir() / f"{session_id}{suffix}.json"
 
 
 def _sidecar_archive_path(session_id: str, chunk_index: int = 0) -> Path:
-    suffix = "" if chunk_index == 0 else f"__{chunk_index}"
-    return sidecars_dir() / f"{session_id}{suffix}.data.zip"
+    return _sidecar_path(session_id, chunk_index).with_suffix(".data.zip")
 
 
 def _remove_sidecar_archive(session_id: str, chunk_index: int = 0) -> None:
@@ -2048,6 +2048,7 @@ def pump_pending(
     retry_backoff: float = 1.5,
     account_email: str | None = None,
     required_org_key: str | None = None,
+    session_ids: set[str] | None = None,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Processa sidecars pendentes (retry-late / loss / failed) e tenta de novo.
@@ -2084,6 +2085,8 @@ def pump_pending(
     if required_org_key is not None:
         pending = [item for item in pending
                    if item.get("org_key") == required_org_key]
+    if session_ids is not None:
+        pending = [item for item in pending if item.get("session_id") in session_ids]
 
     updated: list[dict[str, Any]] = []
     touched_sessions: set[str] = set()

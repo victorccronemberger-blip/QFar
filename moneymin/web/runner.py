@@ -19,6 +19,7 @@ from typing import Any
 
 from .. import campaign, ego_accelerator, holo_accelerator
 from ..campaign import CampaignConfig, run_campaign
+from .operation_state import OperationState
 
 _MAX_EVENTS = 2000
 
@@ -203,7 +204,7 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         if skipped:
             return {
                 "level": "warning", "stage": "Envio", "title": "Conta ignorada",
-                "detail": f"{email} · {friendly_campaign_error(payload.get('error')) if payload.get('error') else 'este vídeo já foi processado'}",
+                "detail": f"{email} · {friendly_campaign_error(payload.get('error')) if payload.get('error') else 'registro local de envio anterior' if payload.get('reason') == 'already_sent' else 'conta pulada nesta execução'}",
             }
         if ok:
             return {
@@ -287,6 +288,9 @@ class CampaignRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._resume = threading.Event()
+        self._resume.set()
+        self.pause_requested = False
         self._thread: threading.Thread | None = None
         self.state = "idle"  # idle|running|stopping|done|stopped|error
         self.events: deque[dict[str, Any]] = deque(maxlen=_MAX_EVENTS)
@@ -301,6 +305,7 @@ class CampaignRunner:
         self.current = ""  # descrição da atividade atual (p/ a barra de status)
         self.stage = "Aguardando"
         self.on_restriction = None
+        self.operation = OperationState()
 
     # --- ciclo de vida ----------------------------------------------------
     @property
@@ -325,8 +330,11 @@ class CampaignRunner:
             except (TypeError, ValueError, OverflowError) as exc:
                 raise RuntimeError("Configuração numérica da campanha inválida.") from exc
             self._stop.clear()
+            self._resume.set()
+            self.pause_requested = False
             self.state = "running"
             self.events.clear()
+            self.operation = OperationState(account.email for account in cfg.accounts)
             self.error = None
             self.log_path = None
             self.done_sends = 0
@@ -370,10 +378,32 @@ class CampaignRunner:
             if self.state == "running":
                 self.state = "stopping"
                 self._stop.set()
+                self.pause_requested = False
+                self._resume.set()
                 self.stage = "Encerrando"
                 requested = True
         if requested:
             self._record("campaign_stopping")
+
+    def pause(self) -> None:
+        with self._lock:
+            if self.state != "running":
+                raise RuntimeError("Só é possível pausar uma campanha em execução.")
+            self.pause_requested = True
+            self._resume.clear()
+
+    def resume(self) -> None:
+        with self._lock:
+            if self.state != "running" or not self.pause_requested:
+                raise RuntimeError("Não há uma campanha pausada para retomar.")
+            self.pause_requested = False
+            self._resume.set()
+
+    def _checkpoint(self) -> bool:
+        # Requests already in flight may finish. Stop must always release waiters.
+        while not self._stop.is_set() and not self._resume.wait(0.1):
+            pass
+        return self._stop.is_set()
 
     # --- thread de fundo ----------------------------------------------------
     def _run(self, cfg: CampaignConfig) -> None:
@@ -384,13 +414,16 @@ class CampaignRunner:
             if kind in {"campaign_done", "campaign_stopped"}:
                 terminal = (kind, dict(payload))
             else:
+                self._checkpoint()
                 self._on_event(kind, payload)
 
         try:
             result = run_campaign(cfg, progress=on_progress,
-                                  should_stop=self._stop.is_set)
+                                  should_stop=self._checkpoint)
         except Exception as exc:  # noqa: BLE001 — reporta qualquer falha na UI
             with self._lock:
+                self.pause_requested = False
+                self._resume.set()
                 self.state = "error"
                 self.error = friendly_campaign_error(exc)
                 self.current = ""
@@ -409,6 +442,8 @@ class CampaignRunner:
             # retorne sem emitir evento terminal, a interface nunca fica presa
             # eternamente em running/stopping.
             with self._lock:
+                self.pause_requested = False
+                self._resume.set()
                 if isinstance(result, campaign.CampaignLog) and result._path is not None:
                     self.log_path = result._path.name
                 if self.state == "running":
@@ -429,6 +464,7 @@ class CampaignRunner:
                 payload = {**payload, "removal_failed": True}
         self._record(kind, **payload)
         with self._lock:
+            self.operation.event(kind, payload)
             if kind == "account_done":
                 self.done_sends += 1
                 if payload.get("skipped"):
@@ -567,8 +603,10 @@ class CampaignRunner:
             events = [e for e in self.events if e["seq"] > since]
             return {
                 "state": self.state,
+                "pause_requested": self.pause_requested,
                 "events": events,
                 "last_seq": self._seq,
+                "operation": self.operation.snapshot(self.state in {"done", "stopped", "error"}),
                 "totals": {
                     "total_sends": self.total_sends,
                     "done_sends": self.done_sends,

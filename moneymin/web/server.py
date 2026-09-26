@@ -107,6 +107,8 @@ ACCOUNT_HEALTH_PATH = config.DATA_DIR / "account_health.json"
 _BULK_REGISTER_LOCK = threading.Lock()
 _BULK_REGISTER_STATE: dict[str, Any] = {"state": "idle"}
 _HEAVY_RUNNER_LOCK = threading.Lock()
+from .. import recovery
+RECOVERY = recovery.RecoveryRunner()
 _WITHDRAW_LOCK = threading.Lock()
 _PAYOUT_OPERATION_LOCK = threading.Lock()
 _WITHDRAW_IN_FLIGHT: set[str] = set()
@@ -1297,14 +1299,15 @@ def _read_campaign_log(path: Path) -> dict[str, Any]:
 
 
 def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
-    """Resumo operacional legível, sem IDs, caminhos ou respostas de API."""
+    """Resumo e evidências permitidas; nunca inclui respostas brutas ou segredos."""
     configured = [str(email) for email in data.get("accounts", []) if email]
     by_account: dict[str, dict[str, Any]] = {
-        email: {"email": email, "success": 0, "failed": 0, "skipped": 0}
+        email: {"email": email, "success": 0, "failed": 0, "skipped": 0, "pending": 0}
         for email in configured
     }
     items: list[dict[str, Any]] = []
     total_success = total_failed = total_skipped = 0
+    total_pending = 0
     for index, raw_item in enumerate(data.get("items", []), 1):
         if not isinstance(raw_item, dict):
             continue
@@ -1314,17 +1317,26 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
                 continue
             email = str(raw_result.get("email") or "Conta")
             stats = by_account.setdefault(
-                email, {"email": email, "success": 0, "failed": 0, "skipped": 0}
+                email, {"email": email, "success": 0, "failed": 0, "skipped": 0, "pending": 0}
             )
             if raw_result.get("skipped"):
                 status = "skipped"
                 detail = (friendly_campaign_error(raw_result.get("error"))
-                          if raw_result.get("error") else "Vídeo já processado anteriormente.")
+                          if raw_result.get("error") else
+                          "Registro local indica envio anterior." if raw_result.get("reason") == "already_sent" else
+                          "Conta pulada nesta execução; o histórico não informa o motivo.")
                 stats["skipped"] += 1
                 total_skipped += 1
+            elif raw_result.get("ok") and raw_result.get("finalized") is False:
+                status = "pending"
+                detail = "Envio sem confirmação de finalização. Confira a sessão antes de reenviar."
+                stats["pending"] += 1
+                total_pending += 1
             elif raw_result.get("ok"):
                 status = "success"
-                detail = "Envio concluído."
+                detail = ("Finalização confirmada pelo serviço e registrada nesta execução."
+                          if raw_result.get("finalized") is True else
+                          "Sucesso registrado em histórico antigo, sem evidência explícita de finalização.")
                 stats["success"] += 1
                 total_success += 1
             else:
@@ -1332,17 +1344,24 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
                 detail = friendly_campaign_error(raw_result.get("error"))
                 stats["failed"] += 1
                 total_failed += 1
-            results.append({"email": email, "status": status, "detail": detail})
+            identifier = raw_result.get("session_id")
+            results.append({"email": email, "status": status, "detail": detail,
+                            "session_id": identifier if isinstance(identifier, str) else None,
+                            "confirmation": ("remote_ack" if status == "success" and raw_result.get("finalized") is True
+                                             else "legacy_record" if status == "success" else "not_confirmed"),
+                            "recovered": raw_result.get("recovered") is True})
         task = str(raw_item.get("task_name") or raw_item.get("task_scenario")
                    or raw_item.get("scenario") or f"Vídeo {index}")
         duration_s = max(0, int(float(raw_item.get("duration_ms") or 0) / 1000))
         items.append({
             "index": index,
+            "clip_uid": raw_item.get("clip_uid") if isinstance(raw_item.get("clip_uid"), str) else None,
             "task": task,
             "duration_s": duration_s,
             "success": sum(result["status"] == "success" for result in results),
             "failed": sum(result["status"] == "failed" for result in results),
             "skipped": sum(result["status"] == "skipped" for result in results),
+            "pending": sum(result["status"] == "pending" for result in results),
             "accounts": results,
         })
     return {
@@ -1354,6 +1373,7 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
             "success": total_success,
             "failed": total_failed,
             "skipped": total_skipped,
+            "pending": total_pending,
         },
         "accounts": sorted(by_account.values(), key=lambda item: item["email"].lower()),
         "items": items,
@@ -1916,7 +1936,7 @@ def create_app() -> Flask:
 
     @app.post("/api/accounts/migration")
     def start_org_migration():
-        if RUNNER.running or BALANCES_RUNNER.running:
+        if RUNNER.running or RECOVERY.running or BALANCES_RUNNER.running:
             return jsonify({"error": "Aguarde a campanha ou consulta de saldos terminar antes de migrar."}), 409
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
@@ -2341,7 +2361,7 @@ def create_app() -> Flask:
 
     @app.delete("/api/accounts/<email>")
     def remove_account(email: str):
-        if RUNNER.running:
+        if RUNNER.running or RECOVERY.running:
             return jsonify({"error": "pare a campanha antes de remover uma conta"}), 409
         if BALANCES_RUNNER.running:
             return jsonify({"error": "aguarde a consulta de saldos terminar"}), 409
@@ -2391,7 +2411,7 @@ def create_app() -> Flask:
 
     @app.post("/api/accounts/check-all")
     def check_all_accounts():
-        if RUNNER.running:
+        if RUNNER.running or RECOVERY.running:
             return jsonify({
                 "error": "aguarde ou pare a campanha antes de verificar todas as contas",
             }), 409
@@ -2770,16 +2790,28 @@ def create_app() -> Flask:
         """Relatório deliberadamente sem emails, tokens, senhas ou URLs privadas."""
         try:
             ready = readiness.campaign_readiness("all")
-        except Exception as exc:  # noqa: BLE001 — diagnóstico precisa continuar
+        except Exception:  # noqa: BLE001 — diagnóstico precisa continuar sem exportar a exceção
             ready = {
                 "ready": False,
                 "provider": "all",
                 "checks": [{
                     "name": "Diagnóstico de prontidão",
                     "status": "error",
-                    "detail": f"{type(exc).__name__}: {exc}",
+                    "detail": "Não foi possível concluir a verificação local.",
                 }],
             }
+        safe_check_names = {
+            "FFmpeg/FFprobe", "Navegador privado", "Contas Minute", "Catálogo HoloAssist",
+            "Índices HoloAssist", "Acelerador HoloAssist", "Catálogo Ego4D", "Credenciais Ego4D",
+            "Acelerador Ego4D", "Espaço livre", "Criador de contas", "Diagnóstico de prontidão",
+        }
+        # Details may contain exception messages, private paths or signed URLs.
+        # Export structured status only; the local readiness screen keeps its guidance.
+        ready = {"ready": ready.get("ready") is True, "provider": "all",
+                 "details_omitted": True,
+                 "checks": [{"name": check.get("name") if check.get("name") in safe_check_names else "Verificação local",
+                             "status": check.get("status") if check.get("status") in {"ok", "warning", "error"} else "error"}
+                            for check in ready.get("checks", []) if isinstance(check, dict)]}
         campaign_state = RUNNER.snapshot()
         return jsonify({
             "schema": 1,
@@ -2957,7 +2989,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
 
         with _HEAVY_RUNNER_LOCK:
-            if RUNNER.running:
+            if RUNNER.running or RECOVERY.running:
                 return jsonify({
                     "error": "pare a campanha antes de iniciar o acelerador",
                 }), 409
@@ -2997,7 +3029,7 @@ def create_app() -> Flask:
         if provider not in {"ego4d", "holoassist", "all"}:
             return jsonify({"error": "provedor inválido (ego4d|holoassist|all)"}), 400
         with _HEAVY_RUNNER_LOCK:
-            if RUNNER.running or HOLO_CACHE_RUNNER.running:
+            if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running:
                 return jsonify({
                     "error": "pare a campanha e o acelerador antes de limpar a mídia",
                 }), 409
@@ -3161,6 +3193,28 @@ def create_app() -> Flask:
                     and len(blockers) == len(account_errors)
                     and all(i.get("restriction_confirmed") is True for i in account_issues))
         receipt_id = None
+        candidate_plan = None
+        clip_review = []
+        sent_fingerprint = None
+        if reusable and body.get("include_clip_plan") is True:
+            from .. import campaign_plan
+            review_tasks = [TaskSpec(
+                task_id=str(item["id"]), scenario=str(item["scenario"]),
+                task_name=str(item.get("name") or item["scenario"]),
+                task_label=str(item.get("name_pt") or item.get("name") or item["scenario"]),
+                min_dur_s=min_dur_s, max_dur_s=max_dur_s, count=count,
+            ) for item in selected]
+            try:
+                candidate_plan, clip_review, sent_fingerprint = campaign_plan.build(CampaignConfig(
+                    accounts=survivors, tasks=review_tasks, dataset_provider=provider,
+                    content_mode=content_mode))
+                clip_count = len(clip_review)
+                if not any(row["eligible_accounts"] for row in clip_review):
+                    blockers.append("Nenhum clipe candidato está disponível para as contas selecionadas. Revise o conteúdo e a lista de vídeos usados.")
+                    reusable = False
+            except Exception:
+                blockers.append("Não foi possível preparar a prévia dos clipes. Recarregue o catálogo e tente novamente.")
+                reusable = False
         if reusable:
             now = time.monotonic()
             for key in list(preflights):
@@ -3170,12 +3224,14 @@ def create_app() -> Flask:
                 preflights.pop(next(iter(preflights)))
             receipt_id = uuid.uuid4().hex
             preflights[receipt_id] = {"body": body, "accounts": survivors, "catalog": catalog,
+                                      "candidate_plan": candidate_plan, "sent_fingerprint": sent_fingerprint,
                                       "issues": account_issues, "expires": now + 600,
                                       "fingerprint": _preflight_fingerprint(emails)}
 
         return jsonify({
             "ok": not blockers,
             "preflight_id": receipt_id,
+            "clip_plan": clip_review,
             "can_remove_and_continue": reusable and bool(removable),
             "removable_accounts": sorted(removable),
             "provider": provider,
@@ -3450,8 +3506,23 @@ def create_app() -> Flask:
                              content_mode=content_mode,
                              cleanup_after_upload=cleanup_after_upload,
                              realistic_timeline=True,
+                             candidate_plan=receipt.get("candidate_plan") if receipt else None,
                              active_hours=active_hours)
         with _HEAVY_RUNNER_LOCK:
+            if receipt and receipt.get("sent_fingerprint") is not None:
+                from .. import campaign_plan
+                if receipt["sent_fingerprint"] != campaign_plan.registry_fingerprint():
+                    return jsonify({"error": "A lista de vídeos usados mudou. Revise a campanha novamente."}), 409
+            if RECOVERY.running:
+                return jsonify({"error": "Aguarde a recuperação dos envios terminar."}), 409
+            try:
+                unresolved = recovery.snapshot()["items"]
+            except (ValueError, OSError):
+                return jsonify({"error": "Revise os registros de recuperação antes de iniciar outra campanha."}), 409
+            affected = sorted({item["email"] for item in unresolved} & {account.email for account in accounts})
+            if affected:
+                return jsonify({"error": "Resolva os envios anteriores em Pendências e recuperação antes de iniciar para estas contas.",
+                                "recovery_accounts": affected}), 409
             if HOLO_CACHE_RUNNER.running:
                 return jsonify({
                     "error": "pare o acelerador antes de iniciar a campanha",
@@ -3499,6 +3570,60 @@ def create_app() -> Flask:
         except ValueError:
             since = 0
         return jsonify(RUNNER.snapshot(since=since))
+
+    @app.post("/api/campaigns/pause")
+    def pause_campaign():
+        try:
+            RUNNER.pause()
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({"ok": True, "pause_requested": True})
+
+    @app.get("/api/recovery")
+    def recovery_snapshot():
+        from .. import recovery
+        try:
+            return jsonify({**recovery.snapshot(), "wise_cleanup": _wise_cleanup_snapshot(), "worker": RECOVERY.snapshot()})
+        except (ValueError, OSError):
+            return jsonify({"error": "Não foi possível ler todos os registros de recuperação. Preserve os dados e revise a instalação."}), 409
+
+    @app.post("/api/recovery/reconcile")
+    def reconcile_recovery():
+        from .. import recovery
+        with _HEAVY_RUNNER_LOCK:
+            if RUNNER.running or RECOVERY.running:
+                return jsonify({"error": "Aguarde a campanha encerrar antes de reconciliar seus registros."}), 409
+            try:
+                return jsonify(recovery.reconcile_confirmed())
+            except (ValueError, OSError):
+                return jsonify({"error": "A reconciliação não foi concluída. Preserve os registros e tente novamente."}), 409
+
+    @app.post("/api/recovery/resume")
+    def resume_recovery():
+        body = request.get_json(silent=True) or {}
+        email = body.get("email")
+        if body.get("confirmed") is not True or not isinstance(email, str) or not email:
+            return jsonify({"error": "Confirme a conta e a retomada dos envios existentes."}), 400
+        with _HEAVY_RUNNER_LOCK:
+            if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running:
+                return jsonify({"error": "Aguarde a operação em andamento terminar."}), 409
+            try:
+                if email not in {account["email"] for account in _list_accounts()}:
+                    return jsonify({"error": "Conecte novamente essa conta antes de retomar."}), 400
+                if not any(item["email"] == email and item["can_resume"] for item in recovery.snapshot()["items"]):
+                    return jsonify({"error": "Nenhuma sessão desta conta permite retomada automática; revise o histórico."}), 409
+                RECOVERY.start(email, _resolve_org)
+            except (ValueError, OSError, RuntimeError):
+                return jsonify({"error": "Não foi possível iniciar a recuperação. Os registros foram preservados."}), 409
+        return jsonify({"worker": RECOVERY.snapshot()}), 202
+
+    @app.post("/api/campaigns/resume")
+    def resume_campaign():
+        try:
+            RUNNER.resume()
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({"ok": True, "pause_requested": False})
 
     @app.post("/api/campaigns/stop")
     def campaign_stop():
@@ -3925,7 +4050,7 @@ def create_app() -> Flask:
     @app.post("/api/sent/reset")
     def reset_sent():
         with _HEAVY_RUNNER_LOCK:
-            if RUNNER.running:
+            if RUNNER.running or RECOVERY.running:
                 return jsonify({
                     "error": "aguarde a campanha terminar antes de resetar a lista de vídeos usados",
                 }), 409

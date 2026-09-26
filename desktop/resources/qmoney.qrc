@@ -1,5 +1,8 @@
 <RCC>
   <qresource prefix="/qmoney">
+    <file alias="icons/bell.svg">icons/bell.svg</file>
+    <file alias="icons/settings.svg">icons/settings.svg</file>
+    <file alias="icons/brand.svg">icons/brand.svg</file>
     <file alias="icon.png">qmoney-icon.png</file>
     <file alias="icons/home.svg">icons/home.svg</file>
     <file alias="icons/readiness.svg">icons/readiness.svg</file>

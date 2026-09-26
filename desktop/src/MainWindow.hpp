@@ -17,6 +17,11 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QMenu;
+class QBoxLayout;
+class QResizeEvent;
+class OperationTrack;
+class OperationTimeline;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
@@ -33,13 +38,15 @@ class MainWindow final : public QMainWindow {
 
 public:
   explicit MainWindow(oclero::qlementine::QlementineStyle* style,
-                      QWidget* parent = nullptr);
+                      QWidget* parent = nullptr, bool startServices = true);
   ~MainWindow() override;
 
 protected:
   void closeEvent(QCloseEvent* event) override;
+  void resizeEvent(QResizeEvent* event) override;
 
 private:
+  friend class OperationPreview;
   QWidget* buildHomePage();
   QWidget* buildReadinessPage();
   QWidget* buildIntegrationsPage();
@@ -79,6 +86,11 @@ private:
   void setStatus(const QString& text);
 
   void loadHome();
+  void openCommandPalette();
+  void openRecovery();
+  QString _pendingAccountFocus;
+  QString _pendingHistoryFocus;
+  void renderOperation(const QJsonObject& snapshot);
   void loadReadiness();
   void loadIntegrations();
   void saveEgo4dIntegration();
@@ -179,6 +191,35 @@ private:
   QPushButton* _updateButton{};
 
   QLabel* _homeAccounts{};
+  QMenu* _settingsMenu{};
+  QBoxLayout* _operationColumns{};
+  QBoxLayout* _campaignSelectionColumns{};
+  QBoxLayout* _libraryColumns{};
+  QWidget* _operationInspector{};
+  QList<QBoxLayout*> _pageHeaders;
+  QList<QWidget*> _headerIdentities;
+  QTimer _operationPoll;
+  bool _operationPolling{false};
+  QTableWidget* _operationTable{};
+  OperationTrack* _operationTrack{};
+  OperationTimeline* _operationTimeline{};
+  QLabel* _operationTotal{};
+  QWidget* _operationProgressRow{};
+  QLabel* _operationBalance{};
+  QLabel* _operationBalanceNote{};
+  QLabel* _operationContextTitle{};
+  QPushButton* _operationPause{};
+  QLabel* _operationLive{};
+  bool _operationPauseRequested{false};
+  QLabel* _operationStages{};
+  QLabel* _operationFeed{};
+  QLabel* _operationEmpty{};
+  QPushButton* _homeNextAction{};
+  QLabel* _homeAccountStep{};
+  QLabel* _homeRecent{};
+  QLabel* _homeSync{};
+  int _homeDestination{1};
+  int _homeGeneration{0};
   QLabel* _homeCampaigns{};
   QLabel* _homeSuccess{};
   QLabel* _homePulseTitle{};
@@ -320,4 +361,5 @@ private:
 
   QTableWidget* _historyTable{};
   QPlainTextEdit* _historyDetail{};
+  QTableWidget* _historyEvidence{};
 };

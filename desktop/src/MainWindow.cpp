@@ -4,6 +4,15 @@
 #include <utility>
 #include "MainWindow.hpp"
 #include "ComboBox.hpp"
+#include "OperationSummary.hpp"
+#include "OperationWidgets.hpp"
+#include "TableEmptyState.hpp"
+#include "CampaignReviewDialog.hpp"
+#include <QMenu>
+#include <QPointer>
+#include <QResizeEvent>
+#include <QShortcut>
+#include <QToolButton>
 
 #include <QApplication>
 #include <QCheckBox>
@@ -79,17 +88,28 @@ namespace {
 bool confirmWithdrawal(QWidget* parent, int count, QJsonObject& request) {
   QDialog dialog(parent);
   dialog.setWindowTitle(QStringLiteral("Confirmar saque"));
+  dialog.resize(620, 510);
   auto* layout = new QVBoxLayout(&dialog);
+  layout->setContentsMargins(28, 24, 28, 24);
+  layout->setSpacing(18);
+  auto* kicker = new QLabel(QStringLiteral("CARTEIRA / CONFIRMAÇÃO"), &dialog);
+  kicker->setObjectName(QStringLiteral("kicker"));
+  layout->addWidget(kicker);
+  auto* title = new QLabel(QStringLiteral("Revise seu saque"), &dialog);
+  title->setObjectName(QStringLiteral("reviewTitle"));
+  layout->addWidget(title);
   auto* help = new QLabel(QStringLiteral("Solicitar saque para %1 conta(s) elegível(is)?").arg(count));
   help->setWordWrap(true);
   layout->addWidget(help);
   auto* form = new QFormLayout;
-  auto* method = new QComboBox;
+  auto* method = new ComboBox(&dialog);
   method->addItem(QStringLiteral("Método já configurado"), QStringLiteral("saved"));
   method->addItem(QStringLiteral("Wise"), QStringLiteral("wise"));
   auto* name = new QLineEdit;
+  name->setPlaceholderText(QStringLiteral("Nome completo do titular"));
   name->setMaxLength(200);
   auto* email = new QLineEdit;
+  email->setPlaceholderText(QStringLiteral("E-mail cadastrado na Wise"));
   email->setMaxLength(254);
   form->addRow(QStringLiteral("Método"), method);
   form->addRow(QStringLiteral("Nome legal na Wise"), name);
@@ -100,6 +120,10 @@ bool confirmWithdrawal(QWidget* parent, int count, QJsonObject& request) {
   layout->addWidget(explanation);
   auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
   buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Confirmar e solicitar"));
+  buttons->button(QDialogButtonBox::Ok)->setProperty("role", QStringLiteral("primary"));
+  buttons->button(QDialogButtonBox::Ok)->setAutoDefault(false);
+  buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("Voltar"));
+  buttons->button(QDialogButtonBox::Cancel)->setDefault(true);
   auto update = [=] {
     const bool wise = method->currentData().toString() == QStringLiteral("wise");
     name->setEnabled(wise);
@@ -118,6 +142,7 @@ bool confirmWithdrawal(QWidget* parent, int count, QJsonObject& request) {
   QObject::connect(email, &QLineEdit::textChanged, &dialog, [=](const QString&) { update(); });
   QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
   QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addStretch();
   layout->addWidget(buttons);
   update();
   if (dialog.exec() != QDialog::Accepted) return false;
@@ -246,7 +271,9 @@ void configureCombo(QComboBox* combo, int minimumWidth = 360) {
   combo->view()->setVerticalScrollMode(QAbstractItemView::ScrollPerItem);
 }
 
-void configureTable(QTableWidget* table) {
+void configureTable(QTableWidget* table,
+                    const QString& title = QStringLiteral("Os registros aparecerão aqui"),
+                    const QString& detail = QStringLiteral("Sincronize os dados para consultar os resultados disponíveis.")) {
   table->setWordWrap(false);
   table->setTextElideMode(Qt::ElideRight);
   table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
@@ -263,6 +290,7 @@ void configureTable(QTableWidget* table) {
   table->horizontalHeader()->setMinimumSectionSize(92);
   table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
   table->horizontalHeader()->setStretchLastSection(false);
+  new TableEmptyState(table, title, detail);
 }
 
 void configureForm(QFormLayout* form) {
@@ -276,9 +304,9 @@ void configureForm(QFormLayout* form) {
 
 }  // namespace
 
-MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* parent)
+MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* parent, bool startServices)
     : QMainWindow(parent), _style(style), _api(this), _backend(this) {
-  setWindowTitle(QStringLiteral("QMoney — Operations Desk"));
+  setWindowTitle(QStringLiteral("QMoney — Central de operação"));
   resize(1280, 820);
   setMinimumSize(980, 680);
 
@@ -297,6 +325,37 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
   connect(&_cachePoll, &QTimer::timeout, this, &MainWindow::loadAccelerator);
 
   buildShell();
+  auto* commandShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+K")), this);
+  connect(commandShortcut, &QShortcut::activated, this, &MainWindow::openCommandPalette);
+  _operationPoll.setInterval(3000);
+  connect(&_operationPoll, &QTimer::timeout, this, [this] {
+    if (!_backendReady || _pages->currentIndex() != 0 || _operationPolling) return;
+    _operationPolling = true;
+    const int generation = _homeGeneration;
+    _api.get(QStringLiteral("/api/campaigns/current"), [this, generation](bool ok, const QJsonDocument& doc, const QString&) {
+      _operationPolling = false;
+      if (_closing || generation != _homeGeneration) return;
+      if (!ok) {
+        _homeSync->setText(QStringLiteral("Atualização interrompida • tentando novamente"));
+        return;
+      }
+      renderOperation(doc.object());
+      const auto state = doc.object().value("state").toString();
+      const auto totals = doc.object().value("totals").toObject();
+      const int total = totals.value("total_sends").toInt();
+      _homePulseProgress->setValue(total > 0 ? qBound(0, int(100. * totals.value("done_sends").toInt() / total), 100) : 0);
+      _operationProgressRow->setVisible(state == "running" || state == "stopping");
+      if (state == "running" || state == "stopping") {
+        _homePulseTitle->setText(state == "running" ? QStringLiteral("Campanha em andamento") : QStringLiteral("Encerrando com segurança"));
+        _homePulseBody->setText(doc.object().value("current").toString());
+      } else if (state == "done" || state == "stopped" || state == "error") {
+        _homePulseTitle->setText(state == "error" ? QStringLiteral("Execução com pendências") : QStringLiteral("Execução encerrada"));
+        _homePulseBody->setText(QStringLiteral("Confira os resultados por conta no histórico."));
+      }
+      _homeSync->setText(QStringLiteral("Atualizado às %1").arg(QTime::currentTime().toString("HH:mm:ss")));
+    });
+  });
+  if (startServices) _operationPoll.start();
   qInfo() << "QMoney: shell pronto";
   const bool dark = QSettings().value(QStringLiteral("darkTheme"), false).toBool();
   // Aplicado apos a primeira passagem do event loop. O Qlementine instala
@@ -306,7 +365,7 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
   _themeButton->setText(dark ? QStringLiteral("☀  Usar tema claro")
                              : QStringLiteral("◐  Usar tema escuro"));
   qInfo() << "QMoney: tema estrutural pronto";
-  startBackend();
+  if (startServices) startBackend();
   qInfo() << "QMoney: backend solicitado";
 
   connect(&_updates, &UpdateManager::statusChanged, this, &MainWindow::setStatus);
@@ -380,7 +439,7 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
               _repairInstall->setText(QStringLiteral("Baixando… %1%").arg(received * 100 / total));
           });
   connect(&_updates, &UpdateManager::installReady, this, &MainWindow::installUpdate);
-  QTimer::singleShot(1800, this, [this] { checkForUpdates(false); });
+  if (startServices) QTimer::singleShot(1800, this, [this] { checkForUpdates(false); });
 }
 
 MainWindow::~MainWindow() {
@@ -404,6 +463,24 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   QMainWindow::closeEvent(event);
 }
 
+void MainWindow::resizeEvent(QResizeEvent* event) {
+  QMainWindow::resizeEvent(event);
+  const bool compact = width() < 1280;
+  if (_navigation) {
+    const int rowHeight = height() < 800 ? 72 : 96;
+    _navigation->setGridSize(QSize(136, rowHeight));
+    for (int row = 0; row < _navigation->count(); ++row)
+      _navigation->item(row)->setSizeHint(QSize(136, rowHeight - 8));
+  }
+  for (auto* header : _pageHeaders)
+    header->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+  for (auto* identity : _headerIdentities) identity->setVisible(!compact);
+  if (_operationColumns) _operationColumns->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+  if (_campaignSelectionColumns) _campaignSelectionColumns->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+  if (_libraryColumns) _libraryColumns->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+  if (_operationInspector) _operationInspector->setMaximumWidth(compact ? QWIDGETSIZE_MAX : 480);
+}
+
 void MainWindow::buildShell() {
   auto* root = new QWidget;
   auto* rootLayout = new QHBoxLayout(root);
@@ -412,47 +489,49 @@ void MainWindow::buildShell() {
 
   auto* sidebar = new QWidget;
   sidebar->setObjectName(QStringLiteral("sidebar"));
-  sidebar->setFixedWidth(264);
+  sidebar->setFixedWidth(136);
   auto* side = new QVBoxLayout(sidebar);
-  side->setContentsMargins(22, 26, 20, 18);
+  side->setContentsMargins(0, 30, 0, 24);
   side->setSpacing(10);
 
-  auto* brandRow = new QHBoxLayout;
+  auto* brandRow = new QVBoxLayout;
   auto* mark = new QLabel;
   mark->setObjectName(QStringLiteral("brandMark"));
   mark->setAlignment(Qt::AlignCenter);
   mark->setFixedSize(44, 44);
-  mark->setPixmap(QPixmap(QStringLiteral(":/qmoney/icon.png"))
-                      .scaled(42, 42, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+  mark->setPixmap(QIcon(QStringLiteral(":/qmoney/icons/brand.svg")).pixmap(44,44));
   auto* brandCopy = new QVBoxLayout;
   brandCopy->setSpacing(0);
   auto* brand = new QLabel(QStringLiteral("QMoney"));
   brand->setObjectName(QStringLiteral("brand"));
+  brand->setAlignment(Qt::AlignCenter);
   brandCopy->addWidget(brand);
-  auto* brandRole = quietLabel(QStringLiteral("OPERATIONS DESK"));
+  auto* brandRole = quietLabel(QStringLiteral("2.0"));
   brandRole->setObjectName(QStringLiteral("brandRole"));
+  brandRole->setAlignment(Qt::AlignCenter);
   brandCopy->addWidget(brandRole);
-  brandRow->addWidget(mark);
+  brandRow->addWidget(mark, 0, Qt::AlignHCenter);
   brandRow->addSpacing(6);
-  brandRow->addLayout(brandCopy, 1);
+  brandRow->addLayout(brandCopy);
   side->addLayout(brandRow);
   side->addSpacing(20);
 
-  auto* navigationLabel = new QLabel(QStringLiteral("ESPAÇOS DE TRABALHO"));
+  auto* navigationLabel = new QLabel(QStringLiteral("NAVEGAÇÃO"));
   navigationLabel->setObjectName(QStringLiteral("navigationLabel"));
-  side->addWidget(navigationLabel);
+  navigationLabel->setParent(sidebar);
+  navigationLabel->hide();
 
   _navigation = new QListWidget;
   _navigation->setObjectName(QStringLiteral("navigation"));
   _navigation->setFrameShape(QFrame::NoFrame);
   _navigation->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   const QStringList pages = {
-      QStringLiteral("Visão geral"), QStringLiteral("Prontidão"),
+      QStringLiteral("Operação"), QStringLiteral("Requisitos"),
       QStringLiteral("Integrações"), QStringLiteral("Nova campanha"),
       QStringLiteral("Acelerador"),
-      QStringLiteral("Contas"), QStringLiteral("Saldos"),
+      QStringLiteral("Contas"), QStringLiteral("Carteira"),
       QStringLiteral("Histórico"), QStringLiteral("Banidas")};
-  const QStringList icons = {QStringLiteral(":/qmoney/icons/home.svg"),
+  const QStringList icons = {QStringLiteral(":/qmoney/icons/play.svg"),
                              QStringLiteral(":/qmoney/icons/readiness.svg"),
                              QStringLiteral(":/qmoney/icons/integrations.svg"),
                              QStringLiteral(":/qmoney/icons/play.svg"),
@@ -461,12 +540,24 @@ void MainWindow::buildShell() {
                              QStringLiteral(":/qmoney/icons/wallet.svg"),
                              QStringLiteral(":/qmoney/icons/history.svg"),
                              QStringLiteral(":/qmoney/icons/users.svg")};
-  _navigation->setIconSize(QSize(19, 19));
+  _navigation->setViewMode(QListView::IconMode);
+  _navigation->setFlow(QListView::TopToBottom);
+  _navigation->setWrapping(false);
+  _navigation->setMovement(QListView::Static);
+  _navigation->setGridSize(QSize(136, 96));
+  _navigation->setIconSize(QSize(28, 28));
   for (int i = 0; i < pages.size(); ++i) {
     auto* item = new QListWidgetItem(QIcon(icons[i]), pages[i]);
-    item->setSizeHint(QSize(210, 46));
+    item->setSizeHint(QSize(136, 88));
+    item->setTextAlignment(Qt::AlignCenter);
+    item->setToolTip(pages[i]);
     _navigation->addItem(item);
   }
+  for (int hidden : {1, 2, 3, 4, 8}) _navigation->item(hidden)->setHidden(true);
+  auto* settingsItem = new QListWidgetItem(QIcon(QStringLiteral(":/qmoney/icons/settings.svg")), QStringLiteral("Configurações"));
+  settingsItem->setSizeHint(QSize(136,88));
+  settingsItem->setTextAlignment(Qt::AlignCenter);
+  _navigation->addItem(settingsItem);
   _navigation->setCurrentRow(0);
   connect(_navigation, &QListWidget::currentRowChanged, this, &MainWindow::navigate);
   side->addWidget(_navigation, 1);
@@ -474,20 +565,22 @@ void MainWindow::buildShell() {
   auto* connectionCard = new QFrame;
   connectionCard->setObjectName(QStringLiteral("connectionCard"));
   auto* connectionLayout = new QVBoxLayout(connectionCard);
-  connectionLayout->setContentsMargins(14, 12, 14, 12);
+  connectionLayout->setContentsMargins(9, 12, 9, 12);
   connectionLayout->setSpacing(5);
   connectionLayout->addWidget(quietLabel(QStringLiteral("MOTOR LOCAL")));
   _backendState = new QLabel(QStringLiteral("●  Iniciando…"));
   _backendState->setObjectName(QStringLiteral("backendState"));
   connectionLayout->addWidget(_backendState);
-  side->addWidget(connectionCard);
+  connectionCard->setParent(sidebar);
+  connectionCard->hide();
 
   _themeButton = new QPushButton;
   _themeButton->setObjectName(QStringLiteral("sidebarUtility"));
   connect(_themeButton, &QPushButton::clicked, this, [this] {
     setDarkTheme(!QSettings().value(QStringLiteral("darkTheme"), false).toBool());
   });
-  side->addWidget(_themeButton);
+  _themeButton->setParent(sidebar);
+  _themeButton->hide();
 
   _updateButton = new QPushButton(
       QStringLiteral("↻  Verificar atualização"));
@@ -500,7 +593,31 @@ void MainWindow::buildShell() {
       checkForUpdates(true);
     }
   });
-  side->addWidget(_updateButton);
+  _updateButton->setParent(sidebar);
+  _updateButton->hide();
+  auto* settings = new QToolButton;
+  settings->setText(QStringLiteral("Configurações"));
+  settings->setIcon(QIcon(QStringLiteral(":/qmoney/icons/settings.svg")));
+  settings->setIconSize(QSize(26,26));
+  settings->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+  settings->setFixedWidth(136);
+  settings->setObjectName(QStringLiteral("railSettings"));
+  settings->setMinimumHeight(80);
+  auto* settingsMenu = new QMenu(settings);
+  _settingsMenu = settingsMenu;
+  for (const auto& entry : QList<QPair<QString, int>>{{"Requisitos", 1}, {"Integrações", 2}, {"Biblioteca", 4}, {"Contas restritas", 8}})
+    settingsMenu->addAction(entry.first, this, [this, entry] { _navigation->setCurrentRow(entry.second); });
+  settingsMenu->addSeparator();
+  settingsMenu->addAction(QStringLiteral("Recuperação de envios"), this, &MainWindow::openRecovery);
+  settingsMenu->addAction(QStringLiteral("Alternar tema"), _themeButton, &QPushButton::click);
+  settingsMenu->addAction(QStringLiteral("Verificar atualização"), _updateButton, &QPushButton::click);
+  connect(settings, &QToolButton::clicked, this, [settings, settingsMenu] { settingsMenu->exec(settings->mapToGlobal(QPoint(settings->width(), 0))); });
+  settings->setParent(sidebar);
+  settings->hide();
+  auto* profile = new QLabel(QStringLiteral("OL\n\nOperador local"));
+  profile->setObjectName(QStringLiteral("railProfile"));
+  profile->setAlignment(Qt::AlignCenter);
+  side->addWidget(profile);
 
   auto* workspace = new QWidget;
   workspace->setObjectName(QStringLiteral("workspace"));
@@ -547,6 +664,8 @@ void MainWindow::buildShell() {
   connect(refresh, &QPushButton::clicked, this, &MainWindow::refreshCurrentPage);
   statusLayout->addWidget(refresh);
   workspaceLayout->addWidget(statusBar);
+  statusBar->setVisible(false);
+  connect(_pages, &QStackedWidget::currentChanged, statusBar, [statusBar](int index) { statusBar->setVisible(index != 0); });
 
   rootLayout->addWidget(sidebar);
   rootLayout->addWidget(workspace, 1);
@@ -556,21 +675,46 @@ void MainWindow::buildShell() {
 QWidget* MainWindow::pageShell(const QString& title, const QString& subtitle, QWidget* body) {
   auto* shell = new QWidget;
   auto* outer = new QVBoxLayout(shell);
-  outer->setContentsMargins(28, 20, 28, 20);
+  outer->setContentsMargins(19, 24, 14, 24);
   outer->setSpacing(9);
-  auto* contextRow = new QHBoxLayout;
-  auto* context = new QLabel(QStringLiteral("QMONEY  /  %1").arg(title.toUpper()));
-  context->setObjectName(QStringLiteral("pageContext"));
-  contextRow->addWidget(context);
-  contextRow->addStretch();
-  outer->addLayout(contextRow);
-  auto* titleLabel = new QLabel(title);
-  titleLabel->setObjectName(QStringLiteral("pageTitle"));
-  outer->addWidget(titleLabel);
-  auto* subtitleLabel = quietLabel(subtitle);
-  subtitleLabel->setObjectName(QStringLiteral("pageSubtitle"));
-  outer->addWidget(subtitleLabel);
-  outer->addSpacing(2);
+  {
+    auto* header = new QHBoxLayout;
+    _pageHeaders.append(header);
+    auto* headings = new QVBoxLayout;
+    auto* brand = new QLabel(QStringLiteral("QMoney  <span style='color:#754dff'>2.0</span>"));
+    brand->setObjectName(QStringLiteral("workspaceBrand"));
+    headings->addWidget(brand);
+    auto* heading = new QLabel(title);
+    heading->setObjectName(QStringLiteral("workspaceTitle"));
+    headings->addWidget(heading);
+    header->addLayout(headings, 1);
+    auto* search = new QPushButton(QStringLiteral("Buscar conta, campanha ou ação     Ctrl K"));
+    search->setObjectName(QStringLiteral("commandSearch"));
+    search->setMinimumWidth(460);
+    connect(search, &QPushButton::clicked, this, &MainWindow::openCommandPalette);
+    auto* headerActions = new QWidget;
+    auto* headerActionsLayout = new QHBoxLayout(headerActions);
+    headerActionsLayout->setContentsMargins(0, 0, 0, 0);
+    headerActionsLayout->setSpacing(18);
+    headerActionsLayout->addWidget(search, 1);
+    auto* recovery = new QToolButton;
+    recovery->setIcon(QIcon(QStringLiteral(":/qmoney/icons/bell.svg")));
+    recovery->setIconSize(QSize(26, 26));
+    recovery->setFixedSize(42, 42);
+    recovery->setAccessibleName(QStringLiteral("Pendências e recuperação"));
+    recovery->setToolTip(QStringLiteral("Pendências e recuperação"));
+    connect(recovery, &QToolButton::clicked, this, &MainWindow::openRecovery);
+    headerActionsLayout->addWidget(recovery);
+    header->addWidget(headerActions);
+    auto* user = new QLabel(QStringLiteral("OL   Operador local\n      Nesta instalação"));
+    user->setObjectName(QStringLiteral("operatorIdentity"));
+    _headerIdentities.append(user);
+    header->addSpacing(24);
+    header->addWidget(user);
+    outer->addLayout(header);
+    outer->addSpacing(8);
+  }
+  if (title != QStringLiteral("Visão da operação")) outer->addWidget(quietLabel(subtitle));
   outer->addWidget(body, 1);
   return shell;
 }
@@ -584,9 +728,10 @@ QWidget* MainWindow::card(const QString& title, QWidget* content) {
   if (!title.isEmpty()) {
     auto* heading = new QLabel(title);
     heading->setObjectName(QStringLiteral("cardTitle"));
+    heading->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     layout->addWidget(heading);
   }
-  if (content) layout->addWidget(content);
+  if (content) layout->addWidget(content, 1);
   return frame;
 }
 
@@ -597,6 +742,7 @@ QWidget* MainWindow::metric(const QString& value, const QString& caption, QLabel
   layout->setSpacing(3);
   auto* label = new QLabel(caption.toUpper());
   label->setObjectName(QStringLiteral("metricCaption"));
+  label->setWordWrap(true);
   layout->addWidget(label);
   *valueLabel = new QLabel(value);
   (*valueLabel)->setObjectName(QStringLiteral("metricValue"));
@@ -618,123 +764,240 @@ QWidget* MainWindow::buildHomePage() {
   auto* body = new QWidget;
   auto* layout = new QVBoxLayout(body);
   layout->setContentsMargins(0, 0, 0, 0);
-  layout->setSpacing(14);
+  layout->setSpacing(18);
+  auto* toolbar = new QHBoxLayout;
+  auto addTab = [this, toolbar](const QString& text, int page) {
+    auto* button = new QPushButton(text);
+    button->setFlat(true);
+    button->setObjectName(page == 0 ? QStringLiteral("operationTabActive") : QStringLiteral("operationTab"));
+    connect(button, &QPushButton::clicked, this, [this, page] { _navigation->setCurrentRow(page); });
+    toolbar->addWidget(button);
+  };
+  addTab(QStringLiteral("Operação"), 0);
+  addTab(QStringLiteral("Contas"), 5);
+  addTab(QStringLiteral("Biblioteca"), 4);
+  addTab(QStringLiteral("Histórico"), 7);
+  toolbar->addStretch();
+  auto* create = primaryButton(QStringLiteral("+  Nova campanha"));
+  create->setMinimumSize(212, 50);
+  connect(create, &QPushButton::clicked, this, [this] { _navigation->setCurrentRow(3); });
+  toolbar->addWidget(create);
+  layout->addLayout(toolbar);
 
-  auto* pulseContent = new QWidget;
-  auto* pulse = new QHBoxLayout(pulseContent);
-  pulse->setContentsMargins(0, 0, 0, 0);
-  pulse->setSpacing(22);
-
-  auto* signal = new QFrame;
-  signal->setObjectName(QStringLiteral("signalRail"));
-  signal->setFixedWidth(104);
-  auto* signalLayout = new QVBoxLayout(signal);
-  signalLayout->setContentsMargins(12, 12, 12, 12);
-  signalLayout->setSpacing(2);
-  auto* signalTop = new QLabel(QStringLiteral("AO VIVO"));
-  signalTop->setObjectName(QStringLiteral("signalLabel"));
-  signalTop->setAlignment(Qt::AlignCenter);
-  auto* signalDot = new QLabel(QStringLiteral("●"));
-  signalDot->setObjectName(QStringLiteral("signalDot"));
-  signalDot->setAlignment(Qt::AlignCenter);
-  auto* signalPort = new QLabel(QStringLiteral("MOTOR\n8876"));
-  signalPort->setObjectName(QStringLiteral("signalPort"));
-  signalPort->setAlignment(Qt::AlignCenter);
-  signalLayout->addWidget(signalTop);
-  signalLayout->addStretch();
-  signalLayout->addWidget(signalDot);
-  signalLayout->addStretch();
-  signalLayout->addWidget(signalPort);
-  pulse->addWidget(signal);
-
-  auto* pulseCopy = new QWidget;
-  auto* pulseCopyLayout = new QVBoxLayout(pulseCopy);
-  pulseCopyLayout->setContentsMargins(0, 4, 0, 4);
-  pulseCopyLayout->setSpacing(8);
-  auto* pulseHeader = new QHBoxLayout;
-  auto* pulseKicker = new QLabel(QStringLiteral("PULSO DE CAMPANHA"));
-  pulseKicker->setObjectName(QStringLiteral("kicker"));
-  pulseHeader->addWidget(pulseKicker);
-  pulseCopyLayout->addLayout(pulseHeader);
-  _homePulseTitle = new QLabel(QStringLiteral("Aguardando o serviço local"));
-  _homePulseTitle->setObjectName(QStringLiteral("pulseTitle"));
-  pulseCopyLayout->addWidget(_homePulseTitle);
-  _homePulseBody = quietLabel(QStringLiteral("Os dados aparecerão assim que o motor responder."));
-  pulseCopyLayout->addWidget(_homePulseBody);
-  pulseCopyLayout->addSpacing(2);
+  auto* columns = new QHBoxLayout;
+  _operationColumns = columns;
+  columns->setSpacing(18);
+  auto* operation = new QWidget;
+  auto* main = new QVBoxLayout(operation);
+  main->setContentsMargins(10, 14, 10, 14);
+  main->setSpacing(14);
+  _homePulseTitle = new QLabel(QStringLiteral("Consultando sua operação"));
+  _homePulseTitle->setObjectName(QStringLiteral("operationTitle"));
+  _homePulseTitle->setWordWrap(true);
+  auto* operationHeading = new QHBoxLayout;
+  operationHeading->addWidget(_homePulseTitle, 1);
+  _operationLive = new QLabel(QStringLiteral("Aguardando"));
+  _operationLive->setObjectName(QStringLiteral("liveBadge"));
+  _operationLive->setFixedHeight(40);
+  operationHeading->addWidget(_operationLive);
+  _operationPause = new QPushButton(QStringLiteral("Ⅱ  Pausar"));
+  _operationPause->setMinimumSize(118, 40);
+  _operationPause->setEnabled(false);
+  connect(_operationPause, &QPushButton::clicked, this, [this] {
+    _operationPause->setEnabled(false);
+    const QString path = _operationPauseRequested ? QStringLiteral("/api/campaigns/resume") : QStringLiteral("/api/campaigns/pause");
+    _api.post(path, {}, [this](bool ok, const QJsonDocument&, const QString& error) {
+      if (!ok) showError(QStringLiteral("Controle da campanha"), error);
+      loadHome();
+    });
+  });
+  operationHeading->addWidget(_operationPause);
+  main->addLayout(operationHeading);
+  _homePulseBody = quietLabel(QStringLiteral("Aguardando os dados do serviço local."));
+  _homePulseBody->setObjectName(QStringLiteral("operationSubtitle"));
+  main->addWidget(_homePulseBody);
+  _operationStages = new QLabel(operation);
+  _operationStages->hide();
+  _operationTrack = new OperationTrack;
+  main->addSpacing(14);
+  main->addWidget(_operationTrack);
+  _operationTotal = new QLabel(QStringLiteral("— / — <span style='font-size:14px'>contas concluídas</span>"));
+  _operationTotal->setObjectName(QStringLiteral("operationTotal"));
+  main->addWidget(_operationTotal);
   _homePulseProgress = new QProgressBar;
+  _homePulseProgress->setObjectName(QStringLiteral("operationProgress"));
   _homePulseProgress->setRange(0, 100);
   _homePulseProgress->setValue(0);
   _homePulseProgress->setTextVisible(false);
-  pulseCopyLayout->addWidget(_homePulseProgress);
-  pulse->addWidget(pulseCopy, 1);
+  _homePulseProgress->setFixedHeight(9);
+  _operationProgressRow = new QWidget;
+  auto* progressRow = new QHBoxLayout(_operationProgressRow);
+  progressRow->setContentsMargins(0, 0, 0, 0);
+  progressRow->setSpacing(24);
+  progressRow->addWidget(_homePulseProgress, 1);
+  auto* percent = new QLabel(QStringLiteral("0%"));
+  percent->setMinimumWidth(38);
+  percent->setStyleSheet(QStringLiteral("font-size: 16px;"));
+  progressRow->addWidget(percent);
+  connect(_homePulseProgress, &QProgressBar::valueChanged, percent, [percent](int value) {
+    percent->setText(QStringLiteral("%1%").arg(value));
+  });
+  _operationProgressRow->hide();
+  main->addWidget(_operationProgressRow);
+  _operationEmpty = quietLabel(QStringLiteral("Nenhuma campanha carregada. Conecte suas contas e revise uma prévia para começar."));
+  main->addWidget(_operationEmpty);
+  _operationTable = new QTableWidget(0, 4);
+  _operationTable->setHorizontalHeaderLabels({QStringLiteral("Conta"), QStringLiteral("Etapa"), QStringLiteral("Progresso"), QStringLiteral("Resultado")});
+  _operationTable->verticalHeader()->hide();
+  _operationTable->setItemDelegate(new OperationRowDelegate(_operationTable));
+  _operationTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  _operationTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+  _operationTable->setShowGrid(false);
+  _operationTable->setMinimumHeight(260);
+  _operationTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+  _operationTable->setObjectName(QStringLiteral("operationTable"));
+  _operationTable->horizontalHeader()->setFixedHeight(46);
+  _operationTable->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+  main->addWidget(_operationTable, 1);
 
-  auto* newCampaign = primaryButton(QStringLiteral("Criar campanha  →"));
-  newCampaign->setMinimumWidth(158);
-  connect(newCampaign, &QPushButton::clicked, this, [this] { _navigation->setCurrentRow(3); });
-  pulse->addWidget(newCampaign, 0, Qt::AlignVCenter);
-  auto* pulseCard = card(QString(), pulseContent);
-  pulseCard->setObjectName(QStringLiteral("pulseCard"));
-  layout->addWidget(pulseCard);
+  auto* operationSurface = card(QString(), operation);
+  operationSurface->setObjectName(QStringLiteral("operationSurface"));
+  columns->addWidget(operationSurface, 68);
 
-  auto* stats = new QWidget;
-  auto* statsLayout = new QHBoxLayout(stats);
-  statsLayout->setContentsMargins(0, 0, 0, 0);
-  statsLayout->setSpacing(14);
-  auto* accountsMetric = card(QString(), metric(QStringLiteral("—"), QStringLiteral("contas conectadas"), &_homeAccounts));
-  accountsMetric->setObjectName(QStringLiteral("metricCard"));
-  auto* campaignsMetric = card(QString(), metric(QStringLiteral("—"), QStringLiteral("campanhas registradas"), &_homeCampaigns));
-  campaignsMetric->setObjectName(QStringLiteral("metricCard"));
-  auto* successMetric = card(QString(), metric(QStringLiteral("—"), QStringLiteral("envios ok na última"), &_homeSuccess));
-  successMetric->setObjectName(QStringLiteral("metricCard"));
-  statsLayout->addWidget(accountsMetric);
-  statsLayout->addWidget(campaignsMetric);
-  statsLayout->addWidget(successMetric);
-  layout->addWidget(stats);
+  auto* inspector = new QFrame;
+  _operationInspector = inspector;
+  inspector->setObjectName(QStringLiteral("operationInspector"));
+  inspector->setMinimumWidth(310);
+  inspector->setMaximumWidth(480);
+  auto* context = new QVBoxLayout(inspector);
+  context->setContentsMargins(24, 26, 24, 26);
+  context->setSpacing(18);
+  auto* kicker = new QLabel(QStringLiteral("PRÓXIMO PASSO"));
+  kicker->setObjectName(QStringLiteral("heroEyebrow"));
+  context->addWidget(kicker);
+  _operationContextTitle = new QLabel(QStringLiteral("Prepare sua operação"));
+  _operationContextTitle->setObjectName(QStringLiteral("inspectorTitle"));
+  _operationContextTitle->setWordWrap(true);
+  context->addWidget(_operationContextTitle);
+  _homeAccountStep = new QLabel(QStringLiteral("Conecte suas contas e prepare o conteúdo."));
+  _homeAccountStep->setObjectName(QStringLiteral("heroDescription"));
+  _homeAccountStep->setWordWrap(true);
+  context->addWidget(_homeAccountStep);
+  _homeNextAction = primaryButton(QStringLiteral("Consultando…"));
+  _homeNextAction->setEnabled(false);
+  connect(_homeNextAction, &QPushButton::clicked, this, [this] { _navigation->setCurrentRow(_homeDestination); });
+  _homeNextAction->setFlat(true);
+  context->addWidget(_homeNextAction);
+  _operationFeed = new QLabel(QStringLiteral("Os eventos da campanha aparecerão aqui."));
+  _operationFeed->setTextFormat(Qt::PlainText);
+  _operationFeed->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+  _operationFeed->setMargin(8);
+  _operationFeed->setWordWrap(true);
+  _operationFeed->setObjectName(QStringLiteral("heroDescription"));
+  _operationFeed->setParent(inspector);
+  _operationFeed->hide();
+  _operationTimeline = new OperationTimeline;
+  context->addWidget(_operationTimeline, 1);
+  auto* balanceCaption = new QLabel(QStringLiteral("SALDO DISPONÍVEL"));
+  balanceCaption->setObjectName(QStringLiteral("inspectorBalanceCaption"));
+  context->addWidget(balanceCaption);
+  _operationBalance = new QLabel(QStringLiteral("US$ —"));
+  _operationBalance->setObjectName(QStringLiteral("inspectorBalance"));
+  auto* balanceRow = new QHBoxLayout;
+  balanceRow->addWidget(_operationBalance, 1);
+  context->addLayout(balanceRow);
+  _operationBalanceNote = new QLabel(QStringLiteral("Consulte os saldos das suas contas."));
+  _operationBalanceNote->setObjectName(QStringLiteral("heroDescription"));
+  _operationBalanceNote->setWordWrap(true);
+  context->addWidget(_operationBalanceNote);
+  auto* balances = new QPushButton(QStringLiteral("Ver saldos →"));
+  connect(balances, &QPushButton::clicked, this, [this] { _navigation->setCurrentRow(6); });
+  balances->setObjectName(QStringLiteral("inspectorBalanceAction"));
+  balances->setMinimumHeight(40);
+  balanceRow->addWidget(balances);
+  _homeSync = new QLabel(QStringLiteral("Aguardando leitura"));
+  _homeSync->setObjectName(QStringLiteral("heroDescription"));
+  _homeSync->setWordWrap(true);
+  columns->addWidget(inspector, 32);
+  layout->addLayout(columns, 1);
 
-  auto* lower = new QWidget;
-  auto* lowerLayout = new QHBoxLayout(lower);
-  lowerLayout->setContentsMargins(0, 0, 0, 0);
-  lowerLayout->setSpacing(14);
+  auto* summary = new QWidget;
+  auto* stats = new QHBoxLayout(summary);
+  stats->setContentsMargins(0, 0, 0, 0);
+  stats->addWidget(metric(QStringLiteral("—"), QStringLiteral("contas cadastradas"), &_homeAccounts));
+  stats->addWidget(metric(QStringLiteral("—"), QStringLiteral("campanhas no histórico"), &_homeCampaigns));
+  stats->addWidget(metric(QStringLiteral("—"), QStringLiteral("envios OK / tentativas na última"), &_homeSuccess));
+  summary->setParent(body);
+  summary->hide();
+  _homeRecent = quietLabel(QStringLiteral("Consultando histórico…"));
+  _homeRecent->setParent(body);
+  _homeRecent->hide();
+  auto* footer = new QHBoxLayout;
+  auto* privacy = quietLabel(QStringLiteral("Seus dados ficam nesta instalação"));
+  privacy->setWordWrap(false);
+  footer->addWidget(privacy);
+  footer->addStretch();
+  _homeSync->setObjectName(QStringLiteral("quiet"));
+  _homeSync->setWordWrap(false);
+  footer->addWidget(_homeSync);
+  layout->addLayout(footer);
+  auto* scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  scroll->setWidget(body);
+  return pageShell(QStringLiteral("Visão da operação"), QStringLiteral("Acompanhe cada etapa. Decida o próximo passo."), scroll);
+}
 
-  auto* sequence = new QWidget;
-  auto* sequenceLayout = new QVBoxLayout(sequence);
-  sequenceLayout->setContentsMargins(0, 0, 0, 0);
-  sequenceLayout->setSpacing(0);
-  const QStringList steps = {
-      QStringLiteral("01   Conecte e valide as contas de destino"),
-      QStringLiteral("02   Prepare o reservatório de mídia"),
-      QStringLiteral("03   Inicie uma campanha monitorada")};
-  for (const QString& step : steps) {
-    auto* row = new QLabel(step);
-    row->setObjectName(QStringLiteral("sequenceRow"));
-    row->setMinimumHeight(42);
-    sequenceLayout->addWidget(row);
+void MainWindow::renderOperation(const QJsonObject& snapshot) {
+  const bool active = snapshot.value("state").toString() == "running";
+  _operationPauseRequested = snapshot.value("pause_requested").toBool();
+  _operationPause->setEnabled(active);
+  _operationPause->setText(_operationPauseRequested ? QStringLiteral("▷  Retomar") : QStringLiteral("Ⅱ  Pausar"));
+  _operationLive->setText(_operationPauseRequested ? QStringLiteral("Pausa solicitada") : active ? QStringLiteral("●  Ao vivo") : QStringLiteral("Aguardando"));
+  _operationLive->setToolTip(_operationPauseRequested ? QStringLiteral("Requisições em andamento podem terminar; a continuação aguarda Retomar.") : QString());
+  const auto operation = snapshot.value("operation").toObject();
+  const auto rows = operation.value("accounts").toArray();
+  const auto counts = operation.value("counts").toObject();
+  const QHash<QString, QString> labels{
+    {"queued", "Na fila"}, {"waiting", "Aguardando"}, {"preparing", "Preparando"},
+    {"sending", "Enviando"}, {"confirming", "Confirmando"}, {"confirmed", "Confirmado"},
+    {"failed", "Falhou"}, {"skipped", "Pulado"}, {"recovering", "Recuperando"},
+    {"excluded", "Excluída"}, {"pending", "Pendente"}, {"unconfirmed", "Sem confirmação"}};
+  _operationEmpty->setVisible(rows.isEmpty());
+  _operationTrack->setCounts(counts);
+  _operationContextTitle->setText(counts.value("confirming").toInt() > 0 ? QStringLiteral("Confirmar recebimento") : snapshot.value("state").toString() == "running" ? QStringLiteral("Acompanhar os envios") : QStringLiteral("Planejar sua campanha"));
+  _operationTotal->setText(QStringLiteral("%1 / %2 <span style='font-size:14px'>contas com último envio confirmado</span>")
+      .arg(counts.value("confirmed").toInt()).arg(rows.size()));
+  _operationTable->setRowCount(rows.size());
+  for (int i = 0; i < rows.size(); ++i) {
+    const auto row = rows[i].toObject();
+    const auto state = row.value("state").toString();
+    const auto progress = row.value("progress");
+    const QStringList cells{row.value("email").toString(), labels.value(state, QStringLiteral("Não informado")),
+       progress.isDouble() ? QStringLiteral("%1%").arg(progress.toInt()) : QStringLiteral("—"),
+       state == "confirmed" ? QStringLiteral("Enviado") : state == "failed" ? QStringLiteral("Falhou") : state == "sending" ? QStringLiteral("Em andamento") : labels.value(state)};
+    for (int column = 0; column < cells.size(); ++column) {
+      auto* cell = new QTableWidgetItem(cells[column]);
+      cell->setData(Qt::UserRole, row);
+      cell->setToolTip(QStringLiteral("Clipe: %1\nSessão: %2\nFalhas: %3 • Pulados: %4")
+          .arg(row.value("clip_uid").toString(), row.value("session_id").toString())
+          .arg(row.value("failed").toInt()).arg(row.value("skipped").toInt()));
+      _operationTable->setItem(i, column, cell);
+    }
+    _operationTable->setRowHeight(i, 58);
   }
-  lowerLayout->addWidget(card(QStringLiteral("Próxima sequência"), sequence), 3);
-
-  auto* quick = new QWidget;
-  auto* quickLayout = new QVBoxLayout(quick);
-  quickLayout->setContentsMargins(0, 0, 0, 0);
-  quickLayout->setSpacing(8);
-  auto addQuick = [this, quickLayout](const QString& text, int destination) {
-    auto* button = new QPushButton(text + QStringLiteral("   →"));
-    button->setObjectName(QStringLiteral("quickAction"));
-    button->setCursor(Qt::PointingHandCursor);
-    connect(button, &QPushButton::clicked, this,
-            [this, destination] { _navigation->setCurrentRow(destination); });
-    quickLayout->addWidget(button);
-  };
-  addQuick(QStringLiteral("Checar prontidão"), 1);
-  addQuick(QStringLiteral("Configurar integrações"), 2);
-  addQuick(QStringLiteral("Gerenciar contas"), 5);
-  addQuick(QStringLiteral("Consultar histórico"), 7);
-  lowerLayout->addWidget(card(QStringLiteral("Acesso direto"), quick), 2);
-  layout->addWidget(lower);
-  layout->addStretch();
-
-  return pageShell(QStringLiteral("Visão geral"),
-                   QStringLiteral("Acompanhe o estado da operação e siga para a próxima ação."), body);
+  _operationStages->setText(QStringLiteral("Preparando %1   →   Enviando %2   →   Confirmando %3   →   Confirmados %4")
+      .arg(counts.value("preparing").toInt()).arg(counts.value("sending").toInt())
+      .arg(counts.value("confirming").toInt()).arg(counts.value("confirmed").toInt()));
+  QStringList feed;
+  const auto events = snapshot.value("events").toArray();
+  _operationTimeline->setEvents(events);
+  for (int i = qMax(0, int(events.size()) - 3); i < events.size(); ++i) {
+    const auto event = events[i].toObject();
+    const auto time = QDateTime::fromSecsSinceEpoch(qint64(event.value("ts").toDouble())).toString("HH:mm");
+    feed << time + QStringLiteral("  ") + event.value("title").toString() + QStringLiteral("\n") + event.value("detail").toString();
+  }
+  _operationFeed->setText(feed.isEmpty() ? QStringLiteral("Nenhum evento nesta execução.") : feed.join(QStringLiteral("\n\n")));
 }
 
 QWidget* MainWindow::buildReadinessPage() {
@@ -777,7 +1040,8 @@ QWidget* MainWindow::buildReadinessPage() {
   layout->addWidget(commandCard);
 
   _readinessTable = new QTableWidget(0, 3);
-  configureTable(_readinessTable);
+  configureTable(_readinessTable, QStringLiteral("Prepare sua primeira operação"),
+                 QStringLiteral("Execute a verificação para conferir contas, conteúdo e requisitos desta instalação."));
   _readinessTable->setHorizontalHeaderLabels(
       {QStringLiteral("Estado"), QStringLiteral("Componente"), QStringLiteral("Leitura")});
   _readinessTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
@@ -844,13 +1108,25 @@ QWidget* MainWindow::buildIntegrationsPage() {
   _integrationsSummary->setWordWrap(true);
   heroCopy->addWidget(_integrationsSummary);
   heroLayout->addLayout(heroCopy, 1);
-  _integrationSecurity = quietLabel(QStringLiteral("Proteção do Windows"));
+  _integrationSecurity = quietLabel(QStringLiteral("Verificando proteção"));
   _integrationSecurity->setObjectName(QStringLiteral("securityBadge"));
   _integrationSecurity->setAlignment(Qt::AlignCenter);
+  _integrationSecurity->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
   heroLayout->addWidget(_integrationSecurity);
   auto* heroCard = card(QString(), hero);
-  heroCard->setObjectName(QStringLiteral("pulseCard"));
+  heroCard->setObjectName(QStringLiteral("integrationsContext"));
+  heroCard->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
   layout->addWidget(heroCard);
+  auto* connectors = new QTabWidget;
+  layout->addWidget(connectors);
+  const auto addConnector = [connectors](const QString& title, QWidget* panel) {
+    auto* wrapper = new QWidget;
+    auto* column = new QVBoxLayout(wrapper);
+    column->setContentsMargins(0, 0, 0, 0);
+    column->addWidget(panel);
+    column->addStretch();
+    connectors->addTab(wrapper, title);
+  };
 
   auto* egoBody = new QWidget;
   auto* egoLayout = new QVBoxLayout(egoBody);
@@ -917,7 +1193,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
           this, &MainWindow::saveEgo4dIntegration);
   egoActions->addWidget(_ego4dSave);
   egoLayout->addLayout(egoActions);
-  layout->addWidget(card(QStringLiteral("Ego4D · Conteúdo licenciado"), egoBody));
+  addConnector(QStringLiteral("Conteúdo licenciado"), card(QStringLiteral("Ego4D"), egoBody));
 
   auto* hostBody = new QWidget;
   auto* hostLayout = new QVBoxLayout(hostBody);
@@ -940,7 +1216,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
   hostSelectorLayout->setContentsMargins(0, 0, 0, 0);
   hostSelectorLayout->setSpacing(8);
   _hostingerProfile = new ComboBox;
-  configureCombo(_hostingerProfile, 480);
+  configureCombo(_hostingerProfile, 280);
   connect(_hostingerProfile, qOverload<int>(&QComboBox::currentIndexChanged),
           this, &MainWindow::selectHostingerIntegration);
   hostSelectorLayout->addWidget(_hostingerProfile, 1);
@@ -972,7 +1248,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
           this, &MainWindow::saveHostingerIntegration);
   hostActions->addWidget(_hostingerSave);
   hostLayout->addLayout(hostActions);
-  layout->addWidget(card(QStringLiteral("Hostinger · Códigos de verificação"), hostBody));
+  addConnector(QStringLiteral("Códigos de verificação"), card(QStringLiteral("Hostinger"), hostBody));
 
   auto* local = new QWidget;
   auto* localLayout = new QHBoxLayout(local);
@@ -1008,7 +1284,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
     _updates.repair();
   });
   localLayout->addWidget(_repairInstall);
-  layout->addWidget(card(QStringLiteral("Componentes incluídos no QMoney"), local));
+  addConnector(QStringLiteral("Esta instalação"), card(QStringLiteral("Componentes incluídos no QMoney"), local));
   layout->addStretch();
 
   scroll->setWidget(content);
@@ -1023,10 +1299,25 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* bodyLayout = new QVBoxLayout(body);
   bodyLayout->setContentsMargins(0, 0, 0, 0);
   bodyLayout->setSpacing(14);
+  auto* tabs = new QTabWidget;
+  bodyLayout->addWidget(tabs, 1);
 
   auto* scroll = new QScrollArea;
   scroll->setWidgetResizable(true);
   scroll->setFrameShape(QFrame::NoFrame);
+  tabs->addTab(scroll, QStringLiteral("Conteúdo e contas"));
+  const auto addSection = [tabs](const QString& title, QWidget* section) {
+    auto* page = new QScrollArea;
+    page->setWidgetResizable(true);
+    page->setFrameShape(QFrame::NoFrame);
+    auto* wrapper = new QWidget;
+    auto* column = new QVBoxLayout(wrapper);
+    column->setContentsMargins(0, 0, 8, 0);
+    column->addWidget(section);
+    column->addStretch();
+    page->setWidget(wrapper);
+    tabs->addTab(page, title);
+  };
   auto* content = new QWidget;
   auto* layout = new QVBoxLayout(content);
   layout->setContentsMargins(0, 0, 8, 0);
@@ -1095,6 +1386,7 @@ QWidget* MainWindow::buildCampaignPage() {
 
   auto* selection = new QWidget;
   auto* selectionLayout = new QHBoxLayout(selection);
+  _campaignSelectionColumns = selectionLayout;
   selectionLayout->setContentsMargins(0, 0, 0, 0);
   auto* accountCol = new QVBoxLayout;
   auto* accountHeading = quietLabel(QStringLiteral("CONTAS DE DESTINO"));
@@ -1135,6 +1427,8 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignAccountSearch->setClearButtonEnabled(true);
   accountCol->addWidget(_campaignAccountSearch);
   _campaignAccounts = new QListWidget;
+  new TableEmptyState(_campaignAccounts, QStringLiteral("Selecione suas contas"),
+                      QStringLiteral("As contas cadastradas aparecem aqui. Use Contas para conectar a primeira."));
   _campaignAccounts->setMinimumHeight(190);
   _campaignAccounts->setSpacing(2);
   _campaignAccounts->setUniformItemSizes(true);
@@ -1212,6 +1506,8 @@ QWidget* MainWindow::buildCampaignPage() {
   taskHead->addWidget(allTasks);
   taskCol->addLayout(taskHead);
   _campaignTasks = new QListWidget;
+  new TableEmptyState(_campaignTasks, QStringLiteral("Encontre conteúdo compatível"),
+                      QStringLiteral("Selecione uma conta e recarregue as categorias disponíveis."));
   _campaignTasks->setMinimumHeight(190);
   _campaignTasks->setSpacing(2);
   _campaignTasks->setUniformItemSizes(true);
@@ -1332,7 +1628,7 @@ QWidget* MainWindow::buildCampaignPage() {
   hoursLayout->addWidget(_hourEnd);
   hoursLayout->addStretch();
   form->addRow(QStringLiteral("Janela ativa"), hours);
-  layout->addWidget(card(QStringLiteral("Parâmetros"), parameters));
+  addSection(QStringLiteral("Ritmo e limites"), card(QStringLiteral("Como a campanha vai executar"), parameters));
 
   auto* execution = new QWidget;
   auto* executionLayout = new QVBoxLayout(execution);
@@ -1382,10 +1678,9 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignStart = primaryButton(QStringLiteral("Iniciar campanha"));
   connect(_campaignStart, &QPushButton::clicked, this, &MainWindow::startCampaign);
   actions->addWidget(_campaignStart);
-  layout->addWidget(card(QStringLiteral("Execução"), execution));
+  addSection(QStringLiteral("Acompanhamento"), card(QStringLiteral("Execução"), execution));
   layout->addStretch();
   scroll->setWidget(content);
-  bodyLayout->addWidget(scroll);
   bodyLayout->addLayout(actions);
 
   _campaignDraftSave.setSingleShot(true);
@@ -1452,35 +1747,42 @@ QWidget* MainWindow::buildCampaignPage() {
 
 QWidget* MainWindow::buildAcceleratorPage() {
   auto* body = new QWidget;
-  auto* layout = new QVBoxLayout(body);
+  auto* layout = new QHBoxLayout(body);
+  _libraryColumns = layout;
   layout->setContentsMargins(0, 0, 0, 0);
   layout->setSpacing(14);
 
   auto* hero = new QWidget;
   auto* heroLayout = new QVBoxLayout(hero);
   heroLayout->setContentsMargins(0, 0, 0, 0);
-  auto* line = new QHBoxLayout;
+  auto* line = new QVBoxLayout;
   _cacheState = new QLabel(QStringLiteral("Aguardando leitura"));
   _cacheState->setObjectName(QStringLiteral("pulseTitle"));
   line->addWidget(_cacheState);
-  line->addStretch();
   _cacheNumbers = quietLabel(QStringLiteral("—"));
   line->addWidget(_cacheNumbers);
   heroLayout->addLayout(line);
   _cacheProgress = new QProgressBar;
   _cacheProgress->setRange(0, 100);
   heroLayout->addWidget(_cacheProgress);
-  _cacheLastRun = quietLabel(QStringLiteral("Nenhuma preparação registrada neste computador."));
+  _cacheLastRun = quietLabel(QStringLiteral("Última preparação: aguardando leitura."));
   _cacheLastRun->setWordWrap(true);
   heroLayout->addWidget(_cacheLastRun);
-  layout->addWidget(card(QStringLiteral("Reservatório de campanha"), hero));
+  auto* libraryContext = card(QStringLiteral("MÍDIA PREPARADA"), hero);
+  libraryContext->setObjectName(QStringLiteral("libraryContext"));
+  libraryContext->setMinimumWidth(280);
+  _cacheState->setWordWrap(true);
+  heroLayout->addSpacing(24);
+  heroLayout->addWidget(quietLabel(QStringLiteral("Prepare uma vez, use nas campanhas")));
+  heroLayout->addWidget(quietLabel(QStringLiteral("Os vídeos e sensores ficam nesta biblioteca. A preparação respeita o espaço livre reservado no disco.")));
+  heroLayout->addStretch();
 
   auto* config = new QWidget;
   auto* form = new QFormLayout(config);
   configureForm(form);
   form->setContentsMargins(0, 0, 0, 0);
   _cacheProvider = new ComboBox;
-  configureCombo(_cacheProvider, 620);
+  configureCombo(_cacheProvider, 240);
   _cacheProvider->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
   _cacheProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
   connect(_cacheProvider, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, form] {
@@ -1519,7 +1821,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheProviderHelp->setWordWrap(true);
   form->addRow(QString(), _cacheProviderHelp);
   _cacheTask = new ComboBox;
-  configureCombo(_cacheTask, 620);
+  configureCombo(_cacheTask, 240);
   connect(_cacheTask, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
     loadAccelerator();
   });
@@ -1531,6 +1833,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   form->addRow(QString(), _cacheTaskHelp);
   _cacheBudgetLabel = new QLabel(QStringLiteral("Espaço para o cache"));
   _cacheBudget = new QSpinBox;
+  _cacheBudget->setMaximumWidth(220);
   _cacheBudget->setRange(0, 2147483647);
   _cacheBudget->setKeyboardTracking(false);
   _cacheBudget->setSpecialValueText(QStringLiteral("0 GB · desativado"));
@@ -1555,6 +1858,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   form->setRowVisible(_cacheBudget, egoInitiallySelected);
   form->setRowVisible(_cacheBudgetHelp, egoInitiallySelected);
   _cacheLimit = new QSpinBox;
+  _cacheLimit->setMaximumWidth(220);
   _cacheLimit->setRange(0, 1000);
   _cacheLimit->setSpecialValueText(QStringLiteral("Todos"));
   _cacheLimit->setToolTip(QStringLiteral("0 prepara todos os clipes que couberem no espaço escolhido. Outro valor limita apenas esta execução."));
@@ -1567,6 +1871,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheLimitHelp->setWordWrap(true);
   form->addRow(QString(), _cacheLimitHelp);
   _cacheReserve = new QSpinBox;
+  _cacheReserve->setMaximumWidth(220);
   _cacheReserve->setRange(5, 1000);
   _cacheReserve->setValue(50);
   _cacheReserve->setSuffix(QStringLiteral(" GiB livres"));
@@ -1616,12 +1921,21 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheStart = primaryButton(QStringLiteral("Preparar cache"));
   connect(_cacheStart, &QPushButton::clicked, this, &MainWindow::startAccelerator);
   actionLayout->addWidget(_cacheStart);
-  form->addRow(QString(), actions);
-  layout->addWidget(card(QStringLiteral("O que preparar"), config));
-  layout->addStretch();
+  auto* preparation = new QWidget;
+  auto* preparationLayout = new QVBoxLayout(preparation);
+  preparationLayout->setContentsMargins(0, 0, 0, 0);
+  preparationLayout->setSpacing(20);
+  preparationLayout->addWidget(config);
+  preparationLayout->addWidget(actions);
+  layout->addWidget(card(QStringLiteral("Preparar conteúdo"), preparation), 2);
+  layout->addWidget(libraryContext, 1);
+  auto* scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  scroll->setWidget(body);
 
-  return pageShell(QStringLiteral("Acelerador"),
-                   QStringLiteral("Prepare mídia antes da campanha e acompanhe quanto já está pronto no disco."), body);
+  return pageShell(QStringLiteral("Biblioteca"),
+                   QStringLiteral("Prepare seu conteúdo e acompanhe a mídia disponível para as campanhas."), scroll);
 }
 
 QWidget* MainWindow::buildAccountsPage() {
@@ -1716,7 +2030,8 @@ QWidget* MainWindow::buildAccountsPage() {
   _bulkRegisterProgress->setFormat(QStringLiteral("%v/%m"));
   bulkForm->addRow(QStringLiteral("Progresso"), _bulkRegisterProgress);
   _bulkRegisterTable = new QTableWidget(0, 6);
-  configureTable(_bulkRegisterTable);
+  configureTable(_bulkRegisterTable, QStringLiteral("Acompanhe as novas contas"),
+                 QStringLiteral("Ao iniciar a criação, o resultado de cada conta aparece aqui."));
   _bulkRegisterTable->setMinimumHeight(160);
   _bulkRegisterTable->setHorizontalHeaderLabels({
       QStringLiteral("Email"), QStringLiteral("Nome"), QStringLiteral("Sobrenome"),
@@ -1743,7 +2058,8 @@ QWidget* MainWindow::buildAccountsPage() {
   addTab(QStringLiteral("Criar contas"), card(QStringLiteral("Criador de contas"), bulkBody));
 
   _accountsTable = new QTableWidget(0, 4);
-  configureTable(_accountsTable);
+  configureTable(_accountsTable, QStringLiteral("Tudo começa pelas suas contas"),
+                 QStringLiteral("Adicione uma conta ou importe suas credenciais para começar."));
   _accountsTable->setMinimumHeight(230);
   _accountsTable->setHorizontalHeaderLabels(
       {QStringLiteral("Conta"), QStringLiteral("Organização"), QStringLiteral("Última verificação"), QStringLiteral("Ações")});
@@ -1829,7 +2145,10 @@ QWidget* MainWindow::buildBalancesPage() {
   layout->setContentsMargins(0, 0, 0, 0);
   layout->setSpacing(14);
   auto* header = new QWidget;
-  auto* headerLayout = new QHBoxLayout(header);
+  auto* headerContainer = new QVBoxLayout(header);
+  headerContainer->setContentsMargins(0, 0, 0, 0);
+  headerContainer->setSpacing(14);
+  auto* headerLayout = new QHBoxLayout;
   headerLayout->setContentsMargins(0, 0, 0, 0);
   auto* identityCopy = new QWidget;
   auto* identityLayout = new QVBoxLayout(identityCopy);
@@ -1842,7 +2161,8 @@ QWidget* MainWindow::buildBalancesPage() {
       "Se as senhas forem diferentes, conecte o acesso Crowtado na linha abaixo."));
   identityHelp->setWordWrap(true);
   identityLayout->addWidget(identityHelp);
-  headerLayout->addWidget(identityCopy, 1);
+  headerContainer->addWidget(identityCopy);
+  headerContainer->addLayout(headerLayout);
   _balancesRefresh = primaryButton(QStringLiteral("Atualizar todos"));
   connect(_balancesRefresh, &QPushButton::clicked, this, [this] {
     _balancesRefresh->setEnabled(false);
@@ -1919,7 +2239,13 @@ QWidget* MainWindow::buildBalancesPage() {
   connect(_balancesPayoutMethod, &QPushButton::clicked, this, [this] {
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("Método de saque Crowtado"));
+    dialog.resize(620, 400);
     auto* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(28, 24, 28, 24);
+    layout->setSpacing(18);
+    auto* title = new QLabel(QStringLiteral("Destino dos seus saques"), &dialog);
+    title->setObjectName(QStringLiteral("reviewTitle"));
+    layout->addWidget(title);
     auto* help = new QLabel(QStringLiteral(
         "A configuração será aplicada a todas as contas Crowtado conectadas. "
         "Para Wise, escolha o método ao solicitar saque; o vínculo será feito uma conta por vez. "
@@ -1927,7 +2253,7 @@ QWidget* MainWindow::buildBalancesPage() {
     help->setWordWrap(true);
     layout->addWidget(help);
     auto* form = new QFormLayout;
-    auto* method = new QComboBox;
+    auto* method = new ComboBox(&dialog);
     method->addItem(QStringLiteral("Dots"), QStringLiteral("dots"));
     method->addItem(QStringLiteral("PayPal"), QStringLiteral("paypal"));
     auto* legalName = new QLineEdit;
@@ -2038,13 +2364,17 @@ QWidget* MainWindow::buildBalancesPage() {
   layout->addWidget(card(QStringLiteral("Disponibilidade"), header));
 
   auto* filters = new QWidget;
-  auto* filtersLayout = new QHBoxLayout(filters);
+  auto* filterRows = new QVBoxLayout(filters);
+  filterRows->setContentsMargins(0, 0, 0, 0);
+  filterRows->setSpacing(10);
+  auto* filtersLayout = new QHBoxLayout;
   filtersLayout->setContentsMargins(0, 0, 0, 0);
   _balancesSearch = new QLineEdit;
   _balancesSearch->setPlaceholderText(QStringLiteral("Buscar conta por e-mail"));
   _balancesSearch->setClearButtonEnabled(true);
   connect(_balancesSearch, &QLineEdit::textChanged, this, &MainWindow::applyBalanceFilter);
-  filtersLayout->addWidget(_balancesSearch, 1);
+  filterRows->addWidget(_balancesSearch);
+  filterRows->addLayout(filtersLayout);
   _balancesOnlyAvailable = new QCheckBox(QStringLiteral("Só com saldo disponível"));
   connect(_balancesOnlyAvailable, &QCheckBox::toggled, this, [this](bool checked) {
     if (checked) _balancesOnlyPending->setChecked(false);
@@ -2062,10 +2392,12 @@ QWidget* MainWindow::buildBalancesPage() {
   filtersLayout->addWidget(_balancesRefreshNeeded);
   _balancesFilterState = quietLabel(QStringLiteral("0 contas"));
   filtersLayout->addWidget(_balancesFilterState);
-  layout->addWidget(filters);
+
 
   _balancesTable = new QTableWidget(0, 5);
-  configureTable(_balancesTable);
+  _balancesTable->setMinimumHeight(300);
+  configureTable(_balancesTable, QStringLiteral("Uma visão dos seus saldos"),
+                 QStringLiteral("Adicione suas contas e consulte os saldos para verificar os valores disponíveis."));
   _balancesTable->setHorizontalHeaderLabels(
       {QStringLiteral("Conta"), QStringLiteral("Disponível"), QStringLiteral("Pendente"),
        QStringLiteral("Atualizado"), QStringLiteral("Ação")});
@@ -2082,7 +2414,13 @@ QWidget* MainWindow::buildBalancesPage() {
       QStringLiteral("Valor em dólar liberado para solicitar saque."));
   _balancesTable->horizontalHeaderItem(2)->setToolTip(
       QStringLiteral("Valor em dólar registrado pelo Crowtado que ainda não foi liberado para saque."));
-  layout->addWidget(card(QStringLiteral("Saldos no Crowtado"), _balancesTable), 1);
+  auto* accountsBody = new QWidget;
+  auto* accountsLayout = new QVBoxLayout(accountsBody);
+  accountsLayout->setContentsMargins(0, 0, 0, 0);
+  accountsLayout->setSpacing(16);
+  accountsLayout->addWidget(filters);
+  accountsLayout->addWidget(_balancesTable, 1);
+  layout->addWidget(card(QStringLiteral("Saldos por conta"), accountsBody), 1);
 
   auto* summaryBody = new QWidget;
   auto* summaryLayout = new QVBoxLayout(summaryBody);
@@ -2100,7 +2438,7 @@ QWidget* MainWindow::buildBalancesPage() {
     auto* caption = new QLabel(title.toUpper());
     caption->setObjectName(QStringLiteral("balanceTotalCaption"));
     blockLayout->addWidget(caption);
-    *usd = new QLabel(QStringLiteral("US$ 0,00"));
+    *usd = new QLabel(QStringLiteral("US$ —"));
     (*usd)->setObjectName(QStringLiteral("balanceTotalUsd"));
     blockLayout->addWidget(*usd);
     *brl = new QLabel(QStringLiteral("≈ R$ —"));
@@ -2124,10 +2462,17 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesExchange = quietLabel(QStringLiteral("Carregando cotação USD/BRL…"));
   _balancesExchange->setObjectName(QStringLiteral("balanceExchange"));
   summaryLayout->addWidget(_balancesExchange);
-  layout->addWidget(card(QStringLiteral("Resumo em dólar"), summaryBody));
+  auto* summary = card(QStringLiteral("PATRIMÔNIO DA OPERAÇÃO"), summaryBody);
+  summary->setObjectName(QStringLiteral("walletContext"));
+  summary->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+  layout->insertWidget(0, summary);
 
-  return pageShell(QStringLiteral("Saldos"),
-                   QStringLiteral("Acompanhe valores disponíveis e pendentes e solicite o link de saque."), body);
+  auto* scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  scroll->setWidget(body);
+  return pageShell(QStringLiteral("Carteira"),
+                   QStringLiteral("Acompanhe valores disponíveis e pendentes e solicite o link de saque."), scroll);
 }
 
 QWidget* MainWindow::buildBannedPage() {
@@ -2146,7 +2491,8 @@ QWidget* MainWindow::buildBannedPage() {
   help->setWordWrap(true);
   layout->addWidget(help);
   _bannedTable = new QTableWidget(0, 8);
-  configureTable(_bannedTable);
+  configureTable(_bannedTable, QStringLiteral("Contas que precisam de atenção"),
+                 QStringLiteral("As contas restritas identificadas na consulta aparecem aqui."));
   _bannedTable->setHorizontalHeaderLabels({QStringLiteral("E-mail"), QStringLiteral("Status atual"),
       QStringLiteral("Disponível (USD)"), QStringLiteral("Pendente (USD)"),
       QStringLiteral("Banimento"), QStringLiteral("Última consulta"),
@@ -2260,11 +2606,14 @@ void MainWindow::loadBanned() {
 
 QWidget* MainWindow::buildHistoryPage() {
   auto* body = new QWidget;
-  auto* layout = new QHBoxLayout(body);
+  auto* layout = new QVBoxLayout(body);
   layout->setContentsMargins(0, 0, 0, 0);
   layout->setSpacing(14);
   _historyTable = new QTableWidget(0, 4);
-  configureTable(_historyTable);
+  configureTable(_historyTable, QStringLiteral("Sua operação deixa um histórico"),
+                 QStringLiteral("Após executar uma campanha, consulte aqui os resultados de cada conta."));
+  _historyTable->setMinimumHeight(180);
+  _historyTable->setMaximumHeight(250);
   _historyTable->setHorizontalHeaderLabels(
       {QStringLiteral("Início"), QStringLiteral("Contas"), QStringLiteral("Vídeos"), QStringLiteral("Envios OK")});
   _historyTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
@@ -2278,7 +2627,14 @@ QWidget* MainWindow::buildHistoryPage() {
   _historyTable->setSelectionMode(QAbstractItemView::SingleSelection);
   _historyDetail = new QPlainTextEdit;
   _historyDetail->setReadOnly(true);
+  _historyDetail->setMinimumHeight(220);
   _historyDetail->setPlaceholderText(QStringLiteral("Selecione uma campanha para ver o registro completo."));
+  _historyEvidence = new QTableWidget(0,4);
+  configureTable(_historyEvidence, QStringLiteral("Evidências de cada envio"),
+                 QStringLiteral("Selecione uma campanha para consultar conta, clipe, sessão e confirmação."));
+  _historyEvidence->setHorizontalHeaderLabels({QStringLiteral("Conta"),QStringLiteral("Clipe"),QStringLiteral("Sessão"),QStringLiteral("Confirmação")});
+  _historyEvidence->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+  _historyEvidence->setEditTriggers(QAbstractItemView::NoEditTriggers);
   auto* verifyPreviews = new QPushButton(QStringLiteral("Verificar prévias no Minute"));
   connect(verifyPreviews, &QPushButton::clicked, this, [this, verifyPreviews] {
     const int row = _historyTable->currentRow();
@@ -2292,9 +2648,12 @@ QWidget* MainWindow::buildHistoryPage() {
     verifyPreviews->setText(QStringLiteral("Consultando o Minute…"));
     setStatus(QStringLiteral("Consultando o processamento real das prévias no Minute…"));
     _api.post(QStringLiteral("/api/logs/") + encoded(name) + QStringLiteral("/status"), {},
-              [this, verifyPreviews](bool ok, const QJsonDocument& doc, const QString& error) {
+              [this, verifyPreviews, name](bool ok, const QJsonDocument& doc, const QString& error) {
       verifyPreviews->setEnabled(true);
       verifyPreviews->setText(QStringLiteral("Verificar prévias no Minute"));
+      const int selected = _historyTable->currentRow();
+      if (selected < 0 || !_historyTable->item(selected, 0)
+          || _historyTable->item(selected, 0)->data(Qt::UserRole).toString() != name) return;
       if (!ok) return showError(QStringLiteral("Falha ao verificar prévias"), error);
       const auto summary = doc.object().value(QStringLiteral("summary")).toObject();
       const int ready = summary.value(QStringLiteral("ready")).toInt();
@@ -2328,18 +2687,46 @@ QWidget* MainWindow::buildHistoryPage() {
                     .arg(ready).arg(pending).arg(unavailable));
     });
   });
-  connect(_historyTable, &QTableWidget::cellClicked, this, [this](int row, int) {
+  connect(_historyTable, &QTableWidget::currentCellChanged, this, [this](int row, int) {
+    _historyDetail->clear();
+    _historyEvidence->setRowCount(0);
+    if (row < 0 || !_historyTable->item(row, 0)) return;
     const QString name = _historyTable->item(row, 0)->data(Qt::UserRole).toString();
     if (name.isEmpty()) return;
     _api.get(QStringLiteral("/api/logs/") + encoded(name),
-             [this](bool ok, const QJsonDocument& doc, const QString& error) {
+             [this, name](bool ok, const QJsonDocument& doc, const QString& error) {
+      const int selected = _historyTable->currentRow();
+      if(selected < 0 || !_historyTable->item(selected,0) || _historyTable->item(selected,0)->data(Qt::UserRole).toString()!=name) return;
       if (!ok) return showError(QStringLiteral("Falha ao abrir registro"), error);
       const auto root = doc.object();
       const auto summary = root.value(QStringLiteral("summary")).toObject();
+      _historyEvidence->setRowCount(0);
+      for(const auto itemValue:root.value("items").toArray()) {
+        const auto item=itemValue.toObject();
+        for(const auto resultValue:item.value("accounts").toArray()) {
+          const auto result=resultValue.toObject();
+          const auto confirmation=result.value("confirmation").toString();
+          const auto status=result.value("status").toString();
+          const QString proof=confirmation=="remote_ack"?QStringLiteral("Finalização confirmada"):
+              confirmation=="legacy_record"?QStringLiteral("Registro legado"):
+              status=="skipped"?QStringLiteral("Pulado"):
+              status=="failed"?QStringLiteral("Falhou"):QStringLiteral("Sem confirmação");
+          const int row=_historyEvidence->rowCount();
+          _historyEvidence->insertRow(row);
+          const QStringList values{result.value("email").toString(),item.value("clip_uid").toString(QStringLiteral("Não registrado")),result.value("session_id").toString(QStringLiteral("Não registrada")),proof};
+          for(int column=0;column<values.size();++column) {
+            auto* value=new QTableWidgetItem(values[column]);
+            value->setToolTip(values[column]+QStringLiteral("\n")+result.value("detail").toString());
+            _historyEvidence->setItem(row,column,value);
+          }
+          _historyEvidence->setRowHeight(row,48);
+        }
+      }
       QStringList lines;
       lines << QStringLiteral("RESULTADO DA CAMPANHA")
             << friendlyDate(root.value(QStringLiteral("started_at")).toString())
             << QString()
+            << QStringLiteral("%1 envio(s) sem confirmação de finalização").arg(summary.value("pending").toInt())
             << QStringLiteral("VISÃO GERAL")
             << QStringLiteral("%1 vídeo(s) · %2 envio(s) concluído(s) · %3 ignorado(s) · %4 falha(s)")
                    .arg(summary.value(QStringLiteral("videos")).toInt())
@@ -2403,65 +2790,110 @@ QWidget* MainWindow::buildHistoryPage() {
   detailLayout->setContentsMargins(0, 0, 0, 0);
   detailLayout->setSpacing(10);
   detailLayout->addWidget(verifyPreviews, 0, Qt::AlignRight);
-  detailLayout->addWidget(_historyDetail, 1);
-  layout->addWidget(card(QStringLiteral("Campanhas"), _historyTable), 3);
-  layout->addWidget(card(QStringLiteral("Registro"), detailBody), 2);
+  auto* evidenceTabs = new QTabWidget;
+  evidenceTabs->addTab(_historyDetail,QStringLiteral("Resumo"));
+  evidenceTabs->addTab(_historyEvidence,QStringLiteral("Evidências por envio"));
+  detailLayout->addWidget(evidenceTabs,1);
+  layout->addWidget(card(QStringLiteral("Campanhas"), _historyTable));
+  layout->addWidget(card(QStringLiteral("Registro"), detailBody), 1);
+  auto* scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  scroll->setWidget(body);
   return pageShell(QStringLiteral("Histórico"),
-                   QStringLiteral("Audite campanhas anteriores e seus resultados por conta."), body);
+                   QStringLiteral("Audite campanhas anteriores e seus resultados por conta."), scroll);
 }
 
 void MainWindow::applyStructuralStyle(bool dark) {
-  const QString bg = dark ? QStringLiteral("#111315") : QStringLiteral("#f1f3f2");
-  const QString panel = dark ? QStringLiteral("#1a1d1f") : QStringLiteral("#ffffff");
-  const QString sidebar = QStringLiteral("#0e1011");
-  const QString text = dark ? QStringLiteral("#f2f3f1") : QStringLiteral("#202426");
-  const QString muted = dark ? QStringLiteral("#969da1") : QStringLiteral("#697277");
-  const QString border = dark ? QStringLiteral("#2c3134") : QStringLiteral("#d8dddb");
-  const QString selected = QStringLiteral("#35241c");
-  const QString field = dark ? QStringLiteral("#15181a") : QStringLiteral("#f7f8f7");
-  const QString soft = dark ? QStringLiteral("#202427") : QStringLiteral("#edf0ee");
+  const QString bg = dark ? QStringLiteral("#191a20") : QStringLiteral("#f3f4f7");
+  const QString panel = dark ? QStringLiteral("#23242c") : QStringLiteral("#ffffff");
+  const QString sidebar = QStringLiteral("#18191d");
+  const QString text = dark ? QStringLiteral("#f2f3f1") : QStringLiteral("#20212b");
+  const QString muted = dark ? QStringLiteral("#b2b3c3") : QStringLiteral("#606477");
+  const QString border = dark ? QStringLiteral("#383a48") : QStringLiteral("#dfe1ea");
+  const QString selected = QStringLiteral("#30294c");
+  const QString field = dark ? QStringLiteral("#1c1d25") : QStringLiteral("#fafafe");
+  const QString soft = dark ? QStringLiteral("#2b2c36") : QStringLiteral("#edeef5");
 
   setStyleSheet(QStringLiteral(R"(
-    * { font-family: "Inter", "Segoe UI"; }
-    QPushButton { color: %4; background: %9; border: 1px solid %6; border-radius: 6px; padding: 5px 12px; font-weight: 600; }
-    QPushButton:hover { border-color: #ff7a36; }
+    * { font-family: "Segoe UI"; }
+    #operationSurface { background: %8; border: 1px solid %6; border-radius: 14px; }
+    #operationInspector { background: #23242c; border: 1px solid #383a48; border-radius: 14px; }
+    #walletContext, #libraryContext, #integrationsContext { background: #23242c; border: 1px solid #383a48; border-radius: 14px; }
+    #walletContext QLabel, #libraryContext QLabel, #integrationsContext QLabel { color: #f2f3f7; }
+    #walletContext #quiet, #libraryContext #quiet, #integrationsContext #quiet { color: #bfc2ce; }
+    #walletContext #cardTitle, #libraryContext #cardTitle { color: #bfc2ce; letter-spacing: 1px; }
+    #integrationsContext #securityBadge { color: #a8e4ca; background: #293b37; border: 1px solid #466358; }
+    #operationTab, #operationTabActive { font-size: 16px; font-weight: 500; padding: 14px 16px; }
+    #operationTabActive { color: #7046ff; border-bottom: 2px solid #7046ff; border-radius: 0; }
+    #workspaceBrand { color: %4; font-size: 15px; font-weight: 650; }
+    #workspaceTitle { color: %4; font-size: 44px; font-weight: 750; letter-spacing: -1px; }
+    #commandSearch { color: %5; background: transparent; text-align: left; min-height: 28px; font-weight: 400; }
+    #operatorIdentity { color: %4; font-size: 12px; }
+    #inspectorTitle { color: #f5f6fa; font-size: 25px; font-weight: 700; }
+    #inspectorBalanceCaption { color: #c3c6d2; font-size: 12px; letter-spacing: 1.5px; border-top: 1px solid #4a4e5c; padding-top: 28px; }
+    #inspectorBalanceAction { background: transparent; color: #f5f6fa; border: 1px solid #a4aabd; border-radius: 7px; padding: 8px 16px; }
+    #inspectorBalance { color: #f5f6fa; font-size: 36px; font-weight: 700; }
+    #operationInspector #heroDescription { font-size: 15px; }
+    #liveBadge { color: #00845d; background: #d9f4e9; border-radius: 12px; padding: 10px 14px; font-size: 14px; font-weight: 600; }
+    #operationTotal { color: %4; font-size: 38px; font-weight: 750; padding-top: 12px; }
+    #operationTable { background: transparent; border: none; }
+    #operationTable QHeaderView::section { background-color: %2; font-size: 12px; font-weight: 500; padding: 16px 8px; }
+    #operationTitle { color: %4; font-size: 34px; font-weight: 700; }
+    #operationSubtitle { color: %5; font-size: 18px; }
+    #operationProgress { background: #dce0ea; min-height: 9px; max-height: 9px; border-radius: 4px; }
+    #operationStages { color: #9179ff; border-top: 2px solid #7357ec; padding-top: 18px; padding-bottom: 12px; font-size: 12px; font-weight: 600; }
+    #operationHero { background: #23242c; border: 1px solid #383a48; border-radius: 16px; }
+    #heroEyebrow { color: #b9b2d8; font-size: 10px; font-weight: 700; letter-spacing: 1.4px; }
+    #heroTitle { color: #ffffff; font-family: "Bahnschrift", "Segoe UI"; font-size: 30px; font-weight: 650; }
+    #heroDescription { color: #d1d0df; font-size: 12px; }
+    #journeyIndex { color: %5; font-family: "Bahnschrift", "Segoe UI"; font-size: 23px; }
+    #journeyRow { border-bottom: 1px solid %6; }
+    QScrollArea, QScrollArea > QWidget > QWidget { background: %1; }
+    QPushButton { color: %4; background: %9; border: 1px solid %6; border-radius: 9px; padding: 8px 14px; font-weight: 600; }
+    QPushButton:hover { border-color: #7357ec; }
     QPushButton:pressed { background: %8; }
-    QPushButton:focus { border-color: #ff7a36; }
-    QPushButton[role="primary"] { color: #181a1b; background: #ff7a36; border-color: #ff7a36; }
-    QPushButton[role="primary"]:hover { background: #ff934f; }
-    QPushButton[role="primary"]:pressed { background: #e86b2b; }
+    QPushButton:focus { border-color: #7357ec; }
+    QPushButton[role="primary"] { color: #ffffff; background: #7357ec; border-color: #7357ec; }
+    QPushButton[role="primary"]:hover { background: #9179ff; }
+    QPushButton[role="primary"]:pressed { background: #6245d8; }
     QPushButton:disabled, QPushButton[role="primary"]:disabled { color: %5; background: %8; border-color: %6; }
     QPushButton:flat { background: transparent; border-color: transparent; }
-    QPushButton:flat:hover { color: #ff7a36; background: %9; }
+    QPushButton:flat:hover { color: #7357ec; background: %9; }
+    QTabWidget::pane { border: none; background: %1; }
+    QTabBar::tab { color: %5; background: transparent; padding: 12px 18px; border-bottom: 2px solid transparent; font-size: 13px; }
+    QTabBar::tab:selected { color: #7357ec; border-bottom: 2px solid #7357ec; }
     #workspace { background: %1; }
     #sidebar { background: %3; color: #f7f8f7; border-right: 1px solid #282c2e; }
-    #brandMark { background: transparent; border: none; }
-    #brand { color: #ffffff; font-size: 21px; font-weight: 750; letter-spacing: -0.3px; }
-    #brandRole { color: #747c80; font-size: 9px; font-weight: 750; letter-spacing: 1.3px; }
-    #navigationLabel { color: #666e72; font-size: 9px; font-weight: 800; letter-spacing: 1.2px; padding-left: 7px; padding-bottom: 4px; }
+    #brandMark { background: transparent; border: none; color: #aa94ff; font-size: 44px; font-weight: 800; }
+    #brand { color: #ffffff; font-size: 16px; font-weight: 750; letter-spacing: -0.3px; }
+    #brandRole { color: #a9a8bc; font-size: 9px; font-weight: 750; letter-spacing: 1.3px; }
+    #navigationLabel { color: #a9a8bc; font-size: 9px; font-weight: 800; letter-spacing: 1.2px; padding-left: 7px; padding-bottom: 4px; }
     #sidebar #quiet { color: #858d91; font-size: 9px; font-weight: 700; letter-spacing: 0.8px; }
-    #navigation { background: transparent; color: #abb1b4; outline: none; border: none; }
-    #navigation::item { border-radius: 7px; padding-left: 13px; margin: 2px 0; }
+    #navigation { background: transparent; color: #c9c7d8; outline: none; border: none; }
+    #navigation::item { border-radius: 0; padding: 12px 0; margin: 0; }
+    #railSettings { color: #c9c7d8; background: transparent; border: none; font-size: 12px; }
+    #railProfile { color: #c9c7d8; padding: 22px 0; border-top: 1px solid #383944; }
     #navigation::item:hover { background: #191c1e; color: #ffffff; }
-    #navigation::item:selected { background: %7; color: #ffffff; font-weight: 650; border-left: 2px solid #ff7a36; }
-    #connectionCard { background: #151819; border: 1px solid #292e30; border-radius: 8px; }
+    #navigation::item:selected { background: %7; color: #ffffff; font-weight: 650; border-left: 2px solid #7357ec; }
+    #connectionCard { background: #22232b; border: 1px solid #383944; border-radius: 8px; }
     #backendState { color: #dfe3e1; font-size: 12px; font-weight: 650; }
-    #sidebarUtility { color: #bac0c2; background: #171a1c; border: 1px solid #292e30; border-radius: 7px; text-align: left; padding: 8px 12px; }
+    #sidebarUtility { color: #c9c7d8; background: #22232b; border: 1px solid #383944; border-radius: 7px; text-align: left; padding: 8px 12px; }
     #sidebarUtility:hover { color: white; background: #202427; border-color: #3a4144; }
-    #pageContext { color: #ff7a36; font-size: 9px; font-weight: 850; letter-spacing: 1.45px; }
+    #pageContext { color: %5; font-size: 9px; font-weight: 850; letter-spacing: 1.45px; }
     #modeBadge { color: %5; background: %8; border: 1px solid %6; border-radius: 10px; padding: 4px 10px; font-size: 9px; font-weight: 750; letter-spacing: 0.8px; }
-    #pageTitle { color: %4; font-size: 30px; font-weight: 760; letter-spacing: -0.6px; }
+    #pageTitle { color: %4; font-family: "Bahnschrift", "Segoe UI"; font-size: 30px; font-weight: 650; letter-spacing: -0.6px; }
     #pageSubtitle { color: %5; font-size: 13px; }
-    #card, #pulseCard, #metricCard { background: %2; border: 1px solid %6; border-radius: 9px; }
-    #pulseCard { border-top: 2px solid #ff7a36; }
-    #metricCard:hover { border-color: #ff7a36; }
+    #card, #pulseCard, #metricCard { background: %2; border: 1px solid %6; border-radius: 14px; }
+    #pulseCard { border-top: 2px solid #7357ec; }
+    #metricCard:hover { border-color: #7357ec; }
     #cardTitle { color: %4; font-size: 13px; font-weight: 720; letter-spacing: 0.15px; }
     #metricCaption { color: %5; font-size: 9px; font-weight: 800; letter-spacing: 1.1px; }
     #metricValue { color: %4; font-family: "Cascadia Mono", Consolas; font-size: 32px; font-weight: 700; }
     #metricTiming { color: %5; font-size: 8px; font-weight: 700; letter-spacing: 0.9px; }
     #balanceTotalCaption { color: %5; font-size: 9px; font-weight: 800; letter-spacing: 1.05px; }
     #balanceTotalUsd { color: %4; font-family: "Cascadia Mono", Consolas; font-size: 23px; font-weight: 720; }
-    #balanceTotalBrl { color: #ff7a36; font-family: "Cascadia Mono", Consolas; font-size: 12px; font-weight: 680; }
+    #balanceTotalBrl { color: #7357ec; font-family: "Cascadia Mono", Consolas; font-size: 12px; font-weight: 680; }
     #balanceExchange { color: %5; font-size: 10px; border-top: 1px solid %6; padding-top: 8px; }
     #balanceDivider { color: %6; }
     #pulseTitle { color: %4; font-size: 21px; font-weight: 735; letter-spacing: -0.2px; }
@@ -2472,37 +2904,44 @@ void MainWindow::applyStructuralStyle(bool dark) {
     #integrationMiniTitle { color: %4; font-size: 13px; font-weight: 720; }
     #campaignStage { color: %4; font-size: 17px; font-weight: 735; letter-spacing: -0.1px; }
     #campaignStats { color: %5; font-family: "Cascadia Mono", Consolas; font-size: 10px; font-weight: 650; }
-    #kicker { color: #ff7a36; font-size: 9px; font-weight: 850; letter-spacing: 1.35px; }
+    #kicker { color: #7357ec; font-size: 9px; font-weight: 850; letter-spacing: 1.35px; }
     #signalRail { background: #111416; border: 1px solid #2d3336; border-radius: 7px; }
-    #signalLabel { color: #ff7a36; font-size: 8px; font-weight: 850; letter-spacing: 1.1px; }
+    #signalLabel { color: #7357ec; font-size: 8px; font-weight: 850; letter-spacing: 1.1px; }
     #signalDot { color: #48c78e; font-size: 24px; }
     #signalPort { color: #8d9599; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 650; }
     #sequenceRow { color: %4; border-bottom: 1px solid %6; padding-left: 4px; font-family: "Cascadia Mono", Consolas; font-size: 11px; }
     #quickAction { color: %4; background: %9; border: 1px solid %6; border-radius: 6px; text-align: left; padding: 8px 12px; font-weight: 620; }
-    #quickAction:hover { border-color: #ff7a36; color: #ff7a36; }
+    #quickAction:hover { border-color: #7357ec; color: #7357ec; }
     #quiet { color: %5; }
+    #reviewTitle { color: %4; font-size: 28px; font-weight: 700; }
+    #reviewMetric { background: %9; border: 1px solid %6; border-radius: 12px; }
+    #reviewValue { color: %4; font-size: 28px; font-weight: 700; }
+    #reviewWarning { color: %4; border-left: 3px solid #7357ec; padding: 10px; background: %9; }
+    #emptyHeading { color: %4; font-size: 18px; font-weight: 650; }
+    #tableEmptyState { background: transparent; }
     #appStatusBar { background: %2; border-top: 1px solid %6; }
     #statusVersion { color: %5; font-family: "Cascadia Mono", Consolas; font-size: 9px; }
     QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QListWidget, QTableWidget {
       color: %4; background-color: %8; border: 1px solid %6; border-radius: 6px;
     }
     QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 40px; padding-left: 12px; padding-right: 12px; }
-    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus, QListWidget:focus { border-color: #ff7a36; }
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus, QListWidget:focus { border-color: #7357ec; }
     QComboBox { combobox-popup: 0; padding-right: 44px; }
     QComboBox::drop-down { width: 40px; border-left: 1px solid %6; }
     QComboBox::down-arrow { image: url(:/qmoney/icons/chevron-down.svg); width: 14px; height: 14px; }
-    QComboBox QAbstractItemView { color: %4; background-color: %2; border: 1px solid %6; border-radius: 0; selection-background-color: #d9652b; selection-color: white; padding: 0; }
+    QComboBox QAbstractItemView { color: %4; background-color: %2; border: 1px solid %6; border-radius: 0; selection-background-color: #7357ec; selection-color: white; padding: 0; }
     QComboBox QAbstractItemView::item { padding: 0 12px; }
     QListWidget::item { padding: 7px 9px; border-radius: 4px; }
-    QListWidget::item:selected { background: #3b2920; color: white; }
-    QTableWidget { gridline-color: %6; selection-background-color: #3b2920; selection-color: white; alternate-background-color: %9; }
+    QListWidget::item:selected { background: #55439a; color: white; }
+    QTableWidget { gridline-color: %6; selection-background-color: #55439a; selection-color: white; alternate-background-color: %9; }
     QTableWidget::item { padding: 8px 10px; border-bottom: 1px solid %6; }
-    QHeaderView::section { color: %5; background: %2; border: none; border-bottom: 1px solid %6; padding: 9px 10px; font-size: 9px; font-weight: 800; }
+    QTableWidget::item:selected { color: white; background-color: #55439a; }
+    QHeaderView::section { color: %5; background: %2; border: none; border-bottom: 1px solid %6; padding: 9px 10px; font-size: 12px; font-weight: 600; }
     QTableCornerButton::section { background: %2; border: none; border-bottom: 1px solid %6; }
     QPlainTextEdit { font-family: "Cascadia Mono", Consolas, monospace; padding: 10px; }
     #campaignTimeline { font-family: "Inter", "Segoe UI"; font-size: 12px; line-height: 1.35; padding: 12px; }
     QProgressBar { min-height: 7px; max-height: 7px; background: %8; border: none; border-radius: 3px; }
-    QProgressBar::chunk { background: #ff7a36; border-radius: 3px; }
+    QProgressBar::chunk { background: #7357ec; border-radius: 3px; }
     #campaignProgress, #bulkRegisterProgress { min-height: 22px; max-height: 22px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 700; }
     QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
     QScrollBar::handle:vertical { background: %6; min-height: 30px; border-radius: 4px; }
@@ -2768,6 +3207,13 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
 }
 
 void MainWindow::navigate(int index) {
+  if (index == 9) {
+    // Settings is an action; retain the selected page so it can be opened again.
+    const QSignalBlocker blocker(_navigation);
+    _navigation->setCurrentRow(_pages->currentIndex());
+    _settingsMenu->popup(_navigation->mapToGlobal(QPoint(136, qMin(480, _navigation->height()))));
+    return;
+  }
   if (index < 0) return;
   _pages->setCurrentIndex(index);
   if (index == 3 && _campaignStop->isEnabled()) _campaignPoll.start();
@@ -2881,42 +3327,262 @@ void MainWindow::setStatus(const QString& text) {
   _status->setToolTip(full == compact ? QString() : full);
 }
 
-void MainWindow::loadHome() {
-  _api.get(QStringLiteral("/api/accounts"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return setStatus(error);
-    _homeAccounts->setText(QString::number(doc.object().value(QStringLiteral("accounts")).toArray().size()));
+void MainWindow::openRecovery() {
+  auto* dialog = new QDialog(this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setWindowTitle(QStringLiteral("Recuperação de envios"));
+  dialog->resize(900, 600);
+  auto* layout = new QVBoxLayout(dialog);
+  layout->setContentsMargins(24, 24, 24, 24);
+  layout->setSpacing(16);
+  auto* title = new QLabel(QStringLiteral("Retome com o estado conhecido"));
+  title->setObjectName(QStringLiteral("reviewTitle"));
+  layout->addWidget(title);
+  auto* summary = quietLabel(QStringLiteral("Lendo os registros desta instalação…"));
+  layout->addWidget(summary);
+  auto* table = new QTableWidget(0, 4);
+  configureTable(table, QStringLiteral("Registros de recuperação"),
+                 QStringLiteral("As sessões que ainda precisam de atenção aparecem aqui."));
+  table->setHorizontalHeaderLabels({QStringLiteral("Conta"), QStringLiteral("Clipe"), QStringLiteral("Sessão"), QStringLiteral("Situação")});
+  table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+  table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  layout->addWidget(table, 1);
+  layout->addWidget(quietLabel(QStringLiteral("Reconciliar registra na lista local apenas finalizações já confirmadas. Essa ação não envia mídia e não solicita saques.")));
+  auto* resumeRow = new QHBoxLayout;
+  auto* resumeAccount = new ComboBox(dialog);
+  resumeAccount->setAccessibleName(QStringLiteral("Conta para retomar envios"));
+  resumeRow->addWidget(resumeAccount, 1);
+  auto* resume = new QPushButton(QStringLiteral("Retomar envios desta conta"), dialog);
+  resume->setEnabled(false);
+  resumeRow->addWidget(resume);
+  layout->addLayout(resumeRow);
+  auto* poll = new QTimer(dialog);
+  poll->setInterval(1500);
+  auto* buttons = new QHBoxLayout;
+  auto* wallet = new QPushButton(QStringLiteral("Restaurar Wise / Dots na carteira"));
+  wallet->hide();
+  connect(wallet, &QPushButton::clicked, dialog, [this, dialog] { dialog->close(); _navigation->setCurrentRow(6); });
+  buttons->addWidget(wallet);
+  buttons->addStretch();
+  auto* reconcile = primaryButton(QStringLiteral("Reconciliar confirmações"));
+  reconcile->setEnabled(false);
+  buttons->addWidget(reconcile);
+  layout->addLayout(buttons);
+  const QPointer<QDialog> guard(dialog);
+  const auto render = [guard, table, summary, reconcile, resume, resumeAccount, poll](bool ok, const QJsonDocument& document, const QString& error) {
+    if (!guard) return;
+    if (!ok) { summary->setText(error); reconcile->setEnabled(false); resume->setEnabled(false); return; }
+    const auto data = document.object();
+    const auto items = data.value("items").toArray();
+    const QString selectedAccount = resumeAccount->currentText();
+    resumeAccount->clear();
+    QSet<QString> resumable;
+    table->setRowCount(items.size());
+    for (int row = 0; row < items.size(); ++row) {
+      const auto item = items[row].toObject();
+      if (item.value("can_resume").toBool()) resumable.insert(item.value("email").toString());
+      const QString status = item.value("status").toString() == "confirmed" ? QStringLiteral("Confirmado; reconciliar") :
+                             item.value("status").toString() == "pending" ? QStringLiteral("Envio pendente") : QStringLiteral("Revisar histórico");
+      const QStringList values{item.value("email").toString(), item.value("clip_uid").toString(QStringLiteral("Não identificado")), item.value("session_id").toString(), status};
+      for (int column = 0; column < values.size(); ++column) {
+        auto* value = cell(values[column]);
+        value->setToolTip(values[column] + QStringLiteral("\n") + item.value("detail").toString());
+        table->setItem(row, column, value);
+      }
+    }
+    summary->setText(QStringLiteral("%1 sessão(ões) pendente(s) · %2 confirmação(ões) para reconciliar")
+        .arg(data.value("pending").toInt()).arg(data.value("confirmed").toInt()));
+    QStringList accountNames(resumable.begin(), resumable.end());
+    accountNames.sort();
+    resumeAccount->addItems(accountNames);
+    if (accountNames.contains(selectedAccount)) resumeAccount->setCurrentText(selectedAccount);
+    const auto worker = data.value("worker").toObject();
+    const bool running = worker.value("state").toString() == "running";
+    if (running) {
+      summary->setText(QStringLiteral("Retomando as sessões existentes de %1…").arg(worker.value("email").toString()));
+      poll->start();
+    } else {
+      poll->stop();
+      if (!worker.value("error").toString().isEmpty()) summary->setText(worker.value("error").toString());
+    }
+    reconcile->setEnabled(!running && data.value("confirmed").toInt() > 0);
+    resume->setEnabled(!running && !accountNames.isEmpty());
+    resumeAccount->setEnabled(!running);
+  };
+  const auto refresh = [this, guard, wallet, render] {
+    if (!guard || guard->property("readingRecovery").toBool()) return;
+    guard->setProperty("readingRecovery", true);
+    _api.get(QStringLiteral("/api/recovery"), [guard, wallet, render](bool ok, const QJsonDocument& document, const QString& error) {
+      if (!guard) return;
+      guard->setProperty("readingRecovery", false);
+      wallet->setVisible(document.object().value("wise_cleanup").toObject().value("pending").toBool());
+      render(ok, document, error);
+    });
+  };
+  connect(poll, &QTimer::timeout, dialog, refresh);
+  connect(resume, &QPushButton::clicked, dialog, [this, guard, resume, resumeAccount, summary, refresh] {
+    const QString email = resumeAccount->currentText();
+    if (email.isEmpty() || !guard) return;
+    if (QMessageBox::question(guard, QStringLiteral("Retomar envios existentes"),
+        QStringLiteral("Retomar os envios interrompidos de %1? Esta ação pode transferir mídia pendente e concluir as sessões existentes no serviço.").arg(email),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+    resume->setEnabled(false);
+    _api.post(QStringLiteral("/api/recovery/resume"), {{"email", email}, {"confirmed", true}},
+              [guard, summary, resume, refresh](bool ok, const QJsonDocument&, const QString& error) {
+      if (!guard) return;
+      if (!ok) { summary->setText(error); resume->setEnabled(true); }
+      else refresh();
+    });
   });
-  _api.get(QStringLiteral("/api/logs"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return setStatus(error);
-    const auto logs = doc.object().value(QStringLiteral("logs")).toArray();
+  refresh();
+  connect(reconcile, &QPushButton::clicked, dialog, [this, reconcile, render] {
+    reconcile->setEnabled(false);
+    _api.post(QStringLiteral("/api/recovery/reconcile"), {}, render);
+  });
+  dialog->show();
+}
+
+void MainWindow::openCommandPalette() {
+  auto* dialog = new QDialog(this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setWindowTitle(QStringLiteral("Buscar no QMoney"));
+  dialog->resize(680, 500);
+  auto* layout = new QVBoxLayout(dialog);
+  layout->setContentsMargins(24,24,24,24);
+  auto* search = new QLineEdit;
+  search->setPlaceholderText(QStringLiteral("Buscar conta, campanha ou ação"));
+  auto* results = new QListWidget;
+  layout->addWidget(search);
+  layout->addWidget(results, 1);
+  auto filter = [results, search] {
+    for (int i=0;i<results->count();++i)
+      results->item(i)->setHidden(!results->item(i)->text().contains(search->text(),Qt::CaseInsensitive));
+  };
+  auto add = [results, filter](const QString& label, int page, const QString& identity=QString()) {
+    auto* item = new QListWidgetItem(label, results);
+    item->setData(Qt::UserRole, page);
+    item->setData(Qt::UserRole+1, identity);
+    filter();
+  };
+  const QStringList names{QStringLiteral("Operação"),QStringLiteral("Requisitos"),QStringLiteral("Integrações"),QStringLiteral("Nova campanha"),QStringLiteral("Biblioteca"),QStringLiteral("Contas"),QStringLiteral("Carteira"),QStringLiteral("Histórico"),QStringLiteral("Contas restritas")};
+  for (int i=0;i<names.size();++i) add(names[i],i);
+  connect(search,&QLineEdit::textChanged,dialog,filter);
+  auto activate = [this, dialog](QListWidgetItem* item) {
+    if (!item) return;
+    const int page=item->data(Qt::UserRole).toInt();
+    if(page==5) _pendingAccountFocus=item->data(Qt::UserRole+1).toString();
+    if(page==7) _pendingHistoryFocus=item->data(Qt::UserRole+1).toString();
+    dialog->accept();
+    if(_navigation->currentRow()==page) refreshCurrentPage(); else _navigation->setCurrentRow(page);
+  };
+  connect(results,&QListWidget::itemActivated,dialog,activate);
+  connect(search,&QLineEdit::returnPressed,dialog,[results, activate] {
+    for(int i=0;i<results->count();++i) if(!results->item(i)->isHidden()) {activate(results->item(i));break;}
+  });
+  QPointer<QDialog> guard(dialog);
+  if (_backendReady) {
+    _api.get(QStringLiteral("/api/accounts"),[guard,add](bool ok,const QJsonDocument& doc,const QString&) {
+      if(!guard || !ok) return;
+      for(const auto value:doc.object().value("accounts").toArray()) {
+        const auto email=value.toObject().value("email").toString();
+        add(QStringLiteral("Conta  ·  ")+email,5,email);
+      }
+    });
+    _api.get(QStringLiteral("/api/logs"),[this,guard,add](bool ok,const QJsonDocument& doc,const QString&) {
+      if(!guard || !ok) return;
+      for(const auto value:doc.object().value("logs").toArray()) {
+        const auto log=value.toObject();
+        add(QStringLiteral("Campanha  ·  ")+friendlyDate(log.value("started_at").toString()),7,log.value("name").toString());
+      }
+    });
+  }
+  dialog->open();
+  search->setFocus();
+}
+
+void MainWindow::loadHome() {
+  const int generation = ++_homeGeneration;
+  _homeSync->setText(QStringLiteral("Atualizando…"));
+  _homeNextAction->setEnabled(false);
+  auto failed = [this, generation](const QString& error) {
+    if (generation != _homeGeneration) return;
+    _homeSync->setText(QStringLiteral("Leitura indisponível • tente sincronizar"));
+    _homePulseTitle->setText(QStringLiteral("Não foi possível atualizar a operação"));
+    _homePulseBody->setText(QStringLiteral("Os dados anteriores podem estar desatualizados. Use Sincronizar dados para tentar novamente."));
+    _homeNextAction->setEnabled(false);
+    setStatus(error);
+  };
+  _api.get(QStringLiteral("/api/accounts"), [this, generation, failed](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (generation != _homeGeneration) return;
+    if (!ok || !doc.object().value("accounts").isArray()) return failed(error);
+    const auto accounts = doc.object().value("accounts").toArray();
+    _homeAccounts->setText(QString::number(accounts.size()));
+    _homeAccountStep->setText(accounts.isEmpty()
+        ? QStringLiteral("Comece conectando sua primeira conta.")
+        : QStringLiteral("%1 conta(s) cadastrada(s). A validação de acesso acontece antes do envio.").arg(accounts.size()));
+    _api.get(QStringLiteral("/api/campaigns/current"), [this, generation, accounts, failed](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (generation != _homeGeneration) return;
+      if (!ok || !doc.object().value("state").isString()) return failed(error);
+      const auto summary = OperationSummary::from(accounts, doc.object());
+      renderOperation(doc.object());
+      _homePulseTitle->setText(summary.title);
+      _homePulseBody->setText(summary.detail);
+      _homePulseProgress->setValue(summary.progress);
+      const auto state = doc.object().value("state").toString();
+      _operationProgressRow->setVisible(state == "running" || state == "stopping");
+      _homeDestination = summary.destination;
+      _homeNextAction->setText(summary.action + QStringLiteral(" →"));
+      _homeNextAction->setEnabled(true);
+      _homeSync->setText(QStringLiteral("Atualizado às %1").arg(QTime::currentTime().toString(QStringLiteral("HH:mm:ss"))));
+    });
+  });
+  _api.get(QStringLiteral("/api/balances"), [this, generation](bool ok, const QJsonDocument& doc, const QString&) {
+    if (generation != _homeGeneration) return;
+    if (!ok) {
+      _operationBalance->setText(QStringLiteral("US$ —"));
+      _operationBalanceNote->setText(QStringLiteral("Não foi possível consultar os saldos."));
+      return;
+    }
+    const auto root = doc.object();
+    const auto balances = root.value("balances").toObject();
+    const auto kinds = root.value("account_kinds").toObject();
+    qint64 cents = 0;
+    int known = 0, eligible = 0;
+    bool stale = false;
+    for (const auto value : root.value("accounts").toArray()) {
+      const auto email = value.toString();
+      if (kinds.value(email).toString() == "claru") continue;
+      ++eligible;
+      const auto balance = balances.value(email).toObject();
+      if (balance.value("availableCents").isDouble()) {
+        cents += qint64(balance.value("availableCents").toDouble());
+        ++known;
+        stale |= balance.value("stale").toBool() || !balance.value("error").toString().isEmpty();
+      }
+    }
+    _operationBalance->setText(known ? usdMoney(cents) : QStringLiteral("US$ —"));
+    _operationBalanceNote->setText(QStringLiteral("Última leitura salva • %1 de %2 contas%3")
+        .arg(known).arg(eligible).arg(stale ? QStringLiteral(" • requer atualização") : QString()));
+  });
+  _api.get(QStringLiteral("/api/logs"), [this, generation](bool ok, const QJsonDocument& doc, const QString&) {
+    if (generation != _homeGeneration) return;
+    if (!ok || !doc.object().value("logs").isArray()) {
+      _homeCampaigns->setText(QStringLiteral("—"));
+      _homeSuccess->setText(QStringLiteral("—"));
+      _homeRecent->setText(QStringLiteral("Histórico indisponível. Sincronize os dados para tentar novamente."));
+      return;
+    }
+    const auto logs = doc.object().value("logs").toArray();
     _homeCampaigns->setText(QString::number(logs.size()));
     if (logs.isEmpty()) {
       _homeSuccess->setText(QStringLiteral("—"));
-      _homePulseBody->setText(QStringLiteral("Ainda não há campanhas. Configure a primeira quando estiver pronto."));
+      _homeRecent->setText(QStringLiteral("Sua primeira campanha aparecerá aqui. Comece pelos passos acima."));
     } else {
       const auto last = logs.first().toObject();
-      _homeSuccess->setText(QStringLiteral("%1/%2")
-          .arg(last.value(QStringLiteral("ok")).toInt())
-          .arg(last.value(QStringLiteral("sends")).toInt()));
-      _homePulseBody->setText(QStringLiteral("Última execução: %1 · %2 clipe(s) · %3 conta(s)")
-          .arg(friendlyDate(last.value(QStringLiteral("started_at")).toString()))
-          .arg(last.value(QStringLiteral("items")).toInt())
-          .arg(last.value(QStringLiteral("accounts")).toArray().size()));
+      _homeSuccess->setText(QStringLiteral("%1 / %2").arg(last.value("ok").toInt()).arg(last.value("sends").toInt()));
+      _homeRecent->setText(QStringLiteral("%1 • %2 clipe(s) • %3 conta(s). Consulte os resultados por conta no histórico.")
+          .arg(friendlyDate(last.value("started_at").toString())).arg(last.value("items").toInt()).arg(last.value("accounts").toArray().size()));
     }
-  });
-  _api.get(QStringLiteral("/api/campaigns/current"),
-           [this](bool ok, const QJsonDocument& doc, const QString&) {
-    if (!ok) return;
-    const auto snap = doc.object();
-    const QString state = snap.value(QStringLiteral("state")).toString();
-    const auto totals = snap.value(QStringLiteral("totals")).toObject();
-    const int total = totals.value(QStringLiteral("total_sends")).toInt();
-    const int done = totals.value(QStringLiteral("done_sends")).toInt();
-    const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
-    _homePulseTitle->setText(running ? QStringLiteral("Campanha em movimento")
-                                     : QStringLiteral("Operação pronta para a próxima campanha"));
-    if (running) _homePulseBody->setText(snap.value(QStringLiteral("current")).toString());
-    _homePulseProgress->setValue(total > 0 ? done * 100 / total : 0);
   });
 }
 
@@ -3436,6 +4102,7 @@ void MainWindow::startCampaign() {
                      QStringLiteral("Marque ao menos uma conta e uma categoria."));
   }
   QJsonObject body{
+      {QStringLiteral("include_clip_plan"), true},
       {QStringLiteral("accounts"), accounts},
       {QStringLiteral("dataset"), _dataset->currentData().toString()},
       {QStringLiteral("content_mode"), _contentMode->currentData().toString()},
@@ -3454,21 +4121,18 @@ void MainWindow::startCampaign() {
     body.insert(QStringLiteral("active_hours"), QJsonValue::Null);
   }
   _campaignStart->setEnabled(false);
-  _campaignStart->setText(QStringLiteral("Executando preflight…"));
+  _campaignStart->setText(QStringLiteral("Verificando campanha…"));
   _api.post(QStringLiteral("/api/campaigns/preflight"), body,
             [this, body, selectedAccountNames](bool ok, const QJsonDocument& doc, const QString& error) {
     if (!ok) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       _campaignStart->setEnabled(true);
-      return showError(QStringLiteral("Preflight não concluído"), error);
+      return showError(QStringLiteral("Verificação não concluída"), error);
     }
     const auto result = doc.object();
     const auto blockers = result.value(QStringLiteral("blockers")).toArray();
-    const auto warnings = result.value(QStringLiteral("warnings")).toArray();
     QStringList blockerLines;
     for (const auto& value : blockers) blockerLines << QStringLiteral("• ") + value.toString();
-    QStringList warningLines;
-    for (const auto& value : warnings) warningLines << QStringLiteral("• ") + value.toString();
     if (!result.value(QStringLiteral("ok")).toBool() || !blockerLines.isEmpty()) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       _campaignStart->setEnabled(true);
@@ -3499,25 +4163,8 @@ void MainWindow::startCampaign() {
                                blockerLines, issues, continueAction);
     }
 
-    const auto accountInfo = result.value(QStringLiteral("accounts")).toObject();
-    const auto taskInfo = result.value(QStringLiteral("tasks")).toObject();
-    QString preview = QStringLiteral(
-        "%1 conta(s) validada(s)\n%2 categoria(s) compatível(is)\n%3 clipes disponíveis\n%4 envio(s) estimado(s)\n%5 envio(s) simultâneo(s)")
-        .arg(accountInfo.value(QStringLiteral("validated")).toInt())
-        .arg(taskInfo.value(QStringLiteral("compatible")).toInt())
-        .arg(result.value(QStringLiteral("clips")).toInt())
-        .arg(result.value(QStringLiteral("estimated_sends")).toInt())
-        .arg(result.value(QStringLiteral("account_workers")).toInt());
-    preview += QStringLiteral("\n\nContas escolhidas:\n")
-        + selectedAccountNames.mid(0, 12).join(QLatin1Char('\n'));
-    if (selectedAccountNames.size() > 12)
-      preview += QStringLiteral("\n… e mais %1 conta(s)").arg(selectedAccountNames.size() - 12);
-    if (!warningLines.isEmpty())
-      preview += QStringLiteral("\n\nAtenções:\n") + warningLines.join(QLatin1Char('\n'));
-    preview += QStringLiteral("\n\nIniciar esta campanha agora?");
-    if (QMessageBox::question(this, QStringLiteral("Prévia da campanha"), preview,
-                              QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
-        != QMessageBox::Yes) {
+    CampaignReviewDialog review(result, selectedAccountNames, this, body);
+    if (review.exec() != QDialog::Accepted) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       _campaignStart->setEnabled(true);
       return;
@@ -4231,6 +4878,11 @@ void MainWindow::loadAccounts() {
       const auto account = value.toObject();
       const QString email = account.value(QStringLiteral("email")).toString();
       _accountsTable->setItem(row, 0, cell(email));
+      if (!_pendingAccountFocus.isEmpty() && _pendingAccountFocus == email) {
+        _accountsTable->selectRow(row);
+        _accountsTable->scrollToItem(_accountsTable->item(row,0));
+        _pendingAccountFocus.clear();
+      }
       const bool isClaru = account.value(QStringLiteral("account_kind")).toString() == QStringLiteral("claru");
       const QString org = account.value(QStringLiteral("org_key")).toString();
       const QString kind = isClaru ? QStringLiteral("Claru") : QStringLiteral("Crowtado");
@@ -5236,6 +5888,14 @@ void MainWindow::loadHistory() {
       ++row;
     }
     _historyTable->resizeRowsToContents();
+    if (!_pendingHistoryFocus.isEmpty()) {
+      for(int i=0;i<_historyTable->rowCount();++i) if(_historyTable->item(i,0)->data(Qt::UserRole).toString()==_pendingHistoryFocus) {
+        _historyTable->setCurrentCell(i,0);
+        _historyTable->scrollToItem(_historyTable->item(i,0));
+        break;
+      }
+      _pendingHistoryFocus.clear();
+    }
     setStatus(QStringLiteral("%1 campanha(s) no histórico.").arg(logs.size()));
   });
 }

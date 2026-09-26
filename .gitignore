@@ -59,6 +59,7 @@ scripts/*
 !scripts/build_release.ps1
 !scripts/browser_parts.ps1
 !scripts/run_tests.py
+!scripts/verify_packaged_service.py
 !scripts/audit_ego4d_catalog.py
 !scripts/ego4d_variety.py
 *.bat

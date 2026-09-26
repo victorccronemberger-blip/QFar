@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 if(DEFINED ENV{QMONEY_VERSION} AND NOT "$ENV{QMONEY_VERSION}" STREQUAL "")
   set(QMONEY_VERSION "$ENV{QMONEY_VERSION}")
 else()
-  set(QMONEY_VERSION "1.0.73")
+  set(QMONEY_VERSION "2.0.0")
 endif()
 project(QMoney VERSION ${QMONEY_VERSION} LANGUAGES CXX)
 
@@ -70,6 +70,12 @@ if(MSVC)
                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 if(WIN32)
+  foreach(QMONEY_BINARY_NAME QMoney QMoneyUpdater)
+    configure_file(resources/version.rc.in
+                   ${CMAKE_CURRENT_BINARY_DIR}/${QMONEY_BINARY_NAME}_version.rc @ONLY)
+    target_sources(${QMONEY_BINARY_NAME} PRIVATE
+                   ${CMAKE_CURRENT_BINARY_DIR}/${QMONEY_BINARY_NAME}_version.rc)
+  endforeach()
   target_link_libraries(QMoneyUpdater PRIVATE shell32)
   target_link_libraries(QMoney PRIVATE bcrypt crypt32)
 endif()
@@ -95,3 +101,19 @@ set_target_properties(QMoney PROPERTIES
 )
 
 install(TARGETS QMoney QMoneyUpdater RUNTIME DESTINATION .)
+
+option(QMONEY_BUILD_VISUAL_PREVIEW "Build isolated offscreen visual fixture" OFF)
+if(QMONEY_BUILD_VISUAL_PREVIEW)
+  enable_testing()
+  qt_add_executable(operation_preview
+    ../test/qt/operation_preview.cpp
+    src/MainWindow.cpp src/MainWindow.hpp src/ApiClient.cpp src/ApiClient.hpp
+    src/UpdateManager.cpp src/UpdateManager.hpp resources/qmoney.qrc)
+  target_link_libraries(operation_preview PRIVATE qlementine Qt6::Core Qt6::Gui Qt6::Network Qt6::Svg Qt6::Widgets)
+  target_compile_definitions(operation_preview PRIVATE QMONEY_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.." QMONEY_VERSION="${PROJECT_VERSION}" QMONEY_HAS_EMBEDDED_SERVICE=0)
+  if(WIN32)
+    target_link_libraries(operation_preview PRIVATE bcrypt crypt32)
+  endif()
+  add_test(NAME operation_ui_live COMMAND operation_preview --smoke)
+  set_tests_properties(operation_ui_live PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+endif()

@@ -1876,6 +1876,50 @@ def run_campaign(
         prefetch.shutdown()
 
 
+def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str, Any]]:
+    """Resolve the candidate pool once; a reviewed pool is reused verbatim."""
+    if config.candidate_plan is not None:
+        if tsk.task_id not in config.candidate_plan:
+            raise ValueError("categoria ausente do plano confirmado")
+        return [dict(clip) for clip in config.candidate_plan[tsk.task_id]]
+    dataset_provider = normalize_dataset_provider(config.dataset_provider)
+    content_mode = normalize_content_mode(config.content_mode)
+    work_dir = Path(config.work_dir)
+    shorts: list[dict[str, Any]] = []
+    if dataset_provider in ("all", "ego4d"):
+        if tsk.task_name and task_matching.rule_for(tsk.task_name):
+            # A mesma seleção usada pela tela inclui o índice
+            # portátil mesmo quando há narrações locais parciais.
+            shorts = list(_compatible_task_clips(
+                tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
+                max_dur_s=tsk.max_dur_s))
+            if content_mode != "dataset":
+                shorts = _with_cached_expansion(
+                    shorts, tsk.task_name, min_dur_s=tsk.min_dur_s,
+                    max_dur_s=tsk.max_dur_s, work_dir=work_dir,
+                    include_disabled=True)
+        else:
+            shorts = ego4d.list_clips(
+                scenario=tsk.scenario,
+                min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
+                gopro_minor=tsk.gopro_minor, max_results=None)
+    if tsk.task_name and dataset_provider in ("all", "holoassist"):
+        try:
+            strict_holoassist = holoassist.list_clips(
+                tsk.task_name,
+                min_dur_s=tsk.min_dur_s,
+                max_dur_s=tsk.max_dur_s,
+            )
+        except FileNotFoundError:
+            strict_holoassist = []
+        # Fonte complementar primeiro: são sessões inteiras de uma
+        # tarefa rotulada, não inferências por texto de narração.
+        shorts = [*strict_holoassist, *shorts]
+    if content_mode == "cache":
+        shorts = [clip for clip in shorts if _clip_is_cached(clip, work_dir)]
+    return shorts
+
+
 def _run_campaign(
     config: CampaignConfig,
     log: CampaignLog | None = None,
@@ -2061,38 +2105,7 @@ def _run_campaign(
                 # seleção automática: pula clipes já enviados a TODAS as contas
                 # (registro em data/sent_videos.json — ver sent_registry)
                 emails = [a.email for a in config.accounts]
-                shorts: list[dict[str, Any]] = []
-                if dataset_provider in ("all", "ego4d"):
-                    if tsk.task_name and task_matching.rule_for(tsk.task_name):
-                        # A mesma seleção usada pela tela inclui o índice
-                        # portátil mesmo quando há narrações locais parciais.
-                        shorts = list(_compatible_task_clips(
-                            tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
-                            max_dur_s=tsk.max_dur_s))
-                        if content_mode != "dataset":
-                            shorts = _with_cached_expansion(
-                                shorts, tsk.task_name, min_dur_s=tsk.min_dur_s,
-                                max_dur_s=tsk.max_dur_s, work_dir=work_dir,
-                                include_disabled=True)
-                    else:
-                        shorts = ego4d.list_clips(
-                            scenario=tsk.scenario,
-                            min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
-                            gopro_minor=tsk.gopro_minor, max_results=None)
-                if tsk.task_name and dataset_provider in ("all", "holoassist"):
-                    try:
-                        strict_holoassist = holoassist.list_clips(
-                            tsk.task_name,
-                            min_dur_s=tsk.min_dur_s,
-                            max_dur_s=tsk.max_dur_s,
-                        )
-                    except FileNotFoundError:
-                        strict_holoassist = []
-                    # Fonte complementar primeiro: são sessões inteiras de uma
-                    # tarefa rotulada, não inferências por texto de narração.
-                    shorts = [*strict_holoassist, *shorts]
-                if content_mode == "cache":
-                    shorts = [clip for clip in shorts if _clip_is_cached(clip, work_dir)]
+                shorts = automatic_candidates(tsk, config)
                 all_clips = shorts
                 fresh = []
                 used_parents = set()
@@ -2337,12 +2350,12 @@ def _run_campaign(
                                                               clip_info["clip_uid"]):
                     _log(f"      -> {account.email} (já recebeu este clipe — pulando)")
                     skip_res = {"email": account.email, "org_key": account.org_key,
-                                "ok": True, "skipped": True}
+                                "ok": True, "skipped": True, "reason": "already_sent"}
                     account_results[account.email] = skip_res
                     # account_done mantém o progresso da UI consistente
                     _emit("account_done", clip_uid=clip_info["clip_uid"],
                           task=tsk.scenario, email=account.email, ok=True,
-                          skipped=True)
+                          skipped=True, reason="already_sent")
                     continue
                 pending_accounts.append(account)
 

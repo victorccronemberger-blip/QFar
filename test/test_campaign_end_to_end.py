@@ -104,6 +104,63 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(self.mark.call_count, 2)
         self.cleanup.assert_called_once()
 
+    def test_campaign_waits_for_selected_account_recovery(self):
+        with patch.object(server.recovery, "snapshot", return_value={"items": [{"email": self.emails[0]}]}):
+            response = self.client.post("/api/campaigns", json=self.body)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["recovery_accounts"], [self.emails[0]])
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_reviewed_candidates_survive_catalog_change_without_new_selection(self):
+        body = {**self.body, "include_clip_plan": True}
+        response = self.client.post("/api/campaigns/preflight", json=body)
+        self.assertEqual(response.status_code, 200)
+        review = response.get_json()
+        self.assertTrue(review["ok"], review)
+        self.assertEqual(review["clip_plan"][0]["clip_uid"], "clip")
+        self.assertEqual(review["clip_plan"][0]["eligible_accounts"], self.emails)
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+        with patch.object(campaign, "_compatible_task_clips", side_effect=AssertionError("catalog must stay frozen")):
+            started = self.client.post("/api/campaigns", json={**body, "preflight_id": review["preflight_id"]})
+            self.assertEqual(started.status_code, 200, started.get_json())
+            snapshot, log = self.finish()
+        self.assertEqual(snapshot["state"], "done")
+        self.assertEqual([item["clip_uid"] for item in log["items"]], ["clip"])
+
+    def test_reset_invalidates_reviewed_account_clip_eligibility(self):
+        registry = self.root / "sent_videos.json"
+        registry.write_text(json.dumps({"minute|task|Furniture Assembly": {"clip": [self.emails[0]]}}), encoding="utf-8")
+        body = {**self.body, "include_clip_plan": True}
+        review = self.client.post("/api/campaigns/preflight", json=body).get_json()
+        self.assertTrue(review["ok"], review)
+        self.assertEqual(review["clip_plan"][0]["excluded_accounts"], [self.emails[0]])
+        self.assertEqual(self.client.post("/api/sent/reset", json={}).status_code, 200)
+        start = self.client.post("/api/campaigns", json={**body, "preflight_id": review["preflight_id"]})
+        self.assertEqual(start.status_code, 409)
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_review_blocks_exhausted_pool_without_preparing_media(self):
+        (self.root / "sent_videos.json").write_text(json.dumps({
+            "minute|task|Furniture Assembly": {"clip": self.emails}}), encoding="utf-8")
+        review = self.client.post("/api/campaigns/preflight", json={**self.body, "include_clip_plan": True}).get_json()
+        self.assertFalse(review["ok"])
+        self.assertIsNone(review["preflight_id"])
+        self.assertEqual(review["clip_plan"][0]["excluded_accounts"], self.emails)
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_review_exposes_only_public_candidate_fields(self):
+        with patch.object(campaign, "_compatible_task_clips", return_value=[{
+                "clip_uid": "clip", "dur_s": 300, "source": "ego4d",
+                "private_url": "https://private.example/secret-token", "video_path": "C:/private/customer"}]):
+            response = self.client.post("/api/campaigns/preflight", json={**self.body, "include_clip_plan": True})
+        self.assertTrue(response.get_json()["ok"])
+        self.assertNotIn("secret-token", response.get_data(as_text=True))
+        self.assertNotIn("C:/private", response.get_data(as_text=True))
+
     def test_task_preview_and_preflight_receive_content_mode(self):
         with patch.object(campaign, "available_tasks", return_value=[{
                 "id": "task", "name": "Furniture Assembly",

@@ -9,6 +9,26 @@ from moneymin.web import server
 
 
 class CampaignHistoryIntegrityTests(unittest.TestCase):
+    def test_evidence_distinguishes_receipt_legacy_pending_and_skip(self):
+        view = server._campaign_log_view({"accounts": ["a"], "items": [{
+            "clip_uid": "clip-id", "accounts": [
+                {"email": "a", "ok": True, "finalized": True, "session_id": "confirmed-session", "token": "SECRET"},
+                {"email": "a", "ok": True, "finalized": False, "session_id": "pending-session"},
+                {"email": "a", "ok": True},
+                {"email": "a", "ok": True, "skipped": True},
+                {"email": "a", "ok": True, "skipped": True, "reason": "already_sent"},
+            ]}]})
+        results = view["items"][0]["accounts"]
+        self.assertEqual([r["confirmation"] for r in results],
+                         ["remote_ack", "not_confirmed", "legacy_record", "not_confirmed", "not_confirmed"])
+        self.assertEqual(view["summary"]["pending"], 1)
+        self.assertEqual(view["summary"]["skipped"], 2)
+        self.assertEqual(view["items"][0]["clip_uid"], "clip-id")
+        self.assertEqual(results[0]["session_id"], "confirmed-session")
+        self.assertIn("não informa o motivo", results[3]["detail"])
+        self.assertIn("Registro local", results[4]["detail"])
+        self.assertNotIn("SECRET", json.dumps(view))
+
     def test_bad_history_does_not_hide_valid_history_or_trigger_remote_checks(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(config, "DATA_DIR", Path(directory)):
             root = Path(directory)

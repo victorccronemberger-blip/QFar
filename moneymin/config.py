@@ -283,7 +283,7 @@ ANDROID_CLOCK_DOMAIN = os.environ.get("MINUTE_ANDROID_CLOCK_DOMAIN", "android_el
 
 def tokens_dir() -> Path:
     """Diretório onde ficam os `token_<email>.json` (gitignored)."""
-    SECRETS_DIR.mkdir(exist_ok=True)
+    SECRETS_DIR.mkdir(parents=True, exist_ok=True)
     return SECRETS_DIR
 
 
