@@ -129,6 +129,18 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(snapshot["state"], "done")
         self.assertEqual([item["clip_uid"] for item in log["items"]], ["clip"])
 
+    def test_review_warns_when_new_content_cannot_fill_hours_goal(self):
+        (self.root / "sent_videos.json").write_text(json.dumps({
+            "minute|task|Furniture Assembly": {"clip": [self.emails[0]]}}), encoding="utf-8")
+        review = self.client.post("/api/campaigns/preflight", json={
+            **self.body, "include_clip_plan": True, "target_hours": 1}).get_json()
+        self.assertTrue(review["ok"], review)
+        warning = next(w for w in review["warnings"] if "Conteúdo novo insuficiente" in w)
+        self.assertIn("2 conta(s)", warning)
+        self.assertIn("0.00–0.08 h", warning)
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+
     def test_reset_invalidates_reviewed_account_clip_eligibility(self):
         registry = self.root / "sent_videos.json"
         registry.write_text(json.dumps({"minute|task|Furniture Assembly": {"clip": [self.emails[0]]}}), encoding="utf-8")

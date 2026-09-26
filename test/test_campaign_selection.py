@@ -211,5 +211,36 @@ class CampaignSelectionTests(unittest.TestCase):
                 self.assertEqual(event["level"], level)
 
 
+    def test_hours_goal_uses_remaining_new_content_after_category_share(self):
+        self.cfg.accounts = self.cfg.accounts[:1]
+        self.cfg.target_hours_per_account = 0.5
+        self.cfg.account_workers = 1
+        self.cfg.account_gap_s = 0
+        self.cfg.cleanup_after_upload = False
+        # Only the first category can supply the requested 30 minutes.
+        self.seed[self.tasks[0].task_name] = tuple(
+            {"clip_uid": f"new-{i}", "parent_video_uid": f"parent-{i}",
+             "source": "ego4d", "dur_s": 300} for i in range(7))
+        self.seed[self.tasks[1].task_name] = ()
+        sent = {"new-0"}  # A previous campaign must not be resent or credited.
+        uploaded, events = [], []
+        def send(item, account, *args, **kwargs):
+            uploaded.append(item["clip_uid"])
+            return {"ok": True, "finalized": True}
+        with patch.object(campaign.sent_registry, "is_sent_to_all", side_effect=lambda key, uid, emails: uid in sent), \
+             patch.object(campaign.sent_registry, "sent_emails", side_effect=lambda key, uid: {self.cfg.accounts[0].email} if uid in sent else set()), \
+             patch.object(campaign.sent_registry, "mark_sent", side_effect=lambda key, uid, email: sent.add(uid)), \
+             patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
+             patch.object(campaign, "prepare_clip", side_effect=lambda *a, **k: {
+                 "duration_ms": 300000, "imu_real": True, "video_path": str(self.tmp / "fake.mp4")}), \
+             patch.object(campaign, "upload_to_account", side_effect=send), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            campaign.run_campaign(self.cfg, progress=lambda k, p: events.append((k, p)))
+        self.assertEqual(set(uploaded), {f"new-{i}" for i in range(1, 7)})
+        self.assertEqual(len(uploaded), 6)
+        self.assertFalse(any(k == "goal_shortfall" for k, p in events))
+        self.assertEqual(sum(p.get("credited_seconds", 0) for k, p in events if k == "account_done"), 1800)
+
+
 if __name__ == "__main__":
     unittest.main()

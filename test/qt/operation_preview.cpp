@@ -28,20 +28,32 @@ public:
     auto* server=new QTcpServer(&window);
     if(!server->listen(QHostAddress::LocalHost)){qApp->exit(40);return;}
     auto phase=std::make_shared<int>(0);
-    QObject::connect(server,&QTcpServer::newConnection,server,[server,phase]{
+    auto oldPreviewReturned=std::make_shared<bool>(false);
+    QObject::connect(server,&QTcpServer::newConnection,server,[server,phase,oldPreviewReturned]{
       auto* socket=server->nextPendingConnection();
-      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,phase]{
+      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,phase,oldPreviewReturned]{
         auto input=socket->property("input").toByteArray()+socket->readAll();
         socket->setProperty("input",input);
         if(!input.contains("\r\n\r\n") || socket->property("answered").toBool())return;
         socket->setProperty("answered",true);
+        if(input.startsWith("POST /api/logs/old-campaign.json/status ")) {
+          QTimer::singleShot(150,socket,[socket,oldPreviewReturned]{
+            const QByteArray body=R"({"summary":{"total":100,"ready":100}})";
+            socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(body.size())+"\r\n\r\n"+body);
+            socket->disconnectFromHost();
+            QTimer::singleShot(100,qApp,[oldPreviewReturned]{*oldPreviewReturned=true;});
+          });
+          return;
+        }
         QJsonObject reply; bool failed=false;
         if(input.startsWith("POST /api/campaigns ")) reply={{"ok",true},{"accounts",QJsonArray{}}};
         else if(input.startsWith("GET /api/campaigns/current?")) {
           failed=*phase==2;
           reply={{"state",*phase==3?"done":*phase==4?"error":"running"},
                  {"current",*phase==0?"Preparando o primeiro clipe":*phase==1?"Enviando clipe para conta de demonstração":"Execução encerrada"},
-                 {"totals",QJsonObject{{"total_sends",*phase==0?0:4},{"done_sends",*phase==0?0:*phase==1?1:4}}}};
+                 {"totals",QJsonObject{{"total_sends",4},{"done_sends",100},{"skipped_sends",99},
+                   {"progress_unit","seconds"},{"progress_target",*phase==0?0:3600},
+                   {"progress_completed",*phase==0?0:*phase==1?900:3600}}}};
         } else {qApp->exit(41);return;}
         const auto bytes=QJsonDocument(reply).toJson(QJsonDocument::Compact);
         socket->write(QByteArray(failed?"HTTP/1.1 503 Unavailable\r\n":"HTTP/1.1 200 OK\r\n")+
@@ -51,18 +63,25 @@ public:
       QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
     });
     window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._previewLogName="old-campaign.json";
+    window.pollCampaignPreviews();
     window.submitCampaign({});
     if(window._campaignTabs->currentIndex()!=2 || window._campaignIndicatorTitle->text()!=QStringLiteral("Iniciando campanha…")) {
       qApp->exit(42);return;
     }
     auto* timer=new QTimer(&window);
-    QObject::connect(timer,&QTimer::timeout,&window,[&window,phase]{
+    QObject::connect(timer,&QTimer::timeout,&window,[&window,phase,oldPreviewReturned]{
       const auto title=window._campaignIndicatorTitle->text();
       if(*phase==0 && window._campaignIndicatorDetail->text().contains("Preparando o primeiro")) {
         if(!window._campaignIndicator->isVisible() || window._campaignIndicatorProgress->maximum()!=0
             || !window._campaignStop->isEnabled() || window._campaignStart->isEnabled()){qApp->exit(43);return;}
         *phase=1;window.pollCampaign();
-      } else if(*phase==1 && window._campaignIndicatorDetail->text().contains("25%")) {
+      } else if(*phase==1 && *oldPreviewReturned && window._campaignIndicatorDetail->text().contains("25%")) {
+        if(window._campaignProgress->value()!=25){qApp->exit(47);return;}
+        window.renderOperation({{"state","running"},{"totals",QJsonObject{
+            {"progress_unit","seconds"},{"progress_target",3600},{"progress_completed",900},
+            {"total_sends",4},{"done_sends",100}}}});
+        if(!window._operationTotal->text().contains("0.25 / 1.00")){qApp->exit(48);return;}
         if(qApp->arguments().contains("--indicator-proof")) window.grab().save(qApp->arguments().at(1));
         window._campaignTabs->setCurrentIndex(0);
         if(!window._campaignIndicator->isVisible() || window._campaignIndicatorProgress->value()!=25){qApp->exit(44);return;}

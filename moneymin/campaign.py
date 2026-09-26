@@ -2019,7 +2019,16 @@ def _run_campaign(
     delay_pending = False
     last_dur_s = 0.0  # duração do último clipe enviado (p/ delay_mode="clip")
     last_batch_started_at: float | None = None
-    for tsk in _maybe_shuffle(list(config.tasks)):
+    ordered_tasks = _maybe_shuffle(list(config.tasks))
+    # First distribute across categories, then use the remaining reviewed content
+    # without a per-category ceiling when another category cannot fill its share.
+    schedule = [(task, per_task_cap_s) for task in ordered_tasks]
+    if quota_s and len(ordered_tasks) > 1:
+        schedule += [(task, quota_s) for task in ordered_tasks if not task.clip_uids]
+    for tsk, per_task_cap_s in schedule:
+        if quota_s and all(a.email in banned or account_seconds.get(a.email, 0) >= quota_s
+                           for a in config.accounts):
+            break
         if should_stop and should_stop():
             _log("  [!] campanha interrompida pelo usuário")
             _emit("campaign_stopped", reason="parada pelo usuário")
@@ -2164,7 +2173,8 @@ def _run_campaign(
             if len(banned) == len(config.accounts):
                 break
             if quota_s and all(
-                    account_seconds.get(a.email, 0) >= quota_s
+                    a.email in banned or account_seconds.get(a.email, 0) >= quota_s
+                    or task_seconds.get(a.email, 0) >= per_task_cap_s
                     for a in config.accounts):
                 break
             if automatic_selection and completed_items >= needed_items:
@@ -2526,11 +2536,13 @@ def _run_campaign(
                 _log(f"         ok={ok}  finalized={acc_res.get('finalized')} "
                      f"evaluate={ev}" + (f"  err={acc_res.get('error','')[:80]}" if not ok else ""))
                 _emit("account_done", clip_uid=clip_uid,
-                      task=task_scenario, email=account.email, ok=ok,
+                      task=task_scenario, registry_key=sent_key, email=account.email, ok=ok,
                       finalized=acc_res.get("finalized"),
                       evaluate=ev, error=acc_res.get("error"),
                       skipped=bool(acc_res.get("skipped")),
-                      session_id=acc_res.get("session_id"))
+                      session_id=acc_res.get("session_id"),
+                      credited_seconds=(duration_s if ok and not acc_res.get("skipped")
+                                        and acc_res.get("finalized") is not False else 0.0))
                 if not ok and (acc_res.get("restriction_confirmed") or _is_disabled_error(acc_res.get("error"))):
                     banned.add(account.email)
                     sessions.pop(account.email, None)

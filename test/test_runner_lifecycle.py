@@ -51,3 +51,30 @@ class RunnerLifecycleTests(unittest.TestCase):
                 instance._run({}, Mock())
         self.assertEqual(instance.state, "error")
         self.assertFalse(instance.running)
+
+
+class CampaignProgressTests(unittest.TestCase):
+    def test_old_skips_failures_and_unfinalized_uploads_do_not_fill_new_goal(self):
+        from moneymin.campaign_types import AccountSpec, CampaignConfig
+        instance = runner.CampaignRunner()
+        cfg = CampaignConfig(accounts=[AccountSpec("a@example.com", "org"),
+                                       AccountSpec("b@example.com", "org")], tasks=[],
+                             target_hours_per_account=1)
+        with patch("moneymin.web.runner.threading.Thread.start"):
+            instance.start(cfg)
+        for _ in range(100):
+            instance._on_event("account_done", {"ok": True, "skipped": True})
+        instance._on_event("account_done", {"ok": True, "finalized": False, "credited_seconds": 3600})
+        self.assertEqual(instance.snapshot()["totals"]["progress_completed"], 0)
+        event = {"email": "a@example.com", "task": "task", "clip_uid": "new",
+                 "ok": True, "finalized": True, "credited_seconds": 4000}
+        instance._on_event("account_done", event)
+        instance._on_event("account_done", event)
+        totals = instance.snapshot()["totals"]
+        self.assertEqual(totals["progress_completed"], 3600)
+        self.assertEqual(totals["progress_target"], 7200)
+        self.assertEqual(totals["ok_sends"], 1)
+        instance.state = "done"
+        with patch("moneymin.web.runner.threading.Thread.start"):
+            instance.start(cfg)
+        self.assertEqual(instance.snapshot()["totals"]["progress_completed"], 0)

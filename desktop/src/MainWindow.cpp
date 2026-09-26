@@ -341,9 +341,7 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
       }
       renderOperation(doc.object());
       const auto state = doc.object().value("state").toString();
-      const auto totals = doc.object().value("totals").toObject();
-      const int total = totals.value("total_sends").toInt();
-      _homePulseProgress->setValue(total > 0 ? qBound(0, int(100. * totals.value("done_sends").toInt() / total), 100) : 0);
+      _homePulseProgress->setValue(OperationSummary::from({}, doc.object()).progress);
       _operationProgressRow->setVisible(state == "running" || state == "stopping");
       if (state == "running" || state == "stopping") {
         _homePulseTitle->setText(state == "running" ? QStringLiteral("Campanha em andamento") : QStringLiteral("Encerrando com segurança"));
@@ -966,8 +964,15 @@ void MainWindow::renderOperation(const QJsonObject& snapshot) {
   _operationEmpty->setVisible(rows.isEmpty());
   _operationTrack->setCounts(counts);
   _operationContextTitle->setText(counts.value("confirming").toInt() > 0 ? QStringLiteral("Confirmar recebimento") : snapshot.value("state").toString() == "running" ? QStringLiteral("Acompanhar os envios") : QStringLiteral("Planejar sua campanha"));
-  _operationTotal->setText(QStringLiteral("%1 / %2 <span style='font-size:14px'>contas com último envio confirmado</span>")
-      .arg(counts.value("confirmed").toInt()).arg(rows.size()));
+  const auto totals = snapshot.value("totals").toObject();
+  if (totals.value("progress_unit").toString() == "seconds") {
+    _operationTotal->setText(QStringLiteral("%1 / %2 <span style='font-size:14px'>h confirmadas nesta campanha</span>")
+        .arg(totals.value("progress_completed").toDouble() / 3600., 0, 'f', 2)
+        .arg(totals.value("progress_target").toDouble() / 3600., 0, 'f', 2));
+  } else {
+    _operationTotal->setText(QStringLiteral("%1 / %2 <span style='font-size:14px'>novos envios confirmados</span>")
+        .arg(totals.value("ok_sends").toInt()).arg(totals.value("total_sends").toInt()));
+  }
   _operationTable->setRowCount(rows.size());
   for (int i = 0; i < rows.size(); ++i) {
     const auto row = rows[i].toObject();
@@ -4367,21 +4372,25 @@ void MainWindow::pollCampaign() {
     }
     _campaignCurrent->setText(current);
     const auto totals = snap.value(QStringLiteral("totals")).toObject();
-    const int total = totals.value(QStringLiteral("total_sends")).toInt();
-    const int done = totals.value(QStringLiteral("done_sends")).toInt();
+    const double total = totals.value("progress_target").toDouble(totals.value("total_sends").toDouble());
+    const double done = totals.value("progress_completed").toDouble(totals.value("ok_sends").toDouble());
+    const bool hoursGoal = totals.value("progress_unit").toString() == "seconds";
     const int successful = totals.value(QStringLiteral("ok_sends")).toInt();
     const int failed = totals.value(QStringLiteral("failed_sends")).toInt();
     const int skipped = totals.value(QStringLiteral("skipped_sends")).toInt();
-    const int percent = total > 0 ? qBound(0, done * 100 / total, 100) : 0;
+    const int percent = total > 0 ? qBound(0, int(done * 100 / total), 100) : 0;
     const bool paused = snap.value(QStringLiteral("pause_requested")).toBool();
     const QString headline = state == "running" ? (paused ? QStringLiteral("Pausa solicitada") : QStringLiteral("Campanha em andamento"))
         : stateLabels.value(state, QStringLiteral("Estado não reconhecido"));
-    const QString progressText = total > 0 ? QStringLiteral("%1 de %2 envios processados · %3%\n").arg(done).arg(total).arg(percent) : QString();
+    const QString goalText = hoursGoal
+        ? QStringLiteral("%1 de %2 h confirmadas nesta campanha").arg(done / 3600., 0, 'f', 2).arg(total / 3600., 0, 'f', 2)
+        : QStringLiteral("%1 de %2 novos envios confirmados").arg(done).arg(total);
+    const QString progressText = total > 0 ? goalText + QStringLiteral(" · %1%\n").arg(percent) : QString();
     setCampaignIndicator(headline, progressText + current, state, running && !paused && total == 0);
     _campaignIndicatorProgress->setValue(percent);
     _campaignProgress->setValue(percent);
     _campaignProgress->setFormat(total > 0
-        ? QStringLiteral("%1 de %2 envios · %p%").arg(done).arg(total)
+        ? goalText + QStringLiteral(" · %p%")
         : QStringLiteral("Calculando os envios…"));
     _campaignStats->setText(QStringLiteral("%1 sucesso · %2 ignorados · %3 falhas")
         .arg(successful).arg(skipped).arg(failed));
@@ -4432,12 +4441,16 @@ void MainWindow::pollCampaign() {
 }
 
 void MainWindow::pollCampaignPreviews() {
-  if (_previewLogName.isEmpty() || _previewCheckActive) return;
+  if (_campaignActive || _campaignStartPending || _previewLogName.isEmpty() || _previewCheckActive) return;
+  const auto previewLog = _previewLogName;
+  const auto revision = _campaignPollRevision;
   _previewCheckActive = true;
   _api.post(QStringLiteral("/api/logs/") + encoded(_previewLogName)
                 + QStringLiteral("/status"), {},
-            [this](bool ok, const QJsonDocument& doc, const QString& error) {
+            [this, previewLog, revision](bool ok, const QJsonDocument& doc, const QString& error) {
     _previewCheckActive = false;
+    if (_campaignActive || _campaignStartPending || previewLog != _previewLogName
+        || revision != _campaignPollRevision) return;
     if (!ok) {
       if (error.contains(QStringLiteral("log não encontrado"), Qt::CaseInsensitive)) {
         _previewPoll.stop();

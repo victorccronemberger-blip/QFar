@@ -9,9 +9,11 @@ int main() {
   expect(OperationSummary::from({}, {{"state", "running"}}).destination == 3);
   expect(OperationSummary::from(accounts, {{"state", "error"}}).destination == 3);
   expect(OperationSummary::from(accounts, {{"state", "stopping"}}).title.contains(QStringLiteral("Encerrando")));
-  expect(OperationSummary::from(accounts, {{"state", "running"}, {"totals", QJsonObject{{"total_sends", 4}, {"done_sends", 2}}}}).progress == 50);
-  expect(OperationSummary::from(accounts, {{"totals", QJsonObject{{"total_sends", 0}, {"done_sends", 5}}}}).progress == 0);
-  expect(OperationSummary::from(accounts, {{"totals", QJsonObject{{"total_sends", 1}, {"done_sends", 5}}}}).progress == 100);
+  expect(OperationSummary::from(accounts, {{"state", "running"}, {"totals", QJsonObject{{"total_sends", 4}, {"ok_sends", 2}}}}).progress == 50);
+  expect(OperationSummary::from(accounts, {{"totals", QJsonObject{{"total_sends", 0}, {"ok_sends", 5}}}}).progress == 0);
+  expect(OperationSummary::from(accounts, {{"totals", QJsonObject{{"total_sends", 1}, {"ok_sends", 5}}}}).progress == 100);
+  expect(OperationSummary::from(accounts, {{"totals", QJsonObject{{"total_sends", 4}, {"done_sends", 100}, {"ok_sends", 0}}}}).progress == 0);
+  expect(OperationSummary::from(accounts, {{"totals", QJsonObject{{"progress_target", 7200}, {"progress_completed", 900}, {"done_sends", 100}}}}).progress == 12);
   if (failures) std::cerr << failures << " operation summary assertions failed\n";
   return failures ? 1 : 0;
 }

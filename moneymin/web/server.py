@@ -3209,6 +3209,20 @@ def create_app() -> Flask:
                     accounts=survivors, tasks=review_tasks, dataset_provider=provider,
                     content_mode=content_mode))
                 clip_count = len(clip_review)
+                if target_hours > 0:
+                    available_seconds = {a.email: 0.0 for a in survivors}
+                    for row in clip_review:
+                        for email in row["eligible_accounts"]:
+                            available_seconds[email] += row["duration_s"]
+                    short = [value for value in available_seconds.values()
+                             if value < target_hours * 3600]
+                    if short:
+                        warnings.append(
+                            f"Conteúdo novo insuficiente para a meta em {len(short)} conta(s): "
+                            f"o catálogo oferece até {min(short) / 3600:.2f}–{max(short) / 3600:.2f} h "
+                            f"por conta, para uma meta de {target_hours:g} h. "
+                            "Selecione mais categorias ou reveja a faixa de duração. "
+                            "Vídeos já enviados não contam para a nova campanha.")
                 if not any(row["eligible_accounts"] for row in clip_review):
                     blockers.append("Nenhum clipe candidato está disponível para as contas selecionadas. Revise o conteúdo e a lista de vídeos usados.")
                     reusable = False

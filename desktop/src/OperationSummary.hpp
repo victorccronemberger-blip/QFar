@@ -12,8 +12,8 @@ struct OperationSummary {
     OperationSummary result;
     const auto state = snapshot.value("state").toString();
     const auto totals = snapshot.value("totals").toObject();
-    const int total = totals.value("total_sends").toInt();
-    const int done = totals.value("done_sends").toInt();
+    const double total = totals.value("progress_target").toDouble(totals.value("total_sends").toDouble());
+    const double done = totals.value("progress_completed").toDouble(totals.value("ok_sends").toDouble());
     result.progress = total > 0 ? qBound(0, int(100.0 * done / total), 100) : 0;
     if (state == "running" || state == "stopping") {
       result.title = state == "stopping" ? QStringLiteral("Encerrando com segurança") : QStringLiteral("Sua campanha está em execução");

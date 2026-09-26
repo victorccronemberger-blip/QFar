@@ -297,6 +297,9 @@ class CampaignRunner:
         self._seq = 0
         self.error: str | None = None
         self.log_path: str | None = None
+        self.target_seconds_per_account = 0.0
+        self.account_seconds: dict[str, float] = {}
+        self.credited_deliveries: set[tuple[str, str, str]] = set()
         self.total_sends = 0
         self.done_sends = 0
         self.ok_sends = 0
@@ -337,6 +340,9 @@ class CampaignRunner:
             self.operation = OperationState(account.email for account in cfg.accounts)
             self.error = None
             self.log_path = None
+            self.target_seconds_per_account = hours * 3600
+            self.account_seconds = {a.email: 0.0 for a in cfg.accounts}
+            self.credited_deliveries.clear()
             self.done_sends = 0
             self.ok_sends = 0
             self.failed_sends = 0
@@ -469,8 +475,15 @@ class CampaignRunner:
                 self.done_sends += 1
                 if payload.get("skipped"):
                     self.skipped_sends += 1
-                elif payload.get("ok"):
-                    self.ok_sends += 1
+                elif payload.get("ok") and payload.get("finalized") is not False:
+                    delivery = (str(payload.get("email") or ""), str(payload.get("registry_key") or payload.get("task") or ""),
+                                str(payload.get("clip_uid") or payload.get("session_id") or ""))
+                    if not delivery[2] or delivery not in self.credited_deliveries:
+                        self.credited_deliveries.add(delivery)
+                        self.ok_sends += 1
+                        seconds = float(payload.get("credited_seconds") or 0)
+                        if math.isfinite(seconds) and seconds > 0 and delivery[0] in self.account_seconds:
+                            self.account_seconds[delivery[0]] += seconds
                 else:
                     self.failed_sends += 1
             elif kind == "campaign_done":
@@ -608,6 +621,12 @@ class CampaignRunner:
                 "last_seq": self._seq,
                 "operation": self.operation.snapshot(self.state in {"done", "stopped", "error"}),
                 "totals": {
+                    "progress_unit": "seconds" if self.target_seconds_per_account else "sends",
+                    "progress_target": (self.target_seconds_per_account * len(self.account_seconds)
+                                        if self.target_seconds_per_account else self.total_sends),
+                    "progress_completed": (sum(min(value, self.target_seconds_per_account)
+                                               for value in self.account_seconds.values())
+                                           if self.target_seconds_per_account else self.ok_sends),
                     "total_sends": self.total_sends,
                     "done_sends": self.done_sends,
                     "ok_sends": self.ok_sends,
