@@ -34,9 +34,9 @@ with patch.object(socket.socket, "connect", side_effect=AssertionError("network 
     recovery = client.get("/api/recovery", headers=headers)
     assert recovery.status_code == 200, recovery.get_json()
     assert recovery.get_json()["items"] == []
-    assert upload.sidecars_dir() == config.DATA_DIR / "sidecars"
-    assert config.DATA_DIR == Path(os.environ["QMONEY_USER_ROOT"]) / "data"
-    assert config.MEDIA_DATA_DIR == Path(os.environ["QMONEY_LIBRARY_ROOT"]) / "data"
+    assert upload.sidecars_dir().resolve() == (config.DATA_DIR / "sidecars").resolve()
+    assert config.DATA_DIR.resolve() == (Path(os.environ["QMONEY_USER_ROOT"]) / "data").resolve()
+    assert config.MEDIA_DATA_DIR.resolve() == (Path(os.environ["QMONEY_LIBRARY_ROOT"]) / "data").resolve()
     assert os.environ.get("INSTALLATION_SENTINEL") != "foreign-library-secret"
     print(json.dumps({"before":before, "after":[row["email"] for row in after.get_json()["accounts"]]}))
 '''

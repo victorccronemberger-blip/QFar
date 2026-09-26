@@ -29,7 +29,7 @@ class UploadStorageIsolationTests(unittest.TestCase):
                 rows = upload.list_sidecars()
                 self.assertEqual([row["session_id"] for row in rows], ["own"])
                 archive = Path(rows[0]["sidecar_data_path"])
-                self.assertEqual(archive.parent, user / "sidecars")
+                self.assertEqual(archive.parent.resolve(), (user / "sidecars").resolve())
                 self.assertEqual(archive.read_bytes(), b"archive-fixture")
                 upload.save_sidecar({**rows[0], "state": "done"})
                 self.assertEqual(upload.list_sidecars()[0]["state"], "done")
