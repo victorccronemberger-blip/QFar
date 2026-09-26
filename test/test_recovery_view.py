@@ -58,6 +58,23 @@ class RecoveryViewTests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(snapshot))
         self.assertNotIn("C:/private", json.dumps(snapshot))
 
+    def test_batch_reconciliation_writes_sent_index_once_and_retries_failed_ack(self):
+        for index in range(100):
+            self.save({**self.row, "session_id": f"session{index}"}, name=f"session{index}.json")
+        with patch.object(sent_registry, "_save", wraps=sent_registry._save) as saved, \
+             patch.object(recovery, "save_json", side_effect=OSError("interrupted acknowledgment")):
+            with self.assertRaises(OSError):
+                recovery.reconcile_confirmed()
+        saved.assert_called_once()
+        self.assertEqual(sent_registry.sent_emails("task", "clip"), {"one@example.com"})
+        with patch.object(sent_registry, "_save", wraps=sent_registry._save) as saved, \
+             patch.object(upload, "sidecars_dir", return_value=self.journals) as directory:
+            result = recovery.reconcile_confirmed()
+        saved.assert_not_called()
+        self.assertEqual(directory.call_count, 2)
+        self.assertEqual(result["reconciled"], 100)
+        self.assertEqual(result["items"], [])
+
     def test_confirmation_is_reconciled_once_without_network(self):
         self.save()
         result = recovery.reconcile_confirmed()

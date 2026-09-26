@@ -5,13 +5,13 @@ import json
 import threading
 
 from . import campaign, sent_registry, upload
-from .campaign_types import AccountSpec
+from .atomic_io import save_json
 
 
-def _groups() -> list[list[dict]]:
+def _groups(directory=None) -> list[list[dict]]:
     groups: dict[tuple[str, str, str], list[dict]] = {}
     owners: dict[str, tuple[str, str]] = {}
-    for path in sorted(upload.sidecars_dir().glob("*.json")):
+    for path in sorted((directory or upload.sidecars_dir()).glob("*.json")):
         try:
             row = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -84,18 +84,31 @@ def snapshot() -> dict:
 
 
 def reconcile_confirmed() -> dict:
-    reconciled = 0
-    for rows in _groups():
-        item = _describe(rows)
+    directory = upload.sidecars_dir()
+    groups = _groups(directory)
+    missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
+               if not rows[0].get("campaign_context")}
+    contexts = campaign._legacy_upload_contexts(missing) if missing else {}
+    confirmed = []
+    deliveries = []
+    for rows in groups:
+        item = _describe(rows, contexts)
         if item is None or item["status"] != "confirmed":
             continue
         first = rows[0]
-        context = first.get("campaign_context") or campaign._legacy_upload_context(item["session_id"], item["email"])
-        campaign._reconcile_uploads(rows, AccountSpec(item["email"], first["org_key"]),
-                                   {"clip_uid": item["clip_uid"], "registry_key": context["registry_key"]},
-                                   first.get("task_id", ""))
-        reconciled += 1
-    return {"reconciled": reconciled, **snapshot()}
+        context = first.get("campaign_context") or contexts[(item["session_id"], item["email"])]
+        deliveries.append((context["registry_key"], item["clip_uid"], item["email"]))
+        confirmed.append(rows)
+    # Commit the complete sent index first. An interrupted acknowledgment can
+    # safely repeat; it never forgets a completed delivery or starts an upload.
+    sent_registry.mark_sent_many(deliveries)
+    for rows in confirmed:
+        for row in rows:
+            if row.get("campaign_reconciled") is True:
+                continue
+            save_json(directory / upload._sidecar_filename(row["session_id"], row["chunk_index"]),
+                      {**row, "campaign_reconciled": True})
+    return {"reconciled": len(confirmed), **snapshot()}
 
 
 def resume_account(email: str, resolve_org) -> dict:

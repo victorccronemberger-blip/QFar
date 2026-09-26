@@ -135,6 +135,22 @@ def recovery_was_reset(session_id: str, scenario: str, history_name: str = "") -
                     or history_name in resets.get("scenarios", {}).get(scenario, [])))
 
 
+def mark_sent_many(deliveries: list[tuple[str, str, str]]) -> None:
+    """Persist a validated reconciliation batch before acknowledging journals."""
+    if not deliveries:
+        return
+    with _LOCK:
+        data = load()
+        changed = False
+        for scenario, clip_uid, email in deliveries:
+            entry = data.setdefault(scenario, {}).setdefault(clip_uid, [])
+            if email not in entry:
+                entry.append(email)
+                changed = True
+        if changed:
+            _save(data)
+
+
 def mark_sent(scenario: str, clip_uid: str, email: str) -> None:
     """Registra que `clip_uid` foi enviado com sucesso para `email`."""
     with _LOCK:
