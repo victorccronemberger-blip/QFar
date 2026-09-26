@@ -1714,8 +1714,6 @@ def _ban_accounts(issues: list[dict]) -> None:
 def _preflight_fingerprint(emails: list[str]) -> str:
     """Vincula a prévia à identidade/configuração, não à rotação da sessão."""
     digest = hashlib.sha256()
-    rotating = {"idToken", "id_token", "refreshToken", "refresh_token",
-                "expiresIn", "expires_in", "expires_at"}
     for email in sorted(set(emails)):
         path = config.token_path(email)
         digest.update(str(path).encode())
@@ -1731,15 +1729,17 @@ def _preflight_fingerprint(emails: list[str]) -> str:
         except (ValueError, UnicodeError):
             digest.update(b"invalid:" + raw)
             continue
-        stable = {key: value for key, value in token.items() if key not in rotating}
+        stable = {"email": str(token.get("email", email)).strip().casefold(),
+                  "subject": token.get("localId") or token.get("user_id") or token.get("uid"),
+                  "organization": {key: token[key] for key in ("org_key", "organization_id", "tenantId") if key in token}}
         # Remover/revogar as credenciais deve invalidar a prévia; renová-las não.
         identity = {"record": stable,
                     "has_id_token": bool(token.get("idToken") or token.get("id_token")),
                     "has_refresh_token": bool(token.get("refreshToken") or token.get("refresh_token"))}
         digest.update(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode())
-    removed = _removed_accounts_path()
-    digest.update(str(removed).encode())
-    digest.update(removed.read_bytes() if removed.exists() else b"missing")
+    removed = _removed_accounts()
+    digest.update(json.dumps(sorted(email.strip().casefold() for email in emails
+                                    if email.strip().casefold() in removed)).encode())
     return digest.hexdigest()
 
 
@@ -3268,10 +3268,17 @@ def create_app() -> Flask:
         if receipt_id:
             receipt = preflights.get(str(receipt_id))
             original = {k: v for k, v in body.items() if k not in {"preflight_id", "remove_restricted"}}
-            if (receipt is None or receipt["expires"] <= time.monotonic()
-                    or original != receipt["body"]
-                    or receipt["fingerprint"] != _preflight_fingerprint(original.get("accounts", []))):
-                return jsonify({"error": "A verificação expirou ou as contas mudaram. Execute o preflight novamente."}), 409
+            invalid = None
+            if receipt is None:
+                invalid = ("preflight_missing", "A prévia não está mais disponível. Revise a campanha novamente.")
+            elif receipt["expires"] <= time.monotonic():
+                invalid = ("preflight_expired", "A prévia passou de 10 minutos. Atualize e revise antes de iniciar.")
+            elif original != receipt["body"]:
+                invalid = ("preflight_request_changed", "Os parâmetros da campanha mudaram. Revise a nova prévia.")
+            elif receipt["fingerprint"] != _preflight_fingerprint(original.get("accounts", [])):
+                invalid = ("preflight_accounts_changed", "O acesso ou a identidade de uma conta mudou. Revise a nova verificação.")
+            if invalid:
+                return jsonify({"error_code": invalid[0], "error": invalid[1]}), 409
             if receipt["issues"] and body.get("remove_restricted") is not True:
                 return jsonify({"error": "Confirme a remoção das contas com restrição para continuar."}), 400
         elif body.get("remove_restricted"):

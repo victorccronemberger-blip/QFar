@@ -120,6 +120,36 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.runner.start.assert_not_called()
 
+    def test_metadata_and_unrelated_removal_do_not_expire_review(self):
+        result = self.preflight()
+        path = server.config.token_path('good@example.com')
+        token = json.loads(path.read_text())
+        token.update(displayName='Updated label', registered=True, kind='login-response')
+        path.write_text(json.dumps(token))
+        server._set_account_removed('unrelated@example.com', True)
+        response = self.client.post('/api/campaigns', json={
+            **self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.runner.start.assert_called_once()
+
+    def test_selected_account_removal_invalidates_review(self):
+        result = self.preflight()
+        server._set_account_removed('good@example.com', True)
+        response = self.client.post('/api/campaigns', json={
+            **self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()['error_code'], 'preflight_accounts_changed')
+        self.runner.start.assert_not_called()
+
+    def test_expiration_has_specific_reason_and_never_starts(self):
+        result = self.preflight()
+        with patch.object(server.time, 'monotonic', return_value=10**15):
+            response = self.client.post('/api/campaigns', json={
+                **self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()['error_code'], 'preflight_expired')
+        self.runner.start.assert_not_called()
+
     def test_ban_purges_legacy_credentials_backups_and_health_but_preserves_healthy(self):
         from moneymin import account_bans
         data = self.root / 'data'

@@ -37,6 +37,12 @@ public:
             .match(QString::fromLatin1(input.left(headerEnd)));
         if(match.hasMatch() && input.size()<headerEnd+4+match.captured(1).toInt()) return;
         socket->setProperty("answered", true);
+        if(input.startsWith("POST /api/campaigns ") && qApp->arguments().contains("--expired-review") && *requests==0) {
+          ++*requests;
+          const QByteArray body=R"({"error_code":"preflight_expired","error":"Expired fixture"})";
+          socket->write("HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(body.size())+"\r\n\r\n"+body);
+          socket->disconnectFromHost(); return;
+        }
         if(input.startsWith("POST /api/campaigns ") && qApp->arguments().contains("--continuation-accept")) {
           const auto body=QJsonDocument::fromJson(input.mid(headerEnd+4)).object();
           const bool correct=*requests==1 && body.value("preflight_id").toString()=="fixture"
@@ -44,6 +50,10 @@ public:
           qApp->exit(correct?0:34); return;
         }
         if (!input.startsWith("POST /api/campaigns/preflight ")) { qApp->exit(31); return; }
+        if(qApp->arguments().contains("--expired-review")) {
+          const auto requestBody=QJsonDocument::fromJson(input.mid(headerEnd+4)).object();
+          if(requestBody.contains("preflight_id") || requestBody.contains("remove_restricted")) {qApp->exit(35);return;}
+        }
         ++*requests;
         const QJsonObject result{{"ok",false},{"can_remove_and_continue",true},{"preflight_id","fixture"},
           {"blockers",QJsonArray{"blocked"}},{"account_errors",QJsonArray{"blocked"}},
@@ -77,7 +87,10 @@ public:
         timer->stop();
         if(correct && qApp->arguments().contains("--continuation-accept")) {dialog->accept();return;}
         dialog->reject();
-        QTimer::singleShot(150,qApp,[requests,correct]{qApp->exit(correct && *requests==1 ? 0:32);});
+        QTimer::singleShot(150,qApp,[requests,correct]{
+          const int expected=qApp->arguments().contains("--expired-review")?2:1;
+          qApp->exit(correct && *requests==expected ? 0:32);
+        });
         return;
       }
       for(auto* button:dialog->findChildren<QPushButton*>())
@@ -85,7 +98,11 @@ public:
     });
     timer->start(25);
     QTimer::singleShot(8000,&window,[]{qApp->exit(33);});
-    window.startCampaign();
+    if(qApp->arguments().contains("--expired-review")) {
+      window.submitCampaign({{"accounts",QJsonArray{"ok@example.com","blocked@example.com"}},
+                             {"tasks",QJsonArray{QJsonObject{{"task_id","fixture-task"}}}},
+                             {"preflight_id","expired"},{"remove_restricted",true}});
+    } else window.startCampaign();
   }
   static void smoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);

@@ -83,6 +83,7 @@ private:
   void showAccountIssues(const QString& title, const QStringList& blockers,
                          const QJsonArray& issues, std::function<void()> continueAction = {});
   void submitCampaign(QJsonObject body);
+  void preflightCampaign(QJsonObject body, QStringList selectedAccountNames);
   void setStatus(const QString& text);
 
   void loadHome();

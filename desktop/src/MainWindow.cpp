@@ -4121,6 +4121,11 @@ void MainWindow::startCampaign() {
     body.insert(QStringLiteral("active_hours"), QJsonValue::Null);
   }
   _campaignStart->setEnabled(false);
+  preflightCampaign(body, selectedAccountNames);
+}
+
+void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccountNames) {
+  _campaignStart->setEnabled(false);
   _campaignStart->setText(QStringLiteral("Verificando campanha…"));
   _api.post(QStringLiteral("/api/campaigns/preflight"), body,
             [this, body, selectedAccountNames](bool ok, const QJsonDocument& doc, const QString& error) {
@@ -4200,10 +4205,22 @@ void MainWindow::submitCampaign(QJsonObject body) {
   _campaignStart->setEnabled(false);
     _campaignStart->setText(QStringLiteral("Iniciando…"));
     _api.post(QStringLiteral("/api/campaigns"), body,
-              [this](bool started, const QJsonDocument& startDoc, const QString& startError) {
+              [this, body](bool started, const QJsonDocument& startDoc, const QString& startError) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       if (!started) {
         _campaignStart->setEnabled(!_campaignActive);
+        const auto code = startDoc.object().value(QStringLiteral("error_code")).toString();
+        if (code == "preflight_expired" || code == "preflight_missing"
+            || code == "preflight_accounts_changed" || code == "preflight_request_changed") {
+          auto refreshed = body;
+          refreshed.remove(QStringLiteral("preflight_id"));
+          refreshed.remove(QStringLiteral("remove_restricted"));
+          QStringList names;
+          for (const auto account : refreshed.value("accounts").toArray()) names.append(account.toString());
+          setStatus(QStringLiteral("Atualizando a prévia. Revise novamente antes de confirmar o início."));
+          preflightCampaign(refreshed, names);
+          return;
+        }
         return showError(QStringLiteral("Campanha não iniciada"), startError);
       }
       if (startDoc.object().value(QStringLiteral("already_running")).toBool()) {

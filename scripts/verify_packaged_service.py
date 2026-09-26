@@ -23,7 +23,7 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
                    if not key.startswith(("QMONEY_", "MINUTE_", "AWS_", "HOSTINGER_", "EGO4D_", "CROWTADO_"))}
     environment.update(QMONEY_USER_ROOT=str(user_root), QMONEY_LIBRARY_ROOT=str(library),
                        QMONEY_RUNTIME_ROOT=str(service.parent), QMONEY_LOCAL_API_TOKEN=token,
-                       QMONEY_APP_VERSION=os.environ.get("QMONEY_VERSION", "2.0.1").lstrip("v"), MINUTE_VPN_ENFORCE="0",
+                       QMONEY_APP_VERSION=os.environ.get("QMONEY_VERSION", "2.0.2").lstrip("v"), MINUTE_VPN_ENFORCE="0",
                        MINUTE_REQUIRE_CURL="0", MINUTE_PUBLISH_APP_OPENED="0",
                        AWS_SHARED_CREDENTIALS_FILE=str(user_root / "secrets/aws/credentials"),
                        AWS_CONFIG_FILE=str(user_root / "secrets/aws/config"), AWS_EC2_METADATA_DISABLED="true")
