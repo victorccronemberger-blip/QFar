@@ -1,6 +1,6 @@
 # QMoney 2.0 — produto por instalação
 
-Cada cliente instala o aplicativo e mantém suas próprias contas e dados. A 2.0 ainda está em desenvolvimento: não representa uma release publicada nem introduz serviço compartilhado.
+Cada cliente instala o aplicativo e mantém suas próprias contas e dados. A versão 2.0.0 foi publicada em 26/09/2026, com pacote Windows, checksum e assinatura de atualização. Não introduz serviço compartilhado.
 
 ## Direção
 
@@ -41,7 +41,7 @@ Não prometer operação sem erros, validação remota sem consulta ou funcionam
 | Instalações independentes | Três processos testam dois clientes e reinício, com biblioteca compartilhada sem compartilhar credenciais/journals. Serviço executável empacotado repetiu verificação em diretórios vazios. |
 | Migração e backup | Testes de journals legados, credenciais e importação/exportação idempotente; transação de atualização preserva dados e faz rollback. |
 | Diagnóstico e pacote | Testes de redação de segredos; ZIP com 685 arquivos inspecionado, SHA-256 e assinatura RSA verificados com a chave pública do atualizador. |
-| Git e distribuição | Pacote local pronto; publicação e workflow remoto ainda pendentes. |
+| Git e distribuição | Código publicado, build remoto aprovado e release 2.0.0 publicada com ZIP/checksum/assinatura. Links e evidência final abaixo. |
 
 ### Limites da validação
 
@@ -144,3 +144,13 @@ Os checkpoints abaixo são históricos; pendências citadas em etapas anteriores
 - 615 testes backend, teste integrado Qt, três testes Qt de resumo/API/atualização e transação nativa do atualizador aprovados.
 - Histórico preenchido validado pelo ApiClient real contra servidor local controlado, com distinção entre confirmação e pendência.
 - Pacote local assinado: SHA-256 `8112e7f416d6b49ba4675d8104d2e2a830e177d7f022825fe34464d275603643`. Serviço empacotado validado em instalações temporárias sem operação externa.
+
+### Publicação concluída — 26/09/2026
+
+- Código da release: `55135814600d9f53d93eda4b54a9bc8c6575b335`.
+- [Build Windows aprovado](https://github.com/victorccronemberger-blip/QFar/actions/runs/36245291089): backend, transação do atualizador, Qt, interface integrada e serviço empacotado.
+- [Release v2.0.0](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.0), publicada como versão estável.
+- Artefato do build remoto baixado, assinatura RSA verificada com a chave pública do atualizador e metadados PE 2.0.0 conferidos. ZIP com 688 arquivos, sem diretórios de credenciais/journals do usuário.
+- Hash do pacote no momento da publicação: `c68fcd496cbb28ec5eaebd7f8cd9abc4d19649c71a5d0bf9f0f86e498fe3ede2`. Digest informado pelo GitHub coincidiu com o arquivo validado.
+- Correção de portabilidade nos testes: comparação de caminhos resolvidos evita falso negativo entre nomes Windows curtos e longos (`RUNNER~1`/`runneradmin`). As asserções de isolamento e preservação permaneceram ativas.
+- Permanecem os limites declarados: provedores controlados, sem saque/upload real, instalação em diretórios vazios no Windows disponível e runner Windows do GitHub; sem VM interativa recém-instalada.
