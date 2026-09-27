@@ -2223,7 +2223,7 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesWithdrawAll = new QPushButton(QStringLiteral("Sacar tudo"));
   _balancesWithdrawAll->setEnabled(false);
   _balancesWithdrawAll->setToolTip(QStringLiteral(
-      "Solicita saques para todas as contas Crowtado elegíveis, inclusive as ocultas pelo filtro da tabela."));
+      "Solicita saques apenas de contas Crowtado com saldo aprovado superior a US$ 25,00, inclusive as ocultas pelo filtro."));
   connect(_balancesWithdrawAll, &QPushButton::clicked, this, [this] {
     const int eligible = _balancesWithdrawAll->property("eligibleCount").toInt();
     QJsonObject request;
@@ -5619,7 +5619,7 @@ void MainWindow::loadBalances() {
       const bool hasPassword = passwordAccounts.contains(email);
       const bool hasBalanceError = !balance.value(QStringLiteral("error")).toString().isEmpty()
           || balance.value(QStringLiteral("stale")).toBool();
-      if (!isClaru && hasPassword && !hasBalanceError && hasAvailable && availableCents > 0)
+      if (!isClaru && hasPassword && !hasBalanceError && hasAvailable && availableCents > 2500)
         ++eligibleWithdrawals;
       auto* actions = new QWidget;
       auto* actionsLayout = new QHBoxLayout(actions);
@@ -5661,19 +5661,18 @@ void MainWindow::loadBalances() {
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);
       withdraw->setEnabled(!cleanupPending && !isClaru && hasPassword && !hasBalanceError
-                           && hasAvailable && availableCents > 0
+                           && hasAvailable && availableCents > 2500
                            && runner.value(QStringLiteral("state")).toString() != QStringLiteral("running")
                            && bulk.value(QStringLiteral("state")).toString() != QStringLiteral("running"));
       withdraw->setToolTip(withdraw->isEnabled()
           ? QStringLiteral("Escolha o método e confirme o saque do saldo disponível desta conta.")
-          : QStringLiteral("Conecte o Crowtado e confirme um saldo disponível positivo antes de solicitar saque."));
+          : QStringLiteral("O saque exige saldo aprovado superior a US$ 25,00 e consulta atualizada. Saldo pendente não conta."));
       connect(withdraw, &QPushButton::clicked, this, [this, email, withdraw] {
         QJsonObject request{{QStringLiteral("email"), email}};
         if (!confirmWithdrawal(this, 1, request)) return;
         withdraw->setEnabled(false);
         _api.post(QStringLiteral("/api/balances/withdraw"), request,
                   [this, withdraw](bool ok, const QJsonDocument& doc, const QString& error) {
-          withdraw->setEnabled(true);
           loadBalances();
           if (!ok) return showError(QStringLiteral("Solicitação precisa de atenção"), error);
           QMessageBox::information(this, QStringLiteral("Solicitação enviada"),

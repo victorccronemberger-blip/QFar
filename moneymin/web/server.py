@@ -429,12 +429,12 @@ def _balance_refresh_needed(
 
 
 def _confirmed_available_balance(record: Any) -> bool:
-    """Only a successful, positive Crowtado reading can trigger a withdrawal."""
+    """Crowtado: only confirmed approved funds strictly above US$25 qualify."""
     if not isinstance(record, dict) or record.get("error") or record.get("stale"):
         return False
     cents = record.get("availableCents")
     return (isinstance(cents, (int, float)) and not isinstance(cents, bool)
-            and math.isfinite(cents) and cents > 0)
+            and math.isfinite(cents) and cents > 2500)
 
 
 def _banned_withdraw_eligibility(row: dict[str, Any]) -> tuple[bool, str]:
@@ -451,7 +451,7 @@ def _banned_withdraw_eligibility(row: dict[str, Any]) -> tuple[bool, str]:
     if monitor.get("balance_status") != "ok" or monitor.get("balance_stale") is not False:
         return False, "Consulte novamente o saldo Crowtado para confirmar o saque."
     if not _confirmed_available_balance(monitor.get("balance")):
-        return False, "Não há saldo disponível confirmado na Crowtado."
+        return False, "O saldo aprovado na Crowtado deve ser superior a US$ 25,00."
     try:
         checked = datetime.datetime.fromisoformat(str(monitor["balance_updated_at"]))
         age = (datetime.datetime.now(datetime.timezone.utc) - checked.astimezone(datetime.timezone.utc)).total_seconds()
@@ -2023,10 +2023,10 @@ def create_app() -> Flask:
         if not _confirmed_available_balance(balance):
             try:
                 _remember_banned_withdraw_result(
-                    email, "no_balance", "Não há saldo disponível para saque na Crowtado.", balance=balance)
+                    email, "no_balance", "O saldo aprovado deve ser superior a US$ 25,00 para saque na Crowtado.", balance=balance)
             except OSError:
                 pass
-            return jsonify({"error": "não há saldo disponível para saque na Crowtado"}), 400
+            return jsonify({"error": "o saldo aprovado deve ser superior a US$ 25,00 para saque na Crowtado"}), 400
         result, status = _withdraw_once(email, row["password"])
         provider_status = str((result.get("result") or {}).get("status") or "")
         if provider_status or not result.get("ok"):
@@ -3985,7 +3985,7 @@ def create_app() -> Flask:
         if _withdraw_bulk_snapshot()["state"] == "running":
             return jsonify({"error": "aguarde o saque em lote terminar"}), 409
         if not _confirmed_available_balance(_load_balances().get(email)):
-            return jsonify({"error": "atualize o saldo desta conta antes de solicitar saque; é necessário saldo disponível confirmado"}), 400
+            return jsonify({"error": "atualize o saldo desta conta antes de solicitar saque; é necessário saldo aprovado superior a US$ 25,00"}), 400
         result, status = (_withdraw_once(email, password, wise) if wise
                           else _withdraw_once(email, password))
         return jsonify(result), status
@@ -4018,7 +4018,7 @@ def create_app() -> Flask:
                 continue
             eligible[email] = passwords[email]
         if not eligible:
-            return jsonify({"error": "não há contas conectadas com saldo disponível confirmado"}), 400
+            return jsonify({"error": "não há contas conectadas com saldo aprovado superior a US$ 25,00"}), 400
         with _WITHDRAW_BULK_LOCK:
             _load_withdraw_bulk_locked()
             if _WITHDRAW_BULK_STATE["state"] == "running":

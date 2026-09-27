@@ -122,7 +122,7 @@ class BannedMonitorTests(unittest.TestCase):
              patch.object(server, '_withdraw_bulk_snapshot', return_value={'state': 'idle'}), \
              patch.object(server, '_list_accounts', side_effect=AssertionError('active accounts not required')), \
              patch.object(monitor, 'check_status', side_effect=AssertionError('Minute must not be contacted')), \
-             patch.object(server.crowtado, 'consultar_saldo_api', return_value={'availableCents': 1500}) as balance, \
+             patch.object(server.crowtado, 'consultar_saldo_api', return_value={'availableCents': 3000}) as balance, \
              patch.object(server, '_withdraw_once', return_value=({'ok': True, 'message': 'link enviado',
                  'result': {'status': 'ok'}}, 200)) as withdraw:
             path = Path(tmp) / 'banned_accounts.json'
@@ -131,7 +131,7 @@ class BannedMonitorTests(unittest.TestCase):
                 'monitor': {'status': 'banned', 'status_label': 'Continua banida',
                             'balance_status': 'ok', 'balance_stale': False,
                             'balance_updated_at': datetime.now(timezone.utc).isoformat(),
-                            'balance': {'availableCents': 1500}}}]}))
+                            'balance': {'availableCents': 3000}}}]}))
             client = server.create_app().test_client()
             snapshot = client.get('/api/accounts/banned/monitor').get_json()
             self.assertTrue(snapshot['accounts'][0]['withdraw_eligible'])
@@ -154,7 +154,7 @@ class BannedMonitorTests(unittest.TestCase):
             row = {'email': email, 'password': 'private-password', 'monitor': {
                 'balance_status': 'ok', 'balance_stale': False,
                 'balance_updated_at': datetime.now(timezone.utc).isoformat(),
-                'balance': {'availableCents': 1500}}}
+                'balance': {'availableCents': 3000}}}
             path.write_text(json.dumps({'schema': 1, 'accounts': [row]}))
             client = server.create_app().test_client()
             response = client.post('/api/accounts/banned/withdraw', json={'email': email})

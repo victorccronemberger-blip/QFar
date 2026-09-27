@@ -9,6 +9,16 @@ from moneymin.web import server
 
 
 class BulkWithdrawalTests(unittest.TestCase):
+    def test_approved_balance_must_exceed_25_dollars(self):
+        for cents, expected in ((0, False), (2499, False), (2500, False), (2501, True), (3000, True)):
+            with self.subTest(cents=cents):
+                self.assertEqual(server._confirmed_available_balance({
+                    "availableCents": cents, "pendingCents": 100000}), expected)
+        for record in ({"availableCents": 3000, "stale": True},
+                       {"availableCents": 3000, "error": "offline"},
+                       {"pendingCents": 100000}, {"availableCents": float("inf")}):
+            self.assertFalse(server._confirmed_available_balance(record))
+
     def test_wise_cleanup_runs_after_every_withdrawal_outcome(self):
         destination = {"legal_name": "Test Name", "destination_email": "destination@example.com"}
         for outcome in ({"status": "ok"}, {"status": "review_required"},
@@ -127,7 +137,7 @@ class BulkWithdrawalTests(unittest.TestCase):
 
         with patch.object(server, "_list_accounts", return_value=[{"email": e} for e in emails]), \
              patch.object(server, "_configured_crowtado_creds", return_value=dict.fromkeys(emails, "pw")), \
-             patch.object(server, "_load_balances", return_value={e: {"availableCents": 100} for e in emails}), \
+             patch.object(server, "_load_balances", return_value={e: {"availableCents": 3000} for e in emails}), \
              patch.object(server.org_policy, "account_kind", return_value="crowtado"), \
              patch.object(server.threading, "Thread", ImmediateThread), \
              patch.object(server.crowtado, "configurar_metodo_saque", side_effect=configure), \
@@ -181,7 +191,7 @@ class BulkWithdrawalTests(unittest.TestCase):
         destination = {"legal_name": "Test Name", "destination_email": "destination@example.com"}
         with patch.object(server, "_list_accounts", return_value=[{"email": email}]), \
              patch.object(server, "_configured_crowtado_creds", return_value={email: "pw"}), \
-             patch.object(server, "_load_balances", return_value={email: {"availableCents": 100}}), \
+             patch.object(server, "_load_balances", return_value={email: {"availableCents": 3000}}), \
              patch.object(server.org_policy, "account_kind", return_value="crowtado"), \
              patch.object(server, "_withdraw_once", return_value=({"ok": True}, 200)) as withdraw:
             response = self.client.post("/api/balances/withdraw", json={
@@ -242,7 +252,7 @@ class BulkWithdrawalTests(unittest.TestCase):
             "good@example.com", "zero@example.com", "error@example.com",
             "claru@example.com", "unconnected@example.com")]
         balances = {
-            "good@example.com": {"availableCents": 1200},
+            "good@example.com": {"availableCents": 3000},
             "zero@example.com": {"availableCents": 0},
             "error@example.com": {"availableCents": 900, "error": "consulta falhou"},
             "claru@example.com": {"availableCents": 5000},
@@ -330,7 +340,7 @@ class BulkWithdrawalTests(unittest.TestCase):
     def test_batch_does_not_start_when_history_cannot_be_saved(self):
         with patch.object(server, "_list_accounts", return_value=[{"email": "good@example.com"}]), \
              patch.object(server, "_configured_crowtado_creds", return_value={"good@example.com": "p"}), \
-             patch.object(server, "_load_balances", return_value={"good@example.com": {"availableCents": 100}}), \
+             patch.object(server, "_load_balances", return_value={"good@example.com": {"availableCents": 3000}}), \
              patch.object(server.org_policy, "account_kind", return_value="crowtado"), \
              patch.object(server, "_save_withdraw_bulk_locked", side_effect=OSError("disk full")), \
              patch.object(server.crowtado, "solicitar_link_saque") as withdraw:
@@ -351,7 +361,7 @@ class BulkWithdrawalTests(unittest.TestCase):
             server._WITHDRAW_BULK_STATE["state"] = "running"
         with patch.object(server, "_list_accounts", return_value=[{"email": "a@example.com"}]), \
              patch.object(server, "_configured_crowtado_creds", return_value={"a@example.com": "p"}), \
-             patch.object(server, "_load_balances", return_value={"a@example.com": {"availableCents": 100}}), \
+             patch.object(server, "_load_balances", return_value={"a@example.com": {"availableCents": 3000}}), \
              patch.object(server.org_policy, "account_kind", return_value="crowtado"):
             response = self.client.post("/api/balances/withdraw-all")
         self.assertEqual(response.status_code, 409)
@@ -363,12 +373,16 @@ class BulkWithdrawalTests(unittest.TestCase):
              patch.object(server.org_policy, "account_kind", return_value="crowtado"), \
              patch.object(server.crowtado, "solicitar_link_saque") as withdraw:
             for record in ({"availableCents": 0},
-                           {"availableCents": 100, "error": "offline"},
-                           {"availableCents": 100, "stale": True},
+                           {"availableCents": 2499, "pendingCents": 100000},
+                           {"availableCents": 2500, "pendingCents": 100000},
+                           {"availableCents": 3000, "error": "offline"},
+                           {"availableCents": 3000, "stale": True},
                            {"availableCents": float("nan")}, {}):
                 with self.subTest(record=record), \
                      patch.object(server, "_load_balances", return_value={email: record}):
                     response = self.client.post("/api/balances/withdraw", json={"email": email})
+                    self.assertEqual(response.status_code, 400)
+                    response = self.client.post("/api/balances/withdraw-all", json={})
                     self.assertEqual(response.status_code, 400)
             withdraw.assert_not_called()
 
@@ -379,7 +393,7 @@ class BulkWithdrawalTests(unittest.TestCase):
         with patch.object(server, "_list_accounts", return_value=[{"email": email}]), \
              patch.object(server, "_configured_crowtado_creds", return_value={email: "p"}), \
              patch.object(server.org_policy, "account_kind", return_value="crowtado"), \
-             patch.object(server, "_load_balances", return_value={email: {"availableCents": 100}}), \
+             patch.object(server, "_load_balances", return_value={email: {"availableCents": 3000}}), \
              patch.object(server.crowtado, "solicitar_link_saque") as withdraw:
             response = self.client.post("/api/balances/withdraw", json={"email": email})
         self.assertEqual(response.status_code, 409)
@@ -390,7 +404,7 @@ class BulkWithdrawalTests(unittest.TestCase):
         with patch.object(server, "_list_accounts", return_value=[{"email": email}]), \
              patch.object(server, "_configured_crowtado_creds", return_value={email: "p"}), \
              patch.object(server.org_policy, "account_kind", return_value="crowtado"), \
-             patch.object(server, "_load_balances", return_value={email: {"availableCents": 100}}), \
+             patch.object(server, "_load_balances", return_value={email: {"availableCents": 3000}}), \
              patch.object(server.crowtado, "solicitar_link_saque", return_value={"status": "ok"}) as withdraw:
             response = self.client.post("/api/balances/withdraw", json={"email": email})
         self.assertEqual(response.status_code, 200)
