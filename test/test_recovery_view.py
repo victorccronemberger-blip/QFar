@@ -59,6 +59,17 @@ class RecoveryViewTests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(snapshot))
         self.assertNotIn("C:/private", json.dumps(snapshot))
 
+    def test_listing_reads_resets_once_and_preserves_reset_exclusions(self):
+        for index in range(10):
+            self.save({**self.row, "session_id": f"session{index}"}, name=f"session{index}.json")
+        reset_path = self.root / "sent_reset_history.json"
+        reset_path.write_text(json.dumps({"completed_sessions": ["session0"]}), encoding="utf-8")
+        with patch.object(sent_registry, "_reset_history", wraps=sent_registry._reset_history) as reads:
+            result = recovery.snapshot()
+        self.assertEqual(result["confirmed"], 9)
+        reads.assert_called_once()
+        self.assertNotIn("session0", [item["session_id"] for item in result["items"]])
+
     def test_legacy_media_mapping_requires_unique_clip_task_and_account(self):
         row = {**self.row, "campaign_context": None, "local_video_path": "C:/old/clip_native.mp4"}
         self.save(row)

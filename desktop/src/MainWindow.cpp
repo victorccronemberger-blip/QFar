@@ -3402,6 +3402,13 @@ void MainWindow::openRecovery() {
     if (!guard) return;
     if (!ok) { summary->setText(error); reconcile->setEnabled(false); resume->setEnabled(false); return; }
     const auto data = document.object();
+    if (data.value(QStringLiteral("loading")).toBool()) {
+      summary->setText(data.value(QStringLiteral("message")).toString());
+      reconcile->setEnabled(false);
+      resume->setEnabled(false);
+      poll->start();
+      return;
+    }
     const auto items = data.value("items").toArray();
     const QString selectedAccount = resumeAccount->currentText();
     resumeAccount->clear();
@@ -3444,7 +3451,7 @@ void MainWindow::openRecovery() {
   const auto refresh = [this, guard, wallet, render] {
     if (!guard || guard->property("readingRecovery").toBool()) return;
     guard->setProperty("readingRecovery", true);
-    _api.get(QStringLiteral("/api/recovery"), [guard, wallet, render](bool ok, const QJsonDocument& document, const QString& error) {
+    _api.get(QStringLiteral("/api/recovery?async=1"), [guard, wallet, render](bool ok, const QJsonDocument& document, const QString& error) {
       if (!guard) return;
       guard->setProperty("readingRecovery", false);
       wallet->setVisible(document.object().value("wise_cleanup").toObject().value("pending").toBool());
@@ -4009,6 +4016,10 @@ void MainWindow::loadCampaignData() {
 void MainWindow::loadTasks() {
   _taskReload.stop();
   const int generation = ++_taskLoadGeneration;
+  if (_taskRequestPending) {
+    _taskReload.start(350);
+    return;
+  }
   QString account;
   for (int i = 0; i < _campaignAccounts->count(); ++i) {
     if (_campaignAccounts->item(i)->checkState() == Qt::Checked) {
@@ -4029,18 +4040,30 @@ void MainWindow::loadTasks() {
   }
   _campaignStart->setEnabled(false);
   const QString path = QStringLiteral(
-      "/api/tasks?email=%1&min_dur_s=%2&max_dur_s=%3&dataset=%4&content_mode=%5")
+      "/api/tasks?async=1&email=%1&min_dur_s=%2&max_dur_s=%3&dataset=%4&content_mode=%5")
       .arg(encoded(account)).arg(_minDuration->value() * 60)
       .arg(_maxDuration->value() * 60)
       .arg(encoded(_dataset->currentData().toString()))
       .arg(encoded(_contentMode->currentData().toString()));
+  _taskRequestPending = true;
   _api.get(path, [this, generation](bool ok, const QJsonDocument& doc,
                                    const QString& error) {
+    _taskRequestPending = false;
     if (generation != _taskLoadGeneration) return;
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
     if (!ok) {
       _campaignTasks->addItem(QStringLiteral("Falha: ") + error);
+      return;
+    }
+    if (doc.object().value(QStringLiteral("loading")).toBool()) {
+      QString message = doc.object().value(QStringLiteral("message")).toString(
+          QStringLiteral("Preparando categorias…"));
+      const int elapsed = doc.object().value(QStringLiteral("elapsed_s")).toInt();
+      if (elapsed > 0) message += QStringLiteral(" (%1 s)").arg(elapsed);
+      auto* item = new QListWidgetItem(message, _campaignTasks);
+      item->setFlags(Qt::NoItemFlags);
+      if (_pages->currentIndex() == 3) _taskReload.start(1200);
       return;
     }
     _taskRecords = doc.object().value(QStringLiteral("tasks")).toArray();
@@ -4097,7 +4120,7 @@ void MainWindow::startCampaign() {
       && !_campaignBalancesLoaded)
     return showError(QStringLiteral("Saldos ainda não carregados"),
                      QStringLiteral("Aguarde a leitura dos saldos antes de iniciar."));
-  if (_taskReload.isActive())
+  if (_taskReload.isActive() || _taskRequestPending)
     return showError(QStringLiteral("Categorias ainda não atualizadas"),
                      QStringLiteral("Aguarde a atualização das categorias após mudar as contas."));
   QJsonArray accounts;
@@ -4572,7 +4595,7 @@ void MainWindow::loadAccelerator() {
   const QString provider = _cacheProvider && !_cacheProvider->currentData().toString().isEmpty()
       ? _cacheProvider->currentData().toString() : QStringLiteral("holoassist");
   const QString requestedTask = _cacheTask->count() ? _cacheTask->currentText() : QString();
-  QString path = QStringLiteral("/api/holo-cache?provider=%1").arg(encoded(provider));
+  QString path = QStringLiteral("/api/holo-cache?async=1&provider=%1").arg(encoded(provider));
   if (!requestedTask.isEmpty()) {
     path += QStringLiteral("&task=%1&limit=%2").arg(encoded(requestedTask)).arg(_cacheLimit->value());
   }
@@ -4581,7 +4604,7 @@ void MainWindow::loadAccelerator() {
       path += QStringLiteral("&budget_gb=%1").arg(_cacheBudget->value());
     path += QStringLiteral("&min_free_gb=%1").arg(_cacheReserve->value());
   }
-  const bool live = _cachePoll.isActive()
+  const bool live = !_cacheCatalogPending && _cachePoll.isActive()
       && _cacheCatalogSnapshot.value(QStringLiteral("provider")).toString() == provider
       && (requestedTask.isEmpty()
           || _cacheCatalogSnapshot.value(QStringLiteral("task")).toString() == requestedTask);
@@ -4604,6 +4627,14 @@ void MainWindow::loadAccelerator() {
     if (_cacheProvider && _cacheProvider->currentData().toString() != provider) return;
     if (!requestedTask.isEmpty() && _cacheTask->currentText() != requestedTask) return;
     const auto root = doc.object();
+    if (root.value(QStringLiteral("loading")).toBool()) {
+      _cacheCatalogPending = true;
+      _cacheState->setText(root.value(QStringLiteral("message")).toString());
+      _cacheStart->setEnabled(false);
+      if (_pages->currentIndex() == 4) _cachePoll.start();
+      return;
+    }
+    _cacheCatalogPending = false;
     if (_cacheTask->count() == 0) {
       const QString preferred = root.value(QStringLiteral("default_task")).toString();
       _cacheTask->blockSignals(true);

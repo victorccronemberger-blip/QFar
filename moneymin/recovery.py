@@ -34,7 +34,7 @@ def _groups(directory=None) -> list[list[dict]]:
     return [rows for rows in groups.values() if not all(row.get("campaign_reconciled") is True for row in rows)]
 
 
-def _describe(rows: list[dict], legacy_contexts: dict | None = None) -> dict | None:
+def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_checker=None) -> dict | None:
     first = rows[0]
     sid, email = first["session_id"], first["account_email"]
     context = first.get("campaign_context") or (legacy_contexts.get((sid, email))
@@ -44,7 +44,7 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None) -> dict | N
                   and (not context.get("task_id") or context["task_id"] == first.get("task_id"))
                   and all(row.get("campaign_context") == first.get("campaign_context")
                           and row.get("task_id") == first.get("task_id") for row in rows))
-    if sent_registry.recovery_was_reset(sid, context.get("registry_key", "") if identified else "",
+    if (reset_checker or sent_registry.recovery_was_reset)(sid, context.get("registry_key", "") if identified else "",
                                          context.get("history_name", "") if identified else ""):
         return None
     expected = first.get("expected_chunk_count", 1)
@@ -83,7 +83,8 @@ def snapshot() -> dict:
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
                if not rows[0].get("campaign_context")}
     contexts = campaign._legacy_upload_contexts(missing, [row for rows in groups for row in rows]) if missing else {}
-    items = [item for rows in groups if (item := _describe(rows, contexts)) is not None]
+    reset_checker = sent_registry.recovery_reset_checker()
+    items = [item for rows in groups if (item := _describe(rows, contexts, reset_checker)) is not None]
     return {"items": items, "pending": sum(item["status"] in {"pending", "needs_review"} for item in items),
             "confirmed": sum(item["status"] == "confirmed" for item in items)}
 

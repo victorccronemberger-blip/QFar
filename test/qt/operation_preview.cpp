@@ -19,9 +19,99 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTableWidget>
+#include <QSpinBox>
 
 class OperationPreview {
 public:
+  static void liveCatalogSmoke(MainWindow& window) {
+    const auto email = qEnvironmentVariable("QMONEY_TEST_ACCOUNT");
+    const auto base = qEnvironmentVariable("QMONEY_TEST_API");
+    if (email.isEmpty() || base.isEmpty()) { qApp->exit(70); return; }
+    window._api.setBaseUrl(base);
+    window._pages->setCurrentIndex(3);
+    {
+      const QSignalBlocker blocker(window._campaignAccounts);
+      window._campaignAccounts->clear();
+      auto* account = new QListWidgetItem(QStringLiteral("Conta de validação"), window._campaignAccounts);
+      account->setData(Qt::UserRole, email);
+      account->setCheckState(Qt::Checked);
+    }
+    window._dataset->setCurrentIndex(window._dataset->findData(QStringLiteral("ego4d")));
+    window._minDuration->setValue(5);
+    window._maxDuration->setValue(30);
+    auto* poll = new QTimer(&window);
+    QObject::connect(poll, &QTimer::timeout, &window, [&window] {
+      if (window._taskRequestPending || window._taskReload.isActive()) return;
+      if (window._taskRecords.isEmpty()) { qApp->exit(71); return; }
+      int available = 0;
+      for (const auto value : window._taskRecords)
+        if (value.toObject().value("available_for_duration").toBool()) ++available;
+      if (!available || !window._campaignStart->isEnabled()) { qApp->exit(72); return; }
+      if (QApplication::activeModalWidget()) { qApp->exit(73); return; }
+      qApp->exit(0);
+    });
+    poll->start(250);
+    window.loadTasks();
+    QTimer::singleShot(900000, &window, [] { qApp->exit(74); });
+  }
+  static void catalogLoadingSmoke(MainWindow& window) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(60); return; }
+    auto requests = std::make_shared<int>(0);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, requests] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, requests] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        if (!input.contains("async=1")) { qApp->exit(61); return; }
+        const int number = ++*requests;
+        const bool changed = input.contains("min_dur_s=600");
+        const bool loading = number < 3;
+        const auto body = QJsonDocument(changed ? QJsonObject{{"error", "fixture category failure"}}
+            : loading ? QJsonObject{{"loading", true}, {"state", "running"}, {"message", "Indexando catálogo realista"}, {"elapsed_s", 90}}
+            : QJsonObject{{"tasks", QJsonArray{QJsonObject{{"id", "garden"}, {"name", "Gardening"}, {"clip_count", 3}, {"available_for_duration", true}}}}}).toJson(QJsonDocument::Compact);
+        QTimer::singleShot(100, socket, [socket, body, loading, changed] {
+          socket->write("HTTP/1.1 " + QByteArray(changed ? "400 Error" : loading ? "202 Accepted" : "200 OK")
+              + "\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size())
+              + "\r\nConnection: close\r\n\r\n" + body);
+          socket->disconnectFromHost();
+        });
+      });
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._pages->setCurrentIndex(3);
+    {
+      const QSignalBlocker block(window._campaignAccounts);
+      window._campaignAccounts->clear();
+      auto* item = new QListWidgetItem("fixture@example.com", window._campaignAccounts);
+      item->setData(Qt::UserRole, "fixture@example.com");
+      item->setCheckState(Qt::Checked);
+    }
+    window._minDuration->setValue(5);
+    auto phase = std::make_shared<int>(0);
+    auto sawLoading = std::make_shared<bool>(false);
+    auto* check = new QTimer(&window);
+    QObject::connect(check, &QTimer::timeout, &window, [&window, requests, phase, sawLoading] {
+      const auto* item = window._campaignTasks->item(0);
+      if (item && item->text().contains(QStringLiteral("90 s"))) {
+        *sawLoading = true;
+        if (window._campaignStart->isEnabled()) { qApp->exit(62); return; }
+      }
+      if (*phase == 0 && item && item->data(Qt::UserRole).toString() == "garden") {
+        if (!*sawLoading || !window._campaignStart->isEnabled() || *requests > 4) { qApp->exit(63); return; }
+        *phase = 1;
+        window._minDuration->setValue(10);
+        window.loadTasks();
+      } else if (*phase == 1 && item && item->text().contains("fixture category failure")) {
+        qApp->exit(!window._campaignStart->isEnabled() && !QApplication::activeModalWidget() ? 0 : 64);
+      }
+    });
+    check->start(25);
+    for (int i = 0; i < 20; ++i) window.loadTasks();
+    QTimer::singleShot(10000, &window, [] { qApp->exit(65); });
+  }
   static void balancePollingSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(50); return; }
@@ -251,7 +341,7 @@ public:
         else if (request.startsWith("GET /api/balances ")) response = {{"accounts",QJsonArray{}},{"balances",QJsonObject{}}};
         else if (request.startsWith("POST /api/campaigns/pause ")) { *paused=true; response={{"ok",true}}; }
         else if (request.startsWith("POST /api/campaigns/resume ")) { *paused=false; response={{"ok",true}}; }
-        else if (request.startsWith("GET /api/recovery ")) response = {
+        else if (request.startsWith("GET /api/recovery?async=1 ")) response = {
           {"pending",0},{"confirmed",1},{"items",QJsonArray{QJsonObject{{"email","fixture@example.com"},
               {"session_id","fixture-session"},{"clip_uid","fixture-clip"},{"status","confirmed"}}}}};
         else if (request.startsWith("POST /api/recovery/reconcile ")) {
@@ -389,6 +479,14 @@ int main(int argc, char** argv) {
     return app.exec();
   }
   window.show();
+  if (app.arguments().contains("--live-catalog-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::liveCatalogSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--catalog-loading-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::catalogLoadingSmoke(window); });
+    return app.exec();
+  }
   if (app.arguments().contains("--balance-polling-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::balancePollingSmoke(window); });
     return app.exec();

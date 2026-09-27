@@ -3304,7 +3304,8 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                     include_unavailable: bool = False,
                     dataset_provider: str = "all",
                     content_mode: str = "both",
-                    session: Session | None = None) -> list[dict[str, Any]]:
+                    session: Session | None = None,
+                    remote_tasks: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Devolve as tasks do Minute que têm mídia elegível com IMU real.
 
     Cada item traz clip_count e dur_range_s já calculados para a faixa pedida.
@@ -3313,13 +3314,16 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
     `session` reusa a Session já autenticada (o GET /api/tasks não pode
     refreshar o Firebase duas vezes na mesma conta).
     """
-    sess = session
-    if sess is None:
-        sess = Session.from_email(email)
-        sess.ensure_auth(org_key=org_key)
-    elif not getattr(sess, "_live", False):
-        sess.ensure_auth(org_key=org_key)
-    tasks = sess.all_tasks(org_key)
+    if remote_tasks is None:
+        sess = session
+        if sess is None:
+            sess = Session.from_email(email)
+            sess.ensure_auth(org_key=org_key)
+        elif not getattr(sess, "_live", False):
+            sess.ensure_auth(org_key=org_key)
+        tasks = sess.all_tasks(org_key)
+    else:
+        tasks = remote_tasks
     mode = normalize_content_mode(content_mode)
     ready_by_uid: dict[str, bool] = {}
 

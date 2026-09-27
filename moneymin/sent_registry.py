@@ -135,6 +135,22 @@ def recovery_was_reset(session_id: str, scenario: str, history_name: str = "") -
                     or history_name in resets.get("scenarios", {}).get(scenario, [])))
 
 
+def recovery_reset_checker():
+    """One validated reset snapshot for a read-only recovery listing."""
+    with _LOCK:
+        resets = _reset_history()
+        lists = [resets.get("completed_sessions", []), resets.get("all", []),
+                 *resets.get("scenarios", {}).values()]
+        if any(not isinstance(value, str) for values in lists for value in values):
+            raise ValueError("Histórico de reset inválido; restaure o arquivo antes de continuar.")
+        sessions = set(resets.get("completed_sessions", []))
+        histories = set(resets.get("all", []))
+        scenarios = {name: set(values) for name, values in resets.get("scenarios", {}).items()}
+    return lambda sid, scenario, history: (
+        sid in sessions or bool(history) and (
+            history in histories or history in scenarios.get(scenario, set())))
+
+
 def mark_sent_many(deliveries: list[tuple[str, str, str]]) -> None:
     """Persist a validated reconciliation batch before acknowledging journals."""
     if not deliveries:

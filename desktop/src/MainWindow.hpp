@@ -308,6 +308,8 @@ private:
   QPlainTextEdit* _campaignFeed{};
   QJsonArray _taskRecords;
   int _taskLoadGeneration{};
+  bool _taskRequestPending{};
+  bool _cacheCatalogPending{};
   int _lastCampaignSeq{};
   QString _previewLogName;
   bool _previewCheckActive{};

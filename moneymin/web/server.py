@@ -89,6 +89,7 @@ from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import SecureStoreError, load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
+from .catalog_loader import CatalogLoader
 from .org_migration import OrgMigrationRunner
 from .banned_monitor import BannedMonitor
 from .runner import (
@@ -906,16 +907,25 @@ def _tree_size(path: Path) -> tuple[int, int]:
     total = files = 0
     if not path.exists():
         return total, files
-    try:
-        for root, _, names in os.walk(path, followlinks=False):
-            for name in names:
-                try:
-                    total += (Path(root) / name).stat().st_size
-                    files += 1
-                except OSError:
-                    continue
-    except OSError:
-        pass
+    pending = [path]
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            # DirEntry reuses Windows enumeration metadata;
+                            # Path.stat issues another filesystem query per file.
+                            total += entry.stat(follow_symlinks=False).st_size
+                            files += 1
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return total, files
 
 
@@ -1847,6 +1857,9 @@ def create_app() -> Flask:
     # No QMoney o Flask e apenas o servico local consumido pela interface Qt.
     # Nenhum frontend web e publicado ou usado como fallback.
     app = Flask(__name__, static_folder=None)
+    task_catalog = CatalogLoader()
+    accelerator_catalog = CatalogLoader()
+    recovery_catalog = CatalogLoader(ttl_s=2)
 
     @app.before_request
     def authenticate_local_client():
@@ -1891,7 +1904,8 @@ def create_app() -> Flask:
             g.integration_operation_locked = True
         account_write = request.path.startswith("/api/accounts") and request.method != "GET"
         campaign_start = request.path in ("/api/campaigns", "/api/campaigns/preflight") and request.method == "POST"
-        if account_write or campaign_start or request.path == "/api/tasks":
+        synchronous_tasks = request.path == "/api/tasks" and request.args.get("async") != "1"
+        if account_write or campaign_start or synchronous_tasks:
             _ACCOUNT_OPERATION_LOCK.acquire()
             g.account_operation_locked = True
             with _BULK_REGISTER_LOCK:
@@ -2473,6 +2487,33 @@ def create_app() -> Flask:
             min_dur_s, max_dur_s = _parse_duration_range(request.args)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        if request.args.get("async") == "1":
+            def load(progress):
+                try:
+                    progress("Conferindo acesso e categorias da conta…")
+                    with _ACCOUNT_OPERATION_LOCK:
+                        if ORG_MIGRATION.running or _BULK_REGISTER_STATE.get("state") == "running":
+                            return {"error": "Aguarde a operação de contas em andamento."}, 409
+                        sess = Session.from_email(email)
+                        org_key = _resolve_org(email, session=sess)
+                        remote_tasks = sess.all_tasks(org_key)
+                    # Local indexing does not hold account authentication or
+                    # mutation locks. Polling requests never wait on this work.
+                    progress("Preparando catálogo para a duração e o conteúdo selecionados…")
+                    tasks = campaign.available_tasks(
+                        email, org_key, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                        include_unavailable=True, dataset_provider=dataset_provider,
+                        content_mode=content_mode, remote_tasks=remote_tasks)
+                    return {"email": email, "org_key": org_key, "tasks": tasks,
+                            "dataset": dataset_provider, "content_mode": content_mode,
+                            "scenarios_pt": campaign.SCENARIO_PT}, 200
+                except Exception as exc:
+                    issue = account_issue(email, exc, stage="Carregamento de categorias")
+                    return {"error": issue["reason"] + " " + issue["action"], "issue": issue}, 400
+
+            result, status = task_catalog.get(
+                (email, dataset_provider, content_mode, min_dur_s, max_dur_s), load)
+            return jsonify(result), status
         try:
             # Uma Session só: _resolve_org + catálogo. Dois refresh seguidos
             # no Firebase invalidam o refreshToken e o GET vira 400.
@@ -2911,37 +2952,45 @@ def create_app() -> Flask:
                 "runner": HOLO_CACHE_RUNNER.snapshot(),
                 "last_run": load_json(module.state_path(), {}),
             })
-        try:
-            if provider == "ego4d":
-                cache = module.cache_status(task, limit=limit, budget_gb=budget_gb,
-                                            min_free_gb=min_free_gb)
-            else:
-                cache = module.cache_status(task, limit=limit)
-        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-            cache = {
+        def read_cache(progress):
+            progress("Conferindo conteúdo e arquivos preparados…")
+            try:
+                if provider == "ego4d":
+                    cache = module.cache_status(task, limit=limit, budget_gb=budget_gb,
+                                                min_free_gb=min_free_gb)
+                else:
+                    cache = module.cache_status(task, limit=limit)
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                cache = {
+                    "provider": provider,
+                    "task": task,
+                    "total": 0,
+                    "ready": 0,
+                    "partial": 0,
+                    "pending": 0,
+                    "last_run": {},
+                    "catalog_error": str(exc),
+                }
+                if budget_gb is not None:
+                    try:
+                        cache.update(ego_accelerator.storage_limits(
+                            budget_gb, min_free_gb=min_free_gb))
+                    except OSError:
+                        cache.update({"budget_gb": 0, "max_budget_gb": 0})
+            return {
                 "provider": provider,
-                "task": task,
-                "total": 0,
-                "ready": 0,
-                "partial": 0,
-                "pending": 0,
-                "last_run": {},
-                "catalog_error": str(exc),
-            }
-            if budget_gb is not None:
-                try:
-                    cache.update(ego_accelerator.storage_limits(
-                        budget_gb, min_free_gb=min_free_gb))
-                except OSError:
-                    cache.update({"budget_gb": 0, "max_budget_gb": 0})
-        return jsonify({
-            "provider": provider,
-            "default_task": module.DEFAULT_TASK,
-            "configured_budget_gb": ego_accelerator.configured_budget_gb() if provider == "ego4d" else None,
-            "cache": cache,
-            "runner": HOLO_CACHE_RUNNER.snapshot(),
-            "tasks": tasks,
-        })
+                "default_task": module.DEFAULT_TASK,
+                "configured_budget_gb": ego_accelerator.configured_budget_gb() if provider == "ego4d" else None,
+                "cache": cache,
+                "runner": HOLO_CACHE_RUNNER.snapshot(),
+                "tasks": tasks,
+            }, 200
+        if request.args.get("async") == "1":
+            result, status = accelerator_catalog.get(
+                (provider, task, limit, budget_gb, min_free_gb), read_cache)
+        else:
+            result, status = read_cache(lambda message: None)
+        return jsonify(result), status
 
     @app.post("/api/holo-cache/start")
     def holo_cache_start():
@@ -3632,6 +3681,16 @@ def create_app() -> Flask:
     @app.get("/api/recovery")
     def recovery_snapshot():
         from .. import recovery
+        if request.args.get("async") == "1":
+            worker = RECOVERY.snapshot()
+            def read(progress):
+                progress("Lendo os registros de recuperação desta instalação…")
+                try:
+                    return recovery.snapshot(), 200
+                except (ValueError, OSError):
+                    return {"error": "Não foi possível ler todos os registros de recuperação. Preserve os dados e revise a instalação."}, 409
+            result, status = recovery_catalog.get((worker.get("state"), worker.get("email")), read)
+            return jsonify({**result, "wise_cleanup": _wise_cleanup_snapshot(), "worker": worker}), status
         try:
             return jsonify({**recovery.snapshot(), "wise_cleanup": _wise_cleanup_snapshot(), "worker": RECOVERY.snapshot()})
         except (ValueError, OSError):
