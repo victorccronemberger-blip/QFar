@@ -1161,6 +1161,104 @@ def list_task_spans(
     return out
 
 
+def _narration_evidence_for_video(
+    video: dict[str, Any],
+    events: tuple[tuple[float, str], ...] | list[tuple[float, str]],
+    rules: list[tuple[str, Any]],
+    *,
+    min_dur_s: float,
+    max_dur_s: float,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Amplia com trechos narrados, sem estender a prova para o vídeo inteiro."""
+    from . import task_matching
+
+    if (not math.isfinite(min_dur_s) or not math.isfinite(max_dur_s)
+            or min_dur_s <= 0 or max_dur_s < min_dur_s):
+        raise ValueError("Intervalo de duração inválido")
+    scenarios = scenario_values(video)
+    rules = [(name, rule) for name, rule in rules
+             if task_matching.score_scenarios(rule, scenarios) is not None]
+    if not rules:
+        return []
+    prepared = task_matching.prepare_span_events(events)
+    if not prepared:
+        return []
+    # Classificar também as tarefas de outros cenários permite detectar uma
+    # mudança de atividade mesmo quando o cenário do vídeo é muito genérico.
+    search_text = task_matching.span_search_text(events)
+    all_rules = [(name, rule) for name, rule in task_matching.TASK_RULES.items()
+                 if task_matching.span_evidence_possible(rule, search_text)]
+    labels = task_matching.label_span_events(prepared, all_rules)
+    times = tuple(row[0] for row in prepared)
+    duration = float(video.get("duration_sec") or 0)
+    intervals = imu_coverage_intervals(video)
+    if not intervals and math.isfinite(duration) and duration > 0:
+        intervals = [(0.0, duration)]
+    found: list[tuple[str, dict[str, Any]]] = []
+    for name, rule in rules:
+        scenario_score = task_matching.score_scenarios(rule, scenarios)
+        if scenario_score is None:
+            continue
+        minimum = max(min_dur_s, rule.min_span_s or 0)
+        if minimum > max_dur_s:
+            continue
+        rivals = task_matching.competing_span_names(name, all_rules)
+        for start, end in intervals:
+            first, last = bisect_left(times, start), bisect_right(times, end)
+            # Sem padding: nenhuma parte sem evidência é anexada às pontas.
+            for span in task_matching.extract_spans(
+                    rule, (), min_s=minimum, max_s=max_dur_s, pad_s=0,
+                    video_duration_s=min(end, duration) if duration > 0 else end,
+                    prepared_events=prepared[first:last], task_name=name,
+                    event_task_names=labels[first:last],
+                    competing_task_names=rivals):
+                if not imu_window_is_covered(video, (span["start"], span["end"])):
+                    continue
+                record = _span_record(video, span)
+                record["match_score"] += scenario_score
+                record["match_confidence"] = rule.confidence
+                found.append((name, record))
+    return found
+
+
+def narration_evidence_clips(
+    *,
+    min_dur_s: float = WINDOW_MIN_S,
+    max_dur_s: float = WINDOW_TARGET_S,
+) -> dict[str, list[dict[str, Any]]]:
+    """Trechos com evidência temporal da ação e cobertura declarada de IMU.
+
+    A cobertura real dos sensores continua sendo validada na preparação.
+    """
+    from . import task_matching
+
+    buckets: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in task_matching.TASK_RULES}
+    narrations = load_timed_narrations()
+    if not narrations:
+        return buckets
+    rules = list(task_matching.TASK_RULES.items())
+    for video in _cat().videos.values():
+        if video.get("has_imu") is not True or not video.get("s3_path"):
+            continue
+        uid = str(video.get("video_uid") or "")
+        if uid in KNOWN_INCOMPLETE_IMU_VIDEO_UIDS:
+            continue
+        events = narrations.get(uid)
+        if not events:
+            continue
+        for name, record in _narration_evidence_for_video(
+                video, events, rules, min_dur_s=min_dur_s, max_dur_s=max_dur_s):
+            buckets[name].append(record)
+    for items in buckets.values():
+        items.sort(key=lambda row: (
+            -(row.get("match_score") or 0),
+            -(row.get("dur_s") or 0),
+            str(row.get("clip_uid") or ""),
+        ))
+    return buckets
+
+
 def rank_all_task_spans(
     *,
     min_dur_s: float = WINDOW_MIN_S,

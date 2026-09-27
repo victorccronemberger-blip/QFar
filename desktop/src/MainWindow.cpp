@@ -4070,7 +4070,7 @@ void MainWindow::loadTasks() {
                              .arg(task.value(QStringLiteral("parent_video_count")).toInt())
                              .arg(cacheOnly
                                   ? QStringLiteral("Todos já estão preparados neste computador.")
-                                  : QStringLiteral("A seleção pode incluir conteúdo ainda não baixado.")));
+                                  : QStringLiteral("Inclui cortes narrados e clipes oficiais compatíveis com a tarefa. Os sensores são verificados antes do envio.")));
       }
       if (!available) {
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);

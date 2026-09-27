@@ -3223,6 +3223,10 @@ def create_app() -> Flask:
                     accounts=survivors, tasks=review_tasks, dataset_provider=provider,
                     content_mode=content_mode, recovery_exclusions=recovery_exclusions))
                 clip_count = len(clip_review)
+                refined_count = sum(bool(row.get("imu_refined_from")) for row in clip_review)
+                if refined_count:
+                    warnings.append(f"{refined_count} trecho(s) recortado(s) para evitar lacunas nos sensores. "
+                                    "A prévia já usa essas durações; partes de vídeos já recebidos continuam excluídas.")
                 if target_hours > 0:
                     available_seconds = {a.email: 0.0 for a in survivors}
                     for row in clip_review:

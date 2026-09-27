@@ -1383,6 +1383,9 @@ def rank_all_tasks(clips: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, 
         action = str(clip.get("action_text") or clip.get("narration") or "")
         units = clip.get("action_units")
         for name, rule in named_rules:
+            if (rule.min_span_s is not None
+                    and float(clip.get("dur_s") or 0) < rule.min_span_s):
+                continue
             scenario_score = score_scenarios(rule, scenarios)
             if scenario_score is None:
                 continue

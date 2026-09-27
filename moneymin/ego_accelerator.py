@@ -178,11 +178,10 @@ def estimate_clip_bytes(clip: dict[str, Any]) -> int:
 def assign_scenario_clips(
     clips: Iterable[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
-    """Uma tarefa por clipe: melhor cenário, empate fica na regra mais específica já listada.
+    """Cada tarefa cujo cenário combina recebe o clipe.
 
-    Higiene de ban continua obrigatória. Sem evidência da ação o clipe não
-    entra no recorte estrito; ele só completa o cache e a campanha só o usa
-    depois de gravado.
+    Higiene de ban continua obrigatória. A evidência da ação segue no recorte
+    estrito, na frente. Estes clipes ampliam o catálogo Ego4D da mesma tarefa.
     """
     buckets: dict[str, list[dict[str, Any]]] = {name: [] for name in task_matching.TASK_RULES}
     rules = list(task_matching.TASK_RULES.items())
@@ -190,21 +189,15 @@ def assign_scenario_clips(
         if task_matching.hygiene_reject_reason(clip):
             continue
         scenarios = clip.get("scenarios") or [clip.get("scenario", "")]
-        best_name = ""
-        best_score = -1
         for name, rule in rules:
             score = task_matching.score_scenarios(rule, scenarios)
-            if score is None or score <= best_score:
+            if score is None:
                 continue
-            best_name = name
-            best_score = score
-        if not best_name:
-            continue
-        item = dict(clip)
-        item["source"] = "ego4d"
-        item["match_score"] = best_score
-        item["match_tier"] = "scenario"
-        buckets[best_name].append(item)
+            item = dict(clip)
+            item["source"] = "ego4d"
+            item["match_score"] = score
+            item["match_tier"] = "scenario"
+            buckets[name].append(item)
     return buckets
 
 
@@ -227,22 +220,29 @@ def ready_scenario_clips(
     max_dur_s: float = 1800,
     work_dir: Path | None = None,
     allow_disabled: bool = False,
+    require_cached: bool = True,
 ) -> list[dict[str, Any]]:
-    """Clipes de cenário já normalizados. Sem orçamento gravado, a lista é vazia."""
-    if not allow_disabled and configured_budget_gb() < 1:
-        return []
-    from .campaign import ego_clip_cache_state
+    """Clipes cujo cenário cabe na tarefa e que passaram na higiene.
 
+    Com `require_cached`, só devolve o que já está normalizado. Sem isso, o
+    catálogo inteiro desse cenário entra na campanha e o download fica para
+    o preparo. Sem orçamento e sem `allow_disabled`, o modo cache continua vazio.
+    """
+    if require_cached and not allow_disabled and configured_budget_gb() < 1:
+        return []
     canonical = task_matching.canonical_task_name(task)
     work = Path(work_dir or data_dir())
-    ready: list[dict[str, Any]] = []
+    selected: list[dict[str, Any]] = []
     for clip in scenario_buckets().get(canonical, []):
         dur = float(clip.get("dur_s") or 0)
         if not min_dur_s <= dur <= max_dur_s:
             continue
-        if ego_clip_cache_state(clip, work) == "ready":
-            ready.append(clip)
-    return ready
+        if require_cached:
+            from .campaign import ego_clip_cache_state
+            if ego_clip_cache_state(clip, work) != "ready":
+                continue
+        selected.append(clip)
+    return selected
 
 
 def task_names() -> list[str]:
@@ -316,10 +316,6 @@ def allocation_plan(
         except ValueError:
             continue
         for clip in batch:
-            add(name, clip)
-    buckets = scenario_buckets()
-    for name in names:
-        for clip in buckets.get(name, []):
             add(name, clip)
 
     ordered: list[dict[str, Any]] = []

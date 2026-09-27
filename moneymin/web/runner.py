@@ -122,9 +122,9 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         }
     if kind == "task_exhausted":
         return {
-            "level": "warning", "stage": "Conteúdo", "title": "Conteúdo elegível já utilizado",
-            "detail": (f"{payload.get('task_name') or 'Categoria'}: todos os trechos elegíveis "
-                       "já foram usados pelas contas selecionadas. O histórico foi preservado; "
+            "level": "warning", "stage": "Conteúdo", "title": "Sem novos trechos disponíveis",
+            "detail": (f"{payload.get('task_name') or 'Categoria'}: não restam trechos novos disponíveis "
+                       "após verificar histórico, pendências e sensores. O histórico foi preservado; "
                        "escolha outra categoria ou reveja a faixa de duração."),
         }
     if kind in {"task_shortfall", "goal_shortfall"}:

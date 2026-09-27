@@ -22,6 +22,7 @@ import datetime
 import gzip
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -1929,11 +1930,6 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
             shorts = list(_compatible_task_clips(
                 tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
                 max_dur_s=tsk.max_dur_s))
-            if content_mode != "dataset":
-                shorts = _with_cached_expansion(
-                    shorts, tsk.task_name, min_dur_s=tsk.min_dur_s,
-                    max_dur_s=tsk.max_dur_s, work_dir=work_dir,
-                    include_disabled=True)
         else:
             shorts = ego4d.list_clips(
                 scenario=tsk.scenario,
@@ -1953,7 +1949,20 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
         shorts = [*strict_holoassist, *shorts]
     if content_mode == "cache":
         shorts = [clip for clip in shorts if _clip_is_cached(clip, work_dir)]
+    else:
+        from .imu_coverage import refine_candidates
+        shorts = refine_candidates(shorts, work_dir, tsk.min_dur_s, tsk.max_dur_s)
     return shorts
+
+
+def _candidate_sent_emails(registry_key: str, clip: dict) -> set[str]:
+    return set().union(*(sent_registry.sent_emails(registry_key, uid)
+                         for uid in [clip["clip_uid"], *clip.get("dedup_clip_uids", [])]))
+
+
+def _candidate_reserved_emails(config: CampaignConfig, clip: dict) -> set[str]:
+    return set().union(*(set(config.recovery_exclusions.get(uid, []))
+                         for uid in [clip["clip_uid"], *clip.get("dedup_clip_uids", [])]))
 
 
 def _run_campaign(
@@ -2040,6 +2049,7 @@ def _run_campaign(
     work_dir.mkdir(parents=True, exist_ok=True)
     sessions: dict[str, Session] = {}
     banned: set[str] = set()
+    rejected_imu: set[str] = set()
     account_seconds: dict[str, float] = {}
     quota_s = max(0.0, float(config.target_hours_per_account or 0) * 3600.0)
     n_tasks = max(1, len(config.tasks))
@@ -2086,12 +2096,6 @@ def _run_campaign(
                     compatible_ego = list(_compatible_task_clips(
                         tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
                         max_dur_s=tsk.max_dur_s))
-                    if content_mode != "dataset":
-                        compatible_ego = _with_cached_expansion(
-                            compatible_ego, tsk.task_name,
-                            min_dur_s=tsk.min_dur_s,
-                            max_dur_s=tsk.max_dur_s, work_dir=work_dir,
-                            include_disabled=True)
                     ego_compatible = {
                         candidate["clip_uid"]: candidate
                         for candidate in compatible_ego
@@ -2155,19 +2159,21 @@ def _run_campaign(
                 fresh = []
                 used_parents = set()
                 for candidate in all_clips:
-                    reserved_for = set(config.recovery_exclusions.get(candidate["clip_uid"], []))
-                    unavailable = sent_registry.sent_emails(registry_key, candidate["clip_uid"]) | reserved_for if reserved_for else set()
-                    if sent_registry.is_sent_to_all(registry_key, candidate["clip_uid"], emails) or (reserved_for and all(email in unavailable for email in emails)):
+                    if candidate["clip_uid"] in rejected_imu:
+                        continue
+                    reserved_for = _candidate_reserved_emails(config, candidate)
+                    unavailable = _candidate_sent_emails(registry_key, candidate) | reserved_for
+                    if sent_registry.is_sent_to_all(registry_key, candidate["clip_uid"], emails) or all(email in unavailable for email in emails):
                         used_parents.add(parent_key(candidate))
                     else:
                         fresh.append(candidate)
                 skipped_n = len(all_clips) - len(fresh)
                 if skipped_n:
-                    _log(f"  (pulando {skipped_n} clipe(s) já enviado(s) anteriormente)")
+                    _log(f"  (pulando {skipped_n} clipe(s) já enviados, reservados ou reprovados nos sensores)")
                 if not fresh and all_clips:
                     _log(f"  [i] catálogo elegível esgotado para '{display_name}'; histórico preservado")
                     _emit("task_exhausted", scenario=tsk.scenario, task_name=display_name,
-                          eligible=len(all_clips))
+                          eligible=len(all_clips), rejected_imu=sum(c["clip_uid"] in rejected_imu for c in all_clips))
                     continue
                 hours = sum(float(c.get("dur_s") or 0) for c in fresh) / 3600
                 merged_n = sum(1 for c in fresh if c.get("needs_cut"))
@@ -2208,6 +2214,8 @@ def _run_campaign(
         task_sends: dict[str, int] = {}
         task_seconds: dict[str, float] = {}
         for clip_info in clips:
+            if clip_info["clip_uid"] in rejected_imu:
+                continue
             if len(banned) == len(config.accounts):
                 break
             if quota_s and all(
@@ -2224,8 +2232,8 @@ def _run_campaign(
             # anti-desperdício: se TODAS as contas da campanha já receberam este
             # clipe (seleção explícita do wizard ou corrida entre campanhas),
             # pula ANTES do intervalo e de baixar/reencodar.
-            sent_to = sent_registry.sent_emails(registry_key, clip_info["clip_uid"])
-            reserved = set(config.recovery_exclusions.get(clip_info["clip_uid"], []))
+            sent_to = _candidate_sent_emails(registry_key, clip_info)
+            reserved = _candidate_reserved_emails(config, clip_info)
             if all(a.email in sent_to | reserved for a in config.accounts):
                 _log(f"  clipe {clip_info['clip_uid'][:12]} já enviado ou reservado por pendência "
                      f"em todas as contas — pulando (sem baixar/reencodar)")
@@ -2306,6 +2314,10 @@ def _run_campaign(
                         f"vídeo preparado excede a duração máxima de {tsk.max_dur_s:g}s"
                     )
             except Exception as exc:  # noqa: BLE001 — pula o clipe, segue a campanha
+                if any(reason in str(exc).lower() for reason in (
+                        "cobertura imu insuficiente", "sem amostras válidas de imu",
+                        "sem cobertura contínua de imu", "sem imu real")):
+                    rejected_imu.add(clip_info["clip_uid"])
                 error = f"{type(exc).__name__}: {exc}"
                 _log(f"    [!] prepare falhou: {error}")
                 _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
@@ -2402,8 +2414,7 @@ def _run_campaign(
                           email=account.email, ok=False, skipped=True, reason="pending_recovery")
                     continue
                 # dedup por conta: quem já recebeu este clipe é pulado
-                if account.email in sent_registry.sent_emails(registry_key,
-                                                              clip_info["clip_uid"]):
+                if account.email in _candidate_sent_emails(registry_key, clip_info):
                     _log(f"      -> {account.email} (já recebeu este clipe — pulando)")
                     skip_res = {"email": account.email, "org_key": account.org_key,
                                 "ok": True, "skipped": True, "reason": "already_sent"}
@@ -2975,7 +2986,117 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         stamp.append((relative, path.stat().st_size, digest.hexdigest()))
+    # Versão da união narração + clipe oficial. Invalida caches do recorte antigo.
+    stamp.append(("ranked-union", 4, "continuous-action-evidence"))
     return tuple(stamp)
+
+
+def _clip_window(clip: dict[str, Any]) -> tuple[float, float] | None:
+    window = clip.get("window_s")
+    if not isinstance(window, (list, tuple)) or len(window) != 2:
+        return None
+    try:
+        start, end = float(window[0]), float(window[1])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        return None
+    return start, end
+
+
+def _same_action_already_covered(
+    kept: list[dict[str, Any]], clip: dict[str, Any],
+) -> bool:
+    """O corte oficial não entra de novo quando um trecho narrado já cobre a ação."""
+    parent = str(clip.get("parent_video_uid") or "")
+    window = _clip_window(clip)
+    if not parent or window is None:
+        return False
+    start, end = window
+    span = end - start
+    for other in kept:
+        if str(other.get("parent_video_uid") or "") != parent:
+            continue
+        other_window = _clip_window(other)
+        if other_window is None:
+            continue
+        overlap = min(end, other_window[1]) - max(start, other_window[0])
+        if overlap >= min(span, other_window[1] - other_window[0]) * 0.6:
+            return True
+    return False
+
+
+def _union_ranked_clips(
+    spans: dict[str, list[dict[str, Any]] | tuple[dict[str, Any], ...]],
+    official: dict[str, list[dict[str, Any]] | tuple[dict[str, Any], ...]],
+    *,
+    min_dur_s: float = 60,
+    max_dur_s: float = 1800,
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Junta cortes narrados e clipes oficiais que passam na mesma prova de ação.
+
+    Os dois lados já foram aceitos por `score_action`. O cenário sozinho não
+    entra. O trecho narrado permanece primeiro.
+    """
+    names = set(spans) | set(official)
+    result: dict[str, tuple[dict[str, Any], ...]] = {}
+    for name in names:
+        kept: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        by_parent: dict[str, list[dict[str, Any]]] = {}
+
+        def add(clip: dict[str, Any], *, allow_overlap: bool) -> None:
+            try:
+                duration = float(clip.get("dur_s") or 0)
+            except (TypeError, ValueError):
+                return
+            if not min_dur_s <= duration <= max_dur_s:
+                return
+            uid = str(clip.get("clip_uid") or "")
+            if not uid or uid in seen:
+                return
+            parent = str(clip.get("parent_video_uid") or "")
+            overlapping = [other for other in by_parent.get(parent, ())
+                           if _same_action_already_covered([other], clip)]
+            aliases = set(clip.get("dedup_clip_uids") or ())
+            for other in overlapping:
+                # Alternate catalog IDs must not turn previously sent material
+                # into fresh content when the catalog is expanded.
+                aliases.add(str(other["clip_uid"]))
+                aliases.update(other.get("dedup_clip_uids") or ())
+                other["dedup_clip_uids"] = sorted(
+                    (set(other.get("dedup_clip_uids") or ())
+                     | set(clip.get("dedup_clip_uids") or ()) | {uid})
+                    - {str(other["clip_uid"])})
+            if not allow_overlap and overlapping:
+                return
+            seen.add(uid)
+            item = dict(clip)
+            if aliases:
+                item["dedup_clip_uids"] = sorted(aliases - {uid})
+            kept.append(item)
+            if parent:
+                by_parent.setdefault(parent, []).append(item)
+
+        for clip in spans.get(name, ()):
+            add(clip, allow_overlap=True)
+        def number(value: Any) -> float:
+            try:
+                value = float(value or 0)
+                return value if math.isfinite(value) else 0
+            except (TypeError, ValueError):
+                return 0
+
+        extras = list(official.get(name, ()))
+        extras.sort(key=lambda clip: (
+            -number(clip.get("match_score")),
+            -number(clip.get("dur_s")),
+            str(clip.get("clip_uid") or ""),
+        ))
+        for clip in extras:
+            add(clip, allow_overlap=False)
+        result[name] = tuple(kept)
+    return result
 
 
 def _merge_rank_seed(
@@ -2993,11 +3114,17 @@ def _merge_rank_seed(
     agora é sempre a base mínima; dados locais completos apenas o enriquecem.
     """
     seed = _load_rank_seed() or {}
+    # Keep the portable seed's alternatives available (different duration
+    # requests can need them), while linking their overlapping identities.
+    combined = _union_ranked_clips(
+        {name: [*buckets.get(name, ()), *seed.get(name, ())]
+         for name in buckets.keys() | seed.keys()}, {},
+        min_dur_s=min_dur_s, max_dur_s=max_dur_s)
     result: dict[str, tuple[dict[str, Any], ...]] = {}
-    for name in buckets.keys() | seed.keys():
+    for name, candidates in combined.items():
         merged: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in (*buckets.get(name, ()), *seed.get(name, ())):
+        for item in candidates:
             if (str(item.get("parent_video_uid") or "")
                     in ego4d.KNOWN_INCOMPLETE_IMU_VIDEO_UIDS):
                 continue
@@ -3057,12 +3184,13 @@ def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
     cached = _load_rank_cache()
     if cached is not None:
         return _merge_rank_seed(cached)
-    if ego4d.has_timed_narrations():
-        buckets = ego4d.rank_all_task_spans()
-    else:
-        buckets = task_matching.rank_all_tasks(_task_candidates())
-    result = _merge_rank_seed(
-        {name: tuple(items) for name, items in buckets.items()})
+    spans = ego4d.rank_all_task_spans() if ego4d.has_timed_narrations() else {}
+    official = task_matching.rank_all_tasks(_task_candidates())
+    evidenced = (
+        ego4d.narration_evidence_clips() if ego4d.has_timed_narrations() else {})
+    buckets = _union_ranked_clips(
+        _union_ranked_clips(spans, official), evidenced)
+    result = _merge_rank_seed(buckets)
     _save_rank_cache(result)
     return result
 
@@ -3084,12 +3212,17 @@ def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
     if cached is not None:
         return _merge_rank_seed(
             cached, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
-    buckets = ego4d.rank_all_task_spans(
+    spans = ego4d.rank_all_task_spans(
         min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+    official = task_matching.rank_all_tasks(_task_candidates())
+    evidenced = ego4d.narration_evidence_clips(
+        min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+    buckets = _union_ranked_clips(
+        _union_ranked_clips(
+            spans, official, min_dur_s=min_dur_s, max_dur_s=max_dur_s),
+        evidenced, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
     result = _merge_rank_seed(
-        {name: tuple(items) for name, items in buckets.items()},
-        min_dur_s=min_dur_s,
-        max_dur_s=max_dur_s,
+        buckets, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
     )
     _save_rank_cache(result, path)
     return result
@@ -3132,31 +3265,6 @@ def _compatible_task_clips(
     except FileNotFoundError:
         holo_clips = ()
     return (*holo_clips, *ego_clips)
-
-
-def _with_cached_expansion(
-    clips: list[dict[str, Any]],
-    task_name: str,
-    *,
-    min_dur_s: float,
-    max_dur_s: float,
-    work_dir: Path | None = None,
-    include_disabled: bool = False,
-) -> list[dict[str, Any]]:
-    """Acrescenta cenário já gravado pelo acelerador, sem buscar mídia nova."""
-    from .ego_accelerator import ready_scenario_clips
-
-    merged = list(clips)
-    seen = {str(clip.get("clip_uid") or "") for clip in merged}
-    for extra in ready_scenario_clips(
-            task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-            work_dir=work_dir, allow_disabled=include_disabled):
-        uid = str(extra.get("clip_uid") or "")
-        if not uid or uid in seen:
-            continue
-        seen.add(uid)
-        merged.append(extra)
-    return merged
 
 
 def _clip_is_cached(clip: dict[str, Any], work_dir: Path) -> bool:
@@ -3240,14 +3348,6 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                      if 60 <= c["dur_s"] <= 1800]
         clips = list(_compatible_task_clips(
             name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
-        if (mode != "dataset"
-                and normalize_dataset_provider(dataset_provider) in ("all", "ego4d")):
-            all_clips = _with_cached_expansion(
-                all_clips, name, min_dur_s=60, max_dur_s=1800,
-                include_disabled=True)
-            clips = _with_cached_expansion(
-                clips, name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                include_disabled=True)
         if mode == "cache":
             all_clips = [clip for clip in all_clips if cache_ready(clip)]
             clips = [clip for clip in clips if cache_ready(clip)]

@@ -15,6 +15,14 @@ from moneymin.web.server import _campaign_log_view
 
 
 class CampaignSelectionTests(unittest.TestCase):
+    def test_imu_rejection_is_not_prepared_again_in_later_category_pass(self):
+        self.cfg.target_hours_per_account = .5
+        with patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch.object(campaign, "prepare_clip", side_effect=RuntimeError("cobertura IMU insuficiente")) as prepare:
+            result, _ = self.run_with_runner()
+        self.assertEqual(prepare.call_count, 2)
+        self.assertEqual(len([issue for issue in result.issues if issue["kind"] == "clip_prepare_done"]), 2)
+
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -23,6 +31,7 @@ class CampaignSelectionTests(unittest.TestCase):
         self.stack.enter_context(patch.object(campaign, "_rank_cache_stamp", return_value=()))
         self.stack.enter_context(patch.object(campaign.ego4d, "has_timed_narrations", return_value=True))
         self.stack.enter_context(patch.object(campaign.ego4d, "rank_all_task_spans", return_value={}))
+        self.stack.enter_context(patch.object(campaign.ego4d, "narration_evidence_clips", return_value={}))
         self.stack.enter_context(patch.object(campaign, "_task_candidates", return_value=()))
         self.stack.enter_context(patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]))
         self.stack.enter_context(patch.object(campaign.sent_registry, "is_sent_to_all", return_value=False))
@@ -140,6 +149,42 @@ class CampaignSelectionTests(unittest.TestCase):
         self.assertIn("campaign_stopped", events)
         self.assertNotIn("campaign_done", events)
 
+    def test_official_ranked_clip_expands_the_same_action_proof(self):
+        spans = {"Gardening": [{
+            "clip_uid": "span", "parent_video_uid": "parent-a",
+            "window_s": (0, 100), "dur_s": 100, "match_score": 10,
+        }]}
+        official = {"Gardening": [
+            {"clip_uid": "span", "parent_video_uid": "parent-a",
+             "window_s": (0, 100), "dur_s": 100, "match_score": 10},
+            {"clip_uid": "covered", "parent_video_uid": "parent-a",
+             "window_s": (10, 90), "dur_s": 80, "match_score": 4},
+            {"clip_uid": "new", "parent_video_uid": "parent-b",
+             "window_s": (0, 80), "dur_s": 80, "match_score": 6},
+        ]}
+        merged = campaign._union_ranked_clips(spans, official)
+        self.assertEqual(
+            [clip["clip_uid"] for clip in merged["Gardening"]],
+            ["span", "new"])
+        self.assertIn("covered", merged["Gardening"][0]["dedup_clip_uids"])
+
+    def test_expanded_window_cannot_repeat_shorter_existing_content(self):
+        merged = campaign._union_ranked_clips(
+            {"Gardening": [{"clip_uid": "old", "parent_video_uid": "p",
+                            "window_s": (0, 300), "dur_s": 300}]},
+            {"Gardening": [{"clip_uid": "expanded", "parent_video_uid": "p",
+                            "window_s": (0, 1800), "dur_s": 1800}]})
+        self.assertEqual([c["clip_uid"] for c in merged["Gardening"]], ["old"])
+        self.assertIn("expanded", merged["Gardening"][0]["dedup_clip_uids"])
+
+    def test_catalog_union_tolerates_invalid_numeric_metadata(self):
+        result = campaign._union_ranked_clips({}, {"Gardening": [
+            {"clip_uid": "bad", "dur_s": "invalid", "match_score": "invalid"},
+            {"clip_uid": "valid", "dur_s": "90", "match_score": "10"}]})
+        self.assertEqual([c["clip_uid"] for c in result["Gardening"]], ["valid"])
+        self.assertIsNone(campaign._clip_window({"window_s": 10}))
+        self.assertIsNone(campaign._clip_window({"window_s": (0, float("inf"))}))
+
     def test_default_range_also_preserves_seed(self):
         self.assertEqual(len(campaign._compatible_task_clips("Walk the Dog", "ego4d")), 3)
 
@@ -168,23 +213,20 @@ class CampaignSelectionTests(unittest.TestCase):
                     dataset_provider="ego4d", content_mode=mode)[0]["clip_count"]
                 for mode in ("dataset", "cache", "both")
             }
-        self.assertEqual(counts, {"dataset": 2, "cache": 2, "both": 3})
-        self.assertTrue(all(call.kwargs["allow_disabled"] for call in ready_scenario.call_args_list))
+        self.assertEqual(counts, {"dataset": 2, "cache": 1, "both": 2})
+        ready_scenario.assert_not_called()
 
-    def test_explicit_cached_scenario_clip_is_accepted(self):
-        cached = {"clip_uid": "cached-scenario", "dur_s": 300,
-                  "source": "ego4d", "match_tier": "scenario"}
+    def test_explicit_scenario_only_clip_does_not_bypass_action_proof(self):
         self.cfg.tasks = [TaskSpec("dog", "Walking the dog / pet", 180, 780,
                                    task_name="Walk the Dog", clip_uids=["cached-scenario"])]
         events = []
         with patch.object(campaign, "_compatible_task_clips", return_value=()), \
-             patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[cached]), \
              patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
              patch.object(campaign, "prepare_clip", side_effect=RuntimeError("fixture")):
             campaign.run_campaign(self.cfg, progress=lambda kind, payload: events.append((kind, payload)))
         self.assertEqual(
             [payload["clip_uid"] for kind, payload in events if kind == "clip_prepare_start"],
-            ["cached-scenario"])
+            [])
 
     def test_explicit_holo_clip_does_not_open_ego_catalog(self):
         holo = {"clip_uid": "holoassist:one", "video_name": "one", "dur_s": 300,

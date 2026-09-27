@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from moneymin import campaign, ego_accelerator, holo_accelerator
+from moneymin import campaign, ego4d, ego_accelerator, holo_accelerator, task_matching
 from moneymin.web.runner import HoloCacheRunner
 
 
@@ -311,6 +311,14 @@ class EgoBudgetTests(unittest.TestCase):
             self.assertEqual(result["status"], "budget")
             prepare.assert_not_called()
 
+    def test_catalog_scenario_clips_do_not_require_cache(self):
+        clip = {"clip_uid": "g", "dur_s": 90, "source": "ego4d"}
+        with patch.object(ego_accelerator, "scenario_buckets", return_value={"Gardening": [clip]}), \
+             patch.object(campaign, "ego_clip_cache_state", return_value="pending"):
+            self.assertEqual(
+                ego_accelerator.ready_scenario_clips("Gardening", require_cached=False),
+                [clip])
+
     def test_ready_scenario_clips_stay_empty_without_budget(self):
         with patch.object(ego_accelerator, "configured_budget_gb", return_value=0), \
              patch.object(ego_accelerator, "scenario_buckets", return_value={"Gardening": [{"clip_uid": "g", "dur_s": 90}]}):
@@ -323,6 +331,70 @@ class EgoBudgetTests(unittest.TestCase):
              patch.object(campaign, "ego_clip_cache_state", return_value="ready"):
             self.assertEqual(ego_accelerator.ready_scenario_clips(
                 "Gardening", allow_disabled=True), [clip])
+
+
+class NarrationEvidenceTests(unittest.TestCase):
+    def test_official_catalog_respects_task_minimum_duration(self):
+        from dataclasses import replace
+        rule = replace(task_matching.rule_for("Gardening"), min_span_s=180)
+        clip = {"clip_uid": "short", "dur_s": 90, "scenarios": ["Gardening"],
+                "action_text": "#C C waters the plants", "needs_cut": True}
+        with patch.object(task_matching, "TASK_RULES", {"Gardening": rule}):
+            self.assertEqual(task_matching.rank_all_tasks([clip])["Gardening"], [])
+
+    def test_single_mention_does_not_expand_into_a_long_clip(self):
+        video = {"video_uid": "v", "duration_sec": 1800,
+                 "has_imu": True, "scenarios": ["Gardening"]}
+        found = ego4d._narration_evidence_for_video(
+            video, [(10, "#C C waters the plants")],
+            [("Gardening", task_matching.rule_for("Gardening"))],
+            min_dur_s=60, max_dur_s=1800)
+        self.assertEqual(found, [])
+
+    def test_invalid_duration_limits_are_rejected(self):
+        for minimum, maximum in [(0, 0), (60, 0), (90, 60), (60, float("inf"))]:
+            with self.subTest(minimum=minimum, maximum=maximum):
+                with self.assertRaises(ValueError):
+                    ego4d._narration_evidence_for_video(
+                        {}, [], [], min_dur_s=minimum, max_dur_s=maximum)
+
+    def test_spaced_action_narration_passes_the_same_proof(self):
+        video = {
+            "video_uid": "video",
+            "has_imu": True,
+            "s3_path": "s3://ego4d-test/video.mp4",
+            "scenarios": ["Gardening"],
+            "duration_sec": 400,
+        }
+        events = [(float(t), "#C C waters the plants") for t in range(0, 90, 5)]
+        events += [(float(t), "#C C plays basketball") for t in range(200, 280, 5)]
+
+        def record(_video, span):
+            return {
+                "clip_uid": f"{span['start']:.0f}",
+                "dur_s": span["end"] - span["start"],
+                "parent_video_uid": "video",
+                "window_s": (span["start"], span["end"]),
+                "action_text": span["action_text"],
+                "match_score": span["match_score"],
+            }
+
+        with patch.object(ego4d, "_span_record", side_effect=record):
+            found = ego4d._narration_evidence_for_video(
+                video, events, [("Gardening", task_matching.rule_for("Gardening"))],
+                min_dur_s=60, max_dur_s=1800)
+        self.assertEqual([name for name, _clip in found], ["Gardening"])
+        self.assertGreaterEqual(found[0][1]["dur_s"], 60)
+        self.assertIn("plant", found[0][1]["action_text"])
+        self.assertLessEqual(found[0][1]["window_s"][1], 90)
+        self.assertNotIn("basketball", found[0][1]["action_text"])
+        dirty = events + [(300.0, "#C C looks at the phone")]
+        with patch.object(ego4d, "_span_record", side_effect=record):
+            blocked = ego4d._narration_evidence_for_video(
+                video, dirty, [("Gardening", task_matching.rule_for("Gardening"))],
+                min_dur_s=60, max_dur_s=1800)
+        self.assertEqual(len(blocked), 1)
+        self.assertLessEqual(blocked[0][1]["window_s"][1], 90)
 
 
 class CampaignCacheOrderTests(unittest.TestCase):
