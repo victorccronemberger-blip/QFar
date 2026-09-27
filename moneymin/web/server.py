@@ -1743,10 +1743,18 @@ def _preflight_fingerprint(emails: list[str]) -> str:
     return digest.hexdigest()
 
 
-def _on_balance_result(email: str, summary: dict | None, erro: str | None) -> None:
+def _on_balance_result(email: str, summary: dict | None, erro: str | Exception | None) -> None:
     with _PERSISTENCE_LOCK:
         balances = _load_balances()
-        rec = dict(balances.get(email) or {})
+        previous = balances.get(email)
+        rec = dict(previous) if isinstance(previous, dict) else {}
+        if summary is not None:
+            try:
+                summary = crowtado._summary_from_payload(summary)
+                if not summary:
+                    raise crowtado.CrowtadoError("Saldo incompleto", code="invalid_response")
+            except crowtado.CrowtadoError as exc:
+                summary, erro = None, exc
         rec["checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         if summary is not None:
             rec.update(summary)
@@ -1755,7 +1763,8 @@ def _on_balance_result(email: str, summary: dict | None, erro: str | None) -> No
             rec["issue"] = None
             rec["stale"] = False
         else:
-            issue = account_issue(email, RuntimeError(erro or "Consulta inconclusiva"), stage="Consulta de saldo Crowtado")
+            error = erro if isinstance(erro, Exception) else RuntimeError(erro or "Consulta inconclusiva")
+            issue = account_issue(email, error, stage="Consulta de saldo Crowtado")
             rec["error"] = issue_text(issue)
             rec["issue"] = issue
             rec["stale"] = True
@@ -3930,14 +3939,18 @@ def create_app() -> Flask:
         if _withdraw_bulk_snapshot()["state"] == "running":
             return jsonify({"error": "aguarde o saque em lote terminar"}), 409
         body = request.get_json(silent=True) or {}
+        if (not isinstance(body, dict) or not isinstance(body.get("emails", []), list)
+                or any(not isinstance(email, str) for email in body.get("emails", []))):
+            return jsonify({"error": "informe uma lista de e-mails para consultar"}), 400
         configured = {
             a["email"] for a in _list_accounts()
             if org_policy.account_kind(str(a["email"])) == "crowtado"
         }
         creds = {e: p for e, p in _configured_crowtado_creds().items() if e in configured}
-        emails = [str(e).strip() for e in body.get("emails", []) if str(e).strip()]
+        emails = [e.strip().casefold() for e in body.get("emails", []) if e.strip()]
         if emails:
-            selected = {e for e in emails if e in configured}
+            normalized = {e.casefold(): e for e in configured}
+            selected = {normalized[e] for e in emails if e in normalized}
             if not selected:
                 return jsonify({
                     "error": "saldo Crowtado não se aplica às contas selecionadas",

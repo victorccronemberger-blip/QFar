@@ -53,6 +53,33 @@ DEFAULT_REF = config.CROWTADO_REF
 class CrowtadoError(RuntimeError):
     """Falha de login ou consulta no crowtado."""
 
+    def __init__(self, message: str, *, code: str | None = None, http_status: int | None = None):
+        super().__init__(message)
+        self.account_issue_code = code
+        self.http_status = http_status
+
+
+def _remote_error(stage: str, status: int, body: Any) -> CrowtadoError:
+    errors = body.get("errors", []) if isinstance(body, dict) else []
+    errors = errors if isinstance(errors, list) else []
+    codes = {str(item.get("code")) for item in errors if isinstance(item, dict)}
+    code = ("crowtado_account_missing" if "form_identifier_not_found" in codes else
+            "authentication" if codes & {"form_password_incorrect", "form_password_pwned", "session_invalid"}
+            or status == 401 else
+            "rate_limit" if status == 429 else
+            "service" if status >= 500 else
+            "forbidden" if status == 403 else "invalid_response")
+    return CrowtadoError(f"{stage} (HTTP {status})", code=code, http_status=status)
+
+
+def can_use_browser_fallback(error: Exception) -> bool:
+    # Repeating a rejected password, rate limit or outage in Chrome only
+    # duplicates requests and hides the original diagnosis.
+    return getattr(error, "account_issue_code", None) not in {
+        "authentication", "crowtado_account_missing", "rate_limit", "service",
+        "network", "timeout", "tls", "email_verification",
+    }
+
 
 class CrowtadoSession:
     """Sessão autenticada: cookie jar do Clerk + JWT de sessão renovável."""
@@ -64,17 +91,21 @@ class CrowtadoSession:
     def _fapi(self, path: str, data: dict[str, str] | None = None) -> tuple[int, Any]:
         body = urllib.parse.urlencode(data).encode() if data is not None else None
         req = urllib.request.Request(
-            f"{CLERK_BASE}{path}?{_CLERK_QS}", data=body, method="POST" if data else "GET"
+            f"{CLERK_BASE}{path}?{_CLERK_QS}", data=body, method="POST" if data is not None else "GET"
         )
         for k, v in _ORIGIN.items():
             req.add_header(k, v)
         # Cloudflare (erro 1010) bloqueia o UA padrão do urllib — usar UA neutro.
         req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/151.0")
-        if body:
+        if body is not None:
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
         try:
             with self.opener.open(req, timeout=30) as resp:
-                return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+                try:
+                    return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+                except (ValueError, UnicodeError) as exc:
+                    raise CrowtadoError("Resposta inválida da autenticação Crowtado",
+                                        code="invalid_response") from exc
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
             try:
@@ -86,22 +117,28 @@ class CrowtadoSession:
             if "CERTIFICATE_VERIFY_FAILED" in detail.upper():
                 raise CrowtadoError(
                     "a conexão segura não pôde ser validada; use Reparar "
-                    "instalação na aba Integrações e tente novamente"
+                    "instalação na aba Integrações e tente novamente", code="tls"
                 ) from exc
             raise CrowtadoError(
-                "não foi possível conectar ao Crowtado; confira a internet e tente novamente"
+                "não foi possível conectar ao Crowtado; confira a internet e tente novamente", code="network"
             ) from exc
+        except TimeoutError as exc:
+            raise CrowtadoError("Tempo esgotado na autenticação Crowtado", code="timeout") from exc
 
     def session_jwt(self) -> str:
-        """JWT de sessão fresco (lido do last_active_token do client, ~60s de vida)."""
-        status, body = self._fapi("/v1/client")
-        client = (body.get("response") or {}) if isinstance(body, dict) else {}
-        for s in client.get("sessions") or []:
-            if s.get("id") == self.session_id or s.get("status") == "active":
-                jwt = (s.get("last_active_token") or {}).get("jwt")
-                if jwt:
-                    return jwt
-        raise CrowtadoError(f"sessão sem token ativo ({status}): {str(body)[:200]}")
+        """Emite um JWT novo apenas para a sessão autenticada desta conta."""
+        if not self.session_id:
+            raise CrowtadoError("Sessão Crowtado ausente", code="authentication")
+        status, body = self._fapi(f"/v1/client/sessions/{self.session_id}/tokens", {})
+        if status != 200:
+            if status == 404:
+                raise CrowtadoError("Sessão Crowtado expirada", code="authentication", http_status=status)
+            raise _remote_error("Renovação da sessão Crowtado recusada", status, body)
+        payload = body.get("response", body) if isinstance(body, dict) else {}
+        jwt = payload.get("jwt") if isinstance(payload, dict) else None
+        if not isinstance(jwt, str) or not jwt.strip():
+            raise CrowtadoError("Sessão Crowtado sem token válido", code="invalid_response")
+        return jwt
 
 
 _SESSION_LOCK = threading.Lock()
@@ -119,11 +156,12 @@ def clear_cached_session(email: str | None = None) -> None:
         if email is None:
             _SESSION_CACHE.clear()
         else:
-            _SESSION_CACHE.pop(email, None)
+            _SESSION_CACHE.pop(email.strip().casefold(), None)
 
 
 def _cached_login(email: str, password: str) -> CrowtadoSession:
     """Reaproveita o client Clerk enquanto ele ainda consegue emitir um JWT."""
+    email = email.strip().casefold()
     fingerprint = _password_fingerprint(password)
     with _SESSION_LOCK:
         cached = _SESSION_CACHE.get(email)
@@ -131,7 +169,9 @@ def _cached_login(email: str, password: str) -> CrowtadoSession:
         try:
             cached[1].session_jwt()
             return cached[1]
-        except CrowtadoError:
+        except CrowtadoError as exc:
+            if exc.account_issue_code != "authentication":
+                raise
             clear_cached_session(email)
     session = login(email, password)
     with _SESSION_LOCK:
@@ -151,13 +191,14 @@ def login(email: str, password: str) -> CrowtadoSession:
 
     status, body = sess._fapi("/v1/client", {})
     if status != 200:
-        raise CrowtadoError(f"criação de client falhou ({status}): {str(body)[:200]}")
+        raise _remote_error("Criação da sessão Crowtado falhou", status, body)
 
     status, body = sess._fapi(
         "/v1/client/sign_ins",
         {"identifier": email, "password": password, "strategy": "password"},
     )
-    sign_in = ((body.get("response") if isinstance(body, dict) else None) or {})
+    sign_in = body.get("response") if isinstance(body, dict) else None
+    sign_in = sign_in if isinstance(sign_in, dict) else {}
     si_status = sign_in.get("status")
 
     if si_status == "needs_second_factor":
@@ -168,50 +209,48 @@ def login(email: str, password: str) -> CrowtadoSession:
         # Snapshot ANTES de pedir o código: ignora emails antigos na caixa.
         from .hostinger_mail import max_uid, wait_for_code
 
-        uid_base = max_uid(email)
+        try:
+            uid_base = max_uid(email)
+        except Exception as exc:
+            raise CrowtadoError("Não foi possível consultar o código por e-mail da Crowtado",
+                                code="email_verification") from exc
         status, body = sess._fapi(
             f"/v1/client/sign_ins/{sid_sign_in}/prepare_second_factor",
             {"strategy": "email_code"},
         )
         if status != 200:
-            raise CrowtadoError(f"prepare_second_factor falhou ({status}): {str(body)[:200]}")
+            raise _remote_error("Verificação por e-mail Crowtado falhou", status, body)
         # Código chega no email da conta (caixa catch-all da Hostinger).
-        code = wait_for_code(email, sender="crowtado.com", min_uid=uid_base, timeout=180)
+        try:
+            code = wait_for_code(email, sender="crowtado.com", min_uid=uid_base, timeout=180)
+        except Exception as exc:
+            raise CrowtadoError("Não foi possível obter o código por e-mail da Crowtado",
+                                code="email_verification") from exc
         status, body = sess._fapi(
             f"/v1/client/sign_ins/{sid_sign_in}/attempt_second_factor",
             {"strategy": "email_code", "code": code},
         )
-        sign_in = ((body.get("response") if isinstance(body, dict) else None) or {})
+        sign_in = body.get("response") if isinstance(body, dict) else None
+        sign_in = sign_in if isinstance(sign_in, dict) else {}
         si_status = sign_in.get("status")
 
     sid = sign_in.get("created_session_id")
     if status != 200 or si_status != "complete" or not sid:
-        erros = body.get("errors") if isinstance(body, dict) else None
-        detalhe = (erros[0].get("long_message") if erros else str(body)[:200])
-        raise CrowtadoError(f"login falhou ({status}): {detalhe}")
+        raise _remote_error("Login Crowtado não concluído", status, body)
     sess.session_id = sid
     return sess
 
 
-_SUMMARY_RE = re.compile(
-    r'availableCents[\\]*":(\d+)'
-    r'.*?inTransitCents[\\]*":(\d+)'
-    r'.*?lifetimeCents[\\]*":(\d+)'
-    r'.*?pendingCents[\\]*":(\d+)',
-    re.S,
-)
-
-
 def _extrai_summary(texto: str) -> dict[str, int]:
     """Extrai o payouts.summary de um payload flight RSC (com escapes ou não)."""
-    m = _SUMMARY_RE.search(texto)
-    if m:
-        return {
-            "availableCents": int(m.group(1)),
-            "inTransitCents": int(m.group(2)),
-            "lifetimeCents": int(m.group(3)),
-            "pendingCents": int(m.group(4)),
-        }
+    normalized = re.sub(r'\\+"', '"', texto)
+    for match in re.finditer(r'\{[^{}]*"availableCents"[^{}]*\}', normalized):
+        try:
+            result = _summary_from_payload(json.loads(match.group()))
+            if result:
+                return result
+        except (ValueError, CrowtadoError):
+            continue
     return {}
 
 
@@ -221,10 +260,18 @@ def _summary_from_payload(payload: Any) -> dict[str, int]:
     if isinstance(payload, dict):
         if all(name in payload for name in required):
             try:
-                return {name: int(payload[name]) for name in required}
-            except (TypeError, ValueError) as exc:
-                raise CrowtadoError("payouts.summary devolveu valores inválidos") from exc
-        for name in ("summary", "payouts", "data"):
+                values = {}
+                for name in required:
+                    value = payload[name]
+                    if isinstance(value, bool) or not (
+                            isinstance(value, int) or isinstance(value, str)
+                            and re.fullmatch(r"-?\d+", value)):
+                        raise ValueError("invalid cents")
+                    values[name] = int(value)
+                return values
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CrowtadoError("payouts.summary devolveu valores inválidos", code="invalid_response") from exc
+        for name in ("summary", "payouts", "data", "result", "json"):
             if name in payload:
                 summary = _summary_from_payload(payload[name])
                 if summary:
@@ -240,10 +287,18 @@ def _summary_from_payload(payload: Any) -> dict[str, int]:
 def consultar_saldo_api(email: str, senha: str) -> dict[str, int]:
     """Consulta o saldo pela API tRPC, sem iniciar navegador."""
     session = _cached_login(email, senha)
-    payload = _site_trpc(session, "payouts.summary", None, method="GET")
+    try:
+        payload = _site_trpc(session, "payouts.summary", None, method="GET")
+    except CrowtadoError as exc:
+        if exc.account_issue_code != "authentication":
+            raise
+        # Only the read is retried. Never replay a financial mutation.
+        clear_cached_session(email)
+        session = _cached_login(email, senha)
+        payload = _site_trpc(session, "payouts.summary", None, method="GET")
     summary = _summary_from_payload(payload)
     if not summary:
-        raise CrowtadoError(f"payouts.summary sem saldo reconhecível: {str(payload)[:200]}")
+        raise CrowtadoError("payouts.summary sem saldo completo reconhecível", code="invalid_response")
     return summary
 
 
@@ -419,9 +474,9 @@ def consultar_saldo_navegador(
                 body = resp.json()
                 for item in (body if isinstance(body, list) else [body]):
                     data = ((item or {}).get("result") or {}).get("data") or {}
-                    payload = data.get("json") or {}
-                    if isinstance(payload, dict) and "availableCents" in payload:
-                        summary.update(payload)
+                    parsed = _summary_from_payload(data)
+                    if parsed:
+                        summary.update(parsed)
             elif "dashboard/earnings" in resp.url and "_rsc" in resp.url:
                 summary.update(_extrai_summary(resp.text()))
         except Exception:  # noqa: BLE001 — resposta ilegível, segue o fluxo
@@ -442,7 +497,14 @@ def consultar_saldo_navegador(
 
             page.wait_for_selector("#identifier-field", timeout=60_000)
             page.fill("#identifier-field", email)
-            uid_base = max_uid(email)
+            mailbox_error = None
+            try:
+                uid_base = max_uid(email)
+            except Exception as exc:
+                # A password-only account does not require a mailbox integration.
+                # Keep the failure for a real email challenge, if one appears.
+                uid_base = None
+                mailbox_error = exc
             page.click("button.cl-formButtonPrimary")
 
             page.wait_for_selector("#password-field", timeout=60_000)
@@ -472,13 +534,17 @@ def consultar_saldo_navegador(
             print(f"[*] pós-senha: {destino} — {page.url.split('?')[0]}")
 
             if destino == "2fa":
+                if mailbox_error is not None:
+                    raise CrowtadoError(
+                        "A Crowtado exige um código por e-mail, mas a caixa de entrada não pôde ser consultada.",
+                        code="email_verification") from mailbox_error
                 # 2FA por email: campo OTP único (data-input-otp) ou digit-N.
                 page.wait_for_selector('input[data-input-otp], input[id^="digit-"]',
                                        timeout=30_000)
                 print(f"[*] 2FA: aguardando código no email {email} ...")
                 code = wait_for_code(email, sender="crowtado.com",
                                      min_uid=uid_base, timeout=180)
-                print(f"[+] código recebido: {code}")
+                print("[+] código de verificação recebido")
                 if page.query_selector('input[id^="digit-"]'):
                     for i, digit in enumerate(code):
                         page.fill(f"#digit-{i}-field", digit)
@@ -513,7 +579,7 @@ def consultar_saldo(
     try:
         return consultar_saldo_api(email, senha)
     except CrowtadoError as api_error:
-        if not fallback_browser:
+        if not fallback_browser or not can_use_browser_fallback(api_error):
             raise
         try:
             return consultar_saldo_navegador(email, senha, headed=headed)
@@ -567,13 +633,28 @@ def _site_trpc(sess: CrowtadoSession, proc: str, payload: dict[str, Any] | None,
         with sess.opener.open(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        raise CrowtadoError(
-            f"tRPC {proc} falhou ({exc.code}): "
-            f"{exc.read().decode('utf-8', 'replace')[:200]}") from exc
+        raise _remote_error(f"Consulta Crowtado {proc} recusada", exc.code, {}) from exc
+    except urllib.error.URLError as exc:
+        code = "tls" if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason).upper() else "network"
+        raise CrowtadoError("Falha na conexão segura com Crowtado", code=code) from exc
+    except TimeoutError as exc:
+        raise CrowtadoError("Tempo esgotado ao consultar Crowtado", code="timeout") from exc
+    except (ValueError, UnicodeError) as exc:
+        raise CrowtadoError("Resposta inválida do Crowtado", code="invalid_response") from exc
     item = data[0] if isinstance(data, list) and data else data
     if isinstance(item, dict) and item.get("error"):
-        raise CrowtadoError(f"tRPC {proc} erro: {str(item['error'])[:200]}")
-    return (((item or {}).get("result") or {}).get("data") or {}).get("json")
+        error = item["error"]
+        error = error.get("json", error) if isinstance(error, dict) else {}
+        detail = error.get("data", {}) if isinstance(error, dict) else {}
+        known_status = {"UNAUTHORIZED": 401, "FORBIDDEN": 403,
+                        "TOO_MANY_REQUESTS": 429, "INTERNAL_SERVER_ERROR": 500}
+        status = detail.get("httpStatus", known_status.get(detail.get("code"), 400)) if isinstance(detail, dict) else 400
+        raise _remote_error(f"Consulta Crowtado {proc} recusada", status if isinstance(status, int) else 400, {})
+    result = item.get("result") if isinstance(item, dict) else None
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, dict):
+        raise CrowtadoError("Resposta tRPC incompleta do Crowtado", code="invalid_response")
+    return data.get("json", data)
 
 
 # Gêneros aceitos pelo modal de demografia (gate obrigatório desde 26/08).

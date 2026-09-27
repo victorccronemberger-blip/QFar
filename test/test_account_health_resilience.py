@@ -105,7 +105,8 @@ class HealthResilienceTests(unittest.TestCase):
         self.assertEqual(row["updated_at"], "old-success")
         self.assertTrue(row["stale"])
         self.assertNotIn("private-token", json.dumps(row))
-        server._on_balance_result("a@example.com", {"availableCents": 0, "pendingCents": 0}, None)
+        server._on_balance_result("a@example.com", {"availableCents": 0, "pendingCents": 0,
+                                                   "inTransitCents": 0, "lifetimeCents": 0}, None)
         row = server._load_balances()["a@example.com"]
         self.assertFalse(row["stale"])
         self.assertIsNone(row["error"])

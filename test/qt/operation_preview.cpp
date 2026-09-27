@@ -22,6 +22,45 @@
 
 class OperationPreview {
 public:
+  static void balancePollingSmoke(MainWindow& window) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(50); return; }
+    auto requests = std::make_shared<int>(0);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, requests] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, requests] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        const int number = ++*requests;
+        QTimer::singleShot(250, socket, [socket, number] {
+          const QByteArray body = number == 1 ? QByteArray("{\"error\":\"fixture offline\"}")
+              : QByteArray("{\"accounts\":[],\"balances\":{},\"runner\":{\"state\":\"done\",\"failed\":1,\"total\":2}}");
+          socket->write("HTTP/1.1 " + QByteArray(number == 1 ? "503 Unavailable" : "200 OK")
+              + "\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size())
+              + "\r\nConnection: close\r\n\r\n" + body);
+          socket->disconnectFromHost();
+        });
+      });
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._pages->setCurrentIndex(6);
+    for (int i = 0; i < 20; ++i) window.loadBalances();
+    QTimer::singleShot(450, &window, [&window, requests] {
+      if (*requests != 1 || window._balancePolling || QApplication::activeModalWidget()
+          || !window._balancesState->text().contains("fixture offline")
+          || window._balancesWithdrawAll->isEnabled()) { qApp->exit(51); return; }
+      for (int i = 0; i < 20; ++i) window.loadBalances();
+      QTimer::singleShot(450, &window, [&window, requests] {
+        const bool recovered = *requests == 2 && !window._balancePolling
+            && window._balancesState->text().contains(QStringLiteral("1 de 2"))
+            && !window._balancePoll.isActive() && !QApplication::activeModalWidget();
+        qApp->exit(recovered ? 0 : 52);
+      });
+    });
+    QTimer::singleShot(8000, &window, [] { qApp->exit(53); });
+  }
   static void campaignIndicatorSmoke(MainWindow& window) {
     page(window,3);
     window.applyStructuralStyle(qApp->arguments().contains("--dark"));
@@ -350,6 +389,10 @@ int main(int argc, char** argv) {
     return app.exec();
   }
   window.show();
+  if (app.arguments().contains("--balance-polling-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::balancePollingSmoke(window); });
+    return app.exec();
+  }
   if (app.arguments().contains("--indicator-smoke")) {
     QTimer::singleShot(100,&window,[&window]{OperationPreview::campaignIndicatorSmoke(window);});
     return app.exec();

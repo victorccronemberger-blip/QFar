@@ -670,6 +670,8 @@ class BalancesRunner:
         self.done = 0
         self.fast_done = 0
         self.fallbacks = 0
+        self.failed = 0
+        self.error = ""
 
     @property
     def running(self) -> bool:
@@ -685,6 +687,8 @@ class BalancesRunner:
             self.done = 0
             self.fast_done = 0
             self.fallbacks = 0
+            self.failed = 0
+            self.error = ""
             self.current = "iniciando consulta rápida…"
             try:
                 self._thread = threading.Thread(target=self._run, args=(creds, on_result),
@@ -699,7 +703,29 @@ class BalancesRunner:
     def _run(self, creds: dict[str, str], on_result) -> None:
         # Import tardio: Playwright só é carregado se algum fallback for necessário.
         try:
-            from ..crowtado import consultar_saldo_api, consultar_saldo_navegador
+            from ..crowtado import (consultar_saldo_api, consultar_saldo_navegador,
+                                    can_use_browser_fallback, _summary_from_payload, CrowtadoError)
+
+            def finish(email, summary, error, *, fast=False):
+                if error is None:
+                    try:
+                        summary = _summary_from_payload(summary)
+                        if not summary:
+                            raise CrowtadoError("Saldo incompleto", code="invalid_response")
+                    except CrowtadoError as exc:
+                        summary, error = None, exc
+                try:
+                    on_result(email, summary, error)
+                except Exception:
+                    # A failed local write must not silently abort all remaining
+                    # accounts, or be reported as an authentication failure.
+                    with self._lock:
+                        self.error = "Não foi possível salvar todos os resultados. Confira espaço e permissões da pasta de dados."
+                    error = True
+                with self._lock:
+                    self.done += 1
+                    self.failed += int(error is not None)
+                    self.fast_done += int(fast and error is None)
 
             failures: list[tuple[str, str, Exception]] = []
             workers = min(3, max(1, len(creds)))
@@ -716,12 +742,12 @@ class BalancesRunner:
                     try:
                         summary = future.result()
                     except Exception as exc:  # noqa: BLE001 — tenta fallback depois
-                        failures.append((email, senha, exc))
+                        if can_use_browser_fallback(exc):
+                            failures.append((email, senha, exc))
+                        else:
+                            finish(email, None, exc)
                         continue
-                    on_result(email, summary, None)
-                    with self._lock:
-                        self.done += 1
-                        self.fast_done += 1
+                    finish(email, summary, None, fast=True)
 
             for fallback_index, (email, senha, api_error) in enumerate(failures, 1):
                 with self._lock:
@@ -730,29 +756,26 @@ class BalancesRunner:
                                     f"{len(failures)}: {email}…")
                 try:
                     summary = consultar_saldo_navegador(email, senha, headed=False)
-                    on_result(email, summary, None)
                 except Exception as browser_error:  # noqa: BLE001 — uma conta falha, segue
-                    on_result(
-                        email, None,
-                        f"API: {type(api_error).__name__}: {api_error}; "
-                        f"navegador: {type(browser_error).__name__}: {browser_error}",
-                    )
-                with self._lock:
-                    self.done += 1
+                    finish(email, None, browser_error)
+                else:
+                    finish(email, summary, None)
             with self._lock:
-                self.state = "done"
+                self.state = "error" if self.error else "done"
                 self.current = ""
         except Exception:  # noqa: BLE001
             with self._lock:
                 self.state = "error"
                 self.current = ""
+                self.error = "A consulta foi interrompida. Os resultados já salvos foram preservados; atualize as contas pendentes."
             raise
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {"state": self.state, "current": self.current,
                     "total": self.total, "done": self.done,
-                    "fast_done": self.fast_done, "fallbacks": self.fallbacks}
+                    "fast_done": self.fast_done, "fallbacks": self.fallbacks,
+                    "failed": self.failed, "error": self.error}
 
 
 # Runner único de saldos: APIs paralelas; no máximo um navegador de fallback.

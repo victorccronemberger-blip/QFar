@@ -10,7 +10,13 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     reason = "Não foi possível concluir a verificação desta conta."
     action = "Não remova a conta por este diagnóstico. Verifique novamente; se persistir, copie o diagnóstico para o suporte."
     explicit = getattr(error, "account_issue_code", None)
-    if explicit == "restricted":
+    if explicit == "email_verification":
+        code, reason = "email_verification", "A Crowtado exige verificação por e-mail."
+        action = "Confira a integração da caixa de entrada para receber o código. Não altere a senha por este diagnóstico."
+    elif explicit == "crowtado_account_missing":
+        code, reason = "crowtado_account_missing", "A Crowtado não encontrou uma conta para este e-mail."
+        action = "Confira o acesso no site da Crowtado. Uma conta conectada ao Minute não confirma cadastro na Crowtado."
+    elif explicit == "restricted":
         code, reason = "restricted", "A plataforma informou uma restrição na conta ou organização."
         action = "Consulte o estado no Minute e contate o suporte da plataforma. Trocar a senha não remove a restrição."
     elif explicit == "version":
@@ -72,10 +78,14 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     elif explicit == "authentication" or re.search(r"\b401\b|invalid_login|invalid_password|invalid_grant|invalid_refresh_token|token_expired", raw):
         code, reason = "authentication", "O serviço não aceitou ou não conseguiu renovar o acesso salvo."
         action = "Em Contas, informe o mesmo e-mail e a senha do Minute e clique em Conectar; depois verifique novamente."
+        if "crowtado" in stage.casefold():
+            action = "Use Conectar Crowtado na linha da conta e confira a senha da Crowtado. Não é necessário remover a conta do Minute."
     # Só campos técnicos conhecidos: nunca devolver tokens, URLs assinadas,
     # senhas ou corpos arbitrários de exceções para a UI/área de transferência.
     http = re.search(r"\b(?:400|401|403|404|408|429|500|502|503|504)\b", raw)
-    detail = type(error).__name__ + (f" · HTTP {http.group()}" if http else "")
+    status = getattr(error, "http_status", None)
+    status = status if isinstance(status, int) and 400 <= status <= 599 else (http.group() if http else None)
+    detail = type(error).__name__ + (f" · HTTP {status}" if status else "")
     return dict(email=email, code=code, stage=stage, reason=reason, action=action, detail=detail,
                 restriction_confirmed=explicit == "restricted",
                 retryable=code in {"timeout", "network", "service", "rate_limit", "invalid_response"})

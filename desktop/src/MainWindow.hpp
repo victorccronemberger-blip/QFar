@@ -176,6 +176,7 @@ private:
   QTimer _previewPoll;
   QTimer _taskReload;
   QTimer _balancePoll;
+  bool _balancePolling{};
   QTimer _cachePoll;
   int _probeAttempts{};
   int _probeGeneration{};

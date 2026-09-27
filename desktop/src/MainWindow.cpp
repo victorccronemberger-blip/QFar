@@ -5525,8 +5525,21 @@ void MainWindow::pollBulkRegister() {
 }
 
 void MainWindow::loadBalances() {
+  if (_balancePolling || _closing) return;
+  _balancePolling = true;
   _api.get(QStringLiteral("/api/balances"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return showError(QStringLiteral("Falha ao carregar saldos"), error);
+    _balancePolling = false;
+    if (!ok) {
+      _balancesState->setText(QStringLiteral("Não foi possível atualizar os saldos: %1. Os valores exibidos são da última leitura.").arg(error));
+      _balancesWithdrawAll->setEnabled(false);
+      _balancesPayoutMethod->setEnabled(false);
+      _balancesRefresh->setEnabled(true);
+      _balancePoll.setInterval(5000);
+      if (_pages->currentIndex() == 6) _balancePoll.start();
+      setStatus(QStringLiteral("Falha ao consultar saldos: %1").arg(error));
+      return;
+    }
+    _balancePoll.setInterval(1500);
     const auto root = doc.object();
     _balancesSnapshot = root;
     _balancesExport->setEnabled(!root.value(QStringLiteral("accounts")).toArray().isEmpty());
@@ -5768,9 +5781,18 @@ void MainWindow::loadBalances() {
         ? QStringLiteral("Último lote precisa de atenção · abra o relatório")
         : running
         ? runner.value(QStringLiteral("current")).toString(QStringLiteral("Consultando contas…"))
+        : runner.value(QStringLiteral("state")).toString() == QStringLiteral("error")
+        ? runner.value(QStringLiteral("error")).toString(QStringLiteral("A consulta foi interrompida. Atualize as contas pendentes."))
+        : runner.value(QStringLiteral("failed")).toInt() > 0
+        ? QStringLiteral("Consulta concluída: %1 de %2 conta(s) com erro. Confira o diagnóstico em cada linha.")
+              .arg(runner.value(QStringLiteral("failed")).toInt())
+              .arg(runner.value(QStringLiteral("total")).toInt())
         : QStringLiteral("%1 identidade(s) · %2 Crowtado conectado(s) · %3 Claru preservada(s)")
               .arg(accounts.size()).arg(passwordAccounts.size()).arg(claruCount));
-    if (running || bulkRunning || payoutRunning) _balancePoll.start(); else _balancePoll.stop();
+    if (_pages->currentIndex() == 6 && (running || bulkRunning || payoutRunning))
+      _balancePoll.start();
+    else
+      _balancePoll.stop();
   });
 }
 

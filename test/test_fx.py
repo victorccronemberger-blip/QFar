@@ -24,6 +24,28 @@ class _Response:
 
 
 class ExchangeRateTests(unittest.TestCase):
+    def test_concurrent_poll_does_not_wait_for_external_quote(self):
+        with fx._LOCK:
+            opener = mock.Mock(side_effect=AssertionError("network"))
+            quote = fx.usd_brl_quote(now=100, opener=opener)
+        self.assertFalse(quote["available"])
+        opener.assert_not_called()
+
+    def test_outage_does_not_repeat_network_call_on_every_poll(self):
+        opener = mock.Mock(side_effect=OSError("offline"))
+        for timestamp in (100, 101, 110, 159):
+            self.assertFalse(fx.usd_brl_quote(now=timestamp, opener=opener)["available"])
+        self.assertEqual(opener.call_count, 1)
+        fx.usd_brl_quote(now=160, opener=opener)
+        self.assertEqual(opener.call_count, 2)
+
+    def test_valid_remote_quote_survives_unwritable_cache(self):
+        with mock.patch.object(fx, "save_json", side_effect=OSError("disk")):
+            quote = fx.usd_brl_quote(now=100, opener=mock.Mock(
+                return_value=_Response([{"data": "01/09/2026", "valor": "5.2"}])))
+        self.assertTrue(quote["available"])
+        self.assertFalse(quote["stale"])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.cache = Path(self.temp.name) / "quote.json"
