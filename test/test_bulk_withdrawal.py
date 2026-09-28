@@ -9,6 +9,12 @@ from moneymin.web import server
 
 
 class BulkWithdrawalTests(unittest.TestCase):
+    def test_in_transit_excludes_account_even_with_approved_balance(self):
+        record = {"availableCents": 3685, "inTransitCents": 2704}
+        self.assertFalse(server._confirmed_available_balance(record))
+        self.assertFalse(server._confirmed_available_balance({**record, "inTransitReplaceable": False}))
+        self.assertTrue(server._confirmed_available_balance({**record, "inTransitReplaceable": True}))
+
     def test_approved_balance_must_exceed_25_dollars(self):
         for cents, expected in ((0, False), (2499, False), (2500, False), (2501, True), (3000, True)):
             with self.subTest(cents=cents):

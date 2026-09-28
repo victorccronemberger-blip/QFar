@@ -250,6 +250,27 @@ class PayoutMethodTests(unittest.TestCase):
                          ["payouts.payoutMethods", "payouts.savePayoutPreference", "payouts.summary"])
         self.assertEqual(calls[1][1], {"method": "other"})
 
+    def test_in_transit_blocks_all_methods_without_requesting_money(self):
+        for method in ("wise", "paypal", "other"):
+            with self.subTest(method=method), \
+                 patch.object(crowtado, "_cached_login", return_value=object()), \
+                 patch.object(crowtado, "_site_trpc", return_value={
+                     "payoutPreference": method, "inTransitCents": 2704,
+                     "inTransitReplaceable": False}) as trpc:
+                result = crowtado.solicitar_link_saque("account@example.com", "pw", expected_method=method)
+                self.assertEqual(result, {"status": "in_transit"})
+                trpc.assert_called_once()
+                self.assertEqual(trpc.call_args.args[1:], ("payouts.summary", None))
+                self.assertEqual(trpc.call_args.kwargs, {"method": "GET"})
+
+    def test_balance_normalization_preserves_transit_replacement_permission(self):
+        summary = {"availableCents": 3600, "inTransitCents": 2704,
+                   "pendingCents": 0, "lifetimeCents": 6304, "inTransitReplaceable": True}
+        self.assertEqual(crowtado._summary_from_payload(summary), summary)
+        self.assertFalse(crowtado.payout_in_transit(summary))
+        summary.pop("inTransitReplaceable")
+        self.assertTrue(crowtado.payout_in_transit(summary))
+
     def test_withdraw_uses_remote_preference(self):
         calls = []
 

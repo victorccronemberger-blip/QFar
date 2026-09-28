@@ -126,7 +126,7 @@ public:
         const int number = ++*requests;
         QTimer::singleShot(250, socket, [socket, number] {
           const QByteArray body = number == 1 ? QByteArray("{\"error\":\"fixture offline\"}")
-              : QByteArray("{\"accounts\":[],\"balances\":{},\"runner\":{\"state\":\"done\",\"failed\":1,\"total\":2}}");
+              : QByteArray("{\"accounts\":[\"fixture@example.com\"],\"with_password\":[\"fixture@example.com\"],\"balances\":{\"fixture@example.com\":{\"availableCents\":3685,\"inTransitCents\":2704,\"inTransitReplaceable\":false}},\"runner\":{\"state\":\"done\",\"failed\":1,\"total\":2}}");
           socket->write("HTTP/1.1 " + QByteArray(number == 1 ? "503 Unavailable" : "200 OK")
               + "\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size())
               + "\r\nConnection: close\r\n\r\n" + body);
@@ -145,8 +145,17 @@ public:
       QTimer::singleShot(450, &window, [&window, requests] {
         const bool recovered = *requests == 2 && !window._balancePolling
             && window._balancesState->text().contains(QStringLiteral("1 de 2"))
-            && !window._balancePoll.isActive() && !QApplication::activeModalWidget();
-        qApp->exit(recovered ? 0 : 52);
+            && !window._balancePoll.isActive() && !QApplication::activeModalWidget()
+            && !window._balancesWithdrawAll->isEnabled();
+        bool foundWithdrawal = false;
+        for (auto* button : window._balancesTable->findChildren<QPushButton*>()) {
+          if (button->text() == QStringLiteral("Solicitar saque")) foundWithdrawal = true;
+          if (button->text() == QStringLiteral("Solicitar saque")
+              && (button->isEnabled() || !button->toolTip().contains(QStringLiteral("em trânsito")))) {
+            qApp->exit(54); return;
+          }
+        }
+        qApp->exit(recovered && foundWithdrawal ? 0 : 52);
       });
     });
     QTimer::singleShot(8000, &window, [] { qApp->exit(53); });

@@ -5663,7 +5663,9 @@ void MainWindow::loadBalances() {
       const bool hasPassword = passwordAccounts.contains(email);
       const bool hasBalanceError = !balance.value(QStringLiteral("error")).toString().isEmpty()
           || balance.value(QStringLiteral("stale")).toBool();
-      if (!isClaru && hasPassword && !hasBalanceError && hasAvailable && availableCents > 2500)
+      const bool paymentInTransit = balance.value(QStringLiteral("inTransitCents")).toDouble() > 0
+          && !balance.value(QStringLiteral("inTransitReplaceable")).toBool(false);
+      if (!isClaru && hasPassword && !hasBalanceError && hasAvailable && availableCents > 2500 && !paymentInTransit)
         ++eligibleWithdrawals;
       auto* actions = new QWidget;
       auto* actionsLayout = new QHBoxLayout(actions);
@@ -5705,12 +5707,14 @@ void MainWindow::loadBalances() {
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);
       withdraw->setEnabled(!cleanupPending && !isClaru && hasPassword && !hasBalanceError
-                           && hasAvailable && availableCents > 2500
+                           && hasAvailable && availableCents > 2500 && !paymentInTransit
                            && runner.value(QStringLiteral("state")).toString() != QStringLiteral("running")
                            && bulk.value(QStringLiteral("state")).toString() != QStringLiteral("running"));
       withdraw->setToolTip(withdraw->isEnabled()
           ? QStringLiteral("Escolha o método e confirme o saque do saldo disponível desta conta.")
-          : QStringLiteral("O saque exige saldo aprovado superior a US$ 25,00 e consulta atualizada. Saldo pendente não conta."));
+          : paymentInTransit
+              ? QStringLiteral("Há um pagamento em trânsito que a Crowtado não permite substituir. Aguarde a conclusão e atualize o saldo.")
+              : QStringLiteral("O saque exige saldo aprovado superior a US$ 25,00 e consulta atualizada. Saldo pendente não conta."));
       connect(withdraw, &QPushButton::clicked, this, [this, email, withdraw] {
         QJsonObject request{{QStringLiteral("email"), email}};
         if (!confirmWithdrawal(this, 1, request)) return;

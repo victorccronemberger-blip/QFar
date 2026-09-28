@@ -457,6 +457,8 @@ def _confirmed_available_balance(record: Any) -> bool:
     """Crowtado: only confirmed approved funds strictly above US$25 qualify."""
     if not isinstance(record, dict) or record.get("error") or record.get("stale"):
         return False
+    if crowtado.payout_in_transit(record):
+        return False
     cents = record.get("availableCents")
     return (isinstance(cents, (int, float)) and not isinstance(cents, bool)
             and math.isfinite(cents) and cents > 2500)
@@ -1836,6 +1838,7 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
     if status == "review_required":
         return f"saque de {email} enviado para revisão do Crowtado"
     messages = {
+        "in_transit": "há um pagamento em trânsito que a Crowtado não permite substituir; aguarde a conclusão antes de solicitar outro saque",
         "not_requested": "saque não solicitado: a configuração da Wise não foi concluída",
         "unknown": "resultado do saque inconclusivo; confira o histórico na Crowtado antes de repetir",
         "below_minimum": "saldo abaixo do mínimo para saque",
@@ -4085,7 +4088,10 @@ def create_app() -> Flask:
             return jsonify({"error": "aguarde a consulta de saldos terminar"}), 409
         if _withdraw_bulk_snapshot()["state"] == "running":
             return jsonify({"error": "aguarde o saque em lote terminar"}), 409
-        if not _confirmed_available_balance(_load_balances().get(email)):
+        balance = _load_balances().get(email)
+        if isinstance(balance, dict) and crowtado.payout_in_transit(balance):
+            return jsonify({"error": "há um pagamento em trânsito que a Crowtado não permite substituir; atualize o saldo após a conclusão"}), 409
+        if not _confirmed_available_balance(balance):
             return jsonify({"error": "atualize o saldo desta conta antes de solicitar saque; é necessário saldo aprovado superior a US$ 25,00"}), 400
         result, status = (_withdraw_once(email, password, wise) if wise
                           else _withdraw_once(email, password))
@@ -4119,7 +4125,7 @@ def create_app() -> Flask:
                 continue
             eligible[email] = passwords[email]
         if not eligible:
-            return jsonify({"error": "não há contas conectadas com saldo aprovado superior a US$ 25,00"}), 400
+            return jsonify({"error": "não há contas elegíveis: é necessário saldo aprovado superior a US$ 25,00 e nenhum pagamento em trânsito bloqueando novo saque"}), 400
         with _WITHDRAW_BULK_LOCK:
             _load_withdraw_bulk_locked()
             if _WITHDRAW_BULK_STATE["state"] == "running":

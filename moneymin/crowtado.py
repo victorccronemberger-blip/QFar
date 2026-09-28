@@ -268,6 +268,8 @@ def _summary_from_payload(payload: Any) -> dict[str, int]:
                             and re.fullmatch(r"-?\d+", value)):
                         raise ValueError("invalid cents")
                     values[name] = int(value)
+                if type(payload.get("inTransitReplaceable")) is bool:
+                    values["inTransitReplaceable"] = payload["inTransitReplaceable"]
                 return values
             except (TypeError, ValueError, OverflowError) as exc:
                 raise CrowtadoError("payouts.summary devolveu valores inválidos", code="invalid_response") from exc
@@ -399,6 +401,12 @@ def finalizar_wise(email: str, senha: str) -> dict[str, bool]:
     return result
 
 
+def payout_in_transit(summary: dict[str, Any]) -> bool:
+    cents = summary.get("inTransitCents")
+    return (isinstance(cents, (int, float)) and not isinstance(cents, bool)
+            and cents > 0 and summary.get("inTransitReplaceable") is not True)
+
+
 def solicitar_link_saque(email: str, senha: str, *, expected_method: str | None = None,
                          cleanup_wise: bool = True) -> dict[str, Any]:
     """Solicita saque com o método preferido salvo no Crowtado."""
@@ -406,6 +414,8 @@ def solicitar_link_saque(email: str, senha: str, *, expected_method: str | None 
     summary = _site_trpc(session, "payouts.summary", None, method="GET")
     if not isinstance(summary, dict):
         raise CrowtadoError("não foi possível consultar o método de saque")
+    if payout_in_transit(summary):
+        return {"status": "in_transit"}
     method = summary.get("payoutPreference")
     if expected_method and method != expected_method:
         raise CrowtadoError("o método confirmado não corresponde ao solicitado; saque não enviado")
