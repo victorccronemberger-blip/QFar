@@ -209,15 +209,37 @@ def _withdraw_wise_flow(email: str, password: str, wise: dict[str, str]) -> dict
     save_json(_wise_cleanup_path(), {"pending": True, "email": email,
                                     "started_at": time.time()})
     result = {"status": "unknown"}
+    stage = "configure_wise"
     try:
         crowtado.configurar_metodo_saque(email, password, "wise", **wise)
+        stage = "request_withdrawal"
         result = crowtado.solicitar_link_saque(email, password, expected_method="wise", cleanup_wise=False)
-    except Exception:
-        # A solicitação pode ter sido aceita antes de um timeout. Não a repetimos.
-        pass
+    except Exception as exc:
+        # A failure while linking cannot have submitted a withdrawal. Once
+        # the withdrawal function is entered, retain the conservative outcome.
+        code = getattr(exc, "account_issue_code", None)
+        known_codes = {"authentication", "crowtado_account_missing", "rate_limit",
+                       "service", "forbidden", "invalid_response", "network", "timeout",
+                       "tls", "email_verification"}
+        result = {"status": "not_requested" if stage == "configure_wise" else "unknown",
+                  "failureStage": stage,
+                  "failureCode": code if code in known_codes else "unexpected"}
+        http_status = getattr(exc, "http_status", None)
+        if type(http_status) is int and 400 <= http_status <= 599:
+            result["httpStatus"] = http_status
     finally:
         cleanup = _finish_wise_cleanup(email, password)
-    return {**result, **cleanup}
+    result = {**result, **cleanup}
+    # Store only classified evidence, never raw API errors or destination data.
+    try:
+        diagnostic_fields = {"status", "failureStage", "failureCode", "httpStatus",
+                             "wiseDestinationRemoved", "payoutPreferenceRestored", "cleanupPending"}
+        save_json(config.DATA_DIR / "withdraw_last_result.json", {
+            "email": email, "finished_at": time.time(),
+            "result": {key: value for key, value in result.items() if key in diagnostic_fields}})
+    except OSError:
+        pass  # Losing diagnostics must not turn an accepted payout into failure.
+    return result
 
 
 def _load_withdraw_cooldowns_locked() -> None:
@@ -324,7 +346,9 @@ def _withdraw_once_locked(email: str, password: str,
         success = result.get("status") in {"ok", "review_required"}
         message = _withdraw_message(email, result)
         if wise and result.get("cleanupPending") is False and result.get("status") != "ok":
-            message += "; Wise desvinculada e Dots confirmado. Confira o histórico antes de repetir o saque."
+            message += "; Wise desvinculada e Dots confirmado."
+            if result.get("status") != "not_requested":
+                message += " Confira o histórico antes de repetir o saque."
         response = {"ok": success, "email": email, "message": message, "result": result}
         if not success:
             response["error"] = message
@@ -1812,6 +1836,7 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
     if status == "review_required":
         return f"saque de {email} enviado para revisão do Crowtado"
     messages = {
+        "not_requested": "saque não solicitado: a configuração da Wise não foi concluída",
         "unknown": "resultado do saque inconclusivo; confira o histórico na Crowtado antes de repetir",
         "below_minimum": "saldo abaixo do mínimo para saque",
         "hold": "saques estão temporariamente bloqueados para esta conta",

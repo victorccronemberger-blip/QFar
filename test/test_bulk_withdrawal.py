@@ -49,6 +49,24 @@ class BulkWithdrawalTests(unittest.TestCase):
         cleanup.assert_called_once()
         withdraw.assert_not_called()
         self.assertFalse(result["cleanupPending"])
+        self.assertEqual(result["status"], "not_requested")
+        self.assertEqual(result["failureStage"], "configure_wise")
+
+    def test_uncertain_withdrawal_preserves_safe_diagnostics_without_retry(self):
+        error = server.crowtado.CrowtadoError("secret-token destination@example.com", code="service", http_status=503)
+        with patch.object(server.crowtado, "configurar_metodo_saque"), \
+             patch.object(server.crowtado, "solicitar_link_saque", side_effect=error) as withdraw, \
+             patch.object(server.crowtado, "finalizar_wise", return_value={
+                 "wiseDestinationRemoved": True, "payoutPreferenceRestored": True}):
+            result = server._withdraw_wise_flow("one@example.com", "pw", {
+                "legal_name": "Test Name", "destination_email": "destination@example.com"})
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["failureStage"], "request_withdrawal")
+        self.assertEqual(result["httpStatus"], 503)
+        withdraw.assert_called_once()
+        saved = (server.config.DATA_DIR / "withdraw_last_result.json").read_text()
+        self.assertNotIn("secret-token", saved)
+        self.assertNotIn("destination@example.com", saved)
 
     def test_pending_cleanup_survives_restart_and_recovery_never_withdraws(self):
         server.save_json(server._wise_cleanup_path(), {"pending": True, "email": "one@example.com"})
