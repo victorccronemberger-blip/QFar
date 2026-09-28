@@ -14,7 +14,6 @@ import math
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .. import campaign, ego_accelerator, holo_accelerator
@@ -654,7 +653,7 @@ RUNNER = CampaignRunner()
 
 
 class BalancesRunner:
-    """Consulta saldos pela API em paralelo, com fallback de navegador serial.
+    """Consulta saldos de uma conta por vez, incluindo login e fallback.
 
     O caminho normal não abre navegador. Se a API falhar para uma conta, apenas
     ela usa o fluxo antigo; fallbacks são seriais para não abrir vários Chromes.
@@ -689,7 +688,7 @@ class BalancesRunner:
             self.fallbacks = 0
             self.failed = 0
             self.error = ""
-            self.current = "iniciando consulta rápida…"
+            self.current = "iniciando consulta sequencial…"
             try:
                 self._thread = threading.Thread(target=self._run, args=(creds, on_result),
                                                 daemon=True, name="moneymin-balances")
@@ -727,39 +726,26 @@ class BalancesRunner:
                     self.failed += int(error is not None)
                     self.fast_done += int(fast and error is None)
 
-            failures: list[tuple[str, str, Exception]] = []
-            workers = min(3, max(1, len(creds)))
-            with ThreadPoolExecutor(max_workers=workers,
-                                    thread_name_prefix="moneymin-balance") as pool:
-                futures = {
-                    pool.submit(consultar_saldo_api, email, senha): (email, senha)
-                    for email, senha in creds.items()
-                }
+            for index, (email, senha) in enumerate(creds.items(), 1):
                 with self._lock:
-                    self.current = f"consultando {len(creds)} conta(s) em paralelo…"
-                for future in as_completed(futures):
-                    email, senha = futures[future]
-                    try:
-                        summary = future.result()
-                    except Exception as exc:  # noqa: BLE001 — tenta fallback depois
-                        if can_use_browser_fallback(exc):
-                            failures.append((email, senha, exc))
-                        else:
-                            finish(email, None, exc)
-                        continue
-                    finish(email, summary, None, fast=True)
-
-            for fallback_index, (email, senha, api_error) in enumerate(failures, 1):
-                with self._lock:
-                    self.fallbacks = len(failures)
-                    self.current = (f"fallback pelo navegador {fallback_index}/"
-                                    f"{len(failures)}: {email}…")
+                    self.current = f"consultando conta {index}/{len(creds)}: {email}…"
                 try:
-                    summary = consultar_saldo_navegador(email, senha, headed=False)
-                except Exception as browser_error:  # noqa: BLE001 — uma conta falha, segue
-                    finish(email, None, browser_error)
+                    summary = consultar_saldo_api(email, senha)
+                except Exception as exc:  # noqa: BLE001 — resolve antes da próxima conta
+                    if not can_use_browser_fallback(exc):
+                        finish(email, None, exc)
+                        continue
+                    with self._lock:
+                        self.fallbacks += 1
+                        self.current = f"consulta pelo navegador {index}/{len(creds)}: {email}…"
+                    try:
+                        summary = consultar_saldo_navegador(email, senha, headed=False)
+                    except Exception as browser_error:
+                        finish(email, None, browser_error)
+                    else:
+                        finish(email, summary, None)
                 else:
-                    finish(email, summary, None)
+                    finish(email, summary, None, fast=True)
             with self._lock:
                 self.state = "error" if self.error else "done"
                 self.current = ""
@@ -778,7 +764,7 @@ class BalancesRunner:
                     "failed": self.failed, "error": self.error}
 
 
-# Runner único de saldos: APIs paralelas; no máximo um navegador de fallback.
+# Runner único de saldos: uma conta por vez, até persistir o resultado.
 BALANCES_RUNNER = BalancesRunner()
 
 

@@ -143,6 +143,13 @@ class CrowtadoSession:
 
 _SESSION_LOCK = threading.Lock()
 _SESSION_CACHE: dict[str, tuple[str, CrowtadoSession]] = {}
+_LOGIN_LOCKS = [threading.RLock() for _ in range(64)]
+
+
+def _login_lock(email: str):
+    # Bounded lock storage; the same account cannot request competing OTPs.
+    key = email.strip().casefold().encode("utf-8")
+    return _LOGIN_LOCKS[int.from_bytes(hashlib.sha256(key).digest()[:2], "big") % 64]
 
 
 def _password_fingerprint(password: str) -> str:
@@ -160,6 +167,11 @@ def clear_cached_session(email: str | None = None) -> None:
 
 
 def _cached_login(email: str, password: str) -> CrowtadoSession:
+    with _login_lock(email):
+        return _cached_login_locked(email, password)
+
+
+def _cached_login_locked(email: str, password: str) -> CrowtadoSession:
     """Reaproveita o client Clerk enquanto ele ainda consegue emitir um JWT."""
     email = email.strip().casefold()
     fingerprint = _password_fingerprint(password)
@@ -180,6 +192,11 @@ def _cached_login(email: str, password: str) -> CrowtadoSession:
 
 
 def login(email: str, password: str) -> CrowtadoSession:
+    with _login_lock(email):
+        return _login_locked(email, password)
+
+
+def _login_locked(email: str, password: str) -> CrowtadoSession:
     """Autentica no Clerk por senha. Levanta CrowtadoError se falhar.
 
     Se a conta pedir segundo fator por email (email_code), busca o código na

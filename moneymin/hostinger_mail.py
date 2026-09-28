@@ -29,6 +29,10 @@ class MailError(RuntimeError):
     """Falha na Hostinger Mail API (token inválido, caixa não achada, etc.)."""
 
 
+class TemporaryMailError(MailError):
+    """Falha transitória que pode ser repetida dentro do prazo da consulta."""
+
+
 def _connection_id(values: dict[str, Any]) -> str:
     explicit = str(values.get("id") or "").strip()
     if explicit:
@@ -97,7 +101,7 @@ def _request(path: str, method: str = "GET", body: Any = None,
     except urllib.error.HTTPError as exc:
         return exc.code, _parse(exc.read().decode("utf-8", "replace"))
     except Exception as exc:  # noqa: BLE001
-        raise MailError(f"falha de rede na Mail API: {exc}") from exc
+        raise TemporaryMailError("falha temporária de rede na Mail API") from exc
 
 
 def test_connection(token: str | None = None,
@@ -154,6 +158,8 @@ def mailbox_id(*, token: str | None = None, mailbox: str | None = None) -> str:
         return selected
     status, body = _request("/api/v1/me", token=token)
     if status != 200:
+        if status == 429 or status >= 500:
+            raise TemporaryMailError(f"Mail API temporariamente indisponível (HTTP {status})")
         raise MailError(f"/me falhou ({status}): {str(body)[:200]}")
     mailboxes = (body.get("data") or {}).get("mailboxes") or []
     if not mailboxes:
@@ -171,18 +177,21 @@ def search_messages(
     *,
     token: str | None = None,
     mailbox: str | None = None,
+    page: int = 1,
 ) -> list[dict[str, Any]]:
     """Busca mensagens na caixa. `since` é data ISO (YYYY-MM-DD)."""
     criteria = {"to": to, "from": from_, "subject": subject, "since": since}
     body = {k: v for k, v in criteria.items() if v}
     status, resp = _request(
         f"/api/v1/mailboxes/{mailbox_id(token=token, mailbox=mailbox)}/folders/{folder}/messages/search"
-        f"?perPage={per_page}&sort=-date",
+        f"?perPage={per_page}&page={page}&sort=-date",
         "POST",
         body,
         token=token,
     )
     if status != 200:
+        if status == 429 or status >= 500:
+            raise TemporaryMailError(f"Mail API temporariamente indisponível (HTTP {status})")
         raise MailError(f"search falhou ({status}): {str(resp)[:200]}")
     return resp.get("data") or []
 
@@ -195,6 +204,8 @@ def message_text(uid: int, folder: str = "INBOX", *,
         token=token,
     )
     if status != 200:
+        if status == 429 or status >= 500:
+            raise TemporaryMailError(f"Mail API temporariamente indisponível (HTTP {status})")
         raise MailError(f"text da mensagem {uid} falhou ({status}): {str(body)[:200]}")
     if isinstance(body, dict):
         data = body.get("data")
@@ -264,7 +275,7 @@ def extract_code(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def max_uid(to_address: str | None = None) -> int | dict[str, int]:
+def max_uid(to_address: str | None = None) -> dict[str, int]:
     """Maior uid atual na INBOX (para ignorar mensagens antigas no wait_for_code)."""
     connections = configured_connections(to_address)
     if not connections:
@@ -273,18 +284,25 @@ def max_uid(to_address: str | None = None) -> int | dict[str, int]:
     errors: list[str] = []
     for item in connections:
         try:
-            msgs = search_messages(
-                to=to_address, per_page=1,
-                token=str(item["token"]),
-                mailbox=str(item.get("mailbox_id") or "") or None,
-            )
+            for attempt in range(3):
+                try:
+                    msgs = search_messages(
+                        to=to_address, per_page=100,
+                        token=str(item["token"]),
+                        mailbox=str(item.get("mailbox_id") or "") or None,
+                    )
+                    break
+                except TemporaryMailError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(attempt + 1)
             cursors[str(item["id"])] = max(
                 (int(message.get("uid", 0)) for message in msgs), default=0)
         except Exception as exc:  # noqa: BLE001 — outra caixa ainda pode responder
             errors.append(f"{item.get('name') or item['id']}: {exc}")
     if not cursors:
         raise MailError("nenhuma caixa Hostinger respondeu: " + "; ".join(errors))
-    return next(iter(cursors.values())) if len(connections) == 1 else cursors
+    return cursors
 
 
 def wait_for_code(
@@ -305,16 +323,21 @@ def wait_for_code(
       - O código do Clerk vem no SUBJECT ("123456 is your verification code") —
         checa o subject antes do corpo (o corpo pode ter outros números).
     """
-    deadline = time.time() + timeout
-    alvo = to_address.lower()
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    alvo = to_address.strip().lower()
+    # Freeze routing for this challenge; a newly connected mailbox has no
+    # pre-challenge cursor and must not contribute old codes.
+    connections = configured_connections(to_address)
+    if isinstance(min_uid, dict):
+        connections = [c for c in connections if str(c["id"]) in min_uid]
+    if not connections:
+        raise MailError("nenhuma caixa Hostinger com leitura inicial válida para esta conta")
+    while time.monotonic() < deadline:
         # com sender: busca por remetente e filtra destinatário no client;
         # sem sender: o filtro `to` server-side funciona sozinho
-        connections = configured_connections(to_address)
-        if not connections:
-            raise MailError("nenhuma conexão Hostinger configurada")
         errors: list[str] = []
         successful_searches = 0
+        transient_failure = False
         for connection in connections:
             token = str(connection["token"])
             mailbox = str(connection.get("mailbox_id") or "") or None
@@ -322,39 +345,48 @@ def wait_for_code(
             threshold = (int(min_uid.get(connection_id, 0))
                          if isinstance(min_uid, dict) else int(min_uid))
             try:
-                msgs = (search_messages(from_=sender, per_page=20,
-                                        token=token, mailbox=mailbox) if sender
-                        else search_messages(to=to_address, per_page=20,
-                                             token=token, mailbox=mailbox))
+                seen: set[int] = set()
+                page = 1
+                while time.monotonic() < deadline:
+                    batch = search_messages(
+                        from_=sender, to=None if sender else to_address,
+                        per_page=100, page=page, token=token, mailbox=mailbox)
+                    fresh = [m for m in batch if int(m.get("uid", 0)) not in seen]
+                    seen.update(int(m.get("uid", 0)) for m in fresh)
+                    for msg in fresh:
+                        if int(msg.get("uid", 0)) <= threshold:
+                            continue
+                        dests = [str(t.get("address", "")).strip().lower()
+                                 for t in (msg.get("to") or []) if isinstance(t, dict)]
+                        if alvo not in dests:
+                            continue
+                        code = extract_code(str(msg.get("subject") or ""))
+                        if not code:
+                            code = extract_code(message_text(
+                                msg["uid"], token=token, mailbox=mailbox))
+                        if code:
+                            # Reading is not acceptance by Clerk. Retain the
+                            # message until the authentication is resolved.
+                            return code
+                    if len(batch) < 100 or not fresh:
+                        break
+                    # Date ordering does not guarantee UID ordering. Continue
+                    # until the page is entirely older than the snapshot.
+                    if all(int(m.get("uid", 0)) <= threshold for m in batch):
+                        break
+                    page += 1
+            except TemporaryMailError:
+                transient_failure = True
+                continue
             except Exception as exc:  # noqa: BLE001 — tenta as demais conexões
                 errors.append(
                     f"{connection.get('name') or connection_id}: {exc}")
                 continue
             successful_searches += 1
-            for msg in msgs:
-                if int(msg.get("uid", 0)) <= threshold:
-                    continue
-                if sender:
-                    dests = [str(t.get("address", "")).lower()
-                             for t in (msg.get("to") or [])]
-                    if dests and alvo not in dests:
-                        continue
-                code = extract_code(str(msg.get("subject") or ""))
-                if not code:
-                    code = extract_code(message_text(
-                        msg["uid"], token=token, mailbox=mailbox))
-                if code:
-                    # código é de uso único e a caixa catch-all lota rápido:
-                    # apaga o e-mail depois de consumir (best-effort)
-                    try:
-                        delete_message(msg["uid"], token=token, mailbox=mailbox)
-                    except Exception:  # noqa: BLE001 — limpeza não derruba o fluxo
-                        pass
-                    return code
-        if not successful_searches:
+        if not successful_searches and not transient_failure:
             raise MailError(
                 "nenhuma caixa Hostinger respondeu: " + ", ".join(errors))
-        time.sleep(poll)
+        time.sleep(min(poll, max(0, deadline - time.monotonic())))
     raise MailError(
         f"timeout ({timeout}s) esperando email para {to_address}"
         + (f" de {sender}" if sender else "")

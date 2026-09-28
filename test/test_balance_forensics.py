@@ -14,6 +14,30 @@ SUMMARY = {"availableCents": 2600, "pendingCents": 20,
 
 
 class BalanceForensicsTests(unittest.TestCase):
+    def test_refresh_finishes_each_account_before_starting_the_next(self):
+        instance = runner.BalancesRunner()
+        events = []
+
+        def query(email, password):
+            events.append(("api", email))
+            if email == "a":
+                raise RuntimeError("compatibility fallback")
+            return SUMMARY
+
+        def browser(email, password, **kwargs):
+            events.append(("browser", email))
+            return SUMMARY
+
+        with patch.object(crowtado, "consultar_saldo_api", side_effect=query), \
+             patch.object(crowtado, "consultar_saldo_navegador", side_effect=browser):
+            instance._run({"a": "pw", "b": "pw", "c": "pw"},
+                          lambda email, *_: events.append(("saved", email)))
+        self.assertEqual(events, [("api", "a"), ("browser", "a"), ("saved", "a"),
+                                  ("api", "b"), ("saved", "b"),
+                                  ("api", "c"), ("saved", "c")])
+        self.assertEqual(instance.snapshot()["done"], 3)
+        self.assertEqual(instance.snapshot()["fallbacks"], 1)
+
     def test_refresh_rejects_malformed_email_selection(self):
         client = server.create_app().test_client()
         for body in (["unexpected"], {"emails": "a@example.com"}, {"emails": [None]}):
