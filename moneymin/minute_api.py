@@ -235,7 +235,7 @@ def _maybe_latch_version_gate(text: str, *, clear: bool = False) -> None:
 
 
 def _semver_tuple(value: str) -> tuple[int, int, int]:
-    """Compara versões '1.22.0' de forma tolerante a sufixos."""
+    """Compara versões '1.28.0' de forma tolerante a sufixos."""
     return _parse_semver_or_none(value) or (0, 0, 0)
 
 
@@ -642,7 +642,7 @@ class Session:
             "Accept": "*/*",
             "Accept-Language": config.ACCEPT_LANGUAGE,
         }
-        # Identidade de APARELHO da conta (app 1.22.0 envia X-Device-Id
+        # Identidade de APARELHO da conta (contrato anterior do app 1.22.0: X-Device-Id
         # `android.ssaid:...` em toda chamada; o UA carrega o Android daquele
         # aparelho — anti-colusão). A localização (X-Device-Location) só vai
         # nas rotas de quota/geo, como no app.
@@ -652,12 +652,15 @@ class Session:
         else:
             headers["X-App-Version"] = config.APP_VERSION
             headers["User-Agent"] = config.USER_AGENT
+        # App Check opcional, somente com configuração autorizada pelo administrador.
+        from . import appcheck
+        headers.update(appcheck.get_app_check_header())
         status, text = _request(config.BASE_URL + path, method, headers=headers, body=body)
         if status == 403:
             # Kill-switch de versão mínima: o app trava qualquer 403 que pareça
             # version gate (maybeLatchVersionGate); aqui persistem localmente.
             _maybe_latch_version_gate(text)
-        if status != 401 or getattr(self, "_refreshing", False):
+        if status != 401 or appcheck.is_app_check_rejection(text) or getattr(self, "_refreshing", False):
             return status, text
         # Rede de segurança: o Minute recusou o Bearer. Troca no Firebase;
         # se o token novo também cair 401, re-login com a senha salva.
@@ -672,7 +675,7 @@ class Session:
                 config.BASE_URL + path, method, headers=headers, body=body)
             if status2 == 403:
                 _maybe_latch_version_gate(text2)
-            if status2 != 401:
+            if status2 != 401 or appcheck.is_app_check_rejection(text2):
                 return status2, text2
             try:
                 self._relogin()
@@ -702,12 +705,15 @@ class Session:
         else:
             headers["X-App-Version"] = config.APP_VERSION
             headers["User-Agent"] = config.USER_AGENT
+        # App Check opcional; a rejeição do servidor nunca é tratada como sucesso.
+        from . import appcheck
+        headers.update(appcheck.get_app_check_header())
 
         response = _request_detailed(
             config.BASE_URL + path, method, headers=headers, body=body)
         if response.status == 403:
             _maybe_latch_version_gate(response.text)
-        if response.status != 401 or getattr(self, "_refreshing", False):
+        if response.status != 401 or appcheck.is_app_check_rejection(response.text) or getattr(self, "_refreshing", False):
             return response
         self._refreshing = True
         try:
@@ -720,7 +726,7 @@ class Session:
                 config.BASE_URL + path, method, headers=headers, body=body)
             if refreshed.status == 403:
                 _maybe_latch_version_gate(refreshed.text)
-            if refreshed.status != 401:
+            if refreshed.status != 401 or appcheck.is_app_check_rejection(refreshed.text):
                 return refreshed
             try:
                 self._relogin()
@@ -758,14 +764,31 @@ class Session:
     def organizations(self) -> Any:
         return self.json("GET", "/api/v1/organizations")
 
+    def _catalog_json(self, path: str) -> Any:
+        """A denied or malformed catalog must never look like an empty catalog."""
+        status, text = self.get(path)
+        if not 200 <= status < 300:
+            raise _auth_failure(status, text, "Consulta do catálogo")
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            raise AuthError("Catálogo retornou conteúdo inválido.", code="invalid_response") from None
+        if isinstance(data, dict):
+            rows = next((data[k] for k in ("tasks", "items", "data", "results", "categories") if k in data), None)
+        else:
+            rows = data
+        if not isinstance(rows, list) or any(not isinstance(item, dict) for item in rows):
+            raise AuthError("Catálogo retornou estrutura inválida.", code="invalid_response")
+        return data
+
     def categories(self) -> Any:
         """Categorias globais do Minute (base para o enquadramento)."""
-        return self.json("GET", "/api/v1/categories")
+        return self._catalog_json("/api/v1/categories")
 
     def org_tasks(self, org_key: str) -> Any:
         lang = config.ACCEPT_LANGUAGE.split(",", 1)[0].strip()
         query = f"?lang={lang}" if lang else ""
-        return self.json("GET", f"/api/v1/orgs/{org_key}/tasks{query}")
+        return self._catalog_json(f"/api/v1/orgs/{org_key}/tasks{query}")
 
     def org_quota(self, org_key: str) -> Any:
         """Quota/geo da org (`getRecordingGeo` do app)."""
@@ -1037,8 +1060,8 @@ class Session:
         """Tasks de uma org, sempre como lista (normaliza list/dict)."""
         lang = config.ACCEPT_LANGUAGE.split(",", 1)[0].strip()
         query = f"?lang={lang}" if lang else ""
-        _, body = self.get(f"/api/v1/orgs/{org_key}/tasks{query}")
-        return [t for t in _as_list(body) if isinstance(t, dict)]
+        body = self._catalog_json(f"/api/v1/orgs/{org_key}/tasks{query}")
+        return _as_list(body)
 
     # -- telemetria (comportamento de app aberto) ----------------------------
     def app_opened(self, auth_method: str = "SESSION_RESUMED",

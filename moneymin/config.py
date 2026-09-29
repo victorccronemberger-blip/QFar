@@ -149,10 +149,10 @@ HOSTINGER_MAIL_PROFILES = (
 CROWTADO_REF = "4NGM98UV"
 CROWTADO_SIGNUP_URL = f"https://www.crowtado.com/sign-up?ref={CROWTADO_REF}"
 
-# Versão do app usada nos headers (bate com o APK Android v1.22.0 / APKPure).
-# versionCode 1004023 (targetSdk 36). Backend exige min 1.21.0; 1.22.0 é a release atual.
-APP_VERSION = os.environ.get("MINUTE_APP_VERSION", "1.22.0")
-ANDROID_VERSION_CODE = os.environ.get("MINUTE_ANDROID_VERSION_CODE", "1004023")
+# Valores de compatibilidade configurados para esta integração.
+# Aceitação do header não comprova equivalência de uploads com o APK 1.28.0.
+APP_VERSION = os.environ.get("MINUTE_APP_VERSION", "1.28.0")
+ANDROID_VERSION_CODE = os.environ.get("MINUTE_ANDROID_VERSION_CODE", "1004033")
 # UA Android: TODO o HTTP passa pelo OkHttp (RN fetch + AzureBlockUploader) com
 # o header default `okhttp/<versão>` — o bundle não contém nenhum literal de UA
 # custom, e o APK declara okhttp/4.12.0. O OkHttp manda o MESMO header para
@@ -160,7 +160,7 @@ ANDROID_VERSION_CODE = os.environ.get("MINUTE_ANDROID_VERSION_CODE", "1004023")
 USER_AGENT = os.environ.get("MINUTE_USER_AGENT", "okhttp/4.12.0")
 # Android no Brasil (todas as contas operam daqui).
 ACCEPT_LANGUAGE = os.environ.get("MINUTE_ACCEPT_LANGUAGE", "pt-BR,pt;q=0.9")
-# Header X-Device-Location (app Android 1.22.0): CSV lat,lon,accuracy,isMock
+# Header X-Device-Location (contrato anteriormente analisado no app Android 1.22.0): CSV lat,lon,accuracy,isMock
 # (formatDeviceLocationHeader no bundle: lat.toFixed(6),lon.toFixed(6),round(acc),isMock).
 # Só envia se LAT/LNG estiverem no ambiente — não inventa GPS.
 try:
@@ -193,7 +193,7 @@ EGO4D_AWS_REGION = os.environ.get("EGO4D_AWS_REGION", "").strip()
 
 
 # --- Perfil nativo do app ANDROID (réplica do upload) ------------------------
-# Valores extraídos do APK Android v1.22.0 (jadx_out/sources/app/useminute):
+# Valores extraídos anteriormente do APK Android v1.22.0 (jadx_out/sources/app/useminute):
 # o meta do POST /uploads usa o formato CURTO getDeviceUploadMeta
 # (platform={os}, device={model}), enquanto o metadata.json DENTRO do sidecar
 # usa o formato COMPLETO (platform={type,version:sdk} + device com

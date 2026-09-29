@@ -6,6 +6,9 @@
 #include <oclero/qlementine/style/QlementineStyle.hpp>
 #include <QApplication>
 #include <QDialog>
+#include <QMenu>
+#include <QMouseEvent>
+#include <QEventLoop>
 #include <QRegularExpression>
 #include <QComboBox>
 #include <QDir>
@@ -24,6 +27,49 @@
 
 class OperationPreview {
 public:
+  static void settingsSmoke(MainWindow& window) {
+    const auto click = [](QWidget* widget, QPoint point) {
+      QMouseEvent move(QEvent::MouseMove, point, widget->mapToGlobal(point), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+      QApplication::sendEvent(widget, &move);
+      QMouseEvent press(QEvent::MouseButtonPress, point, widget->mapToGlobal(point), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+      QApplication::sendEvent(widget, &press);
+      QMouseEvent release(QEvent::MouseButtonRelease, point, widget->mapToGlobal(point), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+      QApplication::sendEvent(widget, &release);
+      QEventLoop settle;
+      QTimer::singleShot(200, &settle, &QEventLoop::quit);
+      settle.exec();
+    };
+    for (int pass = 0; pass < 2; ++pass) {
+      const QList<int> pages{1, 2, 4, 8};
+      for (int i = 0; i < pages.size(); ++i) {
+        click(window._navigation->viewport(), window._navigation->visualItemRect(window._navigation->item(9)).center());
+        if (!window._settingsMenu->isVisible()) { qWarning("settings menu did not open"); qApp->exit(90); return; }
+        auto* action = window._settingsMenu->actions().at(i);
+        if (!action->isEnabled()) { qApp->exit(92); return; }
+        click(window._settingsMenu, window._settingsMenu->actionGeometry(action).center());
+        if (window._pages->currentIndex() != pages[i]) { qWarning("settings action failed: %d, page=%d", i, window._pages->currentIndex()); qApp->exit(91); return; }
+      }
+      const bool darkBefore = QSettings().value("darkTheme", false).toBool();
+      click(window._navigation->viewport(), window._navigation->visualItemRect(window._navigation->item(9)).center());
+      click(window._settingsMenu, window._settingsMenu->actionGeometry(window._settingsMenu->actions().at(6)).center());
+      if (QSettings().value("darkTheme", false).toBool() == darkBefore) { qApp->exit(93); return; }
+    }
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:1")); // No live customer service.
+    click(window._navigation->viewport(), window._navigation->visualItemRect(window._navigation->item(9)).center());
+    click(window._settingsMenu, window._settingsMenu->actionGeometry(window._settingsMenu->actions().at(5)).center());
+    QDialog* recovery = nullptr;
+    for (auto* dialog : window.findChildren<QDialog*>())
+      if (dialog->isVisible() && dialog->windowTitle() == QStringLiteral("Recuperação de envios")) recovery = dialog;
+    if (!recovery) { qApp->exit(94); return; }
+    recovery->close();
+    // Verify menu dispatch without contacting GitHub or installing an update.
+    QObject::disconnect(window._updateButton, &QPushButton::clicked, &window, nullptr);
+    int updateClicks = 0;
+    QObject::connect(window._updateButton, &QPushButton::clicked, &window, [&updateClicks] { ++updateClicks; });
+    click(window._navigation->viewport(), window._navigation->visualItemRect(window._navigation->item(9)).center());
+    click(window._settingsMenu, window._settingsMenu->actionGeometry(window._settingsMenu->actions().at(7)).center());
+    qApp->exit(updateClicks == 1 ? 0 : 95);
+  }
   static void mailCleanupSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(80); return; }
@@ -531,6 +577,10 @@ int main(int argc, char** argv) {
     return app.exec();
   }
   window.show();
+  if (app.arguments().contains("--settings-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::settingsSmoke(window); });
+    return app.exec();
+  }
   if (app.arguments().contains("--live-catalog-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::liveCatalogSmoke(window); });
     return app.exec();

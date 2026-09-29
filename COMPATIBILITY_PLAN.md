@@ -94,7 +94,7 @@ real foi realizado. A publicação ainda não faz parte desta entrega.
 Essas verificações corrigem os caminhos descritos; não constituem certificação
 de todos os contratos do servidor nem alteram a origem dos vídeos ou sensores.
 
-## Inventário Duvi (Minute 1.22.0) — terceira etapa
+## Inventário Duvi (Minute 1.28.0) — terceira etapa
 
 Inventário completo do catálogo Duvi (política, segurança, anti-fraude,
 telemetria, OTA). Classes: **A** fechar no código, **B** aproximar no Windows,
