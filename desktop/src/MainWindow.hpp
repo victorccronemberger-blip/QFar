@@ -353,6 +353,7 @@ private:
 
   QTableWidget* _balancesTable{};
   QLabel* _balancesState{};
+  QLabel* _balancesWithdrawReceipt{};
   QPushButton* _balancesRefresh{};
   QPushButton* _balancesRefreshNeeded{};
   QLineEdit* _balancesSearch{};

@@ -191,9 +191,16 @@ def _wise_cleanup_snapshot() -> dict[str, Any]:
 def _finish_wise_cleanup(email: str, password: str) -> dict[str, Any]:
     result = {"wiseDestinationRemoved": False, "payoutPreferenceRestored": False}
     # Repetimos somente a limpeza, nunca a vinculação ou a solicitação de saque.
-    for attempt in range(2):
-        if attempt:
-            time.sleep(2)
+    delays = (0, 2, 4, 8, 15, 30)
+    for attempt, delay in enumerate(delays, 1):
+        try:
+            save_json(_wise_cleanup_path(), {"pending": True, "email": email,
+                "automatic": True, "attempt": attempt, "max_attempts": len(delays),
+                "message": "Aguardando confirmação de Wise desvinculada e Dots restaurado."})
+        except OSError:
+            return {**result, "cleanupPending": True}
+        if delay:
+            time.sleep(delay)
         try:
             result = crowtado.finalizar_wise(email, password)
         except Exception:
@@ -204,6 +211,12 @@ def _finish_wise_cleanup(email: str, password: str) -> dict[str, Any]:
             except OSError:
                 break  # Pendência permanece: recuperação pode repetir a limpeza idempotente.
             return {**result, "cleanupPending": False}
+    try:
+        save_json(_wise_cleanup_path(), {"pending": True, "email": email, "automatic": False,
+            "attempt": len(delays), "max_attempts": len(delays),
+            "message": "A plataforma não confirmou a limpeza após as tentativas automáticas. Saques bloqueados."})
+    except OSError:
+        pass
     return {**result, "cleanupPending": True}
 
 
@@ -232,6 +245,13 @@ def _withdraw_wise_flow(email: str, password: str, wise: dict[str, str]) -> dict
         if type(http_status) is int and 400 <= http_status <= 599:
             result["httpStatus"] = http_status
     finally:
+        # Preserve acceptance before recovery waits, including app/connection loss.
+        try:
+            save_json(config.DATA_DIR / "withdraw_last_result.json", {
+                "email": email, "finished_at": time.time(),
+                "result": {"status": result.get("status", "unknown"), "cleanupPending": True}})
+        except OSError:
+            pass
         cleanup = _finish_wise_cleanup(email, password)
     result = {**result, **cleanup}
     # Store only classified evidence, never raw API errors or destination data.
@@ -404,6 +424,36 @@ def _withdraw_bulk_snapshot() -> dict[str, Any]:
     with _WITHDRAW_BULK_LOCK:
         _load_withdraw_bulk_locked()
         return {**_WITHDRAW_BULK_STATE, "results": list(_WITHDRAW_BULK_STATE["results"])}
+
+
+def _start_withdraw_worker(eligible, wise):
+    with _WITHDRAW_BULK_LOCK:
+        _load_withdraw_bulk_locked()
+        if _WITHDRAW_BULK_STATE["state"] == "running":
+            return ({"error": "já há um saque em lote em andamento"}), 409
+        _WITHDRAW_BULK_STATE.update(
+            state="running", total=len(eligible), done=0, results=[],
+            method=wise.get("method", "wise") if wise else "saved",
+            current=None, message="", started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        try:
+            _save_withdraw_bulk_locked()
+        except OSError:
+            _WITHDRAW_BULK_STATE["state"] = "error"
+            return ({"error": "não foi possível salvar o histórico do lote"}), 503
+    thread = threading.Thread(target=_withdraw_bulk_run, args=(eligible, wise) if wise else (eligible,),
+                              daemon=True, name="moneymin-withdraw-bulk")
+    try:
+        thread.start()
+    except RuntimeError:
+        with _WITHDRAW_BULK_LOCK:
+            _WITHDRAW_BULK_STATE.update(state="error", current=None,
+                message="O processamento não pôde começar; nenhum link foi solicitado.")
+            try:
+                _save_withdraw_bulk_locked()
+            except OSError:
+                pass
+        return ({"error": "não foi possível iniciar o saque em lote"}), 503
+    return {"ok": True, "total": len(eligible), "background": True}, 202
 
 
 def _withdraw_bulk_run(creds: dict[str, str], wise: dict[str, str] | None = None) -> None:
@@ -1847,6 +1897,51 @@ def _on_balance_result(email: str, summary: dict | None, erro: str | Exception |
             rec["stale"] = True
         balances[email] = rec
         _save_balances(balances)
+
+
+def _last_withdrawal_receipt(configured: set[str]) -> dict[str, Any]:
+    """Expose recorded provider acceptance separately from Wise cleanup.
+
+    Legacy Wise diagnostics are sufficient evidence of acceptance, but never of
+    settlement in the recipient's bank. Do not infer success from balance loss.
+    """
+    record = load_json(config.DATA_DIR / "withdraw_last_result.json", {})
+    if not isinstance(record, dict) or record.get("email") not in configured:
+        return {}
+    result = record.get("result")
+    if not isinstance(result, dict):
+        return {}
+    status = result.get("status")
+    if not isinstance(status, str):
+        return {}
+    accepted = status == "ok"
+    email = record["email"]
+    when = record.get("finished_at")
+    if type(when) not in (float, int) or not math.isfinite(when):
+        return {}
+    try:
+        stamp = datetime.datetime.fromtimestamp(when, datetime.timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return {}
+    pending = _wise_cleanup_snapshot()
+    current_pending = bool(pending.get("pending") and
+                           (pending.get("email") == email or pending.get("error")))
+    if accepted:
+        message = "Saque Wise aceito pela Crowtado. Não repita esta solicitação."
+    elif status == "review_required":
+        message = "Solicitação Wise enviada para revisão da Crowtado."
+    else:
+        message = _withdraw_message(email, result)
+    if accepted or status == "review_required":
+        if current_pending:
+            message += " A limpeza Wise está pendente; novos saques permanecem bloqueados."
+        elif result.get("wiseDestinationRemoved") is True and result.get("payoutPreferenceRestored") is True:
+            message += " Wise desvinculada e Dots confirmado."
+        elif result.get("cleanupPending") is True:
+            message += " Houve pendência de limpeza; atualmente não há bloqueio de limpeza registrado."
+        message += " O recebimento na Wise não foi verificado pelo QMoney."
+    return {"email": email, "accepted": accepted, "status": status,
+            "finished_at": stamp, "cleanup_pending": current_pending, "message": message}
 
 
 def _withdraw_message(email: str, result: dict[str, Any]) -> str:
@@ -4055,6 +4150,7 @@ def create_app() -> Flask:
             "withdraw_bulk": _withdraw_bulk_snapshot(),
             "payout_method_bulk": _payout_method_snapshot(),
             "wise_cleanup": _wise_cleanup_snapshot(),
+            "last_withdrawal": _last_withdrawal_receipt(configured_set),
             "exchange": fx.usd_brl_quote(),
         })
 
@@ -4193,6 +4289,11 @@ def create_app() -> Flask:
             return jsonify({"error": "há um pagamento em trânsito que a Crowtado não permite substituir; atualize o saldo após a conclusão"}), 409
         if not _confirmed_available_balance(balance):
             return jsonify({"error": "atualize o saldo desta conta antes de solicitar saque; é necessário saldo aprovado superior a US$ 25,00"}), 400
+        if wise and wise.get("method") != "paypal" and body.get("background") is True:
+            if _wise_cleanup_snapshot().get("pending"):
+                return jsonify({"error": "há uma limpeza Wise pendente; nenhum novo saque será enviado"}), 409
+            payload, status = _start_withdraw_worker({email: password}, wise)
+            return jsonify(payload), status
         result, status = (_withdraw_once(email, password, wise) if wise
                           else _withdraw_once(email, password))
         return jsonify(result), status
@@ -4226,33 +4327,8 @@ def create_app() -> Flask:
             eligible[email] = passwords[email]
         if not eligible:
             return jsonify({"error": "não há contas elegíveis: é necessário saldo aprovado superior a US$ 25,00 e nenhum pagamento em trânsito bloqueando novo saque"}), 400
-        with _WITHDRAW_BULK_LOCK:
-            _load_withdraw_bulk_locked()
-            if _WITHDRAW_BULK_STATE["state"] == "running":
-                return jsonify({"error": "já há um saque em lote em andamento"}), 409
-            _WITHDRAW_BULK_STATE.update(
-                state="running", total=len(eligible), done=0, results=[],
-                method=wise.get("method", "wise") if wise else "saved",
-                current=None, message="", started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
-            try:
-                _save_withdraw_bulk_locked()
-            except OSError:
-                _WITHDRAW_BULK_STATE["state"] = "error"
-                return jsonify({"error": "não foi possível salvar o histórico do lote"}), 503
-        thread = threading.Thread(target=_withdraw_bulk_run, args=(eligible, wise) if wise else (eligible,),
-                                  daemon=True, name="moneymin-withdraw-bulk")
-        try:
-            thread.start()
-        except RuntimeError:
-            with _WITHDRAW_BULK_LOCK:
-                _WITHDRAW_BULK_STATE.update(state="error", current=None,
-                    message="O processamento não pôde começar; nenhum link foi solicitado.")
-                try:
-                    _save_withdraw_bulk_locked()
-                except OSError:
-                    pass
-            return jsonify({"error": "não foi possível iniciar o saque em lote"}), 503
-        return jsonify({"ok": True, "total": len(eligible)})
+        payload, status = _start_withdraw_worker(eligible, wise)
+        return jsonify(payload), (200 if status == 202 else status)
 
     @app.put("/api/balances/credentials")
     def put_balance_credentials():

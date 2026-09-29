@@ -213,8 +213,15 @@ public:
         socket->setProperty("answered", true);
         const int number = ++*requests;
         QTimer::singleShot(250, socket, [socket, number] {
-          const QByteArray body = number == 1 ? QByteArray("{\"error\":\"fixture offline\"}")
+          QByteArray body = number == 1 ? QByteArray("{\"error\":\"fixture offline\"}")
               : QByteArray("{\"accounts\":[\"fixture@example.com\"],\"with_password\":[\"fixture@example.com\"],\"balances\":{\"fixture@example.com\":{\"availableCents\":3685,\"inTransitCents\":2704,\"inTransitReplaceable\":false}},\"runner\":{\"state\":\"done\",\"failed\":1,\"total\":2}}");
+          if (number != 1) {
+            auto data = QJsonDocument::fromJson(body).object();
+            data.insert("last_withdrawal", QJsonObject{{"email","fixture@example.com"},
+                {"accepted",true},{"finished_at","2026-09-29T15:00:00+00:00"},
+                {"message",QStringLiteral("Saque Wise aceito pela Crowtado. Limpeza pendente.")}});
+            body = QJsonDocument(data).toJson(QJsonDocument::Compact);
+          }
           socket->write("HTTP/1.1 " + QByteArray(number == 1 ? "503 Unavailable" : "200 OK")
               + "\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size())
               + "\r\nConnection: close\r\n\r\n" + body);
@@ -243,7 +250,9 @@ public:
             qApp->exit(54); return;
           }
         }
-        qApp->exit(recovered && foundWithdrawal ? 0 : 52);
+        const bool receiptVisible = window._balancesWithdrawReceipt->isVisible()
+            && window._balancesWithdrawReceipt->text().contains(QStringLiteral("aceito pela Crowtado"));
+        qApp->exit(recovered && foundWithdrawal && receiptVisible ? 0 : 52);
       });
     });
     QTimer::singleShot(8000, &window, [] { qApp->exit(53); });

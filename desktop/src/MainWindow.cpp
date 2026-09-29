@@ -2191,6 +2191,13 @@ QWidget* MainWindow::buildBalancesPage() {
   identityLayout->setSpacing(3);
   _balancesState = quietLabel(QStringLiteral("Aguardando leitura…"));
   identityLayout->addWidget(_balancesState);
+  _balancesWithdrawReceipt = new QLabel;
+  _balancesWithdrawReceipt->setObjectName(QStringLiteral("withdrawalReceipt"));
+  _balancesWithdrawReceipt->setTextFormat(Qt::PlainText);
+  _balancesWithdrawReceipt->setWordWrap(true);
+  _balancesWithdrawReceipt->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  _balancesWithdrawReceipt->hide();
+  identityLayout->addWidget(_balancesWithdrawReceipt);
   auto* identityHelp = quietLabel(QStringLiteral(
       "O mesmo e-mail usa o Minute nas campanhas e o Crowtado nos saldos. "
       "Se as senhas forem diferentes, conecte o acesso Crowtado na linha abaixo."));
@@ -5733,7 +5740,21 @@ void MainWindow::loadBalances() {
     const auto payout = root.value(QStringLiteral("payout_method_bulk")).toObject();
     const auto wiseCleanup = root.value(QStringLiteral("wise_cleanup")).toObject();
     const bool cleanupPending = wiseCleanup.value(QStringLiteral("pending")).toBool();
+    const bool cleanupAutomatic = wiseCleanup.value(QStringLiteral("automatic")).toBool()
+        && bulk.value(QStringLiteral("state")).toString() == QStringLiteral("running");
     _balancesWiseCleanup->setVisible(cleanupPending);
+    _balancesWiseCleanup->setEnabled(!cleanupAutomatic);
+    const auto receipt = root.value(QStringLiteral("last_withdrawal")).toObject();
+    _balancesWithdrawReceipt->setVisible(!receipt.isEmpty());
+    if (!receipt.isEmpty()) {
+      _balancesWithdrawReceipt->setText(QStringLiteral("%1 · %2\n%3")
+          .arg(receipt.value(QStringLiteral("email")).toString(),
+               friendlyDate(receipt.value(QStringLiteral("finished_at")).toString()),
+               receipt.value(QStringLiteral("message")).toString()));
+      _balancesWithdrawReceipt->setStyleSheet(receipt.value(QStringLiteral("accepted")).toBool()
+          ? QStringLiteral("padding:12px; border:1px solid #20a475; border-radius:8px;")
+          : QStringLiteral("padding:12px; border:1px solid #bb873c; border-radius:8px;"));
+    }
     _lastWithdrawBulk = bulk;
     _balancesWithdrawHistory->setEnabled(
         bulk.value(QStringLiteral("state")).toString() != QStringLiteral("idle"));
@@ -5867,11 +5888,19 @@ void MainWindow::loadBalances() {
       connect(withdraw, &QPushButton::clicked, this, [this, email, withdraw] {
         QJsonObject request{{QStringLiteral("email"), email}};
         if (!confirmWithdrawal(this, 1, request)) return;
+        if (request.value(QStringLiteral("method")).toString() == QStringLiteral("wise"))
+          request.insert(QStringLiteral("background"), true);
         withdraw->setEnabled(false);
         _api.post(QStringLiteral("/api/balances/withdraw"), request,
                   [this, withdraw](bool ok, const QJsonDocument& doc, const QString& error) {
           loadBalances();
           if (!ok) return showError(QStringLiteral("Solicitação precisa de atenção"), error);
+          if (doc.object().value(QStringLiteral("background")).toBool()) {
+            _bulkWithdrawAwaitingResult = true;
+            _balancePoll.start();
+            setStatus(QStringLiteral("Processando saque Wise e limpeza automática…"));
+            return;
+          }
           QMessageBox::information(this, QStringLiteral("Solicitação enviada"),
                                    doc.object().value(QStringLiteral("message")).toString());
         });
@@ -5959,8 +5988,13 @@ void MainWindow::loadBalances() {
         ++claruCount;
     }
     _balancesState->setText(cleanupPending
-        ? QStringLiteral("Limpeza Wise pendente em %1 · novos saques bloqueados")
-              .arg(wiseCleanup.value(QStringLiteral("email")).toString())
+        ? (cleanupAutomatic
+            ? QStringLiteral("Limpando Wise automaticamente em %1 · tentativa %2 de %3 · aguardando antes da próxima conta")
+                .arg(wiseCleanup.value(QStringLiteral("email")).toString())
+                .arg(wiseCleanup.value(QStringLiteral("attempt")).toInt())
+                .arg(wiseCleanup.value(QStringLiteral("max_attempts")).toInt())
+            : QStringLiteral("Limpeza Wise pendente em %1 · novos saques bloqueados")
+                .arg(wiseCleanup.value(QStringLiteral("email")).toString()))
         : payoutRunning
         ? QStringLiteral("Configurando método de saque: %1 de %2 conta(s)…")
               .arg(payout.value(QStringLiteral("done")).toInt())

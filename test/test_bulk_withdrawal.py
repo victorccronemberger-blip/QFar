@@ -132,7 +132,7 @@ class BulkWithdrawalTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(result["ok"])
         self.assertIn("PENDENTE", result["message"])
-        self.assertEqual(cleanup.call_count, 2)
+        self.assertEqual(cleanup.call_count, 6)
         withdraw.assert_called_once()
         self.assertTrue(server._wise_cleanup_snapshot()["pending"])
 
@@ -254,6 +254,39 @@ class BulkWithdrawalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         withdraw.assert_called_once_with(email, "pw", destination)
 
+    def test_individual_wise_can_use_background_worker(self):
+        email = "one@example.com"
+        destination = {"legal_name": "Test Name", "destination_email": "destination@example.com"}
+        with patch.object(server, "_list_accounts", return_value=[{"email": email}]), \
+             patch.object(server, "_configured_crowtado_creds", return_value={email: "pw"}), \
+             patch.object(server, "_load_balances", return_value={email: {"availableCents": 3000}}), \
+             patch.object(server.org_policy, "account_kind", return_value="crowtado"), \
+             patch.object(server, "_start_withdraw_worker", return_value=({"ok": True, "background": True}, 202)) as worker, \
+             patch.object(server, "_withdraw_once") as withdraw:
+            response = self.client.post("/api/balances/withdraw", json={
+                "email": email, "method": "wise", "wise_confirmed": True, "background": True, **destination})
+        self.assertEqual(response.status_code, 202)
+        worker.assert_called_once_with({email: "pw"}, destination)
+        withdraw.assert_not_called()
+
+    def test_five_accounts_wait_for_delayed_cleanup_without_repeating_withdrawal(self):
+        emails = [f"test-{i}@example.com" for i in range(5)]
+        events = []
+        attempts = {}
+        def cleanup(email, password):
+            attempts[email] = attempts.get(email, 0) + 1
+            events.append((email, "cleanup"))
+            self.assertEqual(server._last_withdrawal_receipt({email})["accepted"], True)
+            return {"wiseDestinationRemoved": attempts[email] >= 4, "payoutPreferenceRestored": True}
+        with patch.object(server.crowtado, "configurar_metodo_saque", side_effect=lambda email,*a,**k:events.append((email,"link"))), \
+             patch.object(server.crowtado, "solicitar_link_saque", side_effect=lambda email,*a,**k:events.append((email,"withdraw")) or {"status":"ok"}) as withdraw, \
+             patch.object(server.crowtado, "finalizar_wise", side_effect=cleanup):
+            server._withdraw_bulk_run(dict.fromkeys(emails,"pw"), {"legal_name":"Test Name","destination_email":"destination@example.com"})
+        self.assertEqual(withdraw.call_count,5)
+        self.assertEqual(events,[(email,action) for email in emails for action in ["link","withdraw","cleanup","cleanup","cleanup","cleanup"]])
+        self.assertEqual(server._withdraw_bulk_snapshot()["state"],"done")
+        self.assertFalse(server._wise_cleanup_snapshot()["pending"])
+
     def test_concurrent_withdrawal_rejected_before_any_remote_change(self):
         with server._PAYOUT_OPERATION_LOCK, \
              patch.object(server.crowtado, "configurar_metodo_saque") as configure, \
@@ -265,6 +298,9 @@ class BulkWithdrawalTests(unittest.TestCase):
         withdraw.assert_not_called()
 
     def setUp(self):
+        delay = patch.object(server.time, "sleep")
+        delay.start()
+        self.addCleanup(delay.stop)
         self._temp = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp.cleanup)
         root = Path(self._temp.name)
