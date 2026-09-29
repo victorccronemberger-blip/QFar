@@ -9,6 +9,37 @@ from moneymin.web import server
 
 
 class BulkWithdrawalTests(unittest.TestCase):
+    def test_paypal_batch_configures_and_requests_each_account_in_order(self):
+        events = []
+        with patch.object(server.crowtado, "configurar_metodo_saque",
+                          side_effect=lambda email, *_: events.append((email, "configure"))), \
+             patch.object(server.crowtado, "solicitar_link_saque",
+                          side_effect=lambda email, *_, **kw: events.append((email, kw["expected_method"])) or {"status": "ok"}):
+            server._withdraw_bulk_run({"a@example.com": "pw", "b@example.com": "pw"}, {"method": "paypal"})
+        self.assertEqual(events, [("a@example.com", "configure"), ("a@example.com", "paypal"),
+                                  ("b@example.com", "configure"), ("b@example.com", "paypal")])
+        self.assertEqual(server._withdraw_bulk_snapshot()["state"], "done")
+
+    def test_paypal_uncertain_response_stops_before_next_account(self):
+        with patch.object(server.crowtado, "configurar_metodo_saque"), \
+             patch.object(server.crowtado, "solicitar_link_saque", side_effect=TimeoutError()) as withdraw:
+            server._withdraw_bulk_run({"a@example.com": "pw", "b@example.com": "pw"}, {"method": "paypal"})
+        withdraw.assert_called_once()
+        snapshot = server._withdraw_bulk_snapshot()
+        self.assertEqual(snapshot["state"], "error")
+        self.assertEqual(snapshot["done"], 1)
+
+    def test_confirmed_paypal_endpoint_preserves_method(self):
+        email = "a@example.com"
+        with patch.object(server, "_list_accounts", return_value=[{"email": email}]), \
+             patch.object(server, "_configured_crowtado_creds", return_value={email: "pw"}), \
+             patch.object(server, "_load_balances", return_value={email: {"availableCents": 3500}}), \
+             patch.object(server, "_withdraw_once", return_value=({"ok": True}, 200)) as withdraw:
+            response = self.client.post("/api/balances/withdraw", json={
+                "email": email, "method": "paypal", "paypal_confirmed": True})
+        self.assertEqual(response.status_code, 200)
+        withdraw.assert_called_once_with(email, "pw", {"method": "paypal"})
+
     def test_in_transit_excludes_account_even_with_approved_balance(self):
         record = {"availableCents": 3685, "inTransitCents": 2704}
         self.assertFalse(server._confirmed_available_balance(record))

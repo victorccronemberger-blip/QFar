@@ -146,7 +146,8 @@ def _payout_method_run(creds: dict[str, str], method: str,
             reason = str(exc).replace(destination_email, "[e-mail]") if destination_email else str(exc)
             reason = reason.replace(legal_name, "[nome]") if legal_name else reason
             result = {"email": email, "ok": False, "message": reason[:300]}
-            if method == "wise" and "already linked to anoth" in reason.lower():
+            if method == "wise" and (getattr(exc, "account_issue_code", None) == "destination_in_use"
+                                     or "already linked to anoth" in reason.lower()):
                 blocked = True
         with _PAYOUT_METHOD_LOCK:
             _PAYOUT_METHOD_STATE["results"].append(result)
@@ -190,7 +191,9 @@ def _wise_cleanup_snapshot() -> dict[str, Any]:
 def _finish_wise_cleanup(email: str, password: str) -> dict[str, Any]:
     result = {"wiseDestinationRemoved": False, "payoutPreferenceRestored": False}
     # Repetimos somente a limpeza, nunca a vinculação ou a solicitação de saque.
-    for _ in range(2):
+    for attempt in range(2):
+        if attempt:
+            time.sleep(2)
         try:
             result = crowtado.finalizar_wise(email, password)
         except Exception:
@@ -220,8 +223,9 @@ def _withdraw_wise_flow(email: str, password: str, wise: dict[str, str]) -> dict
         code = getattr(exc, "account_issue_code", None)
         known_codes = {"authentication", "crowtado_account_missing", "rate_limit",
                        "service", "forbidden", "invalid_response", "network", "timeout",
-                       "tls", "email_verification"}
-        result = {"status": "not_requested" if stage == "configure_wise" else "unknown",
+                       "tls", "email_verification", "destination_in_use", "payout_pending",
+                       "payout_configuration"}
+        result = {"status": "not_requested" if stage == "configure_wise" or getattr(exc, "withdrawal_attempted", True) is False else "unknown",
                   "failureStage": stage,
                   "failureCode": code if code in known_codes else "unexpected"}
         http_status = getattr(exc, "http_status", None)
@@ -289,6 +293,12 @@ def _wise_withdraw_options(body: dict[str, Any]) -> dict[str, str] | None:
     method = body.get("method")
     if method is None:
         return None
+    if method == "paypal":
+        if body.get("paypal_confirmed") is not True:
+            raise ValueError("confirme PayPal antes de solicitar o saque")
+        if body.get("legal_name") or body.get("destination_email"):
+            raise ValueError("PayPal usa o fluxo de pagamento da Crowtado, sem destino manual")
+        return {"method": "paypal"}
     if method != "wise" or body.get("wise_confirmed") is not True:
         raise ValueError("confirme Wise antes de solicitar o saque")
     name = str(body.get("legal_name") or "").strip()
@@ -311,6 +321,22 @@ def _withdraw_once(email: str, password: str,
         return _withdraw_once_locked(email, password, wise)
     finally:
         _PAYOUT_OPERATION_LOCK.release()
+
+
+def _withdraw_paypal_flow(email: str, password: str) -> dict[str, Any]:
+    stage = "configure_paypal"
+    try:
+        crowtado.configurar_metodo_saque(email, password, "paypal")
+        stage = "request_withdrawal"
+        return crowtado.solicitar_link_saque(email, password, expected_method="paypal")
+    except Exception as exc:
+        # Once submitted, a lost response must not encourage another POST.
+        result = {"status": "not_requested" if stage == "configure_paypal" or getattr(exc, "withdrawal_attempted", True) is False else "unknown",
+                  "failureStage": stage, "method": "paypal"}
+        code = getattr(exc, "account_issue_code", None)
+        if code in {"payout_configuration", "destination_in_use", "payout_pending"}:
+            result["failureCode"] = code
+        return result
 
 
 def _withdraw_once_locked(email: str, password: str,
@@ -339,13 +365,21 @@ def _withdraw_once_locked(email: str, password: str,
                     "error": "não foi possível proteger o histórico de solicitações"}, 503
         _WITHDRAW_IN_FLIGHT.add(email)
     try:
-        if wise:
+        if wise and wise.get("method") == "paypal":
+            result = _withdraw_paypal_flow(email, password)
+        elif wise:
             result = _withdraw_wise_flow(email, password, wise)
         else:
-            result = crowtado.solicitar_link_saque(email, password)
+            try:
+                result = crowtado.solicitar_link_saque(email, password)
+            except Exception as exc:
+                if getattr(exc, "withdrawal_attempted", False):
+                    result = {"status": "unknown", "failureStage": "request_withdrawal"}
+                else:
+                    raise
         success = result.get("status") in {"ok", "review_required"}
         message = _withdraw_message(email, result)
-        if wise and result.get("cleanupPending") is False and result.get("status") != "ok":
+        if wise and wise.get("method") != "paypal" and result.get("cleanupPending") is False and result.get("status") != "ok":
             message += "; Wise desvinculada e Dots confirmado."
             if result.get("status") != "not_requested":
                 message += " Confira o histórico antes de repetir o saque."
@@ -354,7 +388,7 @@ def _withdraw_once_locked(email: str, password: str,
             response["error"] = message
         return response, 200 if success else 409
     except Exception as exc:
-        if wise:
+        if wise and wise.get("method") != "paypal":
             return {"email": email, "ok": False, "error": (
                 "O fluxo Wise não foi concluído. Confira o vínculo e o histórico na Crowtado "
                 "antes de repetir; nenhuma nova tentativa automática será feita.")}, 400
@@ -396,22 +430,29 @@ def _withdraw_bulk_run(creds: dict[str, str], wise: dict[str, str] | None = None
             _WITHDRAW_BULK_STATE["done"] += 1
             _WITHDRAW_BULK_STATE["current"] = None
             detail = result.get("result") or {}
-            stop_wise = wise and not (
+            stop_wise = wise and wise.get("method") != "paypal" and not (
                 result.get("ok") and detail.get("status") == "ok"
                 and detail.get("wiseDestinationRemoved") is True
                 and detail.get("payoutPreferenceRestored") is True
                 and detail.get("cleanupPending") is not True)
+            stop_uncertain = detail.get("status") in {
+                "unknown", "dots_pending_retry", "manual_pending_retry",
+                "tremendous_pending_retry", "stripe_global_pending_retry"}
             if stop_wise:
                 _WITHDRAW_BULK_STATE.update(state="error", message=(
                     "Lote Wise interrompido. Confira a última conta: somente após saque aceito, "
                     "Wise desvinculada e Dots confirmado a próxima conta pode começar."))
+            elif stop_uncertain:
+                _WITHDRAW_BULK_STATE.update(state="error", message=(
+                    "Lote interrompido: a última solicitação está pendente ou inconclusiva. "
+                    "Confira o histórico na Crowtado antes de repetir."))
             try:
                 _save_withdraw_bulk_locked()
             except OSError:
                 _WITHDRAW_BULK_STATE.update(
                     state="error", message="O resultado não pôde ser salvo. Confira o link antes de repetir.")
                 return
-            if stop_wise:
+            if stop_wise or stop_uncertain:
                 return
     with _WITHDRAW_BULK_LOCK:
         _WITHDRAW_BULK_STATE["state"] = "done"
@@ -1837,6 +1878,18 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
         return f"solicitação de saque enviada para {email}"
     if status == "review_required":
         return f"saque de {email} enviado para revisão do Crowtado"
+    if status.endswith("_pending_retry"):
+        return (f"A Crowtado registrou uma tentativa pendente para {email} e fará nova tentativa. "
+                "Não solicite outro saque; acompanhe o histórico da plataforma.")
+    if status == "not_requested":
+        method = "PayPal" if result.get("method") == "paypal" or result.get("failureStage") == "configure_paypal" else "Wise"
+        reasons = {
+            "destination_in_use": "o destino está vinculado a outra conta",
+            "payout_pending": "há pagamento pendente impedindo a alteração",
+            "payout_configuration": "a Crowtado ainda não confirmou a configuração",
+        }
+        reason = reasons.get(result.get("failureCode"), "a configuração não foi concluída")
+        return f"Saque não solicitado por {method}: {reason}."
     messages = {
         "in_transit": "há um pagamento em trânsito que a Crowtado não permite substituir; aguarde a conclusão antes de solicitar outro saque",
         "not_requested": "saque não solicitado: a configuração da Wise não foi concluída",
@@ -1844,12 +1897,18 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
         "below_minimum": "saldo abaixo do mínimo para saque",
         "hold": "saques estão temporariamente bloqueados para esta conta",
         "dots_not_ready": "o método Dots ainda não está disponível para esta conta",
+        "manual_not_ready": "a Crowtado não confirmou o destino manual; configure Wise antes de solicitar",
+        "tremendous_not_ready": "o provedor de pagamento da Crowtado não está disponível para esta conta",
+        "stripe_global_not_ready": "o provedor de pagamento ainda não está pronto",
+        "tremendous_failed": "o provedor de pagamento recusou a solicitação; confira o histórico na Crowtado",
+        "manual_failed": "o pagamento manual falhou; confira o histórico na Crowtado antes de repetir",
+        "stripe_global_failed": "o provedor de pagamento recusou a solicitação; confira o histórico na Crowtado",
         "no_balance": "não há saldo disponível para saque",
         "dots_failed": "o Dots recusou a solicitação de saque",
         "dots_pending_retry": "o Crowtado ainda tentará enviar o link novamente",
     }
     return messages.get(
-        status, f"saque não solicitado (status: {status or 'desconhecido'})")
+        status, "Resposta de saque não reconhecida. Confira o histórico na Crowtado antes de repetir.")
 
 
 # --- app -----------------------------------------------------------------------
@@ -3926,6 +3985,45 @@ def create_app() -> Flask:
             },
         })
 
+    # -- limpeza revisada de e-mail (apenas INBOX -> lixeira) -------------------
+    @app.get("/api/mail-cleanup")
+    def mail_cleanup_status():
+        from ..mail_cleanup import CLEANUP
+        result = CLEANUP.snapshot()
+        result["profiles"] = [{"id": p["id"], "name": p.get("name") or "Caixa Hostinger"}
+                              for p in hostinger_mail.configured_connections() if p.get("mailbox_id")]
+        return jsonify(result)
+
+    @app.post("/api/mail-cleanup/preview")
+    def mail_cleanup_preview():
+        from ..mail_cleanup import CLEANUP, CleanupError
+        body = request.get_json(silent=True) or {}
+        profiles = [p for p in hostinger_mail.configured_connections()
+                    if p["id"] == body.get("profile_id") and p.get("mailbox_id")]
+        if len(profiles) != 1:
+            return jsonify({"error": "Selecione uma caixa Hostinger configurada."}), 400
+        try:
+            return jsonify(CLEANUP.start(profiles[0])), 202
+        except CleanupError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.post("/api/mail-cleanup/apply")
+    def mail_cleanup_apply():
+        from ..mail_cleanup import CLEANUP, CleanupError
+        body = request.get_json(silent=True) or {}
+        if body.get("confirmed") is not True:
+            return jsonify({"error": "Revise e confirme os e-mails que irão para a lixeira."}), 400
+        try:
+            return jsonify(CLEANUP.apply(body.get("id"), body.get("uids"))), 202
+        except CleanupError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.post("/api/mail-cleanup/stop")
+    def mail_cleanup_stop():
+        from ..mail_cleanup import CLEANUP
+        CLEANUP.cancel.set()
+        return jsonify({"ok": True})
+
     # -- saldos (crowtado) -----------------------------------------------------
     @app.get("/api/balances")
     def get_balances():
@@ -3995,7 +4093,9 @@ def create_app() -> Flask:
             return jsonify({"error": "escolha Dots, PayPal ou Wise"}), 400
         if method == "wise":
             return jsonify({"error": "selecione Wise ao solicitar saque; o vínculo é feito uma conta por vez"}), 400
-        if method in {"paypal", "wise"}:
+        if method == "paypal" and (legal_name or destination_email):
+            return jsonify({"error": "PayPal usa o fluxo da Crowtado, sem destino manual. Atualize o QMoney."}), 400
+        if method == "wise":
             if len(legal_name) < 2 or len(destination_email) > 254 or not re.fullmatch(
                     r"[^\s@]+@[^\s@]+\.[^\s@]+", destination_email):
                 return jsonify({"error": "informe nome legal e e-mail válido do destino"}), 400
@@ -4132,7 +4232,7 @@ def create_app() -> Flask:
                 return jsonify({"error": "já há um saque em lote em andamento"}), 409
             _WITHDRAW_BULK_STATE.update(
                 state="running", total=len(eligible), done=0, results=[],
-                method="wise" if wise else "saved",
+                method=wise.get("method", "wise") if wise else "saved",
                 current=None, message="", started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
             try:
                 _save_withdraw_bulk_locked()

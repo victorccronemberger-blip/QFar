@@ -29,6 +29,7 @@ import http.cookiejar
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -347,7 +348,10 @@ def configurar_metodo_saque(email: str, senha: str, method: str,
     remote_method = ("other" if "other" in available else "dots") if method == "dots" else method
     if remote_method not in available:
         raise CrowtadoError(f"{method} não está disponível para esta conta")
-    if method in {"paypal", "wise"}:
+    if method == "paypal" and (legal_name or destination_email):
+        raise CrowtadoError("PayPal usa o fluxo de pagamento da Crowtado; não informe um destino manual.",
+                            code="payout_configuration")
+    if method == "wise":
         legal_name = legal_name.strip()
         destination_email = destination_email.strip()
         if len(legal_name) < 2 or not destination_email or "@" not in destination_email or len(destination_email) > 254:
@@ -357,26 +361,45 @@ def configurar_metodo_saque(email: str, senha: str, method: str,
             "paypalReceiverType": "email", "payoutCurrency": "USD",
             "makePreferred": True,
         }
-        manual_payload["paypalEmail" if method == "paypal" else "wiseEmail"] = destination_email
+        manual_payload["wiseEmail"] = destination_email
         _site_trpc(session, "kyc.saveManualPayoutMethod", manual_payload)
     _site_trpc(session, "payouts.savePayoutPreference", {"method": remote_method})
-    summary = _site_trpc(session, "payouts.summary", None, method="GET")
+    summary = _wait_payout_state(session, lambda row: (
+        row.get("payoutPreference") == remote_method and
+        (method != "wise" or (row.get("wiseReady") is True and any(
+            isinstance(item, dict) and item.get("method") == "wise" and item.get("isPreferred") is True
+            for item in row.get("manualDestinations") or [])))))
     if not isinstance(summary, dict) or summary.get("payoutPreference") != remote_method:
         raise CrowtadoError("o Crowtado não confirmou a preferência salva")
     if method == "wise" and not summary.get("wiseReady"):
         raise CrowtadoError("Wise foi salvo, mas ainda não está disponível para saque")
-    if method in {"paypal", "wise"}:
+    if method == "wise":
         destinations = summary.get("manualDestinations") or []
         if not any(isinstance(item, dict) and item.get("method") == method
                    and item.get("isPreferred") for item in destinations):
             raise CrowtadoError("o Crowtado não confirmou o destino preferido")
 
 
+def _wait_payout_state(session: CrowtadoSession, predicate) -> dict[str, Any]:
+    """Only repeat reads while the platform propagates a configuration change."""
+    for attempt in range(4):
+        if attempt:
+            time.sleep(1)
+        summary = _site_trpc(session, "payouts.summary", None, method="GET")
+        if isinstance(summary, dict) and predicate(summary):
+            return summary
+    raise CrowtadoError("A Crowtado ainda não confirmou a alteração do método de saque.",
+                        code="payout_configuration")
+
+
 def desvincular_wise(email: str, senha: str) -> None:
     """Remove o destino Wise e confirma que ele deixou de estar vinculado."""
     session = _cached_login(email, senha)
     _site_trpc(session, "kyc.removeManualPayoutMethod", {"method": "wise"})
-    summary = _site_trpc(session, "payouts.summary", None, method="GET")
+    summary = _wait_payout_state(session, lambda row: (
+        row.get("wiseReady") is False and isinstance(row.get("manualDestinations"), list)
+        and all(isinstance(item, dict) and item.get("method") != "wise"
+                for item in row["manualDestinations"])))
     if (not isinstance(summary, dict) or summary.get("wiseReady") is not False
             or not isinstance(summary.get("manualDestinations"), list)
             or any(item.get("method") == "wise"
@@ -426,6 +449,22 @@ def payout_in_transit(summary: dict[str, Any]) -> bool:
 
 def solicitar_link_saque(email: str, senha: str, *, expected_method: str | None = None,
                          cleanup_wise: bool = True) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    try:
+        result = _request_withdrawal(email, senha, expected_method=expected_method)
+    except Exception as exc:
+        if not hasattr(exc, "withdrawal_attempted"):
+            exc.withdrawal_attempted = False
+        raise
+    finally:
+        if cleanup_wise and expected_method == "wise":
+            cleanup = finalizar_wise(email, senha)
+            result.update(cleanup)
+            result["cleanupPending"] = not all(cleanup.values())
+    return result
+
+
+def _request_withdrawal(email: str, senha: str, *, expected_method: str | None = None) -> dict[str, Any]:
     """Solicita saque com o método preferido salvo no Crowtado."""
     session = _cached_login(email, senha)
     summary = _site_trpc(session, "payouts.summary", None, method="GET")
@@ -444,34 +483,24 @@ def solicitar_link_saque(email: str, senha: str, *, expected_method: str | None 
         raise CrowtadoError("método de saque configurado não é suportado pelo QMoney")
     if method == "wise" and not summary.get("wiseReady"):
         raise CrowtadoError("Wise não está disponível para saque nesta conta")
-    if method in {"paypal", "wise"}:
+    if method == "wise":
         destinations = summary.get("manualDestinations") or []
         if not any(isinstance(item, dict) and item.get("method") == method
                    and item.get("isPreferred") for item in destinations):
             raise CrowtadoError("destino preferido não confirmado; saque não solicitado")
-    payload = _site_trpc(
-        session, "payouts.withdraw", {"method": method}, method="POST")
+    try:
+        payload = _site_trpc(
+            session, "payouts.withdraw", {"method": method}, method="POST")
+    except Exception as exc:
+        exc.withdrawal_attempted = True
+        raise
     if not isinstance(payload, dict) or not payload.get("status"):
-        raise CrowtadoError(
-            f"payouts.withdraw devolveu resposta inválida: {str(payload)[:200]}")
+        error = CrowtadoError("A Crowtado devolveu uma resposta de saque inválida.", code="invalid_response")
+        error.withdrawal_attempted = True
+        raise error
     # Não repassa links/tokens ou campos novos desconhecidos para a interface.
     result = {key: value for key, value in payload.items()
               if key in _WITHDRAW_RESULT_FIELDS}
-    if cleanup_wise and method == "wise" and payload["status"] == "ok":
-        # O saque já foi aceito: falhar ao restaurar não pode parecer falha
-        # do saque e induzir uma nova solicitação.
-        try:
-            desvincular_wise(email, senha)
-        except Exception:
-            result["wiseDestinationRemoved"] = False
-        else:
-            result["wiseDestinationRemoved"] = True
-        try:
-            configurar_metodo_saque(email, senha, "dots")
-        except Exception:
-            result["payoutPreferenceRestored"] = False
-        else:
-            result["payoutPreferenceRestored"] = True
     return result
 
 
@@ -622,6 +651,23 @@ def consultar_saldo(
 TASK_ID_MINUTE = "78d06f56-16f7-449c-8e31-684a1dac6b3e"
 
 
+def _trpc_error(proc: str, status: int, body: Any) -> CrowtadoError:
+    item = body[0] if isinstance(body, list) and body else body
+    error = item.get("error", {}) if isinstance(item, dict) else {}
+    error = error.get("json", error) if isinstance(error, dict) else {}
+    message = str(error.get("message", "")).casefold() if isinstance(error, dict) else ""
+    # Classify known business errors without exposing the remote message,
+    # which can echo an email, legal name or payment token.
+    if proc.startswith(("kyc.", "payouts.")):
+        if "already linked to another" in message:
+            return CrowtadoError("O destino já está vinculado a outra conta Crowtado.",
+                                code="destination_in_use", http_status=status)
+        if "pending payout" in message or "pending withdrawal" in message:
+            return CrowtadoError("A Crowtado bloqueou a alteração porque há pagamento pendente.",
+                                code="payout_pending", http_status=status)
+    return _remote_error(f"Consulta Crowtado {proc} recusada", status, {})
+
+
 def _site_trpc(sess: CrowtadoSession, proc: str, payload: dict[str, Any] | None,
                method: str = "POST") -> Any:
     """Chama /api/trpc/<proc> em www.crowtado.com com o JWT de sessão.
@@ -660,7 +706,11 @@ def _site_trpc(sess: CrowtadoSession, proc: str, payload: dict[str, Any] | None,
         with sess.opener.open(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        raise _remote_error(f"Consulta Crowtado {proc} recusada", exc.code, {}) from exc
+        try:
+            error_body = json.loads(exc.read().decode("utf-8", "replace"))
+        except (ValueError, UnicodeError):
+            error_body = None
+        raise _trpc_error(proc, exc.code, error_body) from exc
     except urllib.error.URLError as exc:
         code = "tls" if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason).upper() else "network"
         raise CrowtadoError("Falha na conexão segura com Crowtado", code=code) from exc
@@ -676,7 +726,7 @@ def _site_trpc(sess: CrowtadoSession, proc: str, payload: dict[str, Any] | None,
         known_status = {"UNAUTHORIZED": 401, "FORBIDDEN": 403,
                         "TOO_MANY_REQUESTS": 429, "INTERNAL_SERVER_ERROR": 500}
         status = detail.get("httpStatus", known_status.get(detail.get("code"), 400)) if isinstance(detail, dict) else 400
-        raise _remote_error(f"Consulta Crowtado {proc} recusada", status if isinstance(status, int) else 400, {})
+        raise _trpc_error(proc, status if isinstance(status, int) else 400, item)
     result = item.get("result") if isinstance(item, dict) else None
     data = result.get("data") if isinstance(result, dict) else None
     if not isinstance(data, dict):

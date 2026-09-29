@@ -217,7 +217,7 @@ def message_text(uid: int, folder: str = "INBOX", *,
 
 def delete_message(uid: int, folder: str = "INBOX", *,
                    token: str | None = None, mailbox: str | None = None) -> bool:
-    """Apaga uma mensagem. Da INBOX ela vai para a Trash; da Trash some de vez.
+    """Exclusão PERMANENTE segundo o contrato atual da API. Não usar para limpeza.
 
     Best-effort: 404 (já apagada) conta como sucesso.
     """
@@ -250,8 +250,8 @@ def purge_sender(sender: str, folder: str = "INBOX",
 
 
 def purge_trash() -> int:
-    """Esvazia a Trash (o DELETE da INBOX só MOVE para lá — continua ocupando
-    espaço na cota da caixa). Pagina até esvaziar; para se uma página não
+    """Exclusão permanente da Trash. Nunca chamar na limpeza revisada da caixa.
+    Pagina até esvaziar; para se uma página não
     apagar nada (proteção contra loop)."""
     apagadas = 0
     while True:

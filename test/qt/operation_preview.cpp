@@ -5,6 +5,7 @@
 #include "../../desktop/src/CampaignReviewDialog.hpp"
 #include <oclero/qlementine/style/QlementineStyle.hpp>
 #include <QApplication>
+#include <QDialog>
 #include <QRegularExpression>
 #include <QComboBox>
 #include <QDir>
@@ -23,6 +24,47 @@
 
 class OperationPreview {
 public:
+  static void mailCleanupSmoke(MainWindow& window) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(80); return; }
+    QObject::connect(server, &QTcpServer::newConnection, server, [server] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        if (!input.startsWith("GET /api/mail-cleanup ")) { qApp->exit(81); return; }
+        const auto body = QJsonDocument(QJsonObject{{"state", "ready"}, {"id", "fixture"},
+          {"mailbox", "Caixa de demonstração"},
+          {"profiles", QJsonArray{QJsonObject{{"id", "demo"}, {"name", "Caixa de demonstração"}}}},
+          {"items", QJsonArray{
+            QJsonObject{{"uid", 1}, {"subject", "Your $38.64 Crowtado payout is ready"}, {"action", "payment"}, {"reason", "Assunto de saque ou pagamento"}},
+            QJsonObject{{"uid", 2}, {"subject", "Código de verificação antigo"}, {"action", "move"}, {"reason", "Sem indicação de saque ou pagamento"}},
+            QJsonObject{{"uid", 3}, {"subject", "Mensagem com anexo"}, {"action", "review"}, {"reason", "Conteúdo não analisável integralmente"}}}}}).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+        socket->disconnectFromHost();
+      });
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window.openMailCleanup();
+    QTimer::singleShot(500, &window, [&window] {
+      auto* table = window.findChild<QTableWidget*>(QStringLiteral("mailCleanupReview"));
+      if (!table || table->rowCount() != 3) { qApp->exit(82); return; }
+      if ((table->item(0, 0)->flags() & Qt::ItemIsUserCheckable)
+          || (table->item(2, 0)->flags() & Qt::ItemIsUserCheckable)
+          || table->item(1, 0)->checkState() != Qt::Checked) { qApp->exit(83); return; }
+      table->item(1, 0)->setCheckState(Qt::Unchecked);
+      if (table->item(1, 0)->checkState() != Qt::Unchecked) { qApp->exit(84); return; }
+      const QString output = qEnvironmentVariable("QMONEY_MAIL_PREVIEW_IMAGE");
+      if (!output.isEmpty()) {
+        auto* dialog = qobject_cast<QDialog*>(table->window());
+        if (!dialog || !dialog->grab().save(output)) { qApp->exit(85); return; }
+      }
+      qApp->exit(0);
+    });
+  }
   static void liveCatalogSmoke(MainWindow& window) {
     const auto email = qEnvironmentVariable("QMONEY_TEST_ACCOUNT");
     const auto base = qEnvironmentVariable("QMONEY_TEST_API");
@@ -481,6 +523,7 @@ int main(int argc, char** argv) {
   style->setAnimationsEnabled(false);
   style->setThemeJsonPath(dark ? ":/qmoney/theme-dark.json" : ":/qmoney/theme-light.json");
   app.setStyle(style);
+  app.setFont(QFont(QStringLiteral("Inter"), 10));
   MainWindow window(style, nullptr, false);
   window.resize(app.arguments().contains("--compact") ? QSize(980, 680) : QSize(1586, 992));
   if (app.arguments().contains("--continuation-smoke")) {
@@ -494,6 +537,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--catalog-loading-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::catalogLoadingSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--mail-cleanup-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::mailCleanupSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--balance-polling-smoke")) {

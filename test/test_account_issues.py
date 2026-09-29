@@ -65,6 +65,8 @@ class AccountDiagnosticEndpointsTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(server, "_list_accounts", return_value=[
                 {"email": email} for email in known]))
             stack.enter_context(mock.patch.object(server, "_resolve_org", side_effect=resolve))
+            # Diagnostics must not depend on this Windows user's live recovery journal.
+            stack.enter_context(mock.patch.object(server.recovery, "snapshot", return_value={"items": []}))
             stack.enter_context(mock.patch.object(server.campaign, "available_tasks", return_value=[
                 {"id": "task", "name": "task", "clip_count": 1, "available_for_duration": True}]))
             stack.enter_context(mock.patch.object(server.readiness, "campaign_readiness", return_value={

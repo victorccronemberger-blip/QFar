@@ -88,6 +88,7 @@ private:
   void setStatus(const QString& text);
 
   void loadHome();
+  void openMailCleanup();
   void openCommandPalette();
   void openRecovery();
   QString _pendingAccountFocus;
