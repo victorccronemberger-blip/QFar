@@ -128,9 +128,9 @@ def warm_cache(
 
     work = Path(work_dir or config.MEDIA_DATA_DIR / "ego4d")
     work.mkdir(parents=True, exist_ok=True)
+    stop_path().unlink(missing_ok=True)
     clips = eligible_clips(
         task, min_dur_s=min_dur_s, max_dur_s=max_dur_s, limit=limit)
-    stop_path().unlink(missing_ok=True)
     started = time.time()
     state: dict[str, Any] = {
         "status": "running",

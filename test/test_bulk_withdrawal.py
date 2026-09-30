@@ -9,6 +9,17 @@ from moneymin.web import server
 
 
 class BulkWithdrawalTests(unittest.TestCase):
+    def test_accepted_withdrawal_survives_balance_storage_failure(self):
+        with patch.object(server.crowtado, "solicitar_link_saque", return_value={
+                "status": "ok", "amountCents": 9000, "currency": "USD"}) as withdraw, \
+             patch.object(server, "_invalidate_balance_after_withdrawal", side_effect=OSError()):
+            response, status = server._withdraw_once_locked("receipt@example.com", "pw")
+        self.assertEqual(status, 200)
+        self.assertTrue(response["ok"])
+        self.assertIn("90.00", response["message"])
+        self.assertIn("Atualize o saldo", response["message"])
+        withdraw.assert_called_once()
+
     def test_paypal_batch_configures_and_requests_each_account_in_order(self):
         events = []
         with patch.object(server.crowtado, "configurar_metodo_saque",

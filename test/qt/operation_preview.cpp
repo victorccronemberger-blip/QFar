@@ -5,6 +5,7 @@
 #include "../../desktop/src/CampaignReviewDialog.hpp"
 #include <oclero/qlementine/style/QlementineStyle.hpp>
 #include <QApplication>
+#include <QClipboard>
 #include <QDialog>
 #include <QMenu>
 #include <QMouseEvent>
@@ -27,6 +28,93 @@
 
 class OperationPreview {
 public:
+  static void acceleratorSmoke(MainWindow& window) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(90); return; }
+    auto started = std::make_shared<bool>(false);
+    auto liveSeen = std::make_shared<bool>(false);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, started, liveSeen] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, started, liveSeen] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        QJsonObject payload;
+        if (input.startsWith("POST /api/holo-cache/start")) {
+          *started = true;
+          payload = {{"ok", true}, {"runner", QJsonObject{{"state", "running"}}}};
+        } else if (input.contains("live=1")) {
+          *liveSeen = true;
+          payload = {{"live", true}, {"runner", QJsonObject{{"state", "done"}, {"provider", "ego4d"}}}};
+        } else {
+          payload = {{"tasks", QJsonArray{"Furniture Assembly"}}, {"default_task", "Furniture Assembly"},
+            {"cache", QJsonObject{{"task", "Furniture Assembly"}, {"total", 2}, {"ready", *started ? 2 : 0},
+              {"pending", *started ? 0 : 2}, {"last_run", QJsonObject{{"status", *started ? "complete" : "stopped"}}}}},
+            {"runner", QJsonObject{{"state", *started ? "done" : "idle"}, {"provider", "ego4d"}}}};
+        }
+        const auto body = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+          + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+        socket->disconnectFromHost();
+      });
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._pages->setCurrentIndex(4);
+    auto phase = std::make_shared<int>(0);
+    auto* poll = new QTimer(&window);
+    QObject::connect(poll, &QTimer::timeout, &window, [&window, phase, liveSeen] {
+      if (*phase == 0 && window._cacheTask->count() && window._cacheStart->isEnabled()) {
+        *phase = 1;
+        window._cacheStart->click();
+      } else if (*phase == 1 && *liveSeen && window._cacheStart->isEnabled() && !window._cachePoll.isActive()) {
+        qApp->exit(window._cacheProgress->value() == 100 && !QApplication::activeModalWidget() ? 0 : 91);
+      }
+    });
+    poll->start(25);
+    window.loadAccelerator();
+    QTimer::singleShot(8000, &window, [] { qApp->exit(92); });
+  }
+  static void credentialCopySmoke(MainWindow& window) {
+    const QString previous = QApplication::clipboard()->text();
+    QObject::connect(qApp, &QCoreApplication::aboutToQuit, qApp, [previous] {
+      QApplication::clipboard()->setText(previous);
+    });
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(80); return; }
+    QObject::connect(server, &QTcpServer::newConnection, server, [server] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("fixture@example.com") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        if (!input.startsWith("POST /api/accounts/password ")) { qApp->exit(81); return; }
+        const QByteArray body = R"({"password":"fixture-only-password"})";
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+          + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+        socket->disconnectFromHost();
+      });
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    auto* panel = window.credentialCopyActions("fixture@example.com", true);
+    panel->setParent(&window);
+    const auto buttons = panel->findChildren<QPushButton*>();
+    if (buttons.size() != 2) { qApp->exit(82); return; }
+    buttons[0]->click();
+    if (QApplication::clipboard()->text() != "fixture@example.com") { qApp->exit(83); return; }
+    buttons[1]->click();
+    if (buttons[1]->isEnabled()) { qApp->exit(84); return; }
+    auto* poll = new QTimer(&window);
+    QObject::connect(poll, &QTimer::timeout, &window, [buttons] {
+      if (!buttons[1]->isEnabled()) return;
+      qApp->exit(QApplication::clipboard()->text() == "fixture-only-password"
+          && buttons[1]->text() == QStringLiteral("Copiado!")
+          && !QApplication::activeModalWidget() ? 0 : 85);
+    });
+    poll->start(25);
+    QTimer::singleShot(5000, &window, [] { qApp->exit(86); });
+  }
   static void settingsSmoke(MainWindow& window) {
     const auto click = [](QWidget* widget, QPoint point) {
       QMouseEvent move(QEvent::MouseMove, point, widget->mapToGlobal(point), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
@@ -594,6 +682,14 @@ int main(int argc, char** argv) {
     return app.exec();
   }
   window.show();
+  if (app.arguments().contains("--accelerator-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::acceleratorSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--credential-copy-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::credentialCopySmoke(window); });
+    return app.exec();
+  }
   if (app.arguments().contains("--settings-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::settingsSmoke(window); });
     return app.exec();

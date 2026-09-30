@@ -2104,7 +2104,7 @@ QWidget* MainWindow::buildAccountsPage() {
   _accountsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
   _accountsTable->setColumnWidth(1, 150);
   _accountsTable->setColumnWidth(2, 175);
-  _accountsTable->setColumnWidth(3, 340);
+  _accountsTable->setColumnWidth(3, 455);
   _accountsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
   _accountsTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
 
@@ -2435,7 +2435,7 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesTable->setColumnWidth(1, 126);
   _balancesTable->setColumnWidth(2, 126);
   _balancesTable->setColumnWidth(3, 176);
-  _balancesTable->setColumnWidth(4, 365);
+  _balancesTable->setColumnWidth(4, 480);
   _balancesTable->horizontalHeaderItem(1)->setToolTip(
       QStringLiteral("Valor em dólar liberado para solicitar saque."));
   _balancesTable->horizontalHeaderItem(2)->setToolTip(
@@ -2586,26 +2586,7 @@ void MainWindow::loadBanned() {
           _bannedTable->setItem(row, col, item);
         }
         const QString email = account.value(QStringLiteral("email")).toString();
-        auto* reveal = new QPushButton(QStringLiteral("Ver senha"));
-        reveal->setMinimumHeight(32);
-        reveal->setEnabled(account.value(QStringLiteral("has_password")).toBool());
-        reveal->setToolTip(reveal->isEnabled()
-            ? QStringLiteral("Mostrar a senha salva para acesso manual.")
-            : QStringLiteral("Esta conta não possui senha salva."));
-        connect(reveal, &QPushButton::clicked, this, [this, email] {
-          _api.post(QStringLiteral("/api/accounts/banned/password"),
-                    {{QStringLiteral("email"), email}},
-                    [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
-            if (!ok) return showError(QStringLiteral("Senha indisponível"), error);
-            QMessageBox dialog(this);
-            dialog.setWindowTitle(QStringLiteral("Senha da conta banida"));
-            dialog.setTextFormat(Qt::PlainText);
-            dialog.setText(QStringLiteral("%1\n\nSenha: %2")
-                .arg(email, doc.object().value(QStringLiteral("password")).toString()));
-            dialog.setTextInteractionFlags(Qt::TextSelectableByMouse);
-            dialog.exec();
-          });
-        });
+        auto* reveal = credentialCopyActions(email, account.value(QStringLiteral("has_password")).toBool(), true);
         _bannedTable->setCellWidget(row, 6, reveal);
         auto* withdraw = new QPushButton(QStringLiteral("Saque"));
         withdraw->setMinimumHeight(32);
@@ -4625,7 +4606,7 @@ void MainWindow::loadAccelerator() {
   _cacheInFlightKey = path;
   _api.get(path, [this, provider, requestedTask, requestId, path, live](bool ok, const QJsonDocument& doc, const QString& error) {
     if (_cacheInFlightKey == path) _cacheInFlightKey.clear();
-    if (requestId != _cacheRequestId) return;
+    if (requestId != _cacheRequestId || _cacheStartPending) return;
     if (!ok) {
       _cacheState->setText(QStringLiteral("Não foi possível consultar o acelerador"));
       _cacheLastRun->setText(error);
@@ -4634,6 +4615,15 @@ void MainWindow::loadAccelerator() {
     if (_cacheProvider && _cacheProvider->currentData().toString() != provider) return;
     if (!requestedTask.isEmpty() && _cacheTask->currentText() != requestedTask) return;
     const auto root = doc.object();
+    const QString runnerState = root.value(QStringLiteral("runner")).toObject()
+        .value(QStringLiteral("state")).toString();
+    if (live && runnerState != QStringLiteral("running") && runnerState != QStringLiteral("stopping")) {
+      // Refresh disk counts once the live run ends; the pre-run snapshot is stale.
+      _cachePoll.stop();
+      _cacheCatalogPending = false;
+      loadAccelerator();
+      return;
+    }
     if (root.value(QStringLiteral("loading")).toBool()) {
       _cacheCatalogPending = true;
       _cacheState->setText(root.value(QStringLiteral("message")).toString());
@@ -4809,6 +4799,7 @@ void MainWindow::loadAccelerator() {
 }
 
 void MainWindow::startAccelerator() {
+  if (_cacheStartPending) return;
   if (_cacheTask->currentText().isEmpty()) return;
   const QString provider = _cacheProvider && !_cacheProvider->currentData().toString().isEmpty()
       ? _cacheProvider->currentData().toString() : QStringLiteral("holoassist");
@@ -4819,13 +4810,19 @@ void MainWindow::startAccelerator() {
   else body.insert(QStringLiteral("limit"), QJsonValue::Null);
   if (provider == QStringLiteral("ego4d") && _cacheBudget)
     body.insert(QStringLiteral("budget_gb"), _cacheBudget->value());
+  _cacheStartPending = true;
+  ++_cacheRequestId;
   _cacheStart->setEnabled(false);
+  _cacheState->setText(QStringLiteral("Iniciando preparação…"));
   _api.post(QStringLiteral("/api/holo-cache/start"), body,
             [this](bool ok, const QJsonDocument&, const QString& error) {
+    _cacheStartPending = false;
     if (!ok) {
       _cacheStart->setEnabled(true);
+      _cacheState->setText(QStringLiteral("Preparação não iniciada"));
       return showError(QStringLiteral("Acelerador não iniciado"), error);
     }
+    _cacheCatalogPending = false;
     _cachePoll.start();
     loadAccelerator();
   });
@@ -5136,26 +5133,7 @@ void MainWindow::loadAccounts() {
       connect(remove, &QPushButton::clicked, this, [this, email] {
         removeAccount(email);
       });
-      auto* reveal = new QPushButton(QStringLiteral("Ver senha"));
-      reveal->setMinimumSize(100, 32);
-      reveal->setEnabled(account.value(QStringLiteral("has_password")).toBool());
-      reveal->setToolTip(reveal->isEnabled()
-          ? QStringLiteral("Mostrar a senha salva para acesso manual.")
-          : QStringLiteral("Esta conta não possui senha salva."));
-      connect(reveal, &QPushButton::clicked, this, [this, email] {
-        _api.post(QStringLiteral("/api/accounts/password"),
-                  {{QStringLiteral("email"), email}},
-                  [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
-          if (!ok) return showError(QStringLiteral("Senha indisponível"), error);
-          QMessageBox dialog(this);
-          dialog.setWindowTitle(QStringLiteral("Senha da conta"));
-          dialog.setTextFormat(Qt::PlainText);
-          dialog.setText(QStringLiteral("%1\n\nSenha: %2")
-              .arg(email, doc.object().value(QStringLiteral("password")).toString()));
-          dialog.setTextInteractionFlags(Qt::TextSelectableByMouse);
-          dialog.exec();
-        });
-      });
+      auto* reveal = credentialCopyActions(email, account.value(QStringLiteral("has_password")).toBool(), false);
       actionsLayout->addWidget(check);
       actionsLayout->addWidget(reveal);
       actionsLayout->addWidget(remove);
@@ -5166,6 +5144,55 @@ void MainWindow::loadAccounts() {
     if (_accountsCheckAll) _accountsCheckAll->setEnabled(!accounts.isEmpty() && !_accountTransferBusy && !_orgMigrationRunning);
     setStatus(QStringLiteral("%1 conta(s) cadastrada(s).").arg(accounts.size()));
   });
+}
+
+QWidget* MainWindow::credentialCopyActions(const QString& email, bool hasPassword, bool banned) {
+  auto* widget = new QWidget;
+  auto* layout = new QHBoxLayout(widget);
+  layout->setContentsMargins(0, 0, 0, 0);
+  layout->setSpacing(7);
+  auto* copyEmail = new QPushButton(QStringLiteral("Copiar e-mail"), widget);
+  auto* copyPassword = new QPushButton(QStringLiteral("Copiar senha"), widget);
+  copyEmail->setMinimumHeight(32);
+  copyPassword->setMinimumHeight(32);
+  copyEmail->setAccessibleName(QStringLiteral("Copiar e-mail de %1").arg(email));
+  copyPassword->setAccessibleName(QStringLiteral("Copiar senha de %1").arg(email));
+  copyPassword->setEnabled(hasPassword);
+  copyPassword->setToolTip(hasPassword
+      ? QStringLiteral("Copiar a senha salva sem exibi-la na tela.")
+      : QStringLiteral("Esta conta não possui senha salva."));
+  layout->addWidget(copyEmail);
+  layout->addWidget(copyPassword);
+  const auto feedback = [this](QPushButton* button, const QString& label, const QString& message) {
+    button->setText(QStringLiteral("Copiado!"));
+    setStatus(message);
+    QTimer::singleShot(2000, button, [button, label] { button->setText(label); });
+  };
+  connect(copyEmail, &QPushButton::clicked, widget, [email, copyEmail, feedback] {
+    QApplication::clipboard()->setText(email);
+    feedback(copyEmail, QStringLiteral("Copiar e-mail"), QStringLiteral("E-mail copiado."));
+  });
+  connect(copyPassword, &QPushButton::clicked, widget, [this, email, banned, copyPassword, feedback] {
+    copyPassword->setEnabled(false);
+    copyPassword->setText(QStringLiteral("Copiando…"));
+    const QPointer<QPushButton> guard(copyPassword);
+    _api.post(banned ? QStringLiteral("/api/accounts/banned/password")
+                     : QStringLiteral("/api/accounts/password"),
+              {{QStringLiteral("email"), email}},
+              [this, guard, feedback](bool ok, const QJsonDocument& doc, const QString&) {
+      if (!guard) return;
+      guard->setEnabled(true);
+      const QString password = doc.object().value(QStringLiteral("password")).toString();
+      if (!ok || password.isEmpty()) {
+        guard->setText(QStringLiteral("Copiar senha"));
+        setStatus(QStringLiteral("Não foi possível copiar a senha. Tente novamente."));
+        return;
+      }
+      QApplication::clipboard()->setText(password);
+      feedback(guard, QStringLiteral("Copiar senha"), QStringLiteral("Senha copiada."));
+    });
+  });
+  return widget;
 }
 
 void MainWindow::removeAccount(const QString& email, std::function<void()> onRemoved) {
@@ -5858,26 +5885,7 @@ void MainWindow::loadBalances() {
       connect(credentials, &QPushButton::clicked, this,
               [this, email] { configureCrowtadoAccess(email); });
       actionsLayout->addWidget(credentials);
-      auto* reveal = new QPushButton(QStringLiteral("Ver senha"));
-      reveal->setMinimumHeight(32);
-      reveal->setEnabled(savedPasswordAccounts.contains(email));
-      reveal->setToolTip(reveal->isEnabled()
-          ? QStringLiteral("Mostrar a senha salva para acesso manual.")
-          : QStringLiteral("Esta conta não possui senha salva."));
-      connect(reveal, &QPushButton::clicked, this, [this, email] {
-        _api.post(QStringLiteral("/api/accounts/password"),
-                  {{QStringLiteral("email"), email}},
-                  [this, email](bool ok, const QJsonDocument& doc, const QString& error) {
-          if (!ok) return showError(QStringLiteral("Senha indisponível"), error);
-          QMessageBox dialog(this);
-          dialog.setWindowTitle(QStringLiteral("Senha da conta"));
-          dialog.setTextFormat(Qt::PlainText);
-          dialog.setText(QStringLiteral("%1\n\nSenha: %2")
-              .arg(email, doc.object().value(QStringLiteral("password")).toString()));
-          dialog.setTextInteractionFlags(Qt::TextSelectableByMouse);
-          dialog.exec();
-        });
-      });
+      auto* reveal = credentialCopyActions(email, savedPasswordAccounts.contains(email), false);
       actionsLayout->addWidget(reveal);
       auto* withdraw = new QPushButton(QStringLiteral("Solicitar saque"));
       withdraw->setMinimumHeight(32);

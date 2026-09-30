@@ -397,8 +397,20 @@ def _withdraw_once_locked(email: str, password: str,
                     result = {"status": "unknown", "failureStage": "request_withdrawal"}
                 else:
                     raise
+        balance_saved = True
+        if result.get("status") != "not_requested":
+            try:
+                _invalidate_balance_after_withdrawal(email, result)
+            except OSError:
+                # Provider acceptance must never become a failed/retryable withdrawal.
+                balance_saved = False
         success = result.get("status") in {"ok", "review_required"}
         message = _withdraw_message(email, result)
+        amount = result.get("amountCents")
+        if type(amount) is int and amount >= 0 and result.get("currency") == "USD":
+            message += f"; valor informado pela Crowtado: US$ {amount / 100:.2f}"
+        if not balance_saved:
+            message += "; não foi possível marcar o saldo anterior como desatualizado. Atualize o saldo antes de continuar; não repita este saque."
         if wise and wise.get("method") != "paypal" and result.get("cleanupPending") is False and result.get("status") != "ok":
             message += "; Wise desvinculada e Dots confirmado."
             if result.get("status") != "not_requested":
@@ -1870,6 +1882,29 @@ def _preflight_fingerprint(emails: list[str]) -> str:
     return digest.hexdigest()
 
 
+def _invalidate_balance_after_withdrawal(email: str, result: dict[str, Any]) -> None:
+    """Keep the previous reading as historical, never infer the remaining balance."""
+    with _PERSISTENCE_LOCK:
+        balances = _load_balances()
+        previous = balances.get(email)
+        rec = dict(previous) if isinstance(previous, dict) else {}
+        receipt = {
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "status": result.get("status"),
+            "previousAvailableCents": rec.get("availableCents"),
+            "previousUpdatedAt": rec.get("updated_at"),
+        }
+        amount = result.get("amountCents")
+        if type(amount) is int and amount >= 0:
+            receipt["amountCents"] = amount
+        if result.get("currency") in {"USD", "BRL", "EUR", "GBP"}:
+            receipt["currency"] = result["currency"]
+        rec.update(stale=True, lastWithdrawal=receipt,
+                   error="Saldo anterior à tentativa de saque. Atualize para consultar o valor atual.")
+        balances[email] = rec
+        _save_balances(balances)
+
+
 def _on_balance_result(email: str, summary: dict | None, erro: str | Exception | None) -> None:
     with _PERSISTENCE_LOCK:
         balances = _load_balances()
@@ -1884,6 +1919,7 @@ def _on_balance_result(email: str, summary: dict | None, erro: str | Exception |
                 summary, erro = None, exc
         rec["checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         if summary is not None:
+            rec.pop("inTransitReplaceable", None)
             rec.update(summary)
             rec["updated_at"] = rec["checked_at"]
             rec["error"] = None
@@ -3168,11 +3204,20 @@ def create_app() -> Flask:
                 "runner": HOLO_CACHE_RUNNER.snapshot(),
                 "tasks": tasks,
             }, 200
+        runner = HOLO_CACHE_RUNNER.snapshot()
         if request.args.get("async") == "1":
             result, status = accelerator_catalog.get(
-                (provider, task, limit, budget_gb, min_free_gb), read_cache)
+                (provider, task, limit, budget_gb, min_free_gb,
+                 runner.get("run_id", 0), runner.get("state")), read_cache,
+                scope="accelerator")
         else:
             result, status = read_cache(lambda message: None)
+        # Catalog data may be cached; execution state must always be current.
+        result = dict(result)
+        result["runner"] = HOLO_CACHE_RUNNER.snapshot()
+        if isinstance(result.get("cache"), dict):
+            result["cache"] = dict(result["cache"])
+            result["cache"]["last_run"] = load_json(module.state_path(), {})
         return jsonify(result), status
 
     @app.post("/api/holo-cache/start")
@@ -3216,38 +3261,28 @@ def create_app() -> Flask:
                 "runner": HOLO_CACHE_RUNNER.snapshot(),
             })
 
-        # Falhe antes de abrir a thread quando o catálogo ainda não existe.
-        try:
-            if provider == "ego4d":
-                catalog = module.cache_status(task, limit=limit, budget_gb=budget_gb,
-                                              min_free_gb=min_free_gb)
-                budget_gb = catalog["budget_gb"]
-                if budget_gb == 0:
-                    return jsonify({"error": "não há espaço disponível para cache acima da reserva de disco"}), 400
-            else:
-                catalog = module.cache_status(task, limit=limit)
-        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-            return jsonify({"error": str(exc)}), 400
-
+        # Reserve the runner before expensive planning, so start and stop remain
+        # responsive even with a cold catalog. warm_cache validates the plan.
         with _HEAVY_RUNNER_LOCK:
             if RUNNER.running or RECOVERY.running:
-                return jsonify({
-                    "error": "pare a campanha antes de iniciar o acelerador",
-                }), 409
+                return jsonify({"error": "pare a campanha antes de iniciar o acelerador"}), 409
             if HOLO_CACHE_RUNNER.running:
-                return jsonify({
-                    "ok": True,
-                    "already_running": True,
-                    "runner": HOLO_CACHE_RUNNER.snapshot(),
-                })
+                return jsonify({"ok": True, "already_running": True,
+                                "runner": HOLO_CACHE_RUNNER.snapshot()})
+            catalog = {}
             try:
+                if provider == "ego4d":
+                    if not module.catalog_installed():
+                        return jsonify({"error": "catálogo Ego4D ainda não está instalado"}), 400
+                    catalog = module.storage_limits(budget_gb, min_free_gb=min_free_gb)
+                    budget_gb = catalog["budget_gb"]
+                    if budget_gb == 0:
+                        return jsonify({"error": "não há espaço disponível para cache acima da reserva de disco"}), 400
                 HOLO_CACHE_RUNNER.start(
-                    provider=provider,
-                    task=task,
-                    limit=limit,
-                    budget_gb=budget_gb,
-                    min_free_gb=min_free_gb,
-                )
+                    provider=provider, task=task, limit=limit,
+                    budget_gb=budget_gb, min_free_gb=min_free_gb)
+            except (OSError, ValueError) as exc:
+                return jsonify({"error": str(exc)}), 400
             except RuntimeError as exc:
                 return jsonify({"error": str(exc)}), 409
         return jsonify({

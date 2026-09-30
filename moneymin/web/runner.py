@@ -785,6 +785,7 @@ class HoloCacheRunner:
         self.error: str | None = None
         self.result: dict[str, Any] | None = None
         self.provider = "holoassist"
+        self.run_id = 0
 
     @property
     def running(self) -> bool:
@@ -805,6 +806,7 @@ class HoloCacheRunner:
             if self.running:
                 raise RuntimeError("o acelerador já está em andamento")
             self._stop.clear()
+            self.run_id += 1
             self.state = "running"
             self.provider = provider
             self.current = "preparando catálogo…"
@@ -935,6 +937,7 @@ class HoloCacheRunner:
         with self._lock:
             return {
                 "state": self.state,
+                "run_id": self.run_id,
                 "provider": self.provider,
                 "current": self.current,
                 "phase": self.phase,

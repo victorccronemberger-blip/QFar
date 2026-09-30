@@ -119,6 +119,31 @@ class BalanceForensicsTests(unittest.TestCase):
         self.assertTrue(saved["stale"])
         self.assertEqual(saved["issue"]["code"], "invalid_response")
 
+    def test_withdrawal_invalidates_reading_without_inventing_remaining_balance(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):
+            server._save_balances({"a": {**SUMMARY, "updated_at": "previous"}})
+            server._invalidate_balance_after_withdrawal(
+                "a", {"status": "ok", "amountCents": 9000, "currency": "USD"})
+            saved = server._load_balances()["a"]
+            self.assertTrue(saved["stale"])
+            self.assertEqual(saved["availableCents"], 2600)
+            self.assertEqual(saved["updated_at"], "previous")
+            self.assertEqual(saved["lastWithdrawal"]["amountCents"], 9000)
+            self.assertEqual(saved["lastWithdrawal"]["previousAvailableCents"], 2600)
+            self.assertFalse(server._confirmed_available_balance(saved))
+            server._on_balance_result("a", SUMMARY, None)
+            self.assertFalse(server._load_balances()["a"]["stale"])
+
+    def test_refresh_does_not_keep_old_replaceable_flag(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):
+            server._save_balances({"a": {**SUMMARY, "inTransitReplaceable": True}})
+            server._on_balance_result("a", {**SUMMARY, "inTransitCents": 3000}, None)
+            saved = server._load_balances()["a"]
+            self.assertNotIn("inTransitReplaceable", saved)
+            self.assertFalse(server._confirmed_available_balance(saved))
+
     def test_one_corrupted_record_does_not_abort_valid_result(self):
         with tempfile.TemporaryDirectory() as folder, \
              patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):

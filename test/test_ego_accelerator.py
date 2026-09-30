@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -564,20 +565,105 @@ class EgoCacheApiTests(unittest.TestCase):
         expensive.assert_not_called()
 
     def test_start_forwards_disk_capped_budget(self):
-        with patch.object(ego_accelerator, "cache_status", return_value={"budget_gb": 250}) as status, \
+        with patch.object(ego_accelerator, "storage_limits", return_value={"budget_gb": 250}) as status, \
+             patch.object(ego_accelerator, "catalog_installed", return_value=True), \
              patch.object(self.server, "HOLO_CACHE_RUNNER", Mock(running=False)) as runner, \
              patch.object(self.server, "RUNNER", Mock(running=False)):
             runner.snapshot.return_value = {}
             response = self.client.post("/api/holo-cache/start", json={
                 "provider": "ego4d", "budget_gb": 400, "min_free_gb": 50})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(status.call_args.kwargs["budget_gb"], 400)
+        self.assertEqual(status.call_args.args[0], 400)
         self.assertEqual(runner.start.call_args.kwargs["budget_gb"], 250)
 
     def test_no_space_does_not_start_worker(self):
-        with patch.object(ego_accelerator, "cache_status", return_value={"budget_gb": 0}), \
-             patch.object(self.server, "HOLO_CACHE_RUNNER") as runner:
+        with patch.object(ego_accelerator, "storage_limits", return_value={"budget_gb": 0}), \
+             patch.object(ego_accelerator, "catalog_installed", return_value=True), \
+             patch.object(self.server, "HOLO_CACHE_RUNNER", Mock(running=False)) as runner:
             response = self.client.post("/api/holo-cache/start", json={
                 "provider": "ego4d", "budget_gb": 400})
         self.assertEqual(response.status_code, 400)
         runner.start.assert_not_called()
+
+
+class AcceleratorLifecycleRegressionTests(unittest.TestCase):
+    def test_holo_stop_during_catalog_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def plan(*args, **kwargs):
+                (root / "stop").write_text("stop")
+                return [{"video_name": "fixture"}]
+            with patch.object(holo_accelerator, "eligible_clips", side_effect=plan), \
+                 patch.object(holo_accelerator, "stop_path", return_value=root / "stop"), \
+                 patch.object(holo_accelerator, "state_path", return_value=root / "state.json"), \
+                 patch.object(campaign, "prepare_holoassist_clip") as prepare:
+                result = holo_accelerator.warm_cache(work_dir=root)
+            self.assertEqual(result["status"], "stopped")
+            prepare.assert_not_called()
+
+    def test_start_avoids_expensive_catalog_on_http_thread(self):
+        from moneymin.web import server
+        with patch.object(ego_accelerator, "catalog_installed", return_value=True), \
+             patch.object(ego_accelerator, "storage_limits", return_value={"budget_gb": 5}), \
+             patch.object(ego_accelerator, "cache_status", side_effect=AssertionError("expensive catalog")), \
+             patch.object(server, "RUNNER", Mock(running=False)), \
+             patch.object(server, "RECOVERY", Mock(running=False)), \
+             patch.object(server, "HOLO_CACHE_RUNNER", Mock(running=False)) as runner:
+            runner.snapshot.return_value = {"state": "running", "phase": "catalog"}
+            response = server.create_app().test_client().post("/api/holo-cache/start", json={"provider": "ego4d", "budget_gb": 5})
+            self.assertEqual(response.status_code, 200)
+            runner.start.assert_called_once()
+
+    def test_active_campaign_rejects_before_catalog_work(self):
+        from moneymin.web import server
+        with patch.object(server, "RUNNER", Mock(running=True)), \
+             patch.object(ego_accelerator, "cache_status") as catalog, \
+             patch.object(ego_accelerator, "storage_limits") as storage:
+            response = server.create_app().test_client().post("/api/holo-cache/start", json={"provider": "ego4d", "budget_gb": 5})
+            self.assertEqual(response.status_code, 409)
+            catalog.assert_not_called()
+            storage.assert_not_called()
+
+    def test_cached_catalog_does_not_cache_execution_state(self):
+        from moneymin.web import server
+        snapshot = {"state": "running", "run_id": 1, "current": "first"}
+        with patch.object(server, "HOLO_CACHE_RUNNER") as runner, \
+             patch.object(ego_accelerator, "cache_status", return_value={"ready": 0}) as catalog, \
+             patch.object(server, "load_json", return_value={}):
+            runner.snapshot.side_effect = lambda: dict(snapshot)
+            client = server.create_app().test_client()
+            path = "/api/holo-cache?async=1&provider=ego4d&budget_gb=5"
+            for _ in range(100):
+                response = client.get(path)
+                if response.status_code == 200: break
+                time.sleep(.01)
+            self.assertEqual(response.status_code, 200)
+            snapshot["current"] = "second"
+            self.assertEqual(client.get(path).json["runner"]["current"], "second")
+            self.assertEqual(catalog.call_count, 1)
+            snapshot["state"] = "done"
+            for _ in range(100):
+                response = client.get(path)
+                if response.status_code == 200: break
+                time.sleep(.01)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(catalog.call_count, 2)
+
+    def test_runner_stop_and_restart(self):
+        runner = HoloCacheRunner()
+        entered = threading.Event()
+        def warm(**kwargs):
+            entered.set()
+            while not kwargs["should_stop"](): time.sleep(.005)
+            return {"status": "stopped", "ready": 1, "total": 2}
+        with patch.object(ego_accelerator, "warm_cache", side_effect=warm):
+            runner.start(task="Furniture Assembly", provider="ego4d")
+            self.assertTrue(entered.wait(1))
+            runner.stop()
+            runner._thread.join(2)
+            self.assertEqual(runner.snapshot()["state"], "stopped")
+        with patch.object(ego_accelerator, "warm_cache", return_value={"status": "complete", "ready": 2, "total": 2}):
+            runner.start(task="Furniture Assembly", provider="ego4d")
+            runner._thread.join(2)
+            state = runner.snapshot()
+            self.assertEqual((state["state"], state["ready"], state["run_id"]), ("done", 2, 2))

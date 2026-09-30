@@ -118,6 +118,7 @@ private:
   void loadAccelerator();
   void startAccelerator();
   void loadAccounts();
+  QWidget* credentialCopyActions(const QString& email, bool hasPassword, bool banned = false);
   void removeAccount(const QString& email, std::function<void()> onRemoved = {});
   void checkAllAccounts();
   void addAccount(bool registerNew);
@@ -311,6 +312,7 @@ private:
   int _taskLoadGeneration{};
   bool _taskRequestPending{};
   bool _cacheCatalogPending{};
+  bool _cacheStartPending{};
   int _lastCampaignSeq{};
   QString _previewLogName;
   bool _previewCheckActive{};
