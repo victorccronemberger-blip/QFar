@@ -7,24 +7,32 @@ from typing import Callable
 
 
 class CatalogLoader:
-    def __init__(self, *, ttl_s: float = 30, max_pending: int = 2):
+    def __init__(self, *, ttl_s: float = 30, max_pending: int = 2, timeout_s: float = 300):
         self._lock = threading.Lock()
         self._worker = threading.Semaphore(1)
         self._jobs: dict[tuple, dict] = {}
         self._ttl_s = ttl_s
         self._max_pending = max_pending
+        self._timeout_s = timeout_s
 
-    def get(self, key: tuple, work: Callable) -> tuple[dict, int]:
+    def get(self, key: tuple, work: Callable, *, scope: str | None = None) -> tuple[dict, int]:
         with self._lock:
             now = time.monotonic()
             for old_key, row in list(self._jobs.items()):
                 if row.get("finished") is not None and now - row["finished"] >= self._ttl_s:
                     del self._jobs[old_key]
+            if scope is not None:
+                # Replace queued selections, never launch concurrent catalog builds.
+                for old_key, old_row in list(self._jobs.items()):
+                    if (old_key != key and old_row.get("scope") == scope
+                            and old_row["state"] == "queued"):
+                        old_row["cancelled"] = True
+                        del self._jobs[old_key]
             if key not in self._jobs:
                 if sum("finished" not in row for row in self._jobs.values()) >= self._max_pending:
                     return {"loading": True, "state": "queued",
                             "message": "Aguardando a preparação do catálogo em andamento."}, 202
-                row = {"state": "queued", "started": now,
+                row = {"state": "queued", "started": now, "scope": scope,
                        "message": "Aguardando a preparação do catálogo."}
                 self._jobs[key] = row
                 try:
@@ -36,6 +44,10 @@ class CatalogLoader:
             row = self._jobs[key]
             if "finished" in row:
                 return row["result"]
+            if now - row["started"] >= self._timeout_s:
+                # Keep the worker registered: a retry must not spawn duplicates.
+                return {"error": "A preparação das categorias excedeu o tempo esperado. "
+                        "O cálculo continua no serviço. Tente recarregar em instantes."}, 504
             return {"loading": True, "state": row["state"], "message": row["message"],
                     "elapsed_s": int(now - row["started"])}, 202
 
@@ -44,6 +56,10 @@ class CatalogLoader:
             with self._lock:
                 row.update(state="running", message=message)
         with self._worker:
+            with self._lock:
+                if row.get("cancelled"):
+                    return
+                row["state"] = "running"
             try:
                 result = work(progress)
             except Exception:

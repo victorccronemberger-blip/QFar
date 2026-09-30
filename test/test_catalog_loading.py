@@ -50,6 +50,47 @@ class CatalogLoadingTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_latest_duration_replaces_queued_catalog(self):
+        loader = CatalogLoader()
+        entered, release, latest_done = (threading.Event() for _ in range(3))
+        def slow(progress):
+            entered.set()
+            release.wait(5)
+            return {"tasks": []}, 200
+        obsolete = Mock(return_value=({"tasks": []}, 200))
+        def latest(progress):
+            latest_done.set()
+            return {"tasks": [{"id": "latest"}]}, 200
+        try:
+            loader.get((1,), slow, scope="campaign")
+            self.assertTrue(entered.wait(1))
+            loader.get((2,), obsolete, scope="campaign")
+            loader.get((3,), latest, scope="campaign")
+        finally:
+            release.set()
+        self.assertTrue(latest_done.wait(2))
+        obsolete.assert_not_called()
+
+    def test_timeout_stops_polling_without_starting_duplicate_work(self):
+        loader = CatalogLoader(timeout_s=1)
+        entered, release = threading.Event(), threading.Event()
+        def slow(progress):
+            entered.set()
+            release.wait(5)
+            return {"tasks": []}, 200
+        work = Mock(side_effect=slow)
+        try:
+            loader.get((1,), work)
+            self.assertTrue(entered.wait(1))
+            with patch("moneymin.web.catalog_loader.time.monotonic", return_value=time.monotonic() + 2):
+                for _ in range(3):
+                    body, status = loader.get((1,), work)
+                    self.assertEqual(status, 504)
+                    self.assertFalse(body.get("loading"))
+            self.assertEqual(work.call_count, 1)
+        finally:
+            release.set()
+
     def test_worker_exception_is_terminal_and_does_not_leak_secrets(self):
         loader = CatalogLoader()
         work = Mock(side_effect=RuntimeError("private-token"))

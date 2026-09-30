@@ -4019,7 +4019,9 @@ void MainWindow::loadTasks() {
   _taskReload.stop();
   const int generation = ++_taskLoadGeneration;
   if (_taskRequestPending) {
-    _taskReload.start(350);
+    // The reply schedules the latest selection. A repeating timer here
+    // invalidates slow replies and needlessly polls while HTTP is in flight.
+    _campaignStart->setEnabled(false);
     return;
   }
   QString account;
@@ -4051,7 +4053,10 @@ void MainWindow::loadTasks() {
   _api.get(path, [this, generation](bool ok, const QJsonDocument& doc,
                                    const QString& error) {
     _taskRequestPending = false;
-    if (generation != _taskLoadGeneration) return;
+    if (generation != _taskLoadGeneration || _taskReload.isActive()) {
+      loadTasks();
+      return;
+    }
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
     if (!ok) {

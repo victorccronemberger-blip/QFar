@@ -155,12 +155,13 @@ public:
         socket->setProperty("answered", true);
         if (!input.contains("async=1")) { qApp->exit(61); return; }
         const int number = ++*requests;
-        const bool changed = input.contains("min_dur_s=600");
+        const bool changed = input.contains("min_dur_s=720");
+        if (input.contains("min_dur_s=660")) { qApp->exit(66); return; }
         const bool loading = number < 3;
         const auto body = QJsonDocument(changed ? QJsonObject{{"error", "fixture category failure"}}
             : loading ? QJsonObject{{"loading", true}, {"state", "running"}, {"message", "Indexando catálogo realista"}, {"elapsed_s", 90}}
             : QJsonObject{{"tasks", QJsonArray{QJsonObject{{"id", "garden"}, {"name", "Gardening"}, {"clip_count", 3}, {"available_for_duration", true}}}}}).toJson(QJsonDocument::Compact);
-        QTimer::singleShot(100, socket, [socket, body, loading, changed] {
+        QTimer::singleShot(700, socket, [socket, body, loading, changed] {
           socket->write("HTTP/1.1 " + QByteArray(changed ? "400 Error" : loading ? "202 Accepted" : "200 OK")
               + "\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size())
               + "\r\nConnection: close\r\n\r\n" + body);
@@ -192,12 +193,19 @@ public:
         *phase = 1;
         window._minDuration->setValue(10);
         window.loadTasks();
+        QTimer::singleShot(50, &window, [&window] {
+          window._minDuration->setValue(11);
+          window.loadTasks();
+          window._minDuration->setValue(12);
+          window.loadTasks();
+        });
       } else if (*phase == 1 && item && item->text().contains("fixture category failure")) {
         qApp->exit(!window._campaignStart->isEnabled() && !QApplication::activeModalWidget() ? 0 : 64);
       }
     });
     check->start(25);
     for (int i = 0; i < 20; ++i) window.loadTasks();
+    if (window._taskReload.isActive()) { qApp->exit(67); return; }
     QTimer::singleShot(10000, &window, [] { qApp->exit(65); });
   }
   static void balancePollingSmoke(MainWindow& window) {

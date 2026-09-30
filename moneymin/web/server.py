@@ -2694,7 +2694,8 @@ def create_app() -> Flask:
                     return {"error": issue["reason"] + " " + issue["action"], "issue": issue}, 400
 
             result, status = task_catalog.get(
-                (email, dataset_provider, content_mode, min_dur_s, max_dur_s), load)
+                (email, dataset_provider, content_mode, min_dur_s, max_dur_s), load,
+                scope="campaign-tasks")
             return jsonify(result), status
         try:
             # Uma Session só: _resolve_org + catálogo. Dois refresh seguidos
