@@ -10,7 +10,10 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     reason = "Não foi possível concluir a verificação desta conta."
     action = "Não remova a conta por este diagnóstico. Verifique novamente; se persistir, copie o diagnóstico para o suporte."
     explicit = getattr(error, "account_issue_code", None)
-    if explicit == "email_verification":
+    if explicit == "app_check":
+        code, reason = "app_check", "O serviço recusou a validação App Check desta instalação."
+        action = "A integração precisa de uma configuração App Check autorizada pela plataforma. Reconectar a conta não remove essa exigência."
+    elif explicit == "email_verification":
         code, reason = "email_verification", "A Crowtado exige verificação por e-mail."
         action = "Confira a integração da caixa de entrada para receber o código. Não altere a senha por este diagnóstico."
     elif explicit == "crowtado_account_missing":
@@ -86,6 +89,11 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     status = getattr(error, "http_status", None)
     status = status if isinstance(status, int) and 400 <= status <= 599 else (http.group() if http else None)
     detail = type(error).__name__ + (f" · HTTP {status}" if status else "")
+    if getattr(error, "profile_read", False) is True:
+        detail += " · GET /api/v1/users/me"
+    blocked = getattr(error, "blocked_reason", None)
+    if blocked in ("user", "device", "uber-device"):
+        detail += f" · X-Blocked-Reason: {blocked}"
     return dict(email=email, code=code, stage=stage, reason=reason, action=action, detail=detail,
                 restriction_confirmed=explicit == "restricted",
                 retryable=code in {"timeout", "network", "service", "rate_limit", "invalid_response"})

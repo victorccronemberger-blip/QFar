@@ -149,7 +149,7 @@ class AuthEvidenceTests(unittest.TestCase):
                                     (-1, "timeout", "timeout"), (429, "rate limit", "rate_limit"),
                                     (200, "[]", "invalid_response"), (200, "{}", "invalid_response")):
             with self.subTest(status=status, body=body), \
-                 mock.patch.object(sess, "request", return_value=(status, body)):
+                 mock.patch.object(sess, "request_detailed", return_value=minute_api.HttpResponse(status, body, {})):
                 with self.assertRaises(AuthError) as caught:
                     sess.ensure_auth()
                 self.assertEqual(caught.exception.account_issue_code, code)
@@ -157,7 +157,7 @@ class AuthEvidenceTests(unittest.TestCase):
     def test_only_explicit_disabled_field_confirms_profile_restriction(self):
         sess = Session({"idToken": "fake"})
         sess._live = True
-        with mock.patch.object(sess, "request", return_value=(200, json.dumps({"disabled": True, "organizations": []}))), \
+        with mock.patch.object(sess, "request_detailed", return_value=minute_api.HttpResponse(200, json.dumps({"disabled": True, "organizations": []}), {})), \
              mock.patch.object(sess, "version_gate", return_value=None):
             with self.assertRaises(AuthError) as caught:
                 sess.ensure_auth()

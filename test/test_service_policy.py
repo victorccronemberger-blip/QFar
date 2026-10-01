@@ -330,7 +330,7 @@ class SessionPolicyTests(unittest.TestCase):
     def test_diagnostic_auth_is_available_with_latched_version(self):
         self.session._live = True
         with patch.object(minute_api, "_version_gate_blocks", return_value=True), \
-             patch.object(self.session, "request", return_value=(200, '{"organizations":[]}')):
+             patch.object(self.session, "request_detailed", return_value=minute_api.HttpResponse(200, '{"organizations":[]}', {})):
             self.assertEqual(self.session.ensure_auth(), {"organizations": []})
             with self.assertRaises(AuthError):
                 self.session._check_write_policy("POST", "/api/v1/organizations/join", {})

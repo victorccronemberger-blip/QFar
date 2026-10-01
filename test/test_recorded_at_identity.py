@@ -919,6 +919,8 @@ class GatesTests(unittest.TestCase):
             raise AssertionError(f"rota inesperada: {path}")
 
         sess = self._session(responder)
+        sess.request_detailed = lambda method, path, body=None: minute_api.HttpResponse(
+            *responder(method, path, body), {})
         try:
             minute_api._maybe_latch_version_gate(
                 '{"detail":{"error":"app_version_too_old",'

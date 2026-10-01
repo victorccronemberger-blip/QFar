@@ -53,7 +53,8 @@ class AuthError(RuntimeError):
         self.account_issue_code = code
 
 
-def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False) -> AuthError:
+def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False,
+                  headers: dict[str, str] | None = None, profile_read: bool = False) -> AuthError:
     """Preserva a causa sem confundir indisponibilidade com senha ou bloqueio."""
     raw = (body or "").casefold()
     code = "unknown"
@@ -69,6 +70,14 @@ def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False)
         code = "authentication"
     elif status == 403:
         code = _classify_minute_403(body) or "forbidden"
+    from . import appcheck
+    blocked = next((str(value).casefold() for key, value in (headers or {}).items()
+                    if key.casefold() == "x-blocked-reason"), "")
+    if status in (401, 403) and not firebase:
+        if appcheck.is_app_check_rejection(body):
+            code = "app_check"
+        elif code == "forbidden" and blocked in ("device", "uber-device"):
+            code = "device" if blocked == "device" else "uber_device"
     if firebase and status in (400, 401, 403):
         try:
             payload = json.loads(body)
@@ -83,7 +92,13 @@ def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False)
             code = "authentication"
         elif message == "TOO_MANY_ATTEMPTS_TRY_LATER":
             code = "rate_limit"
-    return AuthError(f"{stage}: resposta HTTP {status}; verificação não concluída.", code=code)
+    error = AuthError(f"{stage}: resposta HTTP {status}; verificação não concluída.", code=code)
+    error.http_status = status
+    error.profile_read = profile_read
+    # Only known protocol markers may reach logs/UI; never retain response
+    # bodies, authentication headers or arbitrary remote strings here.
+    error.blocked_reason = blocked if blocked in ("user", "device", "uber-device") else None
+    return error
 
 
 @dataclass(frozen=True)
@@ -200,6 +215,10 @@ def _classify_minute_403(text: str) -> str | None:
                 and message.strip().casefold().rstrip(".") == "user account is disabled"):
             return "restricted"
         return None
+    message = detail.get("message")
+    if (isinstance(message, str)
+            and message.strip().casefold().rstrip(".") == "user account is disabled"):
+        return "restricted"
     error = detail.get("error")
     if not isinstance(error, str):
         return None
@@ -1023,7 +1042,8 @@ class Session:
         """
         if not self._live:
             self.refresh()
-        status, body = self.request("GET", "/api/v1/users/me")
+        response = self.request_detailed("GET", "/api/v1/users/me")
+        status, body = response.status, response.text
         email = self._who()
         if status == 200:
             try:
@@ -1057,7 +1077,8 @@ class Session:
                 )
             self.warmup()
             return profile
-        raise _auth_failure(status, body, "Consulta do perfil")
+        raise _auth_failure(status, body, "Consulta do perfil", headers=response.headers,
+                            profile_read=True)
 
     # -- orgs / tasks (respostas normalizadas) -------------------------------
     def my_orgs(self) -> list[dict[str, Any]]:
