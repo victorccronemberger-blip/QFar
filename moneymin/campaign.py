@@ -2998,7 +2998,7 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
                 digest.update(chunk)
         stamp.append((relative, path.stat().st_size, digest.hexdigest()))
     # Versão da união narração + clipe oficial. Invalida caches do recorte antigo.
-    stamp.append(("ranked-union", 5, "candidate-coverage-and-history"))
+    stamp.append(("ranked-union", 6, "prepared-index-duration-filter"))
     return tuple(stamp)
 
 
@@ -3248,6 +3248,14 @@ def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
     cached = _load_rank_cache()
     if cached is not None:
         return _merge_rank_seed(cached)
+    seed = _load_rank_seed()
+    if seed and any(seed.values()):
+        # The release already includes the verified full-range index. Rebuilding
+        # millions of annotations on a cold customer installation blocks every
+        # category query for minutes. Offline rebuilds belong to the seed tool.
+        result = _merge_rank_seed({})
+        _save_rank_cache(result)
+        return result
     spans = ego4d.rank_all_task_spans(min_dur_s=60, max_dur_s=1800) if ego4d.has_timed_narrations() else {}
     official = task_matching.rank_all_tasks(_task_candidates())
     evidenced = (
@@ -3298,7 +3306,7 @@ def _ranked_pools() -> dict[str, tuple[dict[str, Any], ...]]:
 
 @lru_cache(maxsize=8)
 def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
-    """Trechos Ego4D para o teto usado pelo motor, com cache entre reinícios."""
+    """Filter the prepared index; a duration change must not rebuild Ego4D."""
     cache_key = hashlib.sha256(
         f"{float(min_dur_s):.6f}|{float(max_dur_s):.6f}".encode("ascii")
     ).hexdigest()[:16]
@@ -3307,18 +3315,11 @@ def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
     if cached is not None:
         return _merge_rank_seed(
             cached, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
-    spans = ego4d.rank_all_task_spans(
-        min_dur_s=min_dur_s, max_dur_s=max_dur_s)
-    official = task_matching.rank_all_tasks(_task_candidates())
-    evidenced = ego4d.narration_evidence_clips(
-        min_dur_s=min_dur_s, max_dur_s=max_dur_s)
-    buckets = _union_ranked_clips(
-        _union_ranked_clips(
-            spans, official, min_dur_s=min_dur_s, max_dur_s=max_dur_s),
-        evidenced, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
-    result = _merge_rank_seed(
-        buckets, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-    )
+    result = {
+        name: tuple(clip for clip in rows
+                    if min_dur_s <= float(clip.get("dur_s") or 0) <= max_dur_s)
+        for name, rows in _ranked_pools_cached().items()
+    }
     _save_rank_cache(result, path)
     return result
 
@@ -3391,7 +3392,7 @@ def _prefer_cached_clips(
 
 
 def warm_task_catalog() -> None:
-    """Preenche o cache de clipes rankeados. Sem isso o 1º GET /api/tasks leva ~1 min."""
+    """Load the prepared catalog before the first category request."""
     _ranked_pools()
 
 
