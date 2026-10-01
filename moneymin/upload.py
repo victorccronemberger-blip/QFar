@@ -1527,16 +1527,29 @@ def evaluate_upload(session: Any, upload_id: str) -> dict[str, Any]:
     """
     status, text = session.request("POST", f"/api/v1/uploads/{upload_id}/evaluate")
     if status != 200:
-        raise UploadError(f"evaluate falhou ({status}): {text[:500]}")
+        raise UploadError(f"Avaliação não concluída (HTTP {status}).", status_code=status,
+                          transient=(status == -1 or status in (408, 429) or status >= 500),
+                          phase="evaluate")
     try:
-        return json.loads(text)
+        evaluation = json.loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise UploadError(f"resposta evaluate não-JSON: {text[:300]}") from exc
+        raise UploadError("Avaliação devolveu uma resposta inválida.", transient=False,
+                          phase="evaluate") from exc
+    if (not isinstance(evaluation, dict) or evaluation.get("upload_id") != upload_id
+            or not summarize_checks(evaluation)["valid"]):
+        raise UploadError("Avaliação incompleta ou referente a outro vídeo; precisa de revisão.",
+                          transient=False, phase="evaluate")
+    return evaluation
 
 
 def summarize_checks(evaluation: dict[str, Any]) -> dict[str, Any]:
     """Resume o EvaluationResult: contagem pass/fail/skip e lista de falhas."""
-    checks = evaluation.get("checks") or []
+    checks = evaluation.get("checks") if isinstance(evaluation, dict) else None
+    valid = (isinstance(checks, list) and bool(checks)
+             and all(isinstance(c, dict) and c.get("status") in ("pass", "fail", "skip")
+                     for c in checks))
+    if not valid:
+        return {"counts": {"pass": 0, "fail": 0, "skip": 0}, "failures": [], "valid": False}
     counts = {"pass": 0, "fail": 0, "skip": 0}
     failures: list[dict[str, Any]] = []
     for c in checks:
@@ -1544,7 +1557,7 @@ def summarize_checks(evaluation: dict[str, Any]) -> dict[str, Any]:
         counts[status] = counts.get(status, 0) + 1
         if status == "fail":
             failures.append(c)
-    return {"counts": counts, "failures": failures}
+    return {"counts": counts, "failures": failures, "valid": True}
 
 
 def is_perfect(evaluation: dict[str, Any]) -> bool:
@@ -1554,7 +1567,7 @@ def is_perfect(evaluation: dict[str, Any]) -> bool:
     reprova a gravação (política perfect-only).
     """
     summary = summarize_checks(evaluation)
-    return summary["counts"].get("fail", 0) == 0
+    return summary["valid"] and summary["counts"].get("fail", 0) == 0
 
 
 def require_perfect_upload(
@@ -1578,7 +1591,7 @@ def require_perfect_upload(
     """
     evaluation = evaluate_upload(session, upload_id)
     summary = summarize_checks(evaluation)
-    perfect = summary["counts"].get("fail", 0) == 0
+    perfect = is_perfect(evaluation)
     result: dict[str, Any] = {
         "perfect": perfect,
         "evaluation": evaluation,
@@ -1871,8 +1884,9 @@ def upload_session(
             try:
                 chunk.evaluate_result = evaluate_upload(session, chunk.upload_id)
             except UploadError as exc:
-                # Evaluate é opcional — não aborta a sessão se falhar.
-                chunk.evaluate_result = {"error": str(exc)}
+                # Keep the original upload for review; an unavailable evaluation
+                # must not be treated as a passed quality check.
+                chunk.evaluate_result = {"error": str(exc), "http_status": exc.status_code}
 
     result = UploadResult(
         session_id=session_id,
@@ -1883,6 +1897,27 @@ def upload_session(
         total_duration_ms=total_duration,
         recorded_at=recorded_at,
     )
+
+    if evaluate and not require_perfect:
+        blocked = []
+        for chunk in chunks:
+            if chunk.state != STATE_DONE or is_perfect(chunk.evaluate_result):
+                continue
+            summary = summarize_checks(chunk.evaluate_result)
+            failed = ", ".join(str(c.get("id") or "sem identificação")
+                               for c in summary["failures"])
+            http = (chunk.evaluate_result or {}).get("http_status")
+            http_detail = f" (HTTP {http})" if type(http) is int else ""
+            chunk.error = (f"Avaliação reprovada: {failed}." if summary["valid"] else
+                           f"Avaliação inconclusiva{http_detail}; envio preservado para revisão.")
+            chunk.state = STATE_FAILED
+            blocked.append(chunk)
+        if blocked:
+            _update_persisted_journals(
+                state=STATE_QUARANTINE, phase="evaluation_review", finalized=False,
+                evaluation_required=True, evaluation_verified=False,
+                error="; ".join(dict.fromkeys(c.error for c in blocked)))
+            return result
 
     # --- política perfect-only (se requisitada) ----------------------------
     # Roda evaluate em cada chunk. Se QUALQUER check falhar, cancela e deleta

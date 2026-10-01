@@ -191,6 +191,14 @@ def _classify_minute_403(text: str) -> str | None:
     """Mapeia `detail.error` do Minute para código de diagnóstico."""
     detail = _parse_blocked_detail(text)
     if not detail:
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            payload = text
+        message = payload.get("detail") if isinstance(payload, dict) else payload
+        if (isinstance(message, str)
+                and message.strip().casefold().rstrip(".") == "user account is disabled"):
+            return "restricted"
         return None
     error = detail.get("error")
     if not isinstance(error, str):
