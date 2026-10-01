@@ -112,6 +112,7 @@ private:
   void saveCampaignDraft();
   void loadTasks();
   void startCampaign();
+  void updateCampaignActions();
   void pollCampaign();
   void setCampaignIndicator(const QString& title, const QString& detail, const QString& state, bool busy = false);
   void pollCampaignPreviews();
@@ -217,6 +218,7 @@ private:
   QPushButton* _operationPause{};
   QLabel* _operationLive{};
   bool _operationPauseRequested{false};
+  bool _operationPausePending{false};
   QLabel* _operationStages{};
   QLabel* _operationFeed{};
   QLabel* _operationEmpty{};
@@ -318,7 +320,11 @@ private:
   bool _previewCheckActive{};
   bool _campaignActive{};
   bool _campaignStartPending{};
+  bool _campaignPreflightPending{};
+  bool _campaignStopPending{};
+  bool _campaignResetPending{};
   bool _campaignStartUncertain{};
+  QString _campaignRequestedPreflight;
   bool _campaignPollInFlight{};
   int _campaignPollRevision{};
 

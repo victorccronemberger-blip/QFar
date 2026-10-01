@@ -89,6 +89,8 @@ class CampaignConfig:
     # Interface web: reserva gravações reais por conta e só envia após o fim.
     # False mantém chamadas de biblioteca/testes retrocompatíveis.
     realistic_timeline: bool = False
+    # Correlates a lost start response with this exact operation.
+    start_request_id: str | None = None
     # Server-owned snapshot of the reviewed candidate pool; never client data.
     candidate_plan: dict[str, list[dict[str, Any]]] | None = None
     # Server-owned reservations: pending delivery is never a confirmed send.

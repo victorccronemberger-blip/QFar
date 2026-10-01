@@ -2044,6 +2044,31 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
 
 # --- app -----------------------------------------------------------------------
 
+def _validate_campaign_request(body: Any) -> None:
+    """Use the same parameter checks for preview and execution."""
+    if not isinstance(body, dict):
+        raise ValueError("a campanha deve ser um objeto JSON")
+    emails = body.get("accounts", [])
+    if (not isinstance(emails, list) or any(not isinstance(e, str) or not e.strip() for e in emails)
+            or len({e.strip() for e in emails}) != len(emails)):
+        raise ValueError("selecione uma lista de contas válidas, sem duplicação")
+    tasks = body.get("tasks", [])
+    if not isinstance(tasks, list) or any(not isinstance(t, dict) for t in tasks):
+        raise ValueError("selecione uma lista de categorias válidas")
+    for name in ("target_hours", "delay_s", "account_gap_s"):
+        value = body.get(name, 0)
+        if isinstance(value, bool) or not math.isfinite(float(value or 0)):
+            raise ValueError("parâmetro numérico inválido: " + name)
+    if isinstance(body.get("count", 1), bool):
+        raise ValueError("quantidade de vídeos inválida")
+    if body.get("delay_mode", "off") not in {"off", "clip", "fixed"}:
+        raise ValueError("delay_mode inválido (off|clip|fixed)")
+    if not isinstance(body.get("cleanup_after_upload", True), bool):
+        raise ValueError("cleanup_after_upload deve ser true ou false")
+    if _parse_active_hours(body.get("active_hours")) is False:
+        raise ValueError("active_hours inválido — use [início, fim] com 0 <= início < fim <= 24")
+
+
 def _parse_duration_range(values) -> tuple[float, float]:
     """Valida o intervalo de duração solicitado pela interface."""
     bounds = []
@@ -2067,6 +2092,7 @@ def create_app() -> Flask:
     if getattr(sys, "frozen", False) and not local_api_token:
         raise RuntimeError("Inicie o serviço pela interface QMoney para proteger o acesso local.")
     preflights: dict[str, dict] = {}
+    preflight_lock = threading.RLock()
     banned_monitor = BannedMonitor()
     RUNNER.on_restriction = lambda email: _ban_accounts([{
         "email": email, "restriction_confirmed": True, "stage": "Envio da campanha",
@@ -3316,7 +3342,13 @@ def create_app() -> Flask:
     @app.post("/api/campaigns/preflight")
     def campaign_preflight():
         """Valida a operação inteira sem baixar, preparar ou enviar mídia."""
-        body = request.get_json(silent=True) or {}
+        body = request.get_json(silent=True)
+        if body is None:
+            body = {}
+        try:
+            _validate_campaign_request(body)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return jsonify({"error": f"parâmetros inválidos: {exc}"}), 400
         blockers: list[str] = []
         warnings: list[str] = []
         if RUNNER.running:
@@ -3524,17 +3556,18 @@ def create_app() -> Flask:
                 blockers.append("Não foi possível preparar a prévia dos clipes. Recarregue o catálogo e tente novamente.")
                 reusable = False
         if reusable:
-            now = time.monotonic()
-            for key in list(preflights):
-                if preflights[key]["expires"] <= now:
-                    preflights.pop(key)
-            if len(preflights) >= 32:
-                preflights.pop(next(iter(preflights)))
-            receipt_id = uuid.uuid4().hex
-            preflights[receipt_id] = {"body": body, "accounts": survivors, "catalog": catalog,
-                                      "candidate_plan": candidate_plan, "sent_fingerprint": sent_fingerprint,
-                                      "issues": account_issues, "expires": now + 600,
-                                      "fingerprint": _preflight_fingerprint(emails)}
+            with preflight_lock:
+                now = time.monotonic()
+                for key in list(preflights):
+                    if preflights[key]["expires"] <= now:
+                        preflights.pop(key)
+                if len(preflights) >= 32:
+                    preflights.pop(next(iter(preflights)))
+                receipt_id = uuid.uuid4().hex
+                preflights[receipt_id] = {"body": body, "accounts": survivors, "catalog": catalog,
+                                          "candidate_plan": candidate_plan, "sent_fingerprint": sent_fingerprint,
+                                          "issues": account_issues, "expires": now + 600,
+                                          "fingerprint": _preflight_fingerprint(emails)}
 
         return jsonify({
             "ok": not blockers,
@@ -3570,11 +3603,18 @@ def create_app() -> Flask:
             return jsonify({
                 "error": "pare o acelerador antes de iniciar a campanha",
             }), 409
-        body = request.get_json(silent=True) or {}
+        body = request.get_json(silent=True)
+        if body is None:
+            body = {}
+        try:
+            _validate_campaign_request(body)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return jsonify({"error": f"parâmetros inválidos: {exc}"}), 400
         receipt = None
         receipt_id = body.get("preflight_id")
         if receipt_id:
-            receipt = preflights.get(str(receipt_id))
+            with preflight_lock:
+                receipt = preflights.get(str(receipt_id))
             original = {k: v for k, v in body.items() if k not in {"preflight_id", "remove_restricted"}}
             invalid = None
             if receipt is None:
@@ -3821,13 +3861,14 @@ def create_app() -> Flask:
                              content_mode=content_mode,
                              cleanup_after_upload=cleanup_after_upload,
                              realistic_timeline=True,
+                             start_request_id=str(receipt_id) if receipt else None,
                              candidate_plan=receipt.get("candidate_plan") if receipt else None,
                              active_hours=active_hours)
         with _HEAVY_RUNNER_LOCK:
             if receipt and receipt.get("sent_fingerprint") is not None:
                 from .. import campaign_plan
                 if receipt["sent_fingerprint"] != campaign_plan.registry_fingerprint():
-                    return jsonify({"error": "A lista de vídeos usados mudou. Revise a campanha novamente."}), 409
+                    return jsonify({"error_code": "preflight_history_changed", "error": "A lista de vídeos usados mudou. Revise a campanha novamente."}), 409
             if RECOVERY.running:
                 return jsonify({"error": "Aguarde a recuperação dos envios terminar."}), 409
             try:
@@ -3854,7 +3895,8 @@ def create_app() -> Flask:
             try:
                 RUNNER.start(cfg)
                 if receipt_id:
-                    preflights.pop(str(receipt_id), None)
+                    with preflight_lock:
+                        preflights.pop(str(receipt_id), None)
             except RuntimeError as exc:
                 # Corrida entre dois cliques/abas: se o outro request venceu e
                 # iniciou, este POST também é sucesso idempotente, nunca erro 409.
@@ -4434,10 +4476,9 @@ def _parse_active_hours(raw) -> tuple[int, int] | None | bool:
     """[7, 18] -> (7, 18); None/ausente -> None (sem janela); inválido -> False."""
     if raw is None:
         return None
-    try:
-        start, end = int(raw[0]), int(raw[1])
-    except (TypeError, ValueError, IndexError):
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2 or any(type(v) is not int for v in raw):
         return False
+    start, end = raw
     if not (0 <= start < end <= 24):
         return False
     return (start, end)

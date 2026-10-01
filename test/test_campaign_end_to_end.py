@@ -170,6 +170,17 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.prepare.assert_not_called()
         self.send.assert_not_called()
 
+    def test_completed_campaign_retains_review_identity_after_lost_start_response(self):
+        body = {**self.body, "include_clip_plan": True}
+        review = self.client.post("/api/campaigns/preflight", json=body).get_json()
+        self.assertTrue(review["ok"], review)
+        response = self.client.post("/api/campaigns", json={**body, "preflight_id": review["preflight_id"]})
+        self.assertEqual(response.status_code, 200)
+        snapshot, _ = self.finish()
+        self.assertEqual(snapshot["state"], "done")
+        self.assertEqual(snapshot["start_request_id"], review["preflight_id"])
+        self.assertEqual(self.client.get("/api/campaigns/current").get_json()["start_request_id"], review["preflight_id"])
+
     def test_reset_invalidates_reviewed_account_clip_eligibility(self):
         registry = self.root / "sent_videos.json"
         registry.write_text(json.dumps({"minute|task|Furniture Assembly": {"clip": [self.emails[0]]}}), encoding="utf-8")
@@ -180,6 +191,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/sent/reset", json={}).status_code, 200)
         start = self.client.post("/api/campaigns", json={**body, "preflight_id": review["preflight_id"]})
         self.assertEqual(start.status_code, 409)
+        self.assertEqual(start.get_json()["error_code"], "preflight_history_changed")
         self.prepare.assert_not_called()
         self.send.assert_not_called()
 
@@ -221,6 +233,25 @@ class CampaignEndToEndTests(unittest.TestCase):
             "/api/campaigns", json={**self.body, "content_mode": "unknown"})
         self.assertEqual(response.status_code, 400)
         self.assertIn("modo de conteúdo inválido", response.get_json()["error"])
+
+    def test_preview_and_start_reject_invalid_parameters_without_remote_work(self):
+        invalid = [[], "unexpected", {**self.body, "accounts": "a@example.com"},
+                   {**self.body, "accounts": [None]}, {**self.body, "accounts": [self.emails[0]] * 2},
+                   {**self.body, "tasks": [None]}, {**self.body, "target_hours": "nan"},
+                   {**self.body, "target_hours": "inf"}, {**self.body, "delay_s": "nan"},
+                   {**self.body, "cleanup_after_upload": "true"},
+                   {**self.body, "active_hours": {"start": 7, "end": 18}},
+                   {**self.body, "active_hours": [7.5, 18]}, {**self.body, "active_hours": "78"},
+                   {**self.body, "active_hours": [True, 18]}, {**self.body, "delay_mode": "bad"}]
+        with patch.object(server, "_resolve_org") as resolve, patch.object(self.instance, "start") as start:
+            for body in invalid:
+                for path in ("/api/campaigns/preflight", "/api/campaigns"):
+                    with self.subTest(path=path, body=body):
+                        self.assertEqual(self.client.post(path, json=body).status_code, 400)
+        resolve.assert_not_called()
+        start.assert_not_called()
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
 
     def test_upload_concurrency_is_validated_and_forwarded(self):
         for invalid in (0, 16, 1.5, True, "3"):

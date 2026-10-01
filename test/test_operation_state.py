@@ -4,6 +4,15 @@ from moneymin.web.runner import CampaignRunner
 
 
 class OperationStateTests(unittest.TestCase):
+    def test_skip_exposes_actual_reason_without_claiming_authentication_failure(self):
+        state = OperationState(["a"])
+        state.event("account_done", dict(email="a", ok=True, skipped=True, reason="already_sent"))
+        row = state.snapshot()["accounts"][0]
+        self.assertEqual(row["detail"], "Este clipe já foi enviado a esta conta")
+        self.assertIsNone(row["session_id"])
+        state.event("account_done", dict(email="a", ok=False, skipped=True, reason="pending_recovery"))
+        self.assertEqual(state.snapshot()["accounts"][0]["detail"], "Envio anterior pendente de recuperação")
+
     def test_transfer_progress_is_not_receipt_confirmation(self):
         state = OperationState(["a"])
         state.event("account_progress", dict(email="a", phase="transport", percent=100))

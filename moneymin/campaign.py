@@ -2157,6 +2157,7 @@ def _run_campaign(
                 shorts = automatic_candidates(tsk, config)
                 all_clips = shorts
                 fresh = []
+                new_recipient_counts = {}
                 used_parents = set()
                 for candidate in all_clips:
                     if candidate["clip_uid"] in rejected_imu:
@@ -2167,6 +2168,7 @@ def _run_campaign(
                         used_parents.add(parent_key(candidate))
                     else:
                         fresh.append(candidate)
+                        new_recipient_counts[candidate["clip_uid"]] = sum(email not in unavailable for email in emails)
                 skipped_n = len(all_clips) - len(fresh)
                 if skipped_n:
                     _log(f"  (pulando {skipped_n} clipe(s) já enviados, reservados ou reprovados nos sensores)")
@@ -2182,6 +2184,9 @@ def _run_campaign(
                 clips = _prefer_cached_clips(diverse_order(ego4d.prefer_long_clips(
                     fresh, shuffle=config.shuffle_schedule), used_parents=used_parents),
                     work_dir, prioritize=content_mode != "dataset")
+                # Prefer content that serves more accounts, keeping cache/diversity
+                # ordering within each group. Partially sent clips remain fallback.
+                clips.sort(key=lambda clip: -new_recipient_counts[clip["clip_uid"]])
                 _emit("content_pool", task_name=display_name, clips=len(clips),
                       **diversity_summary(clips))
         except Exception as exc:  # noqa: BLE001 — uma categoria não mata as demais
@@ -2207,10 +2212,6 @@ def _run_campaign(
                   dataset=dataset_provider)
             continue
         task_accounts = _maybe_shuffle(list(config.accounts))
-        completed_items = 0
-        needed_items = (10 ** 9 if quota_s else
-                        (tsk.count if config.share_clips
-                         else tsk.count * max(1, len(config.accounts))))
         task_sends: dict[str, int] = {}
         task_seconds: dict[str, float] = {}
         for clip_info in clips:
@@ -2223,7 +2224,9 @@ def _run_campaign(
                     or task_seconds.get(a.email, 0) >= per_task_cap_s
                     for a in config.accounts):
                 break
-            if automatic_selection and completed_items >= needed_items:
+            if automatic_selection and not quota_s and all(
+                    a.email in banned or task_sends.get(a.email, 0) >= tsk.count
+                    for a in config.accounts):
                 break
             if should_stop and should_stop():
                 _log("  [!] campanha interrompida pelo usuário")
@@ -2339,7 +2342,15 @@ def _run_campaign(
                     for account in config.accounts
                 )
             else:
-                should_prefetch = completed_items + 1 < needed_items
+                available_accounts = [a for a in task_accounts
+                                      if a.email not in banned and a.email not in sent_to | reserved
+                                      and task_sends.get(a.email, 0) < tsk.count]
+                current_recipients = {a.email for a in (
+                    available_accounts if config.share_clips else available_accounts[:1])}
+                should_prefetch = any(
+                    a.email not in banned
+                    and task_sends.get(a.email, 0) + int(a.email in current_recipients) < tsk.count
+                    for a in task_accounts)
             if should_prefetch and content_mode != "cache":
                 _prefetch_following(
                     prefetch,
@@ -2353,6 +2364,7 @@ def _run_campaign(
             item["task_name"] = display_name
             item["task_scenario"] = tsk.scenario
             item["registry_key"] = registry_key
+            item["dedup_clip_uids"] = list(clip_info.get("dedup_clip_uids") or [])
             item["accounts"] = []
             pending_accounts: list[AccountSpec] = []
             account_results: dict[str, dict[str, Any]] = {}
@@ -2388,9 +2400,8 @@ def _run_campaign(
                         continue
                     if task_seconds.get(account.email, 0) >= per_task_cap_s:
                         continue
-                elif not config.share_clips:
-                    if task_sends.get(account.email, 0) >= tsk.count:
-                        continue
+                elif automatic_selection and task_sends.get(account.email, 0) >= tsk.count:
+                    continue
                 if not config.allow_new_accounts:
                     age = device_profile.profile_age_days(account.email)
                     if age < float(config.min_account_age_days or 0):
@@ -2769,7 +2780,6 @@ def _run_campaign(
                     "a campanha não avançou. Contas pendentes: " + details
                 )
             if pending_accounts:
-                completed_items += 1
                 if reserved:
                     _log("  armazenamento: mídia preservada para a recuperação do envio anterior")
                 elif (config.cleanup_after_upload and all_pending_succeeded

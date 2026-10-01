@@ -15,7 +15,7 @@ class OperationState:
     @staticmethod
     def _new(email):
         return dict(email=email, state="queued", progress=None, clip_uid=None,
-                    session_id=None, confirmed=0, failed=0, skipped=0)
+                    session_id=None, detail="Aguardando envio", confirmed=0, failed=0, skipped=0)
 
     def event(self, kind, payload):
         email = payload.get("email")
@@ -28,7 +28,7 @@ class OperationState:
         if payload.get("clip_uid"):
             row["clip_uid"] = str(payload["clip_uid"])
         if kind == "account_start":
-            row.update(state="preparing", progress=None, session_id=None)
+            row.update(state="preparing", progress=None, session_id=None, detail="Preparando envio")
         elif kind == "recording_wait_start":
             row.update(state="waiting", progress=None)
         elif kind == "account_retry":
@@ -51,14 +51,21 @@ class OperationState:
             if payload.get("skipped"):
                 row["state"] = "skipped"
                 row["skipped"] += 1
+                row["detail"] = {
+                    "already_sent": "Este clipe já foi enviado a esta conta",
+                    "pending_recovery": "Envio anterior pendente de recuperação",
+                }.get(payload.get("reason"), "Envio pulado; confira o acompanhamento")
             elif payload.get("ok") and payload.get("finalized") is True:
                 row["state"] = "confirmed"
                 row["confirmed"] += 1
+                row["detail"] = "Finalização confirmada"
             elif payload.get("ok"):
                 row["state"] = "unconfirmed"
+                row["detail"] = "Envio sem confirmação de finalização"
             else:
                 row["state"] = "failed"
                 row["failed"] += 1
+                row["detail"] = "Falha no envio; confira o acompanhamento"
             row["progress"] = None
             row["session_id"] = str(payload["session_id"]) if payload.get("session_id") else None
 

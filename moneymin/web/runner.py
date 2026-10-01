@@ -202,7 +202,7 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         ok = bool(payload.get("ok"))
         if skipped:
             return {
-                "level": "warning", "stage": "Envio", "title": "Conta ignorada",
+                "level": "warning", "stage": "Envio", "title": "Clipe já enviado" if payload.get("reason") == "already_sent" else "Envio pendente de recuperação" if payload.get("reason") == "pending_recovery" else "Envio pulado",
                 "detail": f"{email} · {friendly_campaign_error(payload.get('error')) if payload.get('error') else 'registro local de envio anterior' if payload.get('reason') == 'already_sent' else 'conta pulada nesta execução'}",
             }
         if ok:
@@ -308,6 +308,7 @@ class CampaignRunner:
         self.stage = "Aguardando"
         self.on_restriction = None
         self.operation = OperationState()
+        self.start_request_id = None
 
     # --- ciclo de vida ----------------------------------------------------
     @property
@@ -335,6 +336,7 @@ class CampaignRunner:
             self._resume.set()
             self.pause_requested = False
             self.state = "running"
+            self.start_request_id = cfg.start_request_id
             self.events.clear()
             self.operation = OperationState(account.email for account in cfg.accounts)
             self.error = None
@@ -616,6 +618,7 @@ class CampaignRunner:
             return {
                 "state": self.state,
                 "pause_requested": self.pause_requested,
+                "start_request_id": self.start_request_id,
                 "events": events,
                 "last_seq": self._seq,
                 "operation": self.operation.snapshot(self.state in {"done", "stopped", "error"}),

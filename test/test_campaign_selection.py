@@ -15,6 +15,44 @@ from moneymin.web.server import _campaign_log_view
 
 
 class CampaignSelectionTests(unittest.TestCase):
+    def _run_partial_history(self, include_fresh):
+        self.cfg.accounts = self.cfg.accounts[:2]
+        self.cfg.tasks = self.tasks[:1]
+        self.cfg.share_clips = True
+        self.cfg.account_workers = 1
+        self.cfg.account_gap_s = 0
+        self.cfg.cleanup_after_upload = False
+        emails = [a.email for a in self.cfg.accounts]
+        clips = [{"clip_uid": uid, "parent_video_uid": uid, "source": "ego4d", "dur_s": 300}
+                 for uid in (["old-a", "old-b", "fresh"] if include_fresh else ["old-a", "old-b"])]
+        history = {"old-a": {emails[0]}, "old-b": {emails[1]}}
+        uploaded = []
+        def send(item, account, *args, **kwargs):
+            uploaded.append((item["clip_uid"], account.email))
+            return {"ok": True, "finalized": True}
+        with patch.object(campaign, "automatic_candidates", return_value=clips), \
+             patch.object(campaign, "_candidate_sent_emails", side_effect=lambda key, c: history.get(c["clip_uid"], set())), \
+             patch.object(campaign, "_candidate_reserved_emails", return_value=set()), \
+             patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
+             patch.object(campaign, "prepare_clip", side_effect=lambda *a, **k: {
+                 "duration_ms": 300000, "imu_real": True, "video_path": str(self.tmp / "fake.mp4")}), \
+             patch.object(campaign, "upload_to_account", side_effect=send), \
+             patch.object(campaign.sent_registry, "mark_sent"), \
+             patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
+            result = campaign.run_campaign(self.cfg)
+        return uploaded, result
+
+    def test_partial_history_does_not_end_category_before_each_account_receives_new_clip(self):
+        uploaded, result = self._run_partial_history(False)
+        self.assertEqual(set(uploaded), {("old-a", self.cfg.accounts[1].email),
+                                         ("old-b", self.cfg.accounts[0].email)})
+        self.assertFalse(any(i["kind"] == "task_shortfall" for i in result.issues))
+
+    def test_fresh_clip_is_preferred_over_partially_sent_clips(self):
+        uploaded, result = self._run_partial_history(True)
+        self.assertEqual(set(uploaded), {("fresh", a.email) for a in self.cfg.accounts})
+        self.assertEqual(len(uploaded), 2)
+
     def test_imu_rejection_is_not_prepared_again_in_later_category_pass(self):
         self.cfg.target_hours_per_account = .5
         with patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \

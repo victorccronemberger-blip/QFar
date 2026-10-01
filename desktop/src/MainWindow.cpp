@@ -67,6 +67,7 @@
 #include <QStackedWidget>
 #include <QStandardPaths>
 #include <QSignalBlocker>
+#include <QScopeGuard>
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QTimer>
@@ -813,9 +814,12 @@ QWidget* MainWindow::buildHomePage() {
   _operationPause->setMinimumSize(118, 40);
   _operationPause->setEnabled(false);
   connect(_operationPause, &QPushButton::clicked, this, [this] {
+    if (_operationPausePending) return;
+    _operationPausePending = true;
     _operationPause->setEnabled(false);
     const QString path = _operationPauseRequested ? QStringLiteral("/api/campaigns/resume") : QStringLiteral("/api/campaigns/pause");
     _api.post(path, {}, [this](bool ok, const QJsonDocument&, const QString& error) {
+      _operationPausePending = false;
       if (!ok) showError(QStringLiteral("Controle da campanha"), error);
       loadHome();
     });
@@ -960,7 +964,7 @@ QWidget* MainWindow::buildHomePage() {
 void MainWindow::renderOperation(const QJsonObject& snapshot) {
   const bool active = snapshot.value("state").toString() == "running";
   _operationPauseRequested = snapshot.value("pause_requested").toBool();
-  _operationPause->setEnabled(active);
+  _operationPause->setEnabled(active && !_operationPausePending);
   _operationPause->setText(_operationPauseRequested ? QStringLiteral("▷  Retomar") : QStringLiteral("Ⅱ  Pausar"));
   _operationLive->setText(_operationPauseRequested ? QStringLiteral("Pausa solicitada") : active ? QStringLiteral("●  Ao vivo") : QStringLiteral("Aguardando"));
   _operationLive->setToolTip(_operationPauseRequested ? QStringLiteral("Requisições em andamento podem terminar; a continuação aguarda Retomar.") : QString());
@@ -995,9 +999,9 @@ void MainWindow::renderOperation(const QJsonObject& snapshot) {
     for (int column = 0; column < cells.size(); ++column) {
       auto* cell = new QTableWidgetItem(cells[column]);
       cell->setData(Qt::UserRole, row);
-      cell->setToolTip(QStringLiteral("Clipe: %1\nSessão: %2\nFalhas: %3 • Pulados: %4")
+      cell->setToolTip(QStringLiteral("Clipe: %1\nSessão: %2\nFalhas: %3 • Pulados: %4\n%5")
           .arg(row.value("clip_uid").toString(), row.value("session_id").toString())
-          .arg(row.value("failed").toInt()).arg(row.value("skipped").toInt()));
+          .arg(row.value("failed").toInt()).arg(row.value("skipped").toInt()).arg(row.value("detail").toString()));
       _operationTable->setItem(i, column, cell);
     }
     _operationTable->setRowHeight(i, 58);
@@ -1390,6 +1394,8 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignReset->setToolTip(QStringLiteral(
       "Limpa a lista de vídeos já utilizados e permite que eles sejam selecionados novamente."));
   connect(_campaignReset, &QPushButton::clicked, this, [this] {
+    if (_campaignActive || _campaignPreflightPending || _campaignStartPending
+        || _campaignStartUncertain || _campaignResetPending) return;
     const auto choice = QMessageBox::warning(
         this, QStringLiteral("Resetar lista de vídeos usados"),
         QStringLiteral("Os vídeos registrados como já utilizados poderão ser selecionados "
@@ -1398,12 +1404,14 @@ QWidget* MainWindow::buildCampaignPage() {
                        "Deseja continuar?"),
         QMessageBox::Reset | QMessageBox::Cancel, QMessageBox::Cancel);
     if (choice != QMessageBox::Reset) return;
-    _campaignReset->setEnabled(false);
+    _campaignResetPending = true;
+    updateCampaignActions();
     _campaignReset->setText(QStringLiteral("Resetando…"));
     _api.post(QStringLiteral("/api/sent/reset"), {},
               [this](bool ok, const QJsonDocument&, const QString& error) {
+      _campaignResetPending = false;
       _campaignReset->setText(QStringLiteral("Resetar lista"));
-      _campaignReset->setEnabled(!_campaignActive);
+      updateCampaignActions();
       if (!ok)
         return showError(QStringLiteral("Lista não resetada"), error);
       setStatus(QStringLiteral(
@@ -1470,6 +1478,7 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_campaignAccounts, &QListWidget::itemChanged, this, [this] {
     updateCampaignAccountCount();
     _taskReload.start();
+    updateCampaignActions();
   });
   accountCol->addWidget(_campaignAccounts);
   connect(_campaignAccountSearch, &QLineEdit::textChanged, this, [this](const QString& search) {
@@ -1535,7 +1544,8 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(allTasks, &QPushButton::clicked, this, [this] {
     for (int i = 0; i < _campaignTasks->count(); ++i) {
       auto* item = _campaignTasks->item(i);
-      if (item->flags() & Qt::ItemIsEnabled) item->setCheckState(Qt::Checked);
+      if ((item->flags() & Qt::ItemIsEnabled) && !item->data(Qt::UserRole).toString().isEmpty())
+        item->setCheckState(Qt::Checked);
     }
   });
   taskHead->addWidget(allTasks);
@@ -1554,6 +1564,7 @@ QWidget* MainWindow::buildCampaignPage() {
       if (item->checkState() == Qt::Checked && !item->data(Qt::UserRole).toString().isEmpty())
         _campaignSelectedTaskIds.insert(item->data(Qt::UserRole).toString());
     }
+    updateCampaignActions();
   });
   taskCol->addWidget(_campaignTasks);
   selectionLayout->addLayout(accountCol, 1);
@@ -1657,6 +1668,12 @@ QWidget* MainWindow::buildCampaignPage() {
   _hourEnd->setFixedWidth(100);
   connect(_activeHours, &QCheckBox::toggled, _hourStart, &QWidget::setEnabled);
   connect(_activeHours, &QCheckBox::toggled, _hourEnd, &QWidget::setEnabled);
+  connect(_hourStart, &QSpinBox::valueChanged, this, [this](int start) {
+    if (_hourEnd->value() <= start) _hourEnd->setValue(start + 1);
+  });
+  connect(_hourEnd, &QSpinBox::valueChanged, this, [this](int end) {
+    if (_hourStart->value() >= end) _hourStart->setValue(end - 1);
+  });
   hoursLayout->addWidget(_activeHours);
   hoursLayout->addWidget(_hourStart);
   hoursLayout->addWidget(new QLabel(QStringLiteral("e")));
@@ -1704,9 +1721,16 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignStop = new QPushButton(QStringLiteral("Parar com segurança"));
   _campaignStop->setEnabled(false);
   connect(_campaignStop, &QPushButton::clicked, this, [this] {
+    if (_campaignStopPending) return;
+    _campaignStopPending = true;
+    _campaignStop->setEnabled(false);
+    _campaignStop->setText(QStringLiteral("Solicitando parada…"));
     _api.post(QStringLiteral("/api/campaigns/stop"), {}, [this](bool ok, const QJsonDocument&, const QString& error) {
-      if (!ok) showError(QStringLiteral("Não foi possível parar"), error);
-      else setStatus(QStringLiteral("Parada solicitada; o envio atual será concluído."));
+      _campaignStopPending = false;
+      _campaignStop->setText(QStringLiteral("Parar com segurança"));
+      if (!ok) showError(QStringLiteral("Não foi possível confirmar a parada"), error);
+      if (ok) setStatus(QStringLiteral("Parada solicitada; o envio atual será concluído."));
+      pollCampaign();
     });
   });
   actions->addWidget(_campaignStop);
@@ -1750,6 +1774,7 @@ QWidget* MainWindow::buildCampaignPage() {
     _hourStart->setValue(draft.value(QStringLiteral("hour_start")).toInt(7));
     _hourEnd->setValue(draft.value(QStringLiteral("hour_end")).toInt(18));
   }
+  form->setRowVisible(_delaySeconds, _delayMode->currentData().toString() == QStringLiteral("fixed"));
   const QString restoredMode = _campaignAccountMode->currentData().toString();
   const bool automatic = restoredMode != QStringLiteral("manual");
   allAccounts->setVisible(!automatic);
@@ -3946,6 +3971,24 @@ void MainWindow::exportDiagnostics() {
   });
 }
 
+void MainWindow::updateCampaignActions() {
+  bool accounts = false, tasks = false;
+  for (int i = 0; i < _campaignAccounts->count(); ++i)
+    accounts |= _campaignAccounts->item(i)->checkState() == Qt::Checked;
+  for (int i = 0; i < _campaignTasks->count(); ++i) {
+    auto* item = _campaignTasks->item(i);
+    tasks |= item->checkState() == Qt::Checked && (item->flags() & Qt::ItemIsEnabled)
+        && !item->data(Qt::UserRole).toString().isEmpty();
+  }
+  const bool busy = _campaignActive || _campaignPreflightPending || _campaignStartPending
+      || _campaignStartUncertain || _campaignResetPending;
+  const bool balancesReady = !_campaignAccountMode->currentData().toString().startsWith(QStringLiteral("balance_"))
+      || _campaignBalancesLoaded;
+  _campaignStart->setEnabled(!busy && accounts && tasks && balancesReady
+      && !_taskRequestPending && !_taskReload.isActive());
+  _campaignReset->setEnabled(!busy);
+}
+
 void MainWindow::loadCampaignData() {
   // Até o motor responder, mantenha ações destrutivas e uma nova partida
   // bloqueadas. Isso evita uma janela curta em que a tela ainda não conhece
@@ -4021,7 +4064,8 @@ void MainWindow::loadTasks() {
   {
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
-    _campaignTasks->addItem(QStringLiteral("Carregando categorias…"));
+    auto* loading = new QListWidgetItem(QStringLiteral("Carregando categorias…"), _campaignTasks);
+    loading->setFlags(Qt::NoItemFlags);
   }
   _campaignStart->setEnabled(false);
   const QString path = QStringLiteral(
@@ -4041,7 +4085,8 @@ void MainWindow::loadTasks() {
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
     if (!ok) {
-      _campaignTasks->addItem(QStringLiteral("Falha: ") + error);
+      auto* failure = new QListWidgetItem(QStringLiteral("Falha: ") + error, _campaignTasks);
+      failure->setFlags(Qt::NoItemFlags);
       return;
     }
     if (doc.object().value(QStringLiteral("loading")).toBool()) {
@@ -4093,7 +4138,7 @@ void MainWindow::loadTasks() {
     int selectedTasks = 0;
     for (int i = 0; i < _campaignTasks->count(); ++i)
       if (_campaignTasks->item(i)->checkState() == Qt::Checked) ++selectedTasks;
-    _campaignStart->setEnabled(selectedTasks > 0 && !_campaignActive);
+    updateCampaignActions();
     if (compatible == 0) {
       setStatus(QStringLiteral("Nenhuma categoria tem clipe compatível nesta origem e duração."));
     } else {
@@ -4104,6 +4149,8 @@ void MainWindow::loadTasks() {
 }
 
 void MainWindow::startCampaign() {
+  if (_campaignActive || _campaignPreflightPending || _campaignStartPending
+      || _campaignStartUncertain || _campaignResetPending) return;
   if (_campaignAccountMode->currentData().toString().startsWith(QStringLiteral("balance_"))
       && !_campaignBalancesLoaded)
     return showError(QStringLiteral("Saldos ainda não carregados"),
@@ -4168,6 +4215,9 @@ void MainWindow::startCampaign() {
 }
 
 void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccountNames) {
+  if (_campaignPreflightPending || _campaignStartPending) return;
+  _campaignPreflightPending = true;
+  updateCampaignActions();
   ++_campaignPollRevision;
   setCampaignIndicator(QStringLiteral("Verificando campanha"),
                        QStringLiteral("Validando contas e clipes. Nenhum envio iniciado."), QStringLiteral("starting"), true);
@@ -4175,9 +4225,14 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
   _campaignStart->setText(QStringLiteral("Verificando campanha…"));
   _api.post(QStringLiteral("/api/campaigns/preflight"), body,
             [this, body, selectedAccountNames](bool ok, const QJsonDocument& doc, const QString& error) {
+    const auto finishVerification = qScopeGuard([this] {
+      _campaignPreflightPending = false;
+      if (!_campaignStartPending) _campaignStart->setText(QStringLiteral("Iniciar campanha"));
+      updateCampaignActions();
+    });
     if (!ok) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
-      _campaignStart->setEnabled(true);
+      updateCampaignActions();
       setCampaignIndicator(QStringLiteral("Verificação não concluída"), error, QStringLiteral("error"));
       return showError(QStringLiteral("Verificação não concluída"), error);
     }
@@ -4189,7 +4244,7 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
       setCampaignIndicator(QStringLiteral("Campanha não iniciada"),
                            QStringLiteral("Revise as pendências da verificação."), QStringLiteral("error"));
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
-      _campaignStart->setEnabled(true);
+      updateCampaignActions();
       const auto issues = result.value(QStringLiteral("account_issues")).toArray();
       const auto errors = result.value(QStringLiteral("account_errors")).toArray();
       if (!issues.isEmpty()) {
@@ -4246,7 +4301,7 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
     if (review.exec() != QDialog::Accepted) {
       setCampaignIndicator(QStringLiteral("Campanha não iniciada"), QStringLiteral("A revisão foi cancelada. Nenhum envio iniciado."), QStringLiteral("idle"));
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
-      _campaignStart->setEnabled(true);
+      updateCampaignActions();
       return;
     }
 
@@ -4257,6 +4312,7 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
 }
 
 void MainWindow::submitCampaign(QJsonObject body) {
+  _campaignRequestedPreflight = body.value(QStringLiteral("preflight_id")).toString();
   ++_campaignPollRevision;
   _campaignStartPending = true;
   _campaignStage->setText(QStringLiteral("Iniciando campanha…"));
@@ -4273,7 +4329,7 @@ void MainWindow::submitCampaign(QJsonObject body) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       if (!started) {
         setCampaignIndicator(QStringLiteral("Não foi possível confirmar o início"), startError, QStringLiteral("error"));
-        _campaignStart->setEnabled(!_campaignActive);
+        updateCampaignActions();
         const auto code = startDoc.object().value(QStringLiteral("error_code")).toString();
         _campaignProgress->setRange(0, 100);
         if (code == "request_outcome_unknown") {
@@ -4295,7 +4351,8 @@ void MainWindow::submitCampaign(QJsonObject body) {
           return;
         }
         if (code == "preflight_expired" || code == "preflight_missing"
-            || code == "preflight_accounts_changed" || code == "preflight_request_changed") {
+            || code == "preflight_accounts_changed" || code == "preflight_request_changed"
+            || code == "preflight_history_changed") {
           auto refreshed = body;
           refreshed.remove(QStringLiteral("preflight_id"));
           refreshed.remove(QStringLiteral("remove_restricted"));
@@ -4366,14 +4423,17 @@ void MainWindow::setCampaignIndicator(const QString& title, const QString& detai
 }
 
 void MainWindow::pollCampaign() {
-  if (_campaignStartPending || _campaignPollInFlight) return;
+  if (_campaignPreflightPending || _campaignStartPending || _campaignPollInFlight) return;
   _campaignPollInFlight = true;
   const int revision = _campaignPollRevision;
   _api.get(QStringLiteral("/api/campaigns/current?since=%1").arg(_lastCampaignSeq),
            [this, revision](bool ok, const QJsonDocument& doc, const QString&) {
     _campaignPollInFlight = false;
     if (revision != _campaignPollRevision) return;
-    if (!ok) {
+    if (!ok || !QStringList{"idle", "running", "stopping", "done", "stopped", "error"}
+                   .contains(doc.object().value(QStringLiteral("state")).toString())) {
+      _campaignActive = true;
+      updateCampaignActions();
       setCampaignIndicator(QStringLiteral("Sem atualização do serviço"),
           QStringLiteral("Não foi possível confirmar o estado atual. Tentando novamente; isso não significa que a campanha parou."), QStringLiteral("unknown"));
       _campaignPoll.start();
@@ -4382,7 +4442,9 @@ void MainWindow::pollCampaign() {
     const auto snap = doc.object();
     const QString state = snap.value(QStringLiteral("state")).toString();
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
-    if (_campaignStartUncertain && !running) {
+    const bool requestedOperation = !_campaignRequestedPreflight.isEmpty()
+        && snap.value(QStringLiteral("start_request_id")).toString() == _campaignRequestedPreflight;
+    if (_campaignStartUncertain && !running && !requestedOperation) {
       setCampaignIndicator(QStringLiteral("Início não confirmado"),
           QStringLiteral("O serviço ainda não confirmou a execução solicitada. A solicitação não será repetida automaticamente. Se persistir, encerre e reabra o aplicativo antes de tentar novamente."), QStringLiteral("unknown"));
       return;
@@ -4391,10 +4453,10 @@ void MainWindow::pollCampaign() {
     _campaignProgress->setRange(0, 100);
 
     _campaignActive = running;
-    _campaignStop->setEnabled(running && state != QStringLiteral("stopping"));
-    _campaignStart->setEnabled(!running);
+    _campaignStop->setEnabled(running && state != QStringLiteral("stopping") && !_campaignStopPending);
+    updateCampaignActions();
     _campaignStart->setText(running ? QStringLiteral("Campanha em andamento") : QStringLiteral("Iniciar campanha"));
-    _campaignReset->setEnabled(!running);
+    updateCampaignActions();
     const QHash<QString, QString> stateLabels{
         {QStringLiteral("idle"), QStringLiteral("Aguardando")},
         {QStringLiteral("running"), QStringLiteral("Em andamento")},
@@ -4425,6 +4487,7 @@ void MainWindow::pollCampaign() {
     const int percent = total > 0 ? qBound(0, int(done * 100 / total), 100) : 0;
     const bool paused = snap.value(QStringLiteral("pause_requested")).toBool();
     const QString headline = state == "running" ? (paused ? QStringLiteral("Pausa solicitada") : QStringLiteral("Campanha em andamento"))
+        : state == "done" ? snap.value(QStringLiteral("stage")).toString(stateLabels.value(state))
         : stateLabels.value(state, QStringLiteral("Estado não reconhecido"));
     const QString goalText = hoursGoal
         ? QStringLiteral("%1 de %2 h confirmadas nesta campanha").arg(done / 3600., 0, 'f', 2).arg(total / 3600., 0, 'f', 2)
@@ -4485,7 +4548,7 @@ void MainWindow::pollCampaign() {
 }
 
 void MainWindow::pollCampaignPreviews() {
-  if (_campaignActive || _campaignStartPending || _previewLogName.isEmpty() || _previewCheckActive) return;
+  if (_campaignActive || _campaignPreflightPending || _campaignStartPending || _previewLogName.isEmpty() || _previewCheckActive) return;
   const auto previewLog = _previewLogName;
   const auto revision = _campaignPollRevision;
   _previewCheckActive = true;

@@ -41,6 +41,12 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   if (method == "POST" && path == QStringLiteral("/api/campaigns"))
     req.setTransferTimeout(60000);
 
+  if (method == "POST" && path == QStringLiteral("/api/campaigns/preflight"))
+    req.setTransferTimeout(180000);
+  else if (method == "POST" && (path.startsWith(QStringLiteral("/api/campaigns/"))
+                               || path == QStringLiteral("/api/sent/reset")))
+    req.setTransferTimeout(60000);
+
   QNetworkReply* reply = nullptr;
   const QByteArray payload = body ? QJsonDocument(*body).toJson(QJsonDocument::Compact) : QByteArray();
   if (method == "GET") reply = _network.get(req);
@@ -48,7 +54,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   else if (method == "PUT") reply = _network.put(req, payload);
   else reply = _network.sendCustomRequest(req, method, payload);
 
-  connect(reply, &QNetworkReply::finished, this, [reply, callback = std::move(callback)]() {
+  connect(reply, &QNetworkReply::finished, this, [reply, method, path, callback = std::move(callback)]() {
     const QByteArray bytes = reply->readAll();
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
@@ -62,6 +68,20 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       else doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
     } else if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
       error = QStringLiteral("O serviço retornou uma resposta JSON inválida ou incompleta.");
+      if (method == "POST" && path == QStringLiteral("/api/campaigns"))
+        doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
+    } else if (method == "POST" && path == QStringLiteral("/api/campaigns")
+               && !doc.object().value(QStringLiteral("ok")).toBool()) {
+      error = doc.object().value(QStringLiteral("error")).toString(
+          QStringLiteral("O serviço não confirmou o início da campanha."));
+      if (!doc.object().contains(QStringLiteral("ok")))
+        doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
+    }
+    if (!ok && method == "POST" && path == QStringLiteral("/api/campaigns")
+        && (status == 0 || status >= 500) && doc.object().value("error_code").toString().isEmpty()) {
+      auto uncertain = doc.object();
+      uncertain.insert(QStringLiteral("error_code"), QStringLiteral("request_outcome_unknown"));
+      doc = QJsonDocument(uncertain);
     }
     reply->deleteLater();
     callback(ok && error.isEmpty(), doc, error);

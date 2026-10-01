@@ -107,7 +107,7 @@ public:
       p->setPen(ink); font.setWeight(QFont::DemiBold); p->setFont(font);
       p->drawText(text,Qt::AlignTop,p->fontMetrics().elidedText(row.value("email").toString(),Qt::ElideRight,text.width()));
       font.setPointSize(9); font.setWeight(QFont::Normal); p->setFont(font); p->setPen(gray);
-      p->drawText(text,Qt::AlignBottom,p->fontMetrics().elidedText(row.value("session_id").toString(QStringLiteral("Sem sessão confirmada")),Qt::ElideRight,text.width()));
+      p->drawText(text,Qt::AlignBottom,p->fontMetrics().elidedText((state=="skipped" ? row.value("detail").toString(QStringLiteral("Envio pulado; confira o acompanhamento")) : row.value("session_id").toString(row.value("detail").toString(QStringLiteral("Aguardando envio")))),Qt::ElideRight,text.width()));
     } else if(index.column()==1) {
       QRect pill(rect.left(),rect.center().y()-15,qMin(rect.width(),128),30);
       p->setPen(Qt::NoPen); p->setBrush(tint); p->drawRoundedRect(pill,15,15);

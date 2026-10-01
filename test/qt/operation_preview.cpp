@@ -17,6 +17,7 @@
 #include <QPushButton>
 #include <QProgressBar>
 #include <QSettings>
+#include <QTemporaryDir>
 #include <QStackedWidget>
 #include <QListWidget>
 #include <QSignalBlocker>
@@ -25,9 +26,123 @@
 #include <QTcpSocket>
 #include <QTableWidget>
 #include <QSpinBox>
+#include <QCheckBox>
 
 class OperationPreview {
 public:
+  static void campaignParametersSmoke() {
+    QSettings().setValue(QStringLiteral("campaign/draft"),QJsonDocument(QJsonObject{
+      {"delay_mode","fixed"},{"delay_seconds",75},{"active_hours",false},{"hour_start",7},{"hour_end",18}
+    }).toJson(QJsonDocument::Compact));
+    MainWindow restored(qobject_cast<oclero::qlementine::QlementineStyle*>(qApp->style()),nullptr,false);
+    if(restored._delaySeconds->isHidden() || restored._delaySeconds->value()!=75
+        || restored._hourStart->isEnabled() || restored._hourEnd->isEnabled()) { qApp->exit(110); return; }
+    restored._activeHours->setChecked(true); restored._hourStart->setValue(23);
+    if(restored._hourEnd->value()!=24) { qApp->exit(111); return; }
+    restored._hourEnd->setValue(4);
+    if(restored._hourStart->value()!=3) { qApp->exit(112); return; }
+    restored._delayMode->setCurrentIndex(restored._delayMode->findData("off"));
+    if(!restored._delaySeconds->isHidden()) { qApp->exit(113); return; }
+    restored._delayMode->setCurrentIndex(restored._delayMode->findData("fixed"));
+    qApp->exit(!restored._delaySeconds->isHidden() && restored._delaySeconds->value()==75 ? 0:114);
+  }
+  static void campaignControlsSmoke(MainWindow& window) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(100); return; }
+    struct Flow { int preflights=0, starts=0, stops=0, pauses=0, resumes=0, phase=0; bool running=false, paused=false; };
+    auto flow=std::make_shared<Flow>();
+    QObject::connect(server,&QTcpServer::newConnection,server,[server,flow] {
+      auto* socket=server->nextPendingConnection();
+      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow] {
+        auto input=socket->property("input").toByteArray()+socket->readAll(); socket->setProperty("input",input);
+        const int end=input.indexOf("\r\n\r\n");
+        if(end<0 || socket->property("answered").toBool()) return;
+        const auto match=QRegularExpression(QStringLiteral("Content-Length: (\\d+)"),QRegularExpression::CaseInsensitiveOption)
+          .match(QString::fromLatin1(input.left(end)));
+        if(match.hasMatch() && input.size()<end+4+match.captured(1).toInt()) return;
+        socket->setProperty("answered",true);
+        QJsonObject result; int delay=0;
+        if(input.startsWith("POST /api/campaigns/preflight ")) {
+          ++flow->preflights; delay=250;
+          result={{"ok",true},{"preflight_id","fixture"},{"accounts",QJsonObject{{"validated",1}}},
+                  {"tasks",QJsonObject{{"compatible",1}}},{"blockers",QJsonArray{}},{"warnings",QJsonArray{}}};
+        } else if(input.startsWith("POST /api/campaigns ")) {
+          ++flow->starts; flow->running=true; delay=200; result={{"ok",true},{"accounts",QJsonArray{"fixture@example.com"}}};
+        } else if(input.startsWith("POST /api/campaigns/pause ")) {
+          ++flow->pauses; flow->paused=true; result={{"ok",true}};
+        } else if(input.startsWith("POST /api/campaigns/resume ")) {
+          ++flow->resumes; flow->paused=false; result={{"ok",true}};
+        } else if(input.startsWith("POST /api/campaigns/stop ")) {
+          ++flow->stops; flow->running=false; delay=200; result={{"ok",true}};
+        } else if(input.startsWith("GET /api/accounts ")) {
+          result={{"accounts",QJsonArray{QJsonObject{{"email","fixture@example.com"}}}}};
+        } else if(input.startsWith("GET /api/balances ")) { result={{"balances",QJsonObject{}}};
+        } else if(input.startsWith("GET /api/campaigns/current")) {
+          result={{"state",flow->running?"running":flow->stops?"stopped":"idle"},{"pause_requested",flow->paused},
+                  {"totals",QJsonObject{{"total_sends",1},{"ok_sends",0}}}};
+        } else if(input.startsWith("GET /api/logs ")) { result={{"logs",QJsonArray{}}};
+        } else if(input.startsWith("GET /api/tasks?")) {
+          result={{"tasks",QJsonArray{QJsonObject{{"id","fixture-task"},{"name","Fixture"},
+            {"available_for_duration",true},{"clip_count",1}}}}};
+        } else { qApp->exit(101); return; }
+        const auto bytes=QJsonDocument(result).toJson(QJsonDocument::Compact);
+        QTimer::singleShot(delay,socket,[socket,bytes] {
+          socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+            +QByteArray::number(bytes.size())+"\r\n\r\n"+bytes); socket->disconnectFromHost();
+        });
+      });
+      QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._pages->setCurrentIndex(3);
+    {
+      const QSignalBlocker a(window._campaignAccounts),t(window._campaignTasks);
+      auto* account=new QListWidgetItem("fixture@example.com",window._campaignAccounts);
+      account->setData(Qt::UserRole,"fixture@example.com"); account->setCheckState(Qt::Checked);
+      auto* task=new QListWidgetItem("Fixture",window._campaignTasks);
+      task->setData(Qt::UserRole,"fixture-task"); task->setCheckState(Qt::Checked);
+    }
+    window._taskReload.stop(); window._campaignActive=false; window.updateCampaignActions();
+    if(qApp->arguments().contains("--campaign-controls-manual")) {
+      window.setWindowTitle(QStringLiteral("QMoney — teste isolado da campanha"));
+      window.loadHome();
+      return;
+    }
+    auto* timer=new QTimer(&window);
+    QObject::connect(timer,&QTimer::timeout,&window,[&window,flow] {
+      auto* dialog=qobject_cast<QDialog*>(QApplication::activeModalWidget());
+      if(dialog && dialog->windowTitle()==QStringLiteral("Revisar campanha")) {
+        if(window._campaignStart->isEnabled() || window._campaignReset->isEnabled()) { qApp->exit(102); return; }
+        if(flow->phase==1) { flow->phase=2; dialog->reject(); }
+        else if(flow->phase==3) { flow->phase=4; dialog->accept(); }
+        return;
+      }
+      if(flow->phase==0) {
+        window._campaignTasks->item(0)->setCheckState(Qt::Unchecked); window.pollCampaign();
+        if(window._campaignStart->isEnabled()) { qApp->exit(103); return; }
+        window._campaignTasks->item(0)->setCheckState(Qt::Checked);
+        flow->phase=1; window._campaignStart->click(); window.startCampaign(); window.pollCampaign();
+        if(!window._campaignPreflightPending || window._campaignStart->isEnabled()) qApp->exit(104);
+      } else if(flow->phase==1 && window._campaignIndicatorTitle->text()!=QStringLiteral("Verificando campanha")) qApp->exit(105);
+      else if(flow->phase==2 && !window._campaignPreflightPending) {
+        if(flow->preflights!=1 || flow->starts || !window._campaignStart->isEnabled()) { qApp->exit(106); return; }
+        flow->phase=3; window._campaignStart->click();
+      } else if(flow->phase==4 && window._campaignActive && !window._campaignStartPending) {
+        if(flow->starts!=1 || window._campaignStart->isEnabled() || !window._campaignStop->isEnabled()) { qApp->exit(107); return; }
+        flow->phase=5; window.loadHome();
+      } else if(flow->phase==5 && window._operationPause->isEnabled()) {
+        flow->phase=6; window._operationPause->click();
+      } else if(flow->phase==6 && window._operationPauseRequested && window._operationPause->isEnabled()) {
+        flow->phase=7; window._operationPause->click();
+      } else if(flow->phase==7 && !window._operationPauseRequested && flow->resumes==1 && window._operationPause->isEnabled()) {
+        flow->phase=8; window._campaignStop->click(); window._campaignStop->click();
+      } else if(flow->phase==8 && !window._campaignActive && !window._campaignStopPending) {
+        qApp->exit(flow->stops==1 && flow->pauses==1 && flow->resumes==1 && window._campaignStart->isEnabled()
+          && !window._campaignStop->isEnabled() ? 0:108);
+      }
+    });
+    timer->start(25); QTimer::singleShot(10000,&window,[] { qApp->exit(109); });
+  }
   static void acceleratorSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(90); return; }
@@ -354,6 +469,15 @@ public:
     QTimer::singleShot(8000, &window, [] { qApp->exit(53); });
   }
   static void campaignIndicatorSmoke(MainWindow& window) {
+    {
+      const QSignalBlocker a(window._campaignAccounts),t(window._campaignTasks);
+      auto* account=new QListWidgetItem("fixture@example.com",window._campaignAccounts);
+      account->setData(Qt::UserRole,"fixture@example.com"); account->setCheckState(Qt::Checked);
+      auto* task=new QListWidgetItem("Fixture",window._campaignTasks);
+      task->setData(Qt::UserRole,"fixture-task"); task->setCheckState(Qt::Checked);
+    }
+    window._taskReload.stop();
+
     page(window,3);
     window.applyStructuralStyle(qApp->arguments().contains("--dark"));
     auto* server=new QTcpServer(&window);
@@ -381,13 +505,15 @@ public:
           const int starts=qApp->property("campaignStartRequests").toInt()+1;
           qApp->setProperty("campaignStartRequests",starts);
           if(starts!=1){qApp->exit(49);return;}
-          failed=qApp->arguments().contains("--start-uncertain");
+          failed=qApp->arguments().contains("--start-uncertain") || qApp->arguments().contains("--start-terminal");
           reply=failed ? QJsonObject{{"error_code","request_outcome_unknown"},{"error","Resposta perdida"}}
+                       : qApp->arguments().contains("--start-malformed") ? QJsonObject{}
                        : QJsonObject{{"ok",true},{"accounts",QJsonArray{}}};
         }
         else if(input.startsWith("GET /api/campaigns/current?")) {
           failed=*phase==2;
-          reply={{"state",*phase==3?"done":*phase==4?"error":"running"},
+          reply={{"state",qApp->arguments().contains("--start-terminal")?"done":*phase==3?"done":*phase==4?"error":"running"},
+                 {"start_request_id","fixture-request"},
                  {"current",*phase==0?"Preparando o primeiro clipe":*phase==1?"Enviando clipe para conta de demonstração":"Execução encerrada"},
                  {"totals",QJsonObject{{"total_sends",4},{"done_sends",100},{"skipped_sends",99},
                    {"progress_unit","seconds"},{"progress_target",*phase==0?0:3600},
@@ -403,9 +529,19 @@ public:
     window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
     window._previewLogName="old-campaign.json";
     window.pollCampaignPreviews();
-    window.submitCampaign({});
+    window.submitCampaign({{"preflight_id","fixture-request"}});
     if(window._campaignTabs->currentIndex()!=2 || window._campaignIndicatorTitle->text()!=QStringLiteral("Iniciando campanha…")) {
       qApp->exit(42);return;
+    }
+    if(qApp->arguments().contains("--start-terminal")) {
+      auto* probe=new QTimer(&window);
+      QObject::connect(probe,&QTimer::timeout,&window,[&window] {
+        if(window._campaignIndicatorTitle->text()==QStringLiteral("Concluída"))
+          qApp->exit(window._campaignStart->isEnabled() && !window._campaignStartUncertain
+            && qApp->property("campaignStartRequests").toInt()==1 ? 0:50);
+      });
+      probe->start(25); QTimer::singleShot(8000,&window,[] { qApp->exit(51); });
+      return;
     }
     auto* timer=new QTimer(&window);
     QObject::connect(timer,&QTimer::timeout,&window,[&window,phase,oldPreviewReturned]{
@@ -669,6 +805,9 @@ int main(int argc, char** argv) {
   }
   app.setOrganizationName("QMoneyVisualTests");
   app.setApplicationName("OperationPreview");
+  QTemporaryDir testSettings;
+  QSettings::setDefaultFormat(QSettings::IniFormat);
+  QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, testSettings.path());
   const bool dark = app.arguments().contains("--dark");
   auto* style = new oclero::qlementine::QlementineStyle(&app);
   style->setAnimationsEnabled(false);
@@ -682,6 +821,14 @@ int main(int argc, char** argv) {
     return app.exec();
   }
   window.show();
+  if (app.arguments().contains("--campaign-parameters-smoke")) {
+    QTimer::singleShot(100,&window,[] { OperationPreview::campaignParametersSmoke(); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--campaign-controls-smoke") || app.arguments().contains("--campaign-controls-manual")) {
+    QTimer::singleShot(100,&window,[&window] { OperationPreview::campaignControlsSmoke(window); });
+    return app.exec();
+  }
   if (app.arguments().contains("--accelerator-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::acceleratorSmoke(window); });
     return app.exec();
