@@ -303,6 +303,8 @@ private:
   QProgressBar* _campaignProgress{};
   QTabWidget* _campaignTabs{};
   QWidget* _campaignIndicator{};
+  QWidget* _campaignIndicatorIcon{};
+  QLabel* _campaignIndicatorMetric{};
   QLabel* _campaignIndicatorTitle{};
   QLabel* _campaignIndicatorDetail{};
   QProgressBar* _campaignIndicatorProgress{};

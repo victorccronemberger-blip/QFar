@@ -1331,9 +1331,31 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignIndicatorDetail->setWordWrap(true);
   _campaignIndicatorProgress = new QProgressBar;
   _campaignIndicatorProgress->setTextVisible(false);
-  indicatorLayout->addWidget(_campaignIndicatorTitle);
-  indicatorLayout->addWidget(_campaignIndicatorDetail);
+  auto* indicatorHeader = new QHBoxLayout;
+  _campaignIndicatorIcon = new CampaignStatusIcon;
+  indicatorHeader->addWidget(_campaignIndicatorIcon);
+  indicatorHeader->addWidget(_campaignIndicatorTitle, 1);
+  _campaignIndicatorMetric = new QLabel;
+  _campaignIndicatorMetric->setObjectName(QStringLiteral("campaignIndicatorMetric"));
+  indicatorHeader->addWidget(_campaignIndicatorMetric);
+  auto* details = new QToolButton;
+  details->setText(QStringLiteral("Detalhes"));
+  details->setObjectName(QStringLiteral("campaignDetails"));
+  details->setCheckable(true);
+  details->setArrowType(Qt::RightArrow);
+  details->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+  details->setAccessibleName(QStringLiteral("Mostrar detalhes da campanha"));
+  connect(details, &QToolButton::toggled, this, [this, details](bool expanded) {
+    _campaignIndicatorDetail->setVisible(expanded);
+    details->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+    details->setAccessibleName(expanded ? QStringLiteral("Ocultar detalhes da campanha")
+                                      : QStringLiteral("Mostrar detalhes da campanha"));
+  });
+  indicatorHeader->addWidget(details);
+  indicatorLayout->addLayout(indicatorHeader);
   indicatorLayout->addWidget(_campaignIndicatorProgress);
+  indicatorLayout->addWidget(_campaignIndicatorDetail);
+  _campaignIndicatorDetail->hide();
   bodyLayout->addWidget(_campaignIndicator);
   auto* tabs = new QTabWidget;
   _campaignTabs = tabs;
@@ -1693,7 +1715,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignStage->setObjectName(QStringLiteral("campaignStage"));
   executionCopy->addWidget(_campaignStage);
   _campaignCurrent = quietLabel(QStringLiteral(
-      "Configure a campanha; os acontecimentos importantes aparecerão aqui."));
+      "Escolha conteúdo e contas para começar."));
   _campaignCurrent->setWordWrap(true);
   executionCopy->addWidget(_campaignCurrent);
   executionHead->addLayout(executionCopy, 1);
@@ -1714,7 +1736,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignFeed->setMaximumBlockCount(500);
   _campaignFeed->setMinimumHeight(190);
   _campaignFeed->setPlaceholderText(QStringLiteral(
-      "A linha do tempo mostrará preparação, envios, tentativas e resultados — sem logs técnicos."));
+      "Atividade da campanha"));
   executionLayout->addWidget(_campaignFeed);
   auto* actions = new QHBoxLayout;
   actions->addStretch();
@@ -2854,7 +2876,11 @@ void MainWindow::applyStructuralStyle(bool dark) {
     #campaignIndicator[state="running"], #campaignIndicator[state="starting"] { border-left-color: #754dff; }
     #campaignIndicator[state="error"], #campaignIndicator[state="unknown"] { border-left-color: #d58b25; }
     #campaignIndicator[state="done"] { border-left-color: #159a72; }
-    #campaignIndicatorTitle { font-size: 19px; font-weight: 700; }
+    #campaignIndicatorTitle { font-size: 18px; font-weight: 700; }
+    #campaignIndicatorMetric { font-size: 15px; font-weight: 650; }
+    #campaignDetails { color: %4; background: transparent; border: 1px solid %6; border-radius: 6px; padding: 6px 10px; }
+    #campaignDetails:hover, #campaignDetails:checked { background: %5; }
+    #campaignDetails:focus { border-color: #8058ff; }
     #operationInspector { background: #23242c; border: 1px solid #383a48; border-radius: 14px; }
     #walletContext, #libraryContext, #integrationsContext { background: #23242c; border: 1px solid #383a48; border-radius: 14px; }
     #walletContext QLabel, #libraryContext QLabel, #integrationsContext QLabel { color: #f2f3f7; }
@@ -4405,7 +4431,7 @@ void MainWindow::submitCampaign(QJsonObject body) {
       _campaignFeed->clear();
       _campaignPoll.start();
       pollCampaign();
-      setStatus(QStringLiteral("Campanha iniciada após preflight aprovado."));
+      setStatus(QStringLiteral("Campanha iniciada."));
     });
   }
 
@@ -4413,6 +4439,9 @@ void MainWindow::submitCampaign(QJsonObject body) {
 void MainWindow::setCampaignIndicator(const QString& title, const QString& detail, const QString& state, bool busy) {
   _campaignIndicatorTitle->setText(title);
   _campaignIndicatorDetail->setText(detail);
+  _campaignIndicatorTitle->setToolTip(detail);
+  static_cast<CampaignStatusIcon*>(_campaignIndicatorIcon)->setState(state, title);
+  _campaignIndicatorMetric->clear();
   _campaignIndicator->setProperty("state", state);
   _campaignIndicator->style()->unpolish(_campaignIndicator);
   _campaignIndicator->style()->polish(_campaignIndicator);
@@ -4494,10 +4523,18 @@ void MainWindow::pollCampaign() {
         : QStringLiteral("%1 de %2 novos envios confirmados").arg(done).arg(total);
     const QString progressText = total > 0 ? goalText + QStringLiteral(" · %1%\n").arg(percent) : QString();
     setCampaignIndicator(headline, progressText + current, state, running && !paused && total == 0);
+    _campaignIndicatorMetric->setText(total > 0
+        ? (hoursGoal ? QStringLiteral("%1 / %2 h · %3%")
+              .arg(done / 3600., 0, 'f', 2).arg(total / 3600., 0, 'f', 2).arg(percent)
+                     : QStringLiteral("%1 / %2 envios · %3%").arg(done).arg(total).arg(percent))
+        : QString());
+    if (paused) static_cast<CampaignStatusIcon*>(_campaignIndicatorIcon)->setState(QStringLiteral("paused"), headline);
+    else if (state == "done" && headline.contains(QStringLiteral("pendências"), Qt::CaseInsensitive))
+      static_cast<CampaignStatusIcon*>(_campaignIndicatorIcon)->setState(QStringLiteral("error"), headline);
     _campaignIndicatorProgress->setValue(percent);
     _campaignProgress->setValue(percent);
     _campaignProgress->setFormat(total > 0
-        ? goalText + QStringLiteral(" · %p%")
+        ? QStringLiteral("%p%")
         : QStringLiteral("Calculando os envios…"));
     _campaignStats->setText(QStringLiteral("%1 sucesso · %2 ignorados · %3 falhas")
         .arg(successful).arg(skipped).arg(failed));

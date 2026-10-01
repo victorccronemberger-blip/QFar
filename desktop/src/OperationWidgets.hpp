@@ -7,6 +7,55 @@
 #include <QJsonArray>
 #include <QDateTime>
 
+class CampaignStatusIcon final : public QWidget {
+public:
+  explicit CampaignStatusIcon(QWidget* parent = nullptr) : QWidget(parent) {
+    setFixedSize(34, 34);
+  }
+  void setState(const QString& state, const QString& label) {
+    _state = state;
+    setAccessibleName(label);
+    update();
+  }
+protected:
+  void paintEvent(QPaintEvent*) override {
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    const bool warning = _state == "error" || _state == "unknown";
+    const bool done = _state == "done";
+    const bool active = _state == "running" || _state == "starting" || _state == "preflight";
+    const QColor color(warning ? "#d58b25" : done ? "#159a72" : active ? "#8058ff" : "#8b90a2");
+    auto tint = color;
+    tint.setAlpha(32);
+    p.setPen(Qt::NoPen);
+    p.setBrush(tint);
+    p.drawEllipse(QRectF(1, 1, 32, 32));
+    p.setPen(QPen(color, 2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    p.setBrush(Qt::NoBrush);
+    if (done) {
+      p.drawLine(QPointF(10, 17), QPointF(15, 22));
+      p.drawLine(QPointF(15, 22), QPointF(24, 12));
+    } else if (warning) {
+      p.drawLine(QPointF(17, 10), QPointF(17, 18));
+      p.drawPoint(QPointF(17, 24));
+    } else if (_state == "paused") {
+      p.drawLine(QPointF(13, 11), QPointF(13, 23));
+      p.drawLine(QPointF(21, 11), QPointF(21, 23));
+    } else if (_state == "stopping" || _state == "stopped") {
+      p.drawRoundedRect(QRectF(11, 11, 12, 12), 2, 2);
+    } else if (active) {
+      p.setBrush(color);
+      p.setPen(Qt::NoPen);
+      const QPointF points[] = {{13, 10}, {24, 17}, {13, 24}};
+      p.drawPolygon(points, 3);
+    } else {
+      p.drawEllipse(QRectF(11, 11, 12, 12));
+    }
+  }
+private:
+  QString _state;
+};
+
 class OperationTimeline final : public QWidget {
 public:
   explicit OperationTimeline(QWidget* parent=nullptr) : QWidget(parent) { setMinimumHeight(260); }
