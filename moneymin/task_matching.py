@@ -214,6 +214,7 @@ TASK_RULES: dict[str, TaskRule] = {
         "Cleaning / laundry",
         ("bathroom", "toilet", "shower", "bathtub", "bath tub", "washbasin", "bathroom sink"),
         ("clean", "scrub", "wipe", "wash", "rinse"),
+        action_excluded=("bicycle", "bike", "clothes", "garment", "brush washer"),
     ),
     "Clean Appliance": _r(
         "Cleaning / laundry",
@@ -591,6 +592,44 @@ def score_scenarios(rule: TaskRule, scenarios: Iterable[str]) -> int | None:
     return primary_hits * 100 + support_hits * 20 - max(0, len(actual) - 1) * 2
 
 
+# These tasks identify the action/object in the timed annotation itself.
+# Location-dependent and broad one-group rules still require their scenario.
+_NARRATED_CROSS_SCENARIO_TASKS = frozenset({
+    "Change a tire", "Check & add engine oil", "Check tire pressure & add air",
+    "Clean the Bathroom", "Clean Appliance", "Change Sheets & Make Bed",
+    "Folding Clothes or Putting Them on Hangers", "Hanging clothes on hangers",
+    "Using the Laundry Machine", "Loading the Laundry Machine",
+    "Unloading the Laundry Machine", "Hand Washing Clothes",
+    "Pet Grooming & Bath", "Pet Feeding", "Scoop a litter box",
+    "Pump Gas", "Shoveling Snow", "Stack firewood", "Trim a hedge",
+    "Pull weeds by hand", "Planting or Pulling Weeds", "Spread Mulch",
+    "Spreading Mulch or Fertilizer", "Leaf Raking or Blowing",
+    "Leaf Raking & Bagging", "Replace Showerhead", "Replace showerhead",
+    "Replace Bulbs & Batteries", "Tighten Cabinet & Door Hinges",
+    "Hang Curtains", "Hang Art & Mirrors", "Shelve books",
+})
+
+
+def score_narrated_scenarios(task_name: str, rule: TaskRule,
+                             scenarios: Iterable[str]) -> int | None:
+    """A parent label ranks evidence; it cannot erase a specific timed action.
+
+    This fallback only permits extracting a verified span, never approving an
+    entire video from its label. Explicit exclusions remain authoritative.
+    """
+    scenarios = tuple(scenarios)
+    score = score_scenarios(rule, scenarios)
+    if score is not None:
+        return score
+    actual = {_norm(str(s)) for s in scenarios if str(s).strip()}
+    if any(_has(actual, term) for term in rule.excluded):
+        return None
+    if (canonical_task_name(task_name) in _NARRATED_CROSS_SCENARIO_TASKS
+            and len(rule.evidence) >= 2):
+        return 0
+    return None
+
+
 def scenario_is_sufficient(rule: TaskRule, scenarios: Iterable[str]) -> bool:
     """Verdadeiro quando o rótulo Ego4D já equivale exatamente à tarefa."""
     actual = {_norm(str(s)) for s in scenarios if str(s).strip()}
@@ -748,7 +787,8 @@ SPAN_MIN_RATIO = 0.75
 SPAN_MAX_GAP_S = 15.0
 SPAN_PAD_S = 2.0
 ACTIVITY_TARGET_MAX_GAP_S = 30.0
-LONG_ACTIVITY_MIN_S = 600.0
+LONG_ACTIVITY_MIN_S = 300.0
+LONG_ACTIVITY_CONTEXT_MIN_S = 600.0
 # Explicit human scene labels can support five-minute windows. They do not
 # require the ten-minute threshold used for expanding sparse action evidence.
 SCENARIO_ACTIVITY_MIN_S = 300.0
@@ -831,7 +871,7 @@ def _activity_spans(
 ) -> list[dict[str, Any]]:
     """Isola sessões contínuas entre evidências recorrentes da mesma tarefa.
 
-    Narrações Ego4D não têm cadência fixa. Para pedidos de dez minutos ou
+    Narrações Ego4D não têm cadência fixa. Para pedidos de cinco minutos ou
     mais, uma pausa sem anotação não pode ser confundida automaticamente com
     troca de atividade. O modo longo tolera lacunas neutras maiores, mas os
     limites de higiene e qualquer tarefa concorrente continuam encerrando o
@@ -870,7 +910,8 @@ def _activity_spans(
 
     long_mode = min_s >= LONG_ACTIVITY_MIN_S
     strict_cores: list[dict[str, Any]] = []
-    if long_mode:
+    expand_context = min_s >= LONG_ACTIVITY_CONTEXT_MIN_S
+    if expand_context:
         # Primeiro encontra uma ação realmente contínua com os limites
         # conservadores. Ela será a prova semântica para qualquer extensão.
         strict_cores = _activity_spans(
@@ -960,7 +1001,7 @@ def _activity_spans(
                 })
             cursor = best_pos + 1
 
-    if long_mode:
+    if expand_context:
         # Um núcleo verificado de alguns minutos pode estar dentro de uma
         # tomada longa da mesma atividade. Expanda no máximo cinco minutos de
         # cada lado e jamais atravesse uma anotação insegura/concorrente.
@@ -1093,6 +1134,7 @@ def _evidence_hits(segment: str, rule: TaskRule) -> list[int]:
             for group in rule.evidence]
 
 
+@lru_cache(maxsize=131072)
 def _unit_on_task(segment: str, rule: TaskRule) -> bool:
     """Uma fala só conta quando traz evidência suficiente da própria ação."""
     if not rule.evidence:

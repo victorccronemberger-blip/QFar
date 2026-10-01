@@ -62,6 +62,7 @@ scripts/*
 !scripts/verify_packaged_service.py
 !scripts/audit_ego4d_catalog.py
 !scripts/ego4d_variety.py
+!scripts/build_ego4d_task_seed.py
 *.bat
 HowUseMe.md
 PARA_RODAR_NO_DESTINO.md

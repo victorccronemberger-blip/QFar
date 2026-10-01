@@ -2973,6 +2973,7 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
     """Assinatura portátil dos arquivos que alimentam o ranking."""
     files = (
         config.MEDIA_DATA_DIR / "ego4d" / "ego4d.json",
+        config.MEDIA_DATA_DIR / "ego4d" / "clips.csv",
         config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json",
         config.MEDIA_DATA_DIR / "ego4d" / "timed_narrations.jsonl",
         Path(ego4d.__file__),
@@ -2997,7 +2998,7 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
                 digest.update(chunk)
         stamp.append((relative, path.stat().st_size, digest.hexdigest()))
     # Versão da união narração + clipe oficial. Invalida caches do recorte antigo.
-    stamp.append(("ranked-union", 4, "continuous-action-evidence"))
+    stamp.append(("ranked-union", 5, "candidate-coverage-and-history"))
     return tuple(stamp)
 
 
@@ -3079,7 +3080,28 @@ def _union_ranked_clips(
                      | set(clip.get("dedup_clip_uids") or ()) | {uid})
                     - {str(other["clip_uid"])})
             if not allow_overlap and overlapping:
-                return
+                # A short narrated core must not erase a much longer verified
+                # candidate. Only discard when the candidate itself is mostly
+                # covered; aliases above still prevent resending its old core.
+                window = _clip_window(clip)
+                covered = []
+                if window is not None:
+                    for other in by_parent.get(parent, ()):
+                        other_window = _clip_window(other)
+                        if other_window is not None:
+                            a = max(window[0], other_window[0])
+                            b = min(window[1], other_window[1])
+                            if b > a:
+                                covered.append((a, b))
+                    merged_end = window[0]
+                    seconds = 0.0
+                    for a, b in sorted(covered):
+                        seconds += max(0.0, b - max(a, merged_end))
+                        merged_end = max(merged_end, b)
+                    if seconds < (window[1] - window[0]) * 0.6:
+                        overlapping = []
+                if overlapping:
+                    return
             seen.add(uid)
             item = dict(clip)
             if aliases:
@@ -3107,6 +3129,38 @@ def _union_ranked_clips(
             add(clip, allow_overlap=False)
         result[name] = tuple(kept)
     return result
+
+
+def _link_rank_history(
+    current: dict[str, tuple[dict[str, Any], ...]],
+    previous: dict[str, tuple[dict[str, Any], ...]],
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Old IDs are provenance, not permission to retain rejected old content."""
+    old_by_task: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    for name, clips in previous.items():
+        task = task_matching.canonical_task_name(name)
+        parents = old_by_task.setdefault(task, {})
+        for clip in clips:
+            parent = str(clip.get("parent_video_uid") or "")
+            parents.setdefault(parent, {})[str(clip.get("clip_uid") or "")] = clip
+    linked = {}
+    for name, clips in current.items():
+        parents = old_by_task.get(task_matching.canonical_task_name(name), {})
+        result = []
+        for candidate in clips:
+            clip = dict(candidate)
+            uid = str(clip.get("clip_uid") or "")
+            aliases = set(clip.get("dedup_clip_uids") or ())
+            for old_uid, old in parents.get(str(clip.get("parent_video_uid") or ""), {}).items():
+                if uid == old_uid or _same_action_already_covered([old], clip):
+                    aliases.add(old_uid)
+                    aliases.update(old.get("dedup_clip_uids") or ())
+            aliases.discard(uid)
+            if aliases:
+                clip["dedup_clip_uids"] = sorted(aliases)
+            result.append(clip)
+        linked[name] = tuple(result)
+    return linked
 
 
 def _merge_rank_seed(
@@ -3194,10 +3248,10 @@ def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
     cached = _load_rank_cache()
     if cached is not None:
         return _merge_rank_seed(cached)
-    spans = ego4d.rank_all_task_spans() if ego4d.has_timed_narrations() else {}
+    spans = ego4d.rank_all_task_spans(min_dur_s=60, max_dur_s=1800) if ego4d.has_timed_narrations() else {}
     official = task_matching.rank_all_tasks(_task_candidates())
     evidenced = (
-        ego4d.narration_evidence_clips() if ego4d.has_timed_narrations() else {})
+        ego4d.narration_evidence_clips(min_dur_s=60, max_dur_s=1800) if ego4d.has_timed_narrations() else {})
     buckets = _union_ranked_clips(
         _union_ranked_clips(spans, official), evidenced)
     result = _merge_rank_seed(buckets)
@@ -3205,9 +3259,40 @@ def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
     return result
 
 
+_RANK_INPUT_SIGNATURE = None
+
+
+def _refresh_rank_inputs() -> None:
+    """Called under _RANK_LOCK; new metadata must replace in-memory rankings."""
+    global _RANK_INPUT_SIGNATURE
+    paths = (
+        config.MEDIA_DATA_DIR / "ego4d" / "ego4d.json",
+        config.MEDIA_DATA_DIR / "ego4d" / "clips.csv",
+        config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json",
+        ego4d.timed_narrations_path(), _rank_seed_path(),
+    )
+    signature = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            signature.append((str(path), None, None))
+    signature = tuple(signature)
+    if signature == _RANK_INPUT_SIGNATURE:
+        return
+    _task_candidates.cache_clear()
+    _rank_cache_stamp.cache_clear()
+    _load_rank_seed.cache_clear()
+    _ranked_pools_cached.cache_clear()
+    _duration_ranked_pools.cache_clear()
+    _RANK_INPUT_SIGNATURE = signature
+
+
 def _ranked_pools() -> dict[str, tuple[dict[str, Any], ...]]:
     """Todas as tasks de uma vez. Cache em disco para o GET /api/tasks não congelar a UI."""
     with _RANK_LOCK:
+        _refresh_rank_inputs()
         return _ranked_pools_cached()
 
 
@@ -3257,6 +3342,7 @@ def _compatible_task_clips(
         if ((min_dur_s, max_dur_s) != (60, 1800)
                 and ego4d.has_timed_narrations()):
             with _RANK_LOCK:
+                _refresh_rank_inputs()
                 pools = _duration_ranked_pools(min_dur_s, max_dur_s)
         else:
             pools = _ranked_pools()

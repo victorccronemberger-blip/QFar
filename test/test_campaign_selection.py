@@ -212,8 +212,9 @@ class CampaignSelectionTests(unittest.TestCase):
                             "window_s": (0, 300), "dur_s": 300}]},
             {"Gardening": [{"clip_uid": "expanded", "parent_video_uid": "p",
                             "window_s": (0, 1800), "dur_s": 1800}]})
-        self.assertEqual([c["clip_uid"] for c in merged["Gardening"]], ["old"])
+        self.assertEqual([c["clip_uid"] for c in merged["Gardening"]], ["old", "expanded"])
         self.assertIn("expanded", merged["Gardening"][0]["dedup_clip_uids"])
+        self.assertIn("old", merged["Gardening"][1]["dedup_clip_uids"])
 
     def test_catalog_union_tolerates_invalid_numeric_metadata(self):
         result = campaign._union_ranked_clips({}, {"Gardening": [

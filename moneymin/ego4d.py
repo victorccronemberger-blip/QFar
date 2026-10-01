@@ -1072,7 +1072,7 @@ def list_task_spans(
         if require_imu and video.get("has_imu") is not True:
             continue
         scenarios = [str(x) for x in (video.get("scenarios") or [])]
-        if task_matching.score_scenarios(rule, scenarios) is None:
+        if task_matching.score_narrated_scenarios(task_name, rule, scenarios) is None:
             continue
         duration = float(video.get("duration_sec") or 0)
         search_text = task_matching.span_search_text(events)
@@ -1085,7 +1085,7 @@ def list_task_spans(
             continue
         activity_rules = [
             (name, candidate) for name, candidate in task_matching.TASK_RULES.items()
-            if (task_matching.score_scenarios(candidate, scenarios) is not None
+            if (task_matching.score_narrated_scenarios(name, candidate, scenarios) is not None
                 and task_matching.span_evidence_possible(candidate, search_text))
         ]
         prepared = task_matching.prepare_span_events(events)
@@ -1124,9 +1124,10 @@ def list_task_spans(
                         out.append(rec)
         base_min = max(min_dur_s, rule.min_span_s or 0.0)
         span_minimums = [base_min] if has_evidence else []
-        if (has_evidence
-                and base_min < task_matching.LONG_ACTIVITY_MIN_S <= max_dur_s):
-            span_minimums.append(task_matching.LONG_ACTIVITY_MIN_S)
+        if has_evidence:
+            span_minimums.extend(threshold for threshold in (
+                task_matching.LONG_ACTIVITY_MIN_S, task_matching.LONG_ACTIVITY_CONTEXT_MIN_S)
+                if base_min < threshold <= max_dur_s)
         for span_minimum in span_minimums:
             validate_actions = _export_span_validator(
                 rule, prepared, event_labels, task_name, rivals,
@@ -1176,8 +1177,10 @@ def _narration_evidence_for_video(
             or min_dur_s <= 0 or max_dur_s < min_dur_s):
         raise ValueError("Intervalo de duração inválido")
     scenarios = scenario_values(video)
+    search_text = task_matching.span_search_text(events)
     rules = [(name, rule) for name, rule in rules
-             if task_matching.score_scenarios(rule, scenarios) is not None]
+             if (task_matching.score_narrated_scenarios(name, rule, scenarios) is not None
+                 and task_matching.span_evidence_possible(rule, search_text))]
     if not rules:
         return []
     prepared = task_matching.prepare_span_events(events)
@@ -1185,7 +1188,6 @@ def _narration_evidence_for_video(
         return []
     # Classificar também as tarefas de outros cenários permite detectar uma
     # mudança de atividade mesmo quando o cenário do vídeo é muito genérico.
-    search_text = task_matching.span_search_text(events)
     all_rules = [(name, rule) for name, rule in task_matching.TASK_RULES.items()
                  if task_matching.span_evidence_possible(rule, search_text)]
     labels = task_matching.label_span_events(prepared, all_rules)
@@ -1196,7 +1198,7 @@ def _narration_evidence_for_video(
         intervals = [(0.0, duration)]
     found: list[tuple[str, dict[str, Any]]] = []
     for name, rule in rules:
-        scenario_score = task_matching.score_scenarios(rule, scenarios)
+        scenario_score = task_matching.score_narrated_scenarios(name, rule, scenarios)
         if scenario_score is None:
             continue
         minimum = max(min_dur_s, rule.min_span_s or 0)
@@ -1285,7 +1287,7 @@ def rank_all_task_spans(
         duration = float(video.get("duration_sec") or 0)
         candidate_rules = [
             (name, rule) for name, rule in named_rules
-            if task_matching.score_scenarios(rule, scenarios) is not None
+            if task_matching.score_narrated_scenarios(name, rule, scenarios) is not None
         ]
         if not candidate_rules:
             continue
@@ -1342,9 +1344,10 @@ def rank_all_task_spans(
                             buckets[name].append(rec)
             base_min = max(min_dur_s, rule.min_span_s or 0.0)
             span_minimums = [base_min] if name in possible_names else []
-            if (name in possible_names
-                    and base_min < task_matching.LONG_ACTIVITY_MIN_S <= max_dur_s):
-                span_minimums.append(task_matching.LONG_ACTIVITY_MIN_S)
+            if name in possible_names:
+                span_minimums.extend(threshold for threshold in (
+                    task_matching.LONG_ACTIVITY_MIN_S, task_matching.LONG_ACTIVITY_CONTEXT_MIN_S)
+                    if base_min < threshold <= max_dur_s)
             for span_minimum in span_minimums:
                 validate_actions = _export_span_validator(
                     rule, prepared, event_labels, name, rivals,
@@ -1381,6 +1384,92 @@ def rank_all_task_spans(
     for alias, canonical in task_matching.TASK_ALIASES.items():
         buckets[alias] = buckets.get(canonical, [])
     return buckets
+
+
+def revalidate_task_windows(
+    candidates: dict[str, list[dict[str, Any]] | tuple[dict[str, Any], ...]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Recover duration variants using today's evidence, never old approvals.
+
+    A full-range greedy scan may choose different boundaries than a previous
+    duration range. Recheck those windows independently so valid coverage is
+    not lost just because the segmentation changed.
+    """
+    from . import task_matching
+    index = load_timed_narrations()
+    videos = _cat().videos
+    by_parent: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    for raw_name, clips in candidates.items():
+        name = task_matching.canonical_task_name(raw_name)
+        for clip in clips:
+            by_parent[str(clip.get("parent_video_uid") or "")].append((name, clip))
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen: set[tuple[str, str]] = set()
+    for uid, clips in by_parent.items():
+        video = videos.get(uid) or {}
+        events = index.get(uid)
+        if not events or video.get("has_imu") is not True or not video.get("s3_path"):
+            continue
+        scenarios = scenario_values(video)
+        search = task_matching.span_search_text(events)
+        rules = [(name, rule) for name, rule in task_matching.TASK_RULES.items()
+                 if (task_matching.score_narrated_scenarios(name, rule, scenarios) is not None
+                     and task_matching.span_evidence_possible(rule, search))]
+        prepared = task_matching.prepare_span_events(events)
+        labels = task_matching.label_span_events(prepared, rules)
+        times = tuple(row[0] for row in prepared)
+        for name, clip in clips:
+            rule = task_matching.rule_for(name)
+            window = clip.get("window_s")
+            if rule is None or not isinstance(window, (list, tuple)) or len(window) != 2:
+                continue
+            try:
+                start, end = map(float, window)
+            except (TypeError, ValueError):
+                continue
+            if (not math.isfinite(start) or not math.isfinite(end)
+                    or not 60 <= end - start <= 1800
+                    or not imu_window_is_covered(video, (start, end))
+                    or task_matching.score_narrated_scenarios(name, rule, scenarios) is None):
+                continue
+            first, last = bisect_left(times, start), bisect_right(times, end)
+            local = prepared[first:last]
+            local_labels = labels[first:last]
+            rivals = task_matching.competing_span_names(name, rules)
+            spans = []
+            base_min = max(60.0, rule.min_span_s or 0)
+            minimums = [base_min] + [minimum for minimum in (
+                task_matching.LONG_ACTIVITY_MIN_S, task_matching.LONG_ACTIVITY_CONTEXT_MIN_S)
+                if base_min < minimum <= end - start]
+            for minimum in minimums:
+                spans.extend(task_matching.extract_spans(
+                    rule, (), min_s=minimum, max_s=end - start, pad_s=0,
+                    video_duration_s=end, prepared_events=local, activity_mode=True,
+                    task_name=name, event_task_names=local_labels,
+                    competing_task_names=rivals, allowed_intervals=[(start, end)]))
+            if (end - start >= task_matching.SCENARIO_ACTIVITY_MIN_S
+                    and task_matching.scenario_is_sufficient(rule, scenarios)):
+                spans.extend(task_matching.scenario_activity_spans(
+                    [(*row[:3], name in tags,
+                      row[3] or any(task_matching._term_in(row[2], term)
+                                    for term in rule.action_excluded)
+                      or (name not in tags and bool(tags & rivals)))
+                     for row, tags in zip(local, local_labels)],
+                    min_s=max(base_min, task_matching.SCENARIO_ACTIVITY_MIN_S),
+                    max_s=end - start, video_duration_s=end,
+                    allowed_intervals=[(start, end)]))
+            for span in spans:
+                record = _span_record(video, span)
+                key = (name, record["clip_uid"])
+                if key not in seen and imu_window_is_covered(video, tuple(record["window_s"])):
+                    seen.add(key)
+                    record["match_confidence"] = ("scenario" if span.get("scenario_verified")
+                                                   else rule.confidence)
+                    result[name].append(record)
+    for alias, canonical in task_matching.TASK_ALIASES.items():
+        if canonical in result:
+            result[alias] = result[canonical]
+    return dict(result)
 
 
 def _narration_for_window(parent_uid: str, start: float, end: float) -> str:
