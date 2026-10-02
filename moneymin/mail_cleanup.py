@@ -18,6 +18,7 @@ import urllib.request
 from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 
 from . import config, hostinger_mail as mail, tls
 
@@ -26,13 +27,99 @@ class CleanupError(ValueError):
     pass
 
 
-def payment_signal(text):
+def _normalized(text):
     text = ''.join(c for c in unicodedata.normalize('NFKD', html.unescape(text))
                    if not unicodedata.combining(c)).casefold()
-    return bool(re.search(
-        r'payout|pay\s*out|withdraw|cash\s*out|saque|sacar|pagament|payment|'
-        r'paypal|wise|dots|tremendous|airtm|resgat|retirada|transfer|remessa|'
-        r'reward|recompensa|recebimento|receber|claim|redeem', text))
+    return re.sub(r'\s+', ' ', re.sub(r'[\u200b-\u200d\ufeff]', '', text)).strip()
+
+
+def payment_signal(text):
+    """Evidence of a payout, not a provider name or an arbitrary substring.
+
+    Never call this on transport headers, CSS, tracking URLs or signatures:
+    DKIM's signed header list routinely contains Content-TRANSFER-Encoding.
+    """
+    text = _normalized(text)
+    if re.search(r'\b(?:payouts?|pay\s*out|withdraw(?:al|als|n)?|cash\s*out|saques?|sacar)\b', text):
+        return True
+    money = r'(?:payments?|pagamentos?|transfers?|transferencias?|rewards?|recompensas?|resgates?|retirada|remessa|money|dinheiro|funds)'
+    outcome = r'(?:ready|available|sent|received|completed|successful|processed|released|on its way|disponivel|disponiveis|pront[oa]s?|enviad[oa]s?|recebid[oa]s?|aprovad[oa]s?|liberad[oa]s?|confirmad[oa]s?|concluid[oa]s?)'
+    # Do not span sentences: an unrelated footer must not supply the outcome.
+    between = r'(?:[^.!?\n]|\.(?=\d))'
+    if re.search(rf'\b{money}\b{between}{{0,65}}\b{outcome}\b|\b{outcome}\s+(?:(?:your|the|seu|o|um)\s+)?{money}\b', text):
+        return True
+    if re.search(rf'\b(?:claim|redeem|resgatar|receba|receber)\b[^.!?\n]{{0,40}}\b{money}\b', text):
+        return True
+    # Short transfer subjects can omit the amount/status.
+    return bool(re.fullmatch(r'(?:paypal|wise)', text)
+                or re.search(r'\b(?:wise|paypal|dots|tremendous|airtm)\b.{0,30}\b(?:transfer|transferencia|remessa)\b', text))
+
+
+class _MailHTML(HTMLParser):
+    """Visible copy and actionable links; never stylesheet/attribute keywords."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text = []
+        self.links = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('style', 'script', 'head'):
+            self.hidden += 1
+        if self.hidden:
+            return
+        if tag in ('p', 'div', 'br', 'tr', 'li', 'h1', 'h2', 'h3'):
+            self.text.append('\n')
+        if tag in ('a', 'area'):
+            self.links.extend(value for key, value in attrs if key == 'href' and value)
+
+    def handle_endtag(self, tag):
+        if tag in ('style', 'script', 'head') and self.hidden:
+            self.hidden -= 1
+        if not self.hidden and tag in ('p', 'div', 'tr', 'li', 'h1', 'h2', 'h3'):
+            self.text.append('\n')
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.text.append(data)
+
+
+_URL = re.compile(r'https?://[^\s<>"\']+', re.I)
+
+
+def _payment_link(url):
+    """Recognize redemption routes, excluding provider login/legal/marketing links."""
+    try:
+        parsed = urllib.parse.urlsplit(html.unescape(url))
+        host = (parsed.hostname or '').casefold().rstrip('.')
+        path = urllib.parse.unquote(parsed.path).casefold()
+        if host in ('pay.dots.dev', 'paypal.me'):
+            return True
+        if host == 'my.dots.dev' and path.startswith('/flow/'):
+            return True
+        provider = any(host == domain or host.endswith('.' + domain)
+                       for domain in ('dots.dev', 'tremendous.com', 'paypal.com', 'wise.com', 'airtm.com'))
+        return provider and bool(re.search(
+            r'/(?:payouts?|rewards?|redeem|claim|transfers?|pay|payments?)(?:/|$)', path))
+    except ValueError:
+        return False
+
+
+def _uncertain_payment_link(url):
+    """Do not discard an unfamiliar action route on a payment portal."""
+    try:
+        parsed = urllib.parse.urlsplit(html.unescape(url))
+        host = (parsed.hostname or '').casefold().rstrip('.')
+        path = urllib.parse.unquote(parsed.path).casefold().rstrip('/')
+        portal = host in ('my.dots.dev', 'api.tremendous.com', 'wise.com', 'www.wise.com',
+                          'paypal.com', 'www.paypal.com')
+        informational = re.match(
+            r'^/(?:[a-z]{2}/)?(?:confirm-email|verify(?:-email)?|auth|login|signin|sign-in|signup|sign-up|'
+            r'register|reset-password|forgot-password|unsubscribe|privacy|terms|legal|help|support|blog|'
+            r'about|contact|pricing|business|personal)(?:/|$)', path)
+        return bool(portal and path and not informational)
+    except ValueError:
+        return False
 
 
 def classify(raw: bytes, now=None):
@@ -40,36 +127,50 @@ def classify(raw: bytes, now=None):
     now = time.time() if now is None else now
     try:
         msg = BytesParser(policy=policy.default).parsebytes(raw)
-        headers = ' '.join(str(value) for _, value in msg.items())
-        if payment_signal(headers):
-            return 'payment', 'Possível saque ou pagamento'
+        if payment_signal(str(msg.get('Subject') or '')):
+            return 'payment', 'Assunto de saque ou recebimento'
         if any(not msg.get(k) for k in ('From', 'To', 'Date', 'Message-ID', 'Subject')):
             return 'review', 'Identificação incompleta'
         date = parsedate_to_datetime(str(msg['Date']))
         if date.tzinfo is None or now - date.timestamp() < 600:
             return 'review', 'Mensagem recente ou data incerta'
         texts = []
+        links = []
         uncertain = False
         for part in msg.walk():
             uncertain |= bool(part.defects)
             if part.is_multipart():
                 continue
             if part.get_content_type() not in ('text/plain', 'text/html'):
-                uncertain = True
+                # A CID logo is decoration, not an unreadable financial document.
+                inline_image = (part.get_content_maintype() == 'image'
+                                and part.get_content_disposition() == 'inline'
+                                and part.get('Content-ID'))
+                uncertain |= not bool(inline_image)
+                if payment_signal(str(part.get_filename() or '')):
+                    return 'payment', 'Anexo relacionado a saque'
                 continue
             content = part.get_content()
             if not isinstance(content, str) or '\ufffd' in content:
                 uncertain = True
                 continue
-            texts.append(content)
-            # Include HTML URLs and text split across inline tags.
-            texts.append(re.sub(r'<[^>]+>', '', content))
+            if part.get_content_type() == 'text/html':
+                parsed = _MailHTML()
+                parsed.feed(content)
+                content = ''.join(parsed.text)
+                links.extend(parsed.links)
+            links.extend(_URL.findall(content))
+            texts.append(_URL.sub('', content))
             uncertain |= bool(part.defects)
-        if payment_signal(' '.join(texts)):
-            return 'payment', 'Possível saque ou pagamento no conteúdo'
+        if any(_payment_link(link) for link in links):
+            return 'payment', 'Link de saque ou recebimento'
+        if any(payment_signal(text) for text in texts):
+            return 'payment', 'Saque ou recebimento no conteúdo'
+        if any(_uncertain_payment_link(link) for link in links):
+            return 'review', 'Link financeiro não reconhecido; revisar'
         if uncertain or not any(t.strip() for t in texts):
             return 'review', 'Conteúdo não analisável integralmente'
-        return 'move', 'Sem indicação de saque ou pagamento'
+        return 'move', 'Sem indicação de saque ou recebimento'
     except Exception:
         return 'review', 'Falha ao analisar mensagem; preservada'
 
@@ -97,7 +198,16 @@ class Mailbox:
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                 raise CleanupError('Resposta incompleta da caixa; limpeza bloqueada.')
             yield from rows
-            if len(rows) < 100:
+            pagination = body.get('pagination')
+            if isinstance(pagination, dict):
+                current, last = pagination.get('page'), pagination.get('totalPages')
+                if type(current) is not int or type(last) is not int or current != page or last < 0:
+                    raise CleanupError('Paginação inválida; limpeza bloqueada.')
+                if current >= last:
+                    return
+                if not rows:
+                    raise CleanupError('Página incompleta da caixa; limpeza bloqueada.')
+            elif len(rows) < 100:
                 return
         raise CleanupError('Limite de análise atingido; limpeza bloqueada.')
 
