@@ -90,6 +90,7 @@ class RecoveryContractTests(unittest.TestCase):
 
     def pump(self, journals):
         with mock.patch.object(upload, "list_sidecars", return_value=journals), \
+             mock.patch.object(upload, "evaluate_upload", return_value={"checks": [{"status": "pass"}]}), \
              mock.patch.object(upload, "save_sidecar"), \
              mock.patch.object(upload, "load_sidecar", return_value=None), \
              mock.patch.object(upload, "_remove_sidecar_archive"), \
@@ -117,6 +118,14 @@ class RecoveryContractTests(unittest.TestCase):
 
     def test_mixed_owners_or_orgs_cannot_finalize_together(self):
         for changes in ({"account_email": "b@example.com"}, {"org_key": "other"}):
+            with self.subTest(changes=changes):
+                journals = [self.journal(expected_chunk_count=2),
+                            self.journal(chunk_index=1, expected_chunk_count=2, **changes)]
+                self.assertEqual(self.pump(journals)[1], 0)
+
+    def test_mixed_tasks_or_clip_contexts_cannot_finalize_together(self):
+        for changes in ({"task_id": "another-task"},
+                        {"campaign_context": {"registry_key": "task", "clip_uid": "other"}}):
             with self.subTest(changes=changes):
                 journals = [self.journal(expected_chunk_count=2),
                             self.journal(chunk_index=1, expected_chunk_count=2, **changes)]

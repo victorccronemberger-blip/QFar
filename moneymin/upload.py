@@ -1811,6 +1811,9 @@ def upload_session(
                     or (profile.email if profile is not None else "")),
                 "finalize_requested": bool(
                     existing.get("finalize_requested", finalize)),
+                "evaluation_required": bool(evaluate or require_perfect
+                                            or existing.get("evaluation_required")),
+                "evaluation_verified": False,
                 "expected_chunk_count": int(
                     existing.get("expected_chunk_count") or len(paths)),
                 "suppress_per_chunk_catbear": bool(existing.get(
@@ -1963,6 +1966,15 @@ def upload_session(
             # não finaliza sessão reprovada
             return result
 
+    if persist_sidecar and (evaluate or require_perfect):
+        for chunk in chunks:
+            if chunk.state != STATE_DONE or not is_perfect(chunk.evaluate_result):
+                continue
+            stored = load_sidecar(session_id, chunk.chunk_index)
+            if stored:
+                stored.update(evaluation_required=True, evaluation_verified=True)
+                save_sidecar(stored)
+
     # --- 5. Finalize sessão ------------------------------------------------
     # O app só finaliza quando todos os chunks chegaram (expected_chunk_count).
     if finalize and all(c.state == STATE_DONE for c in chunks):
@@ -2004,6 +2016,9 @@ def upload_session(
     if (persist_sidecar and all(c.state == STATE_DONE for c in chunks)
             and (not finalize or result.finalized)):
         for chunk in chunks:
+            stored = load_sidecar(session_id, chunk.chunk_index) or {}
+            if stored.get("finalize_requested") and stored.get("finalized") is not True:
+                continue
             _remove_sidecar_archive(session_id, chunk.chunk_index)
 
     return result
@@ -2151,7 +2166,7 @@ def pump_pending(
         phase = str(sidecar.get("phase") or "")
         try:
             if upload_id and sidecar.get("finalize_requested") and phase in {
-                    "awaiting_finalize", "finalize"}:
+                    "awaiting_finalize", "finalize", "finalizing"}:
                 updated.append(sidecar)
                 continue
             # Blob já chegou: não repete vídeo nem cria outro registro.
@@ -2235,8 +2250,10 @@ def pump_pending(
                 sidecar=require_sidecar,
                 sidecar_data=sidecar_payload,
                 chunk_index_start=idx,
+                evaluate=bool(sidecar.get("evaluation_required", bool(sidecar.get("campaign_context")))
+                              or kwargs.get("evaluate")),
                 **{k: v for k, v in kwargs.items() if k in (
-                    "fail_on_error", "evaluate", "timeout_blob",
+                    "fail_on_error", "timeout_blob",
                     "device_meta", "platform_meta", "video_meta",
                     "network_meta", "profile",
                 )},
@@ -2270,6 +2287,10 @@ def pump_pending(
         organizations = {str(item.get("org_key") or "") for item in journals}
         if len(owners) != 1 or not all(owners) or len(organizations) != 1 or not all(organizations):
             continue
+        if any(item.get("task_id") != journals[0].get("task_id")
+               or item.get("campaign_context") != journals[0].get("campaign_context")
+               for item in journals):
+            continue
         if account_email is not None and owners != {account_email.strip().casefold()}:
             continue
         counts = [item.get("expected_chunk_count", 1) for item in journals]
@@ -2277,13 +2298,36 @@ def pump_pending(
             continue
         expected = counts[0]
         ready = [item for item in journals if item.get("phase") in {
-            "awaiting_finalize", "finalize", "done"}
+            "awaiting_finalize", "finalize", "finalizing", "done"}
             and item.get("state") in {STATE_COMPLETING, STATE_RETRY_LATE, STATE_DONE}
             and item.get("upload_id")]
         indices = [item.get("chunk_index") for item in ready]
         if (expected < 1 or len(ready) != expected or len(journals) != expected
                 or any(type(index) is not int for index in indices)
                 or set(indices) != set(range(expected))):
+            continue
+
+        # Recovery must not bypass the quality gate after complete, or after
+        # a crash between evaluation and session finalization. Legacy campaign
+        # journals without the new flag also require evaluation conservatively.
+        evaluation_blocked = False
+        for item in ready:
+            required = item.get("evaluation_required", bool(item.get("campaign_context")))
+            if not required or item.get("evaluation_verified") is True:
+                continue
+            try:
+                evaluation = evaluate_upload(session, str(item["upload_id"]))
+                if not is_perfect(evaluation):
+                    raise UploadError("Avaliação reprovada; envio preservado para revisão.",
+                                      transient=False, phase="evaluate")
+            except UploadError as exc:
+                item.update(state=STATE_QUARANTINE, phase="evaluation_review", finalized=False,
+                            evaluation_required=True, evaluation_verified=False, error=str(exc))
+                evaluation_blocked = True
+            else:
+                item.update(evaluation_required=True, evaluation_verified=True)
+            save_sidecar(item)
+        if evaluation_blocked:
             continue
 
         org_key = str(ready[0].get("org_key") or "")

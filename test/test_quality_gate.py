@@ -106,3 +106,43 @@ class DisabledAccessDiagnosticTests(unittest.TestCase):
         for body in ('{"detail":"Forbidden"}', 'device disabled', 'unknown'):
             self.assertEqual(_auth_failure(403, body, "Profile").account_issue_code, "forbidden")
         self.assertEqual(_auth_failure(503, 'User account is disabled.', "Profile").account_issue_code, "service")
+
+class RecoveryQualityGateTests(unittest.TestCase):
+    def run_recovery(self, evaluation, phase='awaiting_finalize', required=True, verified=False):
+        journal = {'session_id': 's', 'account_email': 'a@example.com', 'org_key': 'org',
+                   'chunk_index': 0, 'expected_chunk_count': 1, 'upload_id': 'u',
+                   'state': upload.STATE_COMPLETING, 'phase': phase, 'finalize_requested': True,
+                   'evaluation_verified': verified,
+                   'campaign_context': {'registry_key': 'task', 'clip_uid': 'clip'}}
+        if required is not None:
+            journal['evaluation_required'] = required
+        with patch.object(upload, 'list_sidecars', return_value=[journal]), \
+             patch.object(upload, 'save_sidecar'), \
+             patch.object(upload, 'evaluate_upload', side_effect=evaluation) as evaluate, \
+             patch.object(upload, '_finalize_session', return_value=(True, 204)) as finalize, \
+             patch.object(upload, 'upload_session') as resend, \
+             patch.object(upload, '_remove_sidecar_archive') as remove:
+            upload.pump_pending(SimpleNamespace(email='a@example.com'))
+            return journal, evaluate.call_count, finalize.call_count, resend.call_count, remove.call_count
+
+    def test_recovery_evaluation_failure_keeps_original_upload_in_review(self):
+        for reply in ({'checks': [{'status': 'fail'}]}, {}, upload.UploadError('HTTP 503')):
+            with self.subTest(reply=reply):
+                journal, evaluated, finalized, resent, removed = self.run_recovery([reply])
+                self.assertEqual((evaluated, finalized, resent, removed), (1, 0, 0, 0))
+                self.assertEqual(journal['state'], upload.STATE_QUARANTINE)
+                self.assertEqual(journal['phase'], 'evaluation_review')
+                self.assertEqual(journal['upload_id'], 'u')
+                self.assertFalse(journal['finalized'])
+
+    def test_crash_before_finalize_reuses_verified_evaluation_without_resending(self):
+        journal, evaluated, finalized, resent, _ = self.run_recovery([], phase='finalizing', verified=True)
+        self.assertEqual((evaluated, finalized, resent), (0, 1, 0))
+        self.assertTrue(journal['finalized'])
+
+    def test_legacy_campaign_journal_is_evaluated_before_finalize(self):
+        journal, evaluated, finalized, resent, _ = self.run_recovery(
+            [{'checks': [{'status': 'pass'}]}], required=None)
+        self.assertEqual((evaluated, finalized, resent), (1, 1, 0))
+        self.assertTrue(journal['evaluation_verified'])
+        self.assertTrue(journal['finalized'])

@@ -205,6 +205,11 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
                 "level": "warning", "stage": "Envio", "title": "Clipe já enviado" if payload.get("reason") == "already_sent" else "Envio pendente de recuperação" if payload.get("reason") == "pending_recovery" else "Envio pulado",
                 "detail": f"{email} · {friendly_campaign_error(payload.get('error')) if payload.get('error') else 'registro local de envio anterior' if payload.get('reason') == 'already_sent' else 'conta pulada nesta execução'}",
             }
+        if ok and payload.get("finalized") is not True:
+            return {
+                "level": "warning", "stage": "Confirmação", "title": "Finalização não confirmada",
+                "detail": email,
+            }
         if ok:
             return {
                 "level": "success", "stage": "Envio", "title": "Envio concluído",
@@ -257,10 +262,17 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
                 "detail": "Nenhum vídeo foi enviado. Confira os motivos no Histórico.",
             }
         if payload.get("status") == "partial":
+            details = [f"{successful} envio(s) concluído(s)"]
+            if payload.get("shortfall_accounts"):
+                details.append(f"{payload['shortfall_accounts']} conta(s) abaixo da meta")
+            if payload.get("preparation_failures"):
+                details.append(f"{payload['preparation_failures']} vídeo(s) descartado(s) no preparo")
+            if payload.get("failed_sends"):
+                details.append(f"{payload['failed_sends']} envio(s) com falha")
             return {
                 "level": "warning", "stage": "Com pendências",
                 "title": "Campanha encerrada com pendências",
-                "detail": f"{successful} envio(s) concluído(s). Confira os motivos no Histórico.",
+                "detail": " · ".join(details) + ". Confira os motivos no Histórico.",
             }
         if "ok_sends" in payload and not successful:
             return {
@@ -476,7 +488,7 @@ class CampaignRunner:
                 self.done_sends += 1
                 if payload.get("skipped"):
                     self.skipped_sends += 1
-                elif payload.get("ok") and payload.get("finalized") is not False:
+                elif payload.get("ok") and payload.get("finalized") is True:
                     delivery = (str(payload.get("email") or ""), str(payload.get("registry_key") or payload.get("task") or ""),
                                 str(payload.get("clip_uid") or payload.get("session_id") or ""))
                     if not delivery[2] or delivery not in self.credited_deliveries:

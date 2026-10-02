@@ -94,7 +94,34 @@ class SessionPolicyTests(unittest.TestCase):
         self.fetch.return_value = (200, "[]")
         with self.assertRaises(AuthError) as caught:
             self.check()
-        self.assertEqual(caught.exception.account_issue_code, "service")
+        self.assertEqual(caught.exception.account_issue_code, "invalid_response")
+
+    def test_recording_config_failure_preserves_actual_cause_during_backoff(self):
+        for status, body, code in (
+                (403, '{"detail":"User account is disabled."}', "restricted"),
+                (403, '{"detail":{"error":"appcheck_required"}}', "app_check"),
+                (403, '{"detail":"Forbidden"}', "forbidden"),
+                (401, "Unauthorized", "authentication"),
+                (429, "Slow down", "rate_limit"),
+                (503, "Unavailable", "service")):
+            with self.subTest(status=status, code=code):
+                self.session._recording_checked_at = None
+                self.session._recording_retry_at = 0
+                self.fetch.return_value = (status, body)
+                self.fetch.reset_mock()
+                for _ in range(2):
+                    with self.assertRaises(AuthError) as caught:
+                        self.check()
+                    self.assertEqual(caught.exception.account_issue_code, code)
+                self.fetch.assert_called_once()
+
+    def test_successful_policy_refresh_clears_previous_failure_cause(self):
+        self.fetch.side_effect = [(503, "Unavailable"), (200, json.dumps(POLICY))]
+        with self.assertRaises(AuthError):
+            self.check()
+        self.clock.return_value = 106
+        self.check()
+        self.assertEqual(self.session._initialization_causes, {})
 
     def test_remote_limits_are_isolated_even_for_same_email(self):
         original = config.recording_limits()

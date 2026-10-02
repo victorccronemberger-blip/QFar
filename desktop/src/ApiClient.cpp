@@ -40,6 +40,8 @@ void ApiClient::request(const QByteArray& method, const QString& path,
     req.setTransferTimeout(path == QStringLiteral("/api/health") ? 3000 : 60000);
   if (method == "POST" && path == QStringLiteral("/api/campaigns"))
     req.setTransferTimeout(60000);
+  if (method == "POST" && path == QStringLiteral("/api/library/ego4d/index"))
+    req.setTransferTimeout(15000);
 
   if (method == "POST" && path == QStringLiteral("/api/campaigns/preflight"))
     req.setTransferTimeout(180000);

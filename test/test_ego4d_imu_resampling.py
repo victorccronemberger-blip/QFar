@@ -26,6 +26,19 @@ def _write_imu(path: Path, *, accel_gap: bool = False) -> None:
 
 
 class Ego4dImuResamplingTests(unittest.TestCase):
+    def test_sensor_output_cannot_extend_the_original_video_window(self) -> None:
+        with self.assertRaisesRegex(ValueError, 'ultrapassa'):
+            ego4d.build_imu_csv('not-opened.csv', (0, 1), duration_ms=2000)
+
+    def test_account_seed_does_not_change_measured_sensors(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "imu.csv"
+            _write_imu(source)
+            original = ego4d.build_imu_csv(source, (0, 1), duration_ms=1000)
+            for seed in ("account-a", "account-b"):
+                self.assertEqual(original, ego4d.build_imu_csv(
+                    source, (0, 1), duration_ms=1000, seed=seed))
+
     def test_resamples_sensors_with_different_native_rates(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "imu.csv"

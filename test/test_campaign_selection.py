@@ -15,6 +15,35 @@ from moneymin.web.server import _campaign_log_view
 
 
 class CampaignSelectionTests(unittest.TestCase):
+    def test_unconfirmed_result_does_not_enter_sent_history_or_hours(self):
+        with patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
+             patch.object(campaign, "prepare_clip", return_value={
+                 "duration_ms": 300000, "imu_real": True,
+                 "video_path": str(self.tmp / "fake.mp4")}), \
+             patch.object(campaign, "upload_to_account", return_value={"ok": True}), \
+             patch.object(campaign.sent_registry, "mark_sent") as mark:
+            result, snapshot = self.run_with_runner()
+        mark.assert_not_called()
+        self.assertEqual(snapshot["totals"]["ok_sends"], 0)
+        self.assertTrue(all(not a["ok"] for item in result.items for a in item.get("accounts", [])))
+    def test_partial_campaign_shows_shortfall_and_failures_without_suggesting_success(self):
+        event = _public_event("campaign_done", {
+            "status": "partial", "ok_sends": 1109, "shortfall_accounts": 50,
+            "preparation_failures": 22, "failed_sends": 218})
+        self.assertEqual(event["level"], "warning")
+        self.assertIn("50 conta(s) abaixo da meta", event["detail"])
+        self.assertIn("22 vídeo(s) descartado(s) no preparo", event["detail"])
+        self.assertIn("218 envio(s) com falha", event["detail"])
+    def test_invalid_or_short_prepared_video_is_never_uploaded(self):
+        for duration in (float("nan"), float("inf"), 0, -1, 1000):
+            with self.subTest(duration=duration), \
+                 patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
+                 patch.object(campaign, "prepare_clip", return_value={
+                     "duration_ms": duration, "imu_real": True,
+                     "video_path": str(self.tmp / "fake.mp4")}), \
+                 patch.object(campaign, "upload_to_account") as send:
+                self.run_with_runner()
+                send.assert_not_called()
     def _run_partial_history(self, include_fresh):
         self.cfg.accounts = self.cfg.accounts[:2]
         self.cfg.tasks = self.tasks[:1]
@@ -158,7 +187,7 @@ class CampaignSelectionTests(unittest.TestCase):
             if account.email == self.cfg.accounts[0].email:
                 return {"email": account.email, "ok": False,
                         "error": "complete falhou após 1 tentativas: PATCH /complete falhou (403): User account is disabled. [bloqueio: user]"}
-            return {"email": account.email, "ok": True}
+            return {"email": account.email, "ok": True, "finalized": True}
         with patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
              patch.object(campaign, "prepare_clip", side_effect=lambda *a, **k: {
                  "duration_ms": 300000, "imu_real": True, "video_path": str(self.tmp / "fake.mp4")}), \

@@ -1857,6 +1857,10 @@ QWidget* MainWindow::buildAcceleratorPage() {
   heroLayout->addSpacing(24);
   heroLayout->addWidget(quietLabel(QStringLiteral("Prepare uma vez, use nas campanhas")));
   heroLayout->addWidget(quietLabel(QStringLiteral("Os vídeos e sensores ficam nesta biblioteca. A preparação respeita o espaço livre reservado no disco.")));
+  auto* explore = new QPushButton(QStringLiteral("Explorar catálogo Ego4D"));
+  explore->setObjectName(QStringLiteral("egoLibraryExplore"));
+  connect(explore, &QPushButton::clicked, this, &MainWindow::openEgoLibrary);
+  heroLayout->addWidget(explore);
   heroLayout->addStretch();
 
   auto* config = new QWidget;
@@ -4677,6 +4681,239 @@ void MainWindow::pollCampaignPreviews() {
       setStatus(QStringLiteral("Campanha concluída: todas as prévias estão prontas no Minute."));
     }
   });
+}
+
+void MainWindow::openEgoLibrary() {
+  const auto validSummary = [](const QJsonObject& root) {
+    if (root.value(QStringLiteral("state")).toString() != QStringLiteral("ready")
+        || !root.value(QStringLiteral("needs_index")).isBool()
+        || root.value(QStringLiteral("needs_index")).toBool()) return false;
+    for (const auto* key : {"videos", "clips", "annotations"}) {
+      const auto value = root.value(QLatin1String(key));
+      if (!value.isDouble() || value.toDouble() < 0
+          || std::floor(value.toDouble()) != value.toDouble()) return false;
+    }
+    return true;
+  };
+  auto* dialog = new QDialog(this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setObjectName(QStringLiteral("egoLibraryDialog"));
+  dialog->setWindowTitle(QStringLiteral("Catálogo original Ego4D"));
+  dialog->resize(1000, 650);
+  auto* layout = new QVBoxLayout(dialog);
+  auto* summary = new QLabel(QStringLiteral("Consultando catálogo…"));
+  summary->setWordWrap(true);
+  summary->setObjectName(QStringLiteral("egoLibrarySummary"));
+  layout->addWidget(summary);
+  auto* controls = new QHBoxLayout;
+  auto* query = new QLineEdit;
+  query->setObjectName(QStringLiteral("egoLibraryQuery"));
+  query->setPlaceholderText(QStringLiteral("Atividade ou cenário, ex.: gardening"));
+  query->setMaxLength(200);
+  controls->addWidget(query, 1);
+  auto* minimum = new QSpinBox;
+  minimum->setRange(0, 1440);
+  minimum->setSuffix(QStringLiteral(" min ou mais"));
+  minimum->setToolTip(QStringLiteral("Duração do vídeo original"));
+  controls->addWidget(minimum);
+  auto* sensors = new QCheckBox(QStringLiteral("IMU declarada"));
+  controls->addWidget(sensors);
+  auto* find = new QPushButton(QStringLiteral("Buscar"));
+  find->setObjectName(QStringLiteral("egoLibrarySearch"));
+  find->setEnabled(false);
+  controls->addWidget(find);
+  auto* index = new QPushButton(QStringLiteral("Atualizar índice"));
+  index->setObjectName(QStringLiteral("egoLibraryIndex"));
+  controls->addWidget(index);
+  layout->addLayout(controls);
+  auto* progress = new QProgressBar;
+  progress->setRange(0, 0);
+  progress->setVisible(false);
+  layout->addWidget(progress);
+  auto* table = new QTableWidget(0, 5);
+  table->setObjectName(QStringLiteral("egoLibraryTable"));
+  table->setHorizontalHeaderLabels({QStringLiteral("Vídeo de origem"), QStringLiteral("Duração"),
+      QStringLiteral("Cenários"), QStringLiteral("Dispositivo original"), QStringLiteral("Sensores")});
+  table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  table->setSelectionBehavior(QAbstractItemView::SelectRows);
+  table->setSelectionMode(QAbstractItemView::SingleSelection);
+  table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+  table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+  table->verticalHeader()->hide();
+  layout->addWidget(table, 1);
+  auto* footer = new QHBoxLayout;
+  auto* count = new QLabel;
+  count->setObjectName(QStringLiteral("egoLibraryCount"));
+  footer->addWidget(count, 1);
+  auto* previous = new QPushButton(QStringLiteral("Anterior"));
+  previous->setEnabled(false);
+  auto* next = new QPushButton(QStringLiteral("Próxima"));
+  next->setEnabled(false);
+  footer->addWidget(previous);
+  footer->addWidget(next);
+  auto* copy = new QPushButton(QStringLiteral("Copiar ID"));
+  footer->addWidget(copy);
+  connect(copy, &QPushButton::clicked, dialog, [table] {
+    if (table->currentRow() >= 0 && table->item(table->currentRow(), 0))
+      QApplication::clipboard()->setText(table->item(table->currentRow(), 0)->data(Qt::UserRole).toString());
+  });
+  auto* close = new QPushButton(QStringLiteral("Fechar"));
+  footer->addWidget(close);
+  connect(close, &QPushButton::clicked, dialog, &QDialog::close);
+  layout->addLayout(footer);
+  layout->addWidget(quietLabel(QStringLiteral("Origem: Ego4D. CSV presente ou IMU declarada não garantem continuidade dos sensores nem elegibilidade para campanha.")));
+  const QPointer<QDialog> guard(dialog);
+  dialog->setProperty("offset", 0);
+  dialog->setProperty("generation", 0);
+  dialog->setProperty("indexReady", false);
+  auto browse = [this, guard, query, minimum, sensors, table, find, previous, next, count] {
+    if (!guard) return;
+    const int generation = guard->property("generation").toInt() + 1;
+    guard->setProperty("generation", generation);
+    QUrlQuery params;
+    params.addQueryItem(QStringLiteral("q"), query->text());
+    params.addQueryItem(QStringLiteral("min_s"), QString::number(minimum->value() * 60));
+    params.addQueryItem(QStringLiteral("imu"), sensors->isChecked() ? QStringLiteral("declared") : QStringLiteral("all"));
+    params.addQueryItem(QStringLiteral("offset"), QString::number(guard->property("offset").toInt()));
+    find->setEnabled(false); previous->setEnabled(false); next->setEnabled(false);
+    count->setText(QStringLiteral("Buscando…"));
+    _api.get(QStringLiteral("/api/library/ego4d/videos?") + params.toString(QUrl::FullyEncoded),
+      [guard, generation, table, find, previous, next, count](bool ok, const QJsonDocument& doc, const QString& error) {
+        if (!guard || generation != guard->property("generation").toInt()) return;
+        find->setEnabled(true);
+        if (!ok) { count->setText(error); table->setRowCount(0); return; }
+        const auto root = doc.object();
+        const auto totalValue = root.value(QStringLiteral("total"));
+        const auto offsetValue = root.value(QStringLiteral("offset"));
+        if (!root.value(QStringLiteral("items")).isArray()
+            || root.value(QStringLiteral("provenance")).toString() != QStringLiteral("ego4d_original")
+            || !totalValue.isDouble() || totalValue.toDouble() < 0
+            || totalValue.toDouble() != std::floor(totalValue.toDouble())
+            || !offsetValue.isDouble() || offsetValue.toInt(-1) != guard->property("offset").toInt()) {
+          count->setText(QStringLiteral("Resposta incompleta da biblioteca. Tente buscar novamente."));
+          table->setRowCount(0); return;
+        }
+        const auto items = root.value(QStringLiteral("items")).toArray();
+        bool validItems = items.size() <= 100 && items.size() <= totalValue.toDouble();
+        for (const auto& value : items) {
+          const auto item = value.toObject();
+          const auto duration = item.value(QStringLiteral("duration_s"));
+          const auto declared = item.value(QStringLiteral("has_imu"));
+          validItems = validItems && value.isObject()
+            && !item.value(QStringLiteral("uid")).toString().isEmpty()
+            && duration.isDouble() && duration.toDouble() > 0 && std::isfinite(duration.toDouble())
+            && item.value(QStringLiteral("imu_local")).isBool()
+            && (declared.isNull() || (declared.isDouble()
+                && (declared.toDouble() == 0 || declared.toDouble() == 1)));
+        }
+        if (!validItems) {
+          count->setText(QStringLiteral("Dados incompletos da biblioteca. Tente buscar novamente."));
+          table->setRowCount(0); return;
+        }
+        table->setRowCount(items.size());
+        for (int row = 0; row < items.size(); ++row) {
+          const auto item = items.at(row).toObject();
+          const QString uid = item.value(QStringLiteral("uid")).toString();
+          auto* identity = new QTableWidgetItem(uid);
+          identity->setData(Qt::UserRole, uid);
+          identity->setToolTip(uid);
+          table->setItem(row, 0, identity);
+          const int seconds = qRound(item.value(QStringLiteral("duration_s")).toDouble());
+          table->setItem(row, 1, new QTableWidgetItem(QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QChar('0'))));
+          table->item(row, 1)->setToolTip(QStringLiteral("Duração original: %1 segundos").arg(item.value(QStringLiteral("duration_s")).toDouble(), 0, 'f', 3));
+          table->setItem(row, 2, new QTableWidgetItem(item.value(QStringLiteral("scenarios")).toString()));
+          table->setItem(row, 3, new QTableWidgetItem(item.value(QStringLiteral("device")).toString()));
+          const auto declared = item.value(QStringLiteral("has_imu"));
+          const QString state = item.value(QStringLiteral("imu_local")).toBool() ? QStringLiteral("CSV local · verificar")
+            : declared.isNull() ? QStringLiteral("Sem informação")
+            : declared.toInt() == 1 ? QStringLiteral("Declarado · sem CSV local") : QStringLiteral("Não declarado");
+          table->setItem(row, 4, new QTableWidgetItem(state));
+        }
+        const int offset = root.value(QStringLiteral("offset")).toInt();
+        const int total = root.value(QStringLiteral("total")).toInt();
+        count->setText(items.isEmpty() ? QStringLiteral("Nenhum vídeo encontrado")
+          : QStringLiteral("%1–%2 de %3 vídeos de origem").arg(offset + 1).arg(offset + items.size()).arg(total));
+        previous->setEnabled(offset > 0);
+        next->setEnabled(offset + items.size() < total);
+      });
+  };
+  connect(find, &QPushButton::clicked, dialog, [guard, browse] { if (guard) { guard->setProperty("offset", 0); browse(); } });
+  connect(query, &QLineEdit::returnPressed, find, &QPushButton::click);
+  auto filterChanged = [guard, find, previous, next, count] {
+    if (!guard) return;
+    guard->setProperty("generation", guard->property("generation").toInt() + 1);
+    guard->setProperty("offset", 0);
+    previous->setEnabled(false); next->setEnabled(false);
+    find->setEnabled(guard->property("indexReady").toBool());
+    count->setText(QStringLiteral("Buscar para aplicar os filtros"));
+  };
+  connect(query, &QLineEdit::textChanged, dialog, filterChanged);
+  connect(minimum, qOverload<int>(&QSpinBox::valueChanged), dialog, filterChanged);
+  connect(sensors, &QCheckBox::toggled, dialog, filterChanged);
+  connect(previous, &QPushButton::clicked, dialog, [guard, browse] { if (guard) { guard->setProperty("offset", qMax(0, guard->property("offset").toInt() - 50)); browse(); } });
+  connect(next, &QPushButton::clicked, dialog, [guard, browse] { if (guard) { guard->setProperty("offset", guard->property("offset").toInt() + 50); browse(); } });
+  auto* poll = new QTimer(dialog);
+  poll->setInterval(1200);
+  auto update = [this, guard, summary, index, progress, poll, browse, validSummary] {
+    if (!guard) return;
+    if (QDateTime::currentMSecsSinceEpoch() - guard->property("indexStarted").toLongLong() > 180000) {
+      poll->stop(); index->setEnabled(true); progress->hide();
+      guard->setProperty("indexGeneration", guard->property("indexGeneration").toInt() + 1);
+      guard->setProperty("indexInFlight", false);
+      summary->setText(QStringLiteral("Indexação demorou mais que o esperado. Consulte novamente em instantes."));
+      return;
+    }
+    if (guard->property("indexInFlight").toBool()) return;
+    guard->setProperty("indexInFlight", true);
+    const int indexGeneration = guard->property("indexGeneration").toInt();
+    _api.post(QStringLiteral("/api/library/ego4d/index"), {},
+      [guard, summary, index, progress, poll, browse, validSummary, indexGeneration](bool ok, const QJsonDocument& doc, const QString& error) {
+        if (!guard || indexGeneration != guard->property("indexGeneration").toInt()) return;
+        guard->setProperty("indexInFlight", false);
+        const auto root = doc.object();
+        if (!ok || !root.value(QStringLiteral("loading")).toBool()) {
+          poll->stop(); index->setEnabled(true); progress->hide();
+          if (!ok) { summary->setText(error); return; }
+          if (!validSummary(root)) {
+            summary->setText(QStringLiteral("Resposta incompleta da indexação. Tente atualizar novamente."));
+            return;
+          }
+          guard->setProperty("indexReady", true);
+          guard->setProperty("offset", 0);
+          summary->setText(QStringLiteral("%1 vídeos · %2 clipes · %3 anotações originais")
+            .arg(root.value(QStringLiteral("videos")).toInt()).arg(root.value(QStringLiteral("clips")).toInt())
+            .arg(root.value(QStringLiteral("annotations")).toInt()));
+          browse();
+        } else summary->setText(root.value(QStringLiteral("message")).toString());
+      });
+  };
+  connect(poll, &QTimer::timeout, dialog, update);
+  connect(index, &QPushButton::clicked, dialog, [guard, index, progress, poll, update] {
+    if (!guard) return;
+    guard->setProperty("indexStarted", QDateTime::currentMSecsSinceEpoch());
+    guard->setProperty("indexGeneration", guard->property("indexGeneration").toInt() + 1);
+    index->setEnabled(false); progress->show(); poll->start(); update();
+  });
+  _api.get(QStringLiteral("/api/library/ego4d"), [guard, summary, browse, validSummary](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (!guard) return;
+    if (guard->property("indexStarted").isValid()) return;
+    if (!ok) { summary->setText(error); return; }
+    const auto root = doc.object();
+    if (root.value(QStringLiteral("needs_index")).toBool()) {
+      summary->setText(QStringLiteral("Atualize o índice para explorar o catálogo original."));
+      return;
+    }
+    if (!validSummary(root)) {
+      summary->setText(QStringLiteral("Resposta incompleta da biblioteca. Atualize o índice."));
+      return;
+    }
+    guard->setProperty("indexReady", true);
+    summary->setText(QStringLiteral("%1 vídeos · %2 clipes · %3 anotações originais")
+      .arg(root.value(QStringLiteral("videos")).toInt()).arg(root.value(QStringLiteral("clips")).toInt())
+      .arg(root.value(QStringLiteral("annotations")).toInt()));
+    browse();
+  });
+  dialog->show();
 }
 
 void MainWindow::loadAccelerator() {

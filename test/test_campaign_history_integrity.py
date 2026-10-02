@@ -21,7 +21,8 @@ class CampaignHistoryIntegrityTests(unittest.TestCase):
         results = view["items"][0]["accounts"]
         self.assertEqual([r["confirmation"] for r in results],
                          ["remote_ack", "not_confirmed", "legacy_record", "not_confirmed", "not_confirmed"])
-        self.assertEqual(view["summary"]["pending"], 1)
+        self.assertEqual(view["summary"]["pending"], 2)
+        self.assertEqual(view["summary"]["success"], 1)
         self.assertEqual(view["summary"]["skipped"], 2)
         self.assertEqual(view["items"][0]["clip_uid"], "clip-id")
         self.assertEqual(results[0]["session_id"], "confirmed-session")

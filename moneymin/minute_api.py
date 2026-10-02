@@ -559,6 +559,7 @@ class Session:
         self._lock = threading.RLock()
         self.recording_policy: RecordingPolicy | None = None
         self.initialization_errors: dict[str, str] = {}
+        self._initialization_causes: dict[str, AuthError] = {}
         self._recording_checked_at: float | None = None
         self._recording_retry_at = 0.0
         self._quota_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -610,6 +611,7 @@ class Session:
                 self.recording_config = {}
                 self.device_camera_allowed = None
                 self.initialization_errors = {}
+                self._initialization_causes = {}
                 self._recording_checked_at = None
                 self._recording_retry_at = 0.0
                 self._initialization_failures = 0
@@ -1054,6 +1056,10 @@ class Session:
                 ) from exc
             if not isinstance(profile, dict) or not isinstance(profile.get("organizations"), list):
                 raise AuthError("O perfil devolvido pelo serviço está incompleto.", code="invalid_response")
+            if profile.get("disabled") is True:
+                raise AuthError(
+                    "Conta desativada no HUB. A plataforma precisa reativá-la antes de novos envios.",
+                    code="restricted")
             # A autorização de mutações é verificada no write path.
             # Bloqueio POR ORG ALVO (disabled da conta/org + userState). Uma org
             # desativada entre várias NÃO bloqueia a conta inteira — só a org
@@ -1069,12 +1075,6 @@ class Session:
                         f"{email}: {what} para {org_key} — a plataforma não "
                         "aceita envios agora (o app Minute pararia aqui).", code="restricted",
                     )
-            elif profile.get("disabled") is True:
-                who = profile.get("email") or email
-                raise AuthError(
-                    f"conta desativada no HUB: {who}. "
-                    "A plataforma precisa reativá-la antes de novos envios.", code="restricted",
-                )
             self.warmup()
             return profile
         raise _auth_failure(status, body, "Consulta do perfil", headers=response.headers,
@@ -1137,6 +1137,9 @@ class Session:
             return
         self.warmup()
         if self.recording_policy is None or "recording_config" in self.initialization_errors:
+            cause = self._initialization_causes.get("recording_config")
+            if cause is not None:
+                raise cause
             raise AuthError("Não foi possível validar os limites desta sessão. Tente novamente.", code="service")
         if getattr(self, "device_camera_allowed", None) is not True:
             code = "policy" if getattr(self, "device_camera_allowed", None) is False else "service"
@@ -1220,15 +1223,20 @@ class Session:
             if now < self._recording_retry_at:
                 return
             self.initialization_errors = {}
+            self._initialization_causes = {}
             try:
                 status, body = self.fetch_recording_config()
                 if status != 200:
-                    raise ValueError("Consulta de configuração indisponível.")
+                    raise _auth_failure(status, body, "Consulta da configuração de gravação")
                 payload = json.loads(body)
                 self.recording_policy = RecordingPolicy.parse(payload)
                 self.recording_config = payload
-            except Exception:
+            except Exception as exc:
                 self.initialization_errors["recording_config"] = "Não foi possível validar a configuração de gravação."
+                self._initialization_causes["recording_config"] = (
+                    exc if isinstance(exc, AuthError) else
+                    AuthError("A configuração de gravação devolvida pelo serviço é inválida.",
+                              code="invalid_response"))
             # Preserva a consulta existente, mas uma negativa deixa de ser aviso.
             self.device_camera_allowed = None
             try:

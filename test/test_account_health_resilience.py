@@ -163,6 +163,19 @@ class AuthEvidenceTests(unittest.TestCase):
                 sess.ensure_auth()
         self.assertEqual(caught.exception.account_issue_code, "restricted")
 
+    def test_disabled_profile_blocks_org_upload_before_secondary_queries(self):
+        sess = Session({"idToken": "fake"})
+        sess._live = True
+        with mock.patch.object(sess, "request_detailed", return_value=minute_api.HttpResponse(
+                200, json.dumps({"disabled": True, "organizations": []}), {})), \
+             mock.patch.object(sess, "org_state") as organization, \
+             mock.patch.object(sess, "warmup") as policies:
+            with self.assertRaises(AuthError) as caught:
+                sess.ensure_auth(org_key="org")
+        self.assertEqual(caught.exception.account_issue_code, "restricted")
+        organization.assert_not_called()
+        policies.assert_not_called()
+
     def test_firebase_restriction_requires_exact_error_code(self):
         for body, expected in ((json.dumps({"error": {"message": "USER_DISABLED"}}), "restricted"),
                                (json.dumps({"error": {"message": "TOKEN_EXPIRED"}}), "authentication"),

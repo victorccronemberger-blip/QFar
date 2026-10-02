@@ -27,9 +27,107 @@
 #include <QTableWidget>
 #include <QSpinBox>
 #include <QCheckBox>
+#include <QLineEdit>
 
 class OperationPreview {
 public:
+  static void originalLibrarySmoke(MainWindow& window) {
+    const QString previousClipboard = QApplication::clipboard()->text();
+    QObject::connect(qApp, &QCoreApplication::aboutToQuit, qApp, [previousClipboard] { QApplication::clipboard()->setText(previousClipboard); });
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(130); return; }
+    auto builds = std::make_shared<int>(0);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, builds] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, builds] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        QJsonObject payload;
+        int status = 200;
+        if (input.startsWith("GET /api/library/ego4d ")) payload = {{"state","missing"},{"needs_index",true}};
+        else if (input.startsWith("POST /api/library/ego4d/index ")) {
+          if (++*builds == 1) { status = 202; payload = {{"loading",true},{"message","Indexando atividades…"}}; }
+          else if (*builds == 2) payload = {}; // HTTP 200 does not prove index readiness.
+          else payload = {{"state","ready"},{"needs_index",false},{"videos",55},{"clips",100},{"annotations",500}};
+        } else if (input.startsWith("GET /api/library/ego4d/videos?")) {
+          const bool empty = input.contains("q=missing");
+          const int offset = input.contains("offset=50") ? 50 : 0;
+          QJsonArray items;
+          if (!empty) for (int i = 0; i < (offset ? 5 : 50); ++i)
+            items.append(QJsonObject{{"uid",QStringLiteral("original-%1").arg(offset+i)},
+              {"duration_s",600.123},{"scenarios","Gardening"},{"device","Original camera"},
+              {"has_imu",1},{"imu_local",false}});
+          payload = {{"items",items},{"total",empty?0:55},{"offset",offset},{"provenance","ego4d_original"}};
+          if (input.contains("q=broken")) payload = {};
+          if (input.contains("q=invalidrow")) payload["items"] = QJsonArray{QJsonObject{{"uid","bad"}}};
+        } else { qApp->exit(131); return; }
+        const auto bytes = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 " + QByteArray::number(status) + " OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+          + QByteArray::number(bytes.size()) + "\r\n\r\n" + bytes);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._pages->setCurrentIndex(4);
+    auto* explore = window.findChild<QPushButton*>(QStringLiteral("egoLibraryExplore"));
+    if (!explore) { qApp->exit(132); return; }
+    explore->click();
+    auto* poll = new QTimer(&window);
+    auto phase = std::make_shared<int>(0);
+    QObject::connect(poll, &QTimer::timeout, &window, [&window, phase, builds, poll] {
+      auto* dialog = window.findChild<QDialog*>(QStringLiteral("egoLibraryDialog"));
+      if (!dialog) return;
+      auto* summary = dialog->findChild<QLabel*>(QStringLiteral("egoLibrarySummary"));
+      auto* table = dialog->findChild<QTableWidget*>(QStringLiteral("egoLibraryTable"));
+      auto* search = dialog->findChild<QPushButton*>(QStringLiteral("egoLibrarySearch"));
+      auto* index = dialog->findChild<QPushButton*>(QStringLiteral("egoLibraryIndex"));
+      if (*phase == 0 && summary->text().contains("Atualize")) {
+        if (search->isEnabled()) { qApp->exit(133); return; }
+        *phase = 1; index->click(); index->click();
+      } else if (*phase == 1 && summary->text().contains("incompleta")) {
+        if (search->isEnabled() || table->rowCount()) { qApp->exit(139); return; }
+        *phase = 4; index->click();
+      } else if (*phase == 4 && search->isEnabled() && table->rowCount() == 50) {
+        if (*builds != 3) { qApp->exit(134); return; }
+        table->setCurrentCell(0,0);
+        for (auto* button : dialog->findChildren<QPushButton*>()) if (button->text() == "Copiar ID") button->click();
+        if (QApplication::clipboard()->text() != "original-0") { qApp->exit(135); return; }
+        dialog->grab().save(QStringLiteral("build/ego4d-library-preview.png"));
+        *phase = 2;
+        for (auto* button : dialog->findChildren<QPushButton*>()) if (button->text() == "Próxima") button->click();
+      } else if (*phase == 2 && search->isEnabled() && table->rowCount() == 5) {
+        if (table->item(0,0)->text() != "original-50") { qApp->exit(136); return; }
+        *phase = 3;
+        dialog->findChild<QLineEdit*>(QStringLiteral("egoLibraryQuery"))->setText(QStringLiteral("missing"));
+        search->click();
+      } else if (*phase == 3 && search->isEnabled() && table->rowCount() == 0) {
+        if (!dialog->findChild<QLabel*>(QStringLiteral("egoLibraryCount"))->text().contains("Nenhum")) { qApp->exit(137); return; }
+        *phase = 5;
+        dialog->findChild<QLineEdit*>(QStringLiteral("egoLibraryQuery"))->setText(QStringLiteral("broken"));
+        search->click();
+      } else if (*phase == 5 && search->isEnabled()
+          && dialog->findChild<QLabel*>(QStringLiteral("egoLibraryCount"))->text().contains("incompleta")) {
+        if (table->rowCount()) { qApp->exit(140); return; }
+        *phase = 7;
+        dialog->findChild<QLineEdit*>(QStringLiteral("egoLibraryQuery"))->setText(QStringLiteral("invalidrow"));
+        search->click();
+      } else if (*phase == 7 && search->isEnabled()
+          && dialog->findChild<QLabel*>(QStringLiteral("egoLibraryCount"))->text().contains("incompletos")) {
+        if (table->rowCount()) { qApp->exit(141); return; }
+        *phase = 6;
+        dialog->findChild<QLineEdit*>(QStringLiteral("egoLibraryQuery"))->clear();
+        search->click();
+      } else if (*phase == 6 && search->isEnabled() && table->rowCount() == 50) {
+        poll->stop(); dialog->close();
+        QTimer::singleShot(100, &window, [] { qApp->exit(0); });
+      }
+    });
+    poll->start(25);
+    QTimer::singleShot(9000, &window, [] { qApp->exit(138); });
+  }
   static void campaignParametersSmoke() {
     QSettings().setValue(QStringLiteral("campaign/draft"),QJsonDocument(QJsonObject{
       {"delay_mode","fixed"},{"delay_seconds",75},{"active_hours",false},{"hour_start",7},{"hour_end",18}
@@ -831,6 +929,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--accelerator-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::acceleratorSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--original-library-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::originalLibrarySmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--credential-copy-smoke")) {

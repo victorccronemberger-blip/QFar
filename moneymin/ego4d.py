@@ -1846,7 +1846,7 @@ def build_imu_csv(
         raise ValueError("sample_rate_hz deve ser positivo")
     start_ms = float(window_s[0]) * 1000.0
     declared_end_ms = float(window_s[1]) * 1000.0
-    if not (math.isfinite(start_ms) and math.isfinite(declared_end_ms)
+    if not (math.isfinite(start_ms) and start_ms >= 0 and math.isfinite(declared_end_ms)
             and declared_end_ms > start_ms):
         raise ValueError("janela de IMU inválida")
     if duration_ms is None:
@@ -1854,17 +1854,17 @@ def build_imu_csv(
     duration_ms = int(duration_ms)
     if duration_ms <= 0:
         raise ValueError("duration_ms deve ser positivo")
+    if duration_ms > declared_end_ms - start_ms + 100:
+        raise ValueError("duração de IMU ultrapassa a janela original do vídeo")
 
     step_ms = 1000.0 / sample_rate_hz
     step_ns = int(round(1_000_000_000 / sample_rate_hz))
     n = max(1, int(duration_ms / 1000 * sample_rate_hz) + 1)
     sensor_end_ms = start_ms + duration_ms
 
+    # Keep the compatibility parameter, but never alter measured signals by
+    # account identity. Resampling uses the source's canonical timestamps.
     phase_ms = 0.0
-    noise_rng: random.Random | None = None
-    if seed:
-        noise_rng = random.Random(seed)
-        phase_ms = noise_rng.uniform(0.0, min(8.0, step_ms * 0.8))
 
     # Não guarde cada linha como tuplas/objetos Python. Em um vídeo de 30 min
     # isso ultrapassava facilmente centenas de MB e fazia PCs com pouca RAM
@@ -1950,18 +1950,6 @@ def build_imu_csv(
     if validate_only:
         return ""
 
-    # Decorelação POR CONTA: o mesmo clipe injetado em N contas não pode sair
-    # byte-idêntico (antes só havia ±0.002 de ruído). Ganhos/offsets pequenos e
-    # determinísticos (via seed da conta) preservam a forma real do movimento.
-    if noise_rng is not None:
-        accel_gain = tuple(noise_rng.uniform(0.985, 1.015) for _ in range(3))
-        gyro_gain = tuple(noise_rng.uniform(0.98, 1.02) for _ in range(3))
-        accel_bias = tuple(noise_rng.uniform(-0.012, 0.012) for _ in range(3))
-        gyro_bias = tuple(noise_rng.uniform(-0.002, 0.002) for _ in range(3))
-    else:
-        accel_gain = gyro_gain = (1.0, 1.0, 1.0)
-        accel_bias = gyro_bias = (0.0, 0.0, 0.0)
-
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow(IMU_HDR)
@@ -2007,11 +1995,6 @@ def build_imu_csv(
         accel = _component_values(1, idx)
         # Android: grava o sensor COMO LIDO (sem negar o eixo z — convenção
         # de gravidade +z do Android; um aparelho real não inverte o sinal).
-        accel = tuple(v * g + b for v, g, b in zip(accel, accel_gain, accel_bias))
-        gyro = tuple(v * g + b for v, g, b in zip(gyro, gyro_gain, gyro_bias))
-        if noise_rng is not None:
-            accel = tuple(value + noise_rng.gauss(0, 0.002) for value in accel)
-            gyro = tuple(value + noise_rng.gauss(0, 0.0002) for value in gyro)
         writer.writerow([
             idx * step_ns,
             f"{accel[0]:.6f}", f"{accel[1]:.6f}", f"{accel[2]:.6f}",

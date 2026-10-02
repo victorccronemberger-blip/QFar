@@ -518,7 +518,9 @@ def _ego_prepare_plan(clip: dict[str, Any]) -> dict[str, Any]:
     """
     clip_uid = clip["exported_clip_uid"]
     orig_start, orig_end = ego4d.clip_window_s(clip)
-    start_s, end_s = ego4d.humanize_window(orig_start, orig_end, clip_uid)
+    # Preserve the selected source interval; arbitrary trimming changes the
+    # advertised duration and the sensor alignment without source evidence.
+    start_s, end_s = orig_start, orig_end
     parent_uid = str(clip.get("parent_video_uid") or clip_uid)
     needs_cut = bool(clip.get("needs_cut"))
     if needs_cut:
@@ -598,9 +600,14 @@ def prepare_clip(
     """Baixa clipe + IMU real, normaliza o vídeo e monta o sidecar. (sem upload)"""
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+    if not isinstance(clip.get("parent_video_uid"), str) or not clip["parent_video_uid"].strip():
+        raise RuntimeError("Clipe Ego4D sem identidade do pai original")
     plan = _ego_prepare_plan(clip)
     clip_uid = plan["clip_uid"]
     window_s = plan["window_s"]
+    parent_uid = plan["parent_uid"]
+    if video.get("video_uid") and video["video_uid"] != parent_uid:
+        raise RuntimeError("Metadados do vídeo não correspondem ao pai original do clipe Ego4D")
     dur_s = plan["dur_s"]
     dur_ms = int(round(dur_s * 1000))
     if not (MIN_DUR_MS <= dur_ms <= MAX_DUR_MS):
@@ -608,8 +615,6 @@ def prepare_clip(
     if not ego4d.imu_window_is_covered(video, window_s):
         raise RuntimeError(
             f"clipe {clip_uid} atravessa trecho sem cobertura contínua de IMU")
-
-    parent_uid = plan["parent_uid"]
 
     def _progress(phase: str, **payload: Any) -> None:
         if progress:
@@ -659,6 +664,12 @@ def prepare_clip(
 
     # Duração do ARQUIVO (probe) — o encoder nunca entrega N.000 s.
     dur_ms = int(probe["duration_ms"])
+    fps = float(probe.get("fps") or 30.0)
+    tolerance_ms = max(50, math.ceil(2000 / fps)) if math.isfinite(fps) and fps > 0 else 100
+    if abs(dur_ms - round(dur_s * 1000)) > tolerance_ms:
+        raise RuntimeError(
+            f"clipe {clip_uid}: duração codificada divergente da janela original "
+            f"({dur_ms}ms versus {round(dur_s * 1000)}ms)")
     _progress("sidecar")
     imu_csv = ego4d.build_imu_csv(imu_path, window_s, duration_ms=dur_ms)
     # 500 Hz (EgoImu.SAMPLING_PERIOD_US=2000) — o n_samples alimenta o
@@ -674,14 +685,27 @@ def prepare_clip(
         "device": video.get("device"),
         "scenario": " | ".join(ego4d.scenario_values(video)),
         "imu_real": bool(imu_path),
-        # imu.csv/frames.csv por CONTA são remontados no upload com a seed/
-        # offset do perfil do aparelho (anti-colusão); o caminho cru + a janela
-        # ficam no item para isso. A base (sem seed) segue p/ compatibilidade.
+        # Preserve source provenance for duration/sensor checks.
         "imu_csv": imu_csv, "frames_csv": frames_csv,
         "imu_path": str(imu_path),
         "window_s": list(window_s),
         "n_samples": n_samples, "probe": probe,
         "source": "ego4d",
+        # Local audit/history only. Never relabel third-party footage as a
+        # newly captured recording or claim the output grid as the native rate.
+        "source_provenance": {
+            "dataset": "ego4d", "recording_origin": "third_party_dataset",
+            "parent_video_uid": parent_uid, "clip_uid": clip_uid,
+            "parent_identity_verified": video.get("video_uid") == parent_uid,
+            "window_s": list(window_s), "original_device": video.get("device"),
+            "prepared_duration_ms": dur_ms,
+            "imu": {
+                "source_file": Path(imu_path).name,
+                "processing": "resampled_measured_signals",
+                "output_grid_hz": config.ANDROID_IMU_SAMPLE_RATE_HZ,
+                "native_rate_hz": None,
+            },
+        },
         # Exclusivamente interno: nunca entra no log. Só é consumido após todos
         # os uploads deste item confirmarem sucesso.
         "_cleanup_paths": [
@@ -1693,6 +1717,10 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
     é o `_native.mp4` compartilhado, salvo `unique_video=True`.
     """
     result: dict[str, Any] = {"email": account.email, "ok": False}
+    if item.get("source") == "ego4d" and item.get("imu_real") is not True:
+        result.update(finalized=False, retryable=False,
+                      error="Ego4D sem sensores reais confirmados no preparo; envio bloqueado.")
+        return result
     try:
         if (org_policy.account_kind(account.email) == "crowtado"
                 and account.org_key != config.ORG_KEY):
@@ -1705,9 +1733,12 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             sess = session_cache.get(account.email)
         if sess is None:
             sess = Session.from_email(account.email)
+            # _live only means the Firebase token was refreshed. It does not
+            # prove that Minute permits this account/organization to upload.
+            sess.ensure_auth(org_key=account.org_key)
             if session_cache is not None:
                 session_cache[account.email] = sess
-        if not getattr(sess, "_live", False):
+        elif not getattr(sess, "_live", False):
             # Gate de org (quality-screen/userState + disabled) + version gate.
             sess.ensure_auth(org_key=account.org_key)
         else:
@@ -1753,6 +1784,9 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 duration_ms=item["duration_ms"],
                 seed=f"{item['clip_uid']}|{account.email}")
         if not imu_csv:
+            if item.get("source") == "ego4d":
+                raise UploadError("IMU real Ego4D ausente; envio bloqueado sem substituição sintética.",
+                                  transient=False, phase="prepare")
             # Sem IMU real: gera a do APARELHO (sinal próprio por conta — nunca
             # a mesma IMU sintética para N contas).
             imu_csv = build_imu_csv(
@@ -2312,7 +2346,16 @@ def _run_campaign(
                         allow_download=content_mode != "cache")
                 # A duração real pode diferir das anotações ou de um cache antigo.
                 # Nunca envie um MP4 que ultrapasse o teto escolhido.
-                if float(item["duration_ms"]) > tsk.max_dur_s * 1000:
+                prepared_duration = float(item["duration_ms"])
+                if not math.isfinite(prepared_duration) or prepared_duration <= 0:
+                    raise ValueError("vídeo preparado sem duração válida")
+                # Encoding/cache validation already allows up to one second
+                # of container rounding; reject genuinely shortened footage.
+                if prepared_duration + 1000 < tsk.min_dur_s * 1000:
+                    raise ValueError(
+                        f"vídeo preparado abaixo da duração mínima de {tsk.min_dur_s:g}s"
+                    )
+                if prepared_duration > tsk.max_dur_s * 1000:
                     raise ValueError(
                         f"vídeo preparado excede a duração máxima de {tsk.max_dur_s:g}s"
                     )
@@ -2327,7 +2370,8 @@ def _run_campaign(
                       task_name=display_name, ok=False, error=error)
                 continue
             _emit("clip_ready", clip_uid=clip_info["clip_uid"],
-                  duration_ms=item["duration_ms"], imu_real=item["imu_real"])
+                  duration_ms=item["duration_ms"], imu_real=item["imu_real"],
+                  source_provenance=item.get("source_provenance"))
             # Só antecipa outro clipe quando ele será realmente necessário.
             # Uma campanha n=1 não deve baixar material residual em fundo.
             current_dur_s = float(item.get("duration_ms") or 0) / 1000.0
@@ -2579,6 +2623,11 @@ def _run_campaign(
                 seconds: dict[str, float] = task_seconds,
                 duration_s: float = float(item.get("duration_ms") or 0) / 1000.0,
             ) -> None:
+                if (acc_res.get("ok") and not acc_res.get("skipped")
+                        and acc_res.get("finalized") is not True):
+                    acc_res = {**acc_res, "ok": False,
+                               "error": acc_res.get("error") or
+                               "Finalização não confirmada; envio preservado para revisão."}
                 results[account.email] = acc_res
                 # Persiste antes de atualizar o índice de deduplicação. Uma falha
                 # no índice não deve apagar do histórico um envio concluído.
@@ -2588,7 +2637,7 @@ def _run_campaign(
                 except Exception as exc:
                     record_error = exc
                 ok = acc_res.get("ok")
-                if ok and not acc_res.get("skipped") and acc_res.get("finalized") is not False:
+                if ok and not acc_res.get("skipped") and acc_res.get("finalized") is True:
                     try:
                         sent_registry.mark_sent(sent_key, clip_uid, account.email)
                         if acc_res.get("session_id"):
@@ -2611,7 +2660,7 @@ def _run_campaign(
                       skipped=bool(acc_res.get("skipped")),
                       session_id=acc_res.get("session_id"),
                       credited_seconds=(duration_s if ok and not acc_res.get("skipped")
-                                        and acc_res.get("finalized") is not False else 0.0))
+                                        and acc_res.get("finalized") is True else 0.0))
                 if not ok and (acc_res.get("restriction_confirmed") or _is_disabled_error(acc_res.get("error"))):
                     banned.add(account.email)
                     sessions.pop(account.email, None)
@@ -2852,7 +2901,11 @@ def _run_campaign(
         # Só o nome do arquivo vai para a UI — nada de caminhos absolutos.
         _emit("campaign_done", log_path=log_path.name, status=log.status,
               ok_sends=sends["ok"], failed_sends=sends["failed"],
-              skipped_sends=sends["skipped"], issues=len(log.issues))
+              skipped_sends=sends["skipped"], issues=len(log.issues),
+              shortfall_accounts=sum(account_seconds.get(a.email, 0) < quota_s
+                                     for a in config.accounts) if quota_s else 0,
+              preparation_failures=sum(issue.get("kind") == "clip_prepare_done"
+                                       for issue in log.issues))
     return log
 
 

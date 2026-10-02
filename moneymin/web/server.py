@@ -69,6 +69,7 @@ import os
 import platform
 import random
 import shutil
+import sqlite3
 import sys
 import threading
 import time
@@ -80,7 +81,7 @@ from typing import Any
 from flask import Flask, g, jsonify, request
 
 from .. import (
-    campaign, config, crowtado, ego4d, ego_accelerator, fx, holo_accelerator, holoassist,
+    campaign, config, crowtado, ego4d, ego4d_library, ego_accelerator, fx, holo_accelerator, holoassist,
     hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store,
 )
 from ..atomic_io import load_json, save_json
@@ -1466,16 +1467,16 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
                           "Conta pulada nesta execução; o histórico não informa o motivo.")
                 stats["skipped"] += 1
                 total_skipped += 1
-            elif raw_result.get("ok") and raw_result.get("finalized") is False:
+            elif raw_result.get("ok") and raw_result.get("finalized") is not True:
                 status = "pending"
-                detail = "Envio sem confirmação de finalização. Confira a sessão antes de reenviar."
+                detail = ("Envio sem confirmação de finalização. Confira a sessão antes de reenviar."
+                          if raw_result.get("finalized") is False else
+                          "Registro antigo sem evidência explícita de finalização. Confira a sessão antes de reenviar.")
                 stats["pending"] += 1
                 total_pending += 1
             elif raw_result.get("ok"):
                 status = "success"
-                detail = ("Finalização confirmada pelo serviço e registrada nesta execução."
-                          if raw_result.get("finalized") is True else
-                          "Sucesso registrado em histórico antigo, sem evidência explícita de finalização.")
+                detail = "Finalização confirmada pelo serviço e registrada nesta execução."
                 stats["success"] += 1
                 total_success += 1
             else:
@@ -1487,7 +1488,8 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
             results.append({"email": email, "status": status, "detail": detail,
                             "session_id": identifier if isinstance(identifier, str) else None,
                             "confirmation": ("remote_ack" if status == "success" and raw_result.get("finalized") is True
-                                             else "legacy_record" if status == "success" else "not_confirmed"),
+                                             else "legacy_record" if status == "pending" and raw_result.get("finalized") is None
+                                             else "not_confirmed"),
                             "recovered": raw_result.get("recovered") is True})
         task = str(raw_item.get("task_name") or raw_item.get("task_scenario")
                    or raw_item.get("scenario") or f"Vídeo {index}")
@@ -2104,6 +2106,7 @@ def create_app() -> Flask:
     task_catalog = CatalogLoader()
     accelerator_catalog = CatalogLoader()
     recovery_catalog = CatalogLoader(ttl_s=2)
+    original_library_index = CatalogLoader(max_pending=1, timeout_s=180)
 
     @app.before_request
     def authenticate_local_client():
@@ -3066,6 +3069,65 @@ def create_app() -> Flask:
     def get_storage_library():
         return jsonify(_storage_snapshot(include_path=True))
 
+    def original_library_paths():
+        root = config.MEDIA_DATA_DIR / "ego4d"
+        return root, root / "library.sqlite3"
+
+    @app.get("/api/library/ego4d")
+    def get_original_library_summary():
+        root, index = original_library_paths()
+        try:
+            return jsonify(ego4d_library.library_summary(index, root))
+        except (OSError, ValueError, sqlite3.Error):
+            return jsonify({"state": "corrupt", "needs_index": True})
+
+    @app.post("/api/library/ego4d/index")
+    def index_original_library():
+        root, index = original_library_paths()
+        if not all((root / name).is_file() for name in ("ego4d.json", "clips.csv")):
+            return jsonify({"error": "Prepare o catálogo Ego4D em Integrações primeiro."}), 400
+        try:
+            current = ego4d_library.library_summary(index, root)
+            if not current.get("needs_index"):
+                return jsonify(current)
+        except (OSError, ValueError, sqlite3.Error):
+            pass
+        try:
+            sources = tuple((name, (root / name).stat().st_size, (root / name).stat().st_mtime_ns)
+                            for name in ("ego4d.json", "clips.csv", "timed_narrations.jsonl")
+                            if (root / name).is_file())
+        except OSError:
+            return jsonify({"error": "Não foi possível ler o catálogo local."}), 503
+        def build(progress):
+            try:
+                ego4d_library.index_library(root, index, progress=progress)
+                return ego4d_library.library_summary(index, root), 200
+            except (OSError, ValueError, sqlite3.Error):
+                return {"error": "Falha ao indexar os metadados; fontes e índice anterior preservados."}, 500
+        result, status = original_library_index.get((str(root), sources), build, scope="original-library")
+        return jsonify(result), status
+
+    @app.get("/api/library/ego4d/videos")
+    def browse_original_library():
+        root, index = original_library_paths()
+        try:
+            state = ego4d_library.library_summary(index, root)
+            if state.get("needs_index"):
+                return jsonify({"error": "Atualize o índice da biblioteca primeiro.", **state}), 409
+            minimum = float(request.args.get("min_s", 0))
+            maximum = request.args.get("max_s")
+            imu_filter = request.args.get("imu", "all")
+            if imu_filter not in {"all", "declared"}:
+                raise ValueError("Filtro de sensores inválido.")
+            result = ego4d_library.browse_library(index, request.args.get("q", ""), minimum_s=minimum,
+                maximum_s=float(maximum) if maximum else None, imu_only=imu_filter == "declared",
+                limit=int(request.args.get("limit", 50)), offset=int(request.args.get("offset", 0)))
+            return jsonify(result)
+        except (ValueError, sqlite3.OperationalError):
+            return jsonify({"error": "Filtros inválidos ou índice indisponível; atualize a biblioteca."}), 400
+        except (OSError, sqlite3.Error):
+            return jsonify({"error": "Não foi possível consultar a biblioteca local."}), 503
+
     @app.get("/api/health")
     def get_health():
         """Handshake leve: nunca abrir ferramentas, ler contas ou percorrer mídia."""
@@ -3536,10 +3598,8 @@ def create_app() -> Flask:
                     warnings.append(f"{refined_count} trecho(s) recortado(s) para evitar lacunas nos sensores. "
                                     "A prévia já usa essas durações; partes de vídeos já recebidos continuam excluídas.")
                 if target_hours > 0:
-                    available_seconds = {a.email: 0.0 for a in survivors}
-                    for row in clip_review:
-                        for email in row["eligible_accounts"]:
-                            available_seconds[email] += row["duration_s"]
+                    available_seconds = campaign_plan.available_seconds(
+                        clip_review, [a.email for a in survivors])
                     short = [value for value in available_seconds.values()
                              if value < target_hours * 3600]
                     if short:

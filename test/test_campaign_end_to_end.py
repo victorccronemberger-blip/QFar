@@ -133,6 +133,23 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(self.mark.call_count, 2)
         self.cleanup.assert_called_once()
 
+    def test_original_source_provenance_survives_local_history_and_progress(self):
+        origin = {'dataset': 'ego4d', 'recording_origin': 'third_party_dataset',
+                  'parent_video_uid': 'original-parent', 'window_s': [10.123, 310.123],
+                  'original_device': 'original-camera',
+                  'imu': {'processing': 'resampled_measured_signals', 'native_rate_hz': None}}
+        self.prepare.side_effect = lambda *a, **k: {
+            'duration_ms': 300000, 'video_path': str(self.root / 'fixture.mp4'),
+            'imu_real': True, 'source_provenance': origin}
+        with patch.object(self.instance, '_on_event', wraps=self.instance._on_event) as events:
+            response = self.client.post('/api/campaigns', json=self.body)
+            self.assertEqual(response.status_code, 200)
+            snapshot, history = self.finish()
+        self.assertEqual(history['items'][0]['source_provenance'], origin)
+        event = next(call.args[1] for call in events.call_args_list if call.args[0] == 'clip_ready')
+        self.assertEqual(event['source_provenance'], origin)
+        self.assertTrue(any(row['kind'] == 'clip_ready' for row in snapshot['events']))
+
     def test_campaign_waits_for_selected_account_recovery(self):
         with patch.object(server.recovery, "snapshot", return_value={"items": [{"email": self.emails[0]}]}):
             response = self.client.post("/api/campaigns", json=self.body)
@@ -167,6 +184,19 @@ class CampaignEndToEndTests(unittest.TestCase):
         warning = next(w for w in review["warnings"] if "Conteúdo novo insuficiente" in w)
         self.assertIn("2 conta(s)", warning)
         self.assertIn("0.00–0.08 h", warning)
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_preflight_does_not_use_overlapping_footage_to_claim_hours_capacity(self):
+        clips = [dict(clip_uid=uid, parent_video_uid="same-parent", source="ego4d",
+                      dur_s=300, window_s=window)
+                 for uid, window in (("one", [0, 300]), ("two", [150, 450]))]
+        with patch.object(campaign, "_compatible_task_clips", return_value=clips):
+            review = self.client.post("/api/campaigns/preflight", json={
+                **self.body, "include_clip_plan": True, "target_hours": 0.15}).get_json()
+        self.assertTrue(review["ok"], review)
+        warning = next(w for w in review["warnings"] if "Conteúdo novo insuficiente" in w)
+        self.assertIn("0.12–0.12 h", warning)
         self.prepare.assert_not_called()
         self.send.assert_not_called()
 
@@ -527,7 +557,7 @@ class CampaignEndToEndTests(unittest.TestCase):
                 entered.set()
                 if not release.wait(5):
                     raise RuntimeError("test release timeout")
-            return {"email": account.email, "ok": True}
+            return {"email": account.email, "ok": True, "finalized": True}
         self.send.side_effect = send
         self.client.post("/api/campaigns", json=self.body)
         try:
@@ -556,7 +586,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         barrier = threading.Barrier(2)
         def send(item, account, *args, **kwargs):
             barrier.wait(5)
-            return {"email": account.email, "ok": True}
+            return {"email": account.email, "ok": True, "finalized": True}
         self.send.side_effect = send
         self.mark.side_effect = [OSError("disk unavailable"), None]
         with patch.object(runner, "run_campaign", side_effect=lambda cfg, **kw: campaign.run_campaign(
@@ -609,6 +639,7 @@ class CampaignEndToEndTests(unittest.TestCase):
     def test_permanent_failure_is_not_retried_and_preserves_media(self):
         self.send.side_effect = lambda item, account, *a, **k: {
             "email": account.email, "ok": account.email == self.emails[0],
+            "finalized": account.email == self.emails[0],
             "error": "policy refused", "retryable": False}
         self.client.post("/api/campaigns", json=self.body)
         snap, log = self.finish()
@@ -642,7 +673,7 @@ class CampaignEndToEndTests(unittest.TestCase):
             entered.set()
             if not release.wait(5):
                 raise RuntimeError("test release timeout")
-            return {"email": account.email, "ok": True}
+            return {"email": account.email, "ok": True, "finalized": True}
         self.send.side_effect = send
         self.client.post("/api/campaigns", json=self.body)
         try:

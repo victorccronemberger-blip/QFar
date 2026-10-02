@@ -117,6 +117,7 @@ private:
   void setCampaignIndicator(const QString& title, const QString& detail, const QString& state, bool busy = false);
   void pollCampaignPreviews();
   void loadAccelerator();
+  void openEgoLibrary();
   void startAccelerator();
   void loadAccounts();
   QWidget* credentialCopyActions(const QString& email, bool hasPassword, bool banned = false);

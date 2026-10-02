@@ -1,4 +1,4 @@
-"""Read-only smoke of a built Windows service in fresh customer directories."""
+"""Isolated smoke of a built Windows service in fresh customer directories."""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +23,7 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
                    if not key.startswith(("QMONEY_", "MINUTE_", "AWS_", "HOSTINGER_", "EGO4D_", "CROWTADO_"))}
     environment.update(QMONEY_USER_ROOT=str(user_root), QMONEY_LIBRARY_ROOT=str(library),
                        QMONEY_RUNTIME_ROOT=str(service.parent), QMONEY_LOCAL_API_TOKEN=token,
-                       QMONEY_APP_VERSION=os.environ.get("QMONEY_VERSION", "2.0.25").lstrip("v"), MINUTE_VPN_ENFORCE="0",
+                       QMONEY_APP_VERSION=os.environ.get("QMONEY_VERSION", "2.0.26").lstrip("v"), MINUTE_VPN_ENFORCE="0",
                        MINUTE_REQUIRE_CURL="0", MINUTE_PUBLISH_APP_OPENED="0",
                        AWS_SHARED_CREDENTIALS_FILE=str(user_root / "secrets/aws/credentials"),
                        AWS_CONFIG_FILE=str(user_root / "secrets/aws/config"), AWS_EC2_METADATA_DISABLED="true")
@@ -34,9 +34,9 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def get(route, authenticated=True):
+    def get(route, authenticated=True, method='GET'):
         request = urllib.request.Request(f"http://127.0.0.1:{port}{route}",
-                    headers={"X-QMoney-Session": token} if authenticated else {})
+                    headers={"X-QMoney-Session": token} if authenticated else {}, method=method)
         with opener.open(request, timeout=3) as response:
             return json.load(response)
 
@@ -62,6 +62,27 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
         assert "fixture-private-token" not in json.dumps(accounts)
         assert get("/api/campaigns/current")["state"] == "idle"
         assert get("/api/recovery")["items"] == []
+        try:
+            get('/api/library/ego4d', authenticated=False)
+            raise AssertionError('Unauthenticated library request was accepted')
+        except urllib.error.HTTPError as error:
+            assert error.code == 401
+        # These two recordings exist only in the temporary fixture directory.
+        # Exercise SQLite/FTS in the frozen executable, not the source interpreter.
+        index_deadline = time.monotonic() + 15
+        while True:
+            state = get('/api/library/ego4d/index', method='POST')
+            if not state.get('loading'):
+                assert state['state'] == 'ready' and state['videos'] == 2
+                break
+            if time.monotonic() >= index_deadline:
+                raise RuntimeError('Packaged original library index did not finish')
+            time.sleep(.1)
+        results = get('/api/library/ego4d/videos?q=soup&min_s=300')
+        assert results['provenance'] == 'ego4d_original' and results['total'] == 1
+        assert results['items'][0]['duration_s'] == 600.123
+        assert results['items'][0]['has_imu'] is None
+        assert results['items'][0]['imu_local'] is False
     finally:
         # Target only the process tree created above, including the onefile child.
         if process.poll() is None:
@@ -85,6 +106,16 @@ def main() -> None:
         (library / "secrets").mkdir(parents=True)
         (library / "secrets/token_foreign.json").write_text(json.dumps({"email": "foreign@example.invalid"}), encoding="utf-8")
         (library / ".env").write_text("HOSTINGER_MAIL_TOKEN=foreign-library-secret", encoding="utf-8")
+        ego = library / 'data/ego4d'
+        ego.mkdir(parents=True)
+        (ego / 'ego4d.json').write_text(json.dumps({'videos': [
+            {'video_uid': 'fixture-original-1', 'duration_sec': 600.123, 'scenarios': ['Cooking']},
+            {'video_uid': 'fixture-original-2', 'duration_sec': 90, 'has_imu': False},
+        ]}), encoding='utf-8')
+        (ego / 'clips.csv').write_text('exported_clip_uid,parent_video_uid,parent_start_sec,parent_end_sec\n'
+                                      'fixture-clip,fixture-original-1,10,310\n', encoding='utf-8')
+        (ego / 'timed_narrations.jsonl').write_text(json.dumps({
+            'video_uid': 'fixture-original-1', 'events': [[20, '#C stirs soup']]}), encoding='utf-8')
         customer = root / "customer-a"
         probe(service, customer, library, [])
         credentials = customer / "secrets/token_fixture.json"
@@ -95,7 +126,8 @@ def main() -> None:
         probe(service, root / "customer-b", library, [])
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"passed": True, "checks": ["fresh_installation", "restart_preserves_credentials",
-        "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started"]}, indent=2), encoding="utf-8")
+        "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started",
+        "original_library_index_and_fts", "original_duration_and_unknown_sensor_state"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 
 

@@ -65,6 +65,8 @@ class CampaignProgressTests(unittest.TestCase):
         for _ in range(100):
             instance._on_event("account_done", {"ok": True, "skipped": True})
         instance._on_event("account_done", {"ok": True, "finalized": False, "credited_seconds": 3600})
+        instance._on_event("account_done", {"ok": True, "credited_seconds": 3600})
+        instance._on_event("account_done", {"ok": True, "finalized": None, "credited_seconds": 3600})
         self.assertEqual(instance.snapshot()["totals"]["progress_completed"], 0)
         event = {"email": "a@example.com", "task": "task", "clip_uid": "new",
                  "ok": True, "finalized": True, "credited_seconds": 4000}

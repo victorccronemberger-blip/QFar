@@ -189,6 +189,7 @@ class RecoveryViewTests(unittest.TestCase):
                    "finalized": False, "finalize_requested": True, "upload_id": "existing-upload"})
         session = Mock(email="one@example.com")
         with patch.object(recovery.campaign.Session, "from_email", return_value=session), \
+             patch.object(upload, "evaluate_upload", return_value={"checks": [{"status": "pass"}]}), \
              patch.object(upload, "_finalize_session", return_value=(True, 200)) as finalize, \
              patch.object(upload, "upload_session") as new_upload:
             result = recovery.resume_account("one@example.com", lambda email: "org")
