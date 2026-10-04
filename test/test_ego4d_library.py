@@ -80,6 +80,12 @@ class OriginalLibraryTests(unittest.TestCase):
             root = Path(folder)
             native = root / 'native.mp4'
             native.write_bytes(b'fixture')
+            # Declared bytes/CSV make the new lineage checks meaningful; all
+            # acquisition/encoder/probe boundaries remain inert in this test.
+            (root / 'c1.mp4').write_bytes(b'declared original fixture')
+            (root / 'imu.csv').write_text(
+                'canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z\n'
+                '0,1,2,3,4,5,6\n300000,1,2,3,4,5,6\n', encoding='utf-8')
             clip = {'exported_clip_uid': 'c1', 'parent_video_uid': 'v1',
                     'parent_start_sec': '0', 'parent_end_sec': '300'}
             with patch.object(campaign.ego4d, 'imu_window_is_covered', return_value=True), \
@@ -117,6 +123,10 @@ class OriginalLibraryTests(unittest.TestCase):
             root = Path(folder)
             native = root / 'native.mp4'
             native.write_bytes(b'fixture')
+            (root / 'c1.mp4').write_bytes(b'declared original fixture')
+            (root / 'v1_imu.csv').write_text(
+                'canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z\n'
+                '10123,1,2,3,4,5,6\n310123,1,2,3,4,5,6\n', encoding='utf-8')
             clip = {'exported_clip_uid': 'c1', 'parent_video_uid': 'v1',
                     'parent_start_sec': '10.123', 'parent_end_sec': '310.123'}
             video = {'video_uid': 'v1', 'device': 'original-camera', 'has_imu': True}
@@ -124,7 +134,8 @@ class OriginalLibraryTests(unittest.TestCase):
             with patch.object(campaign.ego4d, 'imu_window_is_covered', return_value=True), \
                  patch.object(campaign.ego4d, 'download_imu', return_value=root / 'v1_imu.csv'), \
                  patch.object(campaign.ego4d, 'download_clip'), \
-                 patch.object(campaign.ego4d, 'build_imu_csv', return_value='measured-fixture'), \
+                 patch.object(campaign.ego4d, 'build_imu_csv', return_value=
+                    't,ax,ay,az,wx,wy,wz\n0,4,5,6,1,2,3\n300000000000,4,5,6,1,2,3\n'), \
                  patch.object(campaign, '_normalize_video', return_value=native), \
                  patch.object(campaign, 'probe_video', return_value={'duration_ms': 300000, 'fps': 30}):
                 item = campaign.prepare_clip(clip, video, root)

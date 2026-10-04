@@ -11,16 +11,24 @@ Separação de responsabilidades:
     (`t,ax,ay,az,wx,wy,wz` em 500 Hz).
 
 Requisitos:
-  - Credenciais AWS do Ego4D em `~/.aws/credentials` (profile `default`) com
-    permissão de `GetObject` (NÃO `ListObjects`).
+  - Credenciais AWS autorizadas para o perfil Ego4D configurado, com permissão
+    de `GetObject`; catálogo e mídia são consultados por chaves explícitas.
   - boto3 (opcional; só é exigido ao usar as funções de S3).
 
-A IMU real do Ego4D é o que destrava o catbear: fisicamente coerente com o vídeo
-(gravado pelo mesmo dispositivo), ao contrário da sintética (`build_imu_csv`).
+O CSV fornecido pelo Ego4D contém sinais medidos no relógio canônico do vídeo.
+A grade de saída em 500 Hz identifica a reamostragem feita aqui; a frequência
+original deve ser medida no arquivo de origem. Cobertura parcial, timestamps
+não monotônicos e viés sem calibração são limitações documentadas do dataset.
+Continuidade local e correspondência de janelas são verificações de consistência;
+captura física e aceitação por outro serviço exigem evidência própria.
+
+Referências oficiais: https://ego4d-data.org/docs/data/imu/
+                      https://ego4d-data.org/docs/data/videos/
 """
 from __future__ import annotations
 
 import configparser
+import contextvars
 import csv
 import hashlib
 import hmac
@@ -37,8 +45,9 @@ import uuid
 from array import array
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
@@ -64,23 +73,106 @@ KNOWN_INCOMPLETE_IMU_VIDEO_UIDS = frozenset({
 })
 
 
+_SELECTION_SNAPSHOT = contextvars.ContextVar("ego4d_selection_snapshot", default=None)
+_SELECTION_VERSION = "ego4d-selection-content-v2"
+
+
+@contextmanager
+def selection_operation(*, fresh: bool = False):
+    """Bind bytes read and parsed once per operation; effect gates use fresh=True."""
+    current = _SELECTION_SNAPSHOT.get()
+    if current is not None and not fresh:
+        yield current
+        return
+    snapshot = {}
+    token = _SELECTION_SNAPSHOT.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _SELECTION_SNAPSHOT.reset(token)
+
+
+def selection_boundary(function):
+    @wraps(function)
+    def bound(*args, **kwargs):
+        with selection_operation():
+            return function(*args, **kwargs)
+    return bound
+
+
+def _selection_rank_boundary(function):
+    @wraps(function)
+    def bound(*args, **kwargs):
+        with selection_operation():
+            result = function(*args, **kwargs)
+            return {name: [attach_selection_evidence(clip, name) for clip in clips]
+                    for name, clips in result.items()}
+    return bound
+
+
+def _selection_task_boundary(function):
+    @wraps(function)
+    def bound(*args, **kwargs):
+        with selection_operation():
+            name = args[0] if args else kwargs["task_name"]
+            return [attach_selection_evidence(clip, name) for clip in function(*args, **kwargs)]
+    return bound
+
+
+def _selection_source(path: Path) -> tuple[bytes | None, int, str]:
+    """Hash the exact immutable bytes used by parsers, never a separate reread."""
+    path = Path(path)
+    # Lexical absolute identity avoids a filesystem resolution for every clip.
+    key = str(path.absolute())
+    snapshot = _SELECTION_SNAPSHOT.get()
+    if snapshot is not None and key in snapshot:
+        return snapshot[key]
+    try:
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read()
+            after = os.fstat(stream.fileno())
+        final = path.stat()
+        identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if identity(before) != identity(after) or identity(after) != identity(final) or len(raw) != after.st_size:
+            raise ValueError("Ego4D selection source changed while reading")
+        result = (raw, len(raw), hashlib.sha256(raw).hexdigest())
+    except FileNotFoundError:
+        result = (None, 0, "missing")
+    if snapshot is not None:
+        snapshot[key] = result
+    return result
+
+
+def _selection_rank_seed(path: Path) -> None:
+    """Bind the actual portable seed used by this ranking boundary."""
+    snapshot = _SELECTION_SNAPSHOT.get()
+    if snapshot is not None:
+        snapshot["@rank_seed_path"] = Path(path)
+
+
 @lru_cache(maxsize=2)
-def _action_index_cached(path: str, mtime_ns: int, size: int) -> dict[str, str]:
+def _action_bytes_cached(raw: bytes | None) -> dict[str, str]:
     """Metadados temporizados de ações Ego4D, indexados por clipe."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(raw) if raw is not None else {}
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
         return {}
     return {str(uid): str(text) for uid, text in data.items() if text}
 
 
+def _action_index_cached(path: str, mtime_ns: int = 0, size: int = 0) -> dict[str, str]:
+    return _action_bytes_cached(_selection_source(Path(path))[0])
+
+
+_action_index_cached.cache_clear = _action_bytes_cached.cache_clear
+
+
 def _action_index() -> dict[str, str]:
     path = EGO4D_DIR / "clip_narrations.json"
-    try:
-        stat = path.stat()
-    except OSError:
-        return {}
-    return _action_index_cached(str(path), stat.st_mtime_ns, stat.st_size)
+    return _action_index_cached(str(path))
 
 
 def _action_units(text: str) -> list[str]:
@@ -478,14 +570,11 @@ class _Catalog(NamedTuple):
 
 
 @lru_cache(maxsize=2)
-def _catalog(meta_path: str, clips_path: str,
-             meta_mtime: float, clips_mtime: float) -> _Catalog:
-    """Índice único do Ego4D (JSON grande). Chave inclui mtime p/ invalidar."""
-    with open(meta_path, encoding="utf-8") as f:
-        meta = json.load(f)
+def _catalog_bytes_cached(meta_raw: bytes, clips_raw: bytes) -> _Catalog:
+    """Content-keyed index of the same bytes bound by selection_operation."""
+    meta = json.loads(meta_raw)
     videos = {v["video_uid"]: v for v in meta["videos"]}
-    with open(clips_path, encoding="utf-8") as f:
-        clips = tuple(csv.DictReader(f))
+    clips = tuple(csv.DictReader(io.StringIO(clips_raw.decode("utf-8"))))
     by_uid: dict[str, dict[str, Any]] = {}
     grouped: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
     for row in clips:
@@ -508,12 +597,26 @@ def _catalog(meta_path: str, clips_path: str,
     )
 
 
+def _catalog(meta_path: str, clips_path: str,
+             meta_mtime: float = 0, clips_mtime: float = 0) -> _Catalog:
+    with selection_operation():
+        meta_raw = _selection_source(Path(meta_path))[0]
+        clips_raw = _selection_source(Path(clips_path))[0]
+        if meta_raw is None or clips_raw is None:
+            raise ValueError("Ego4D selection catalog unavailable")
+        result = _catalog_bytes_cached(meta_raw, clips_raw)
+        _SELECTION_SNAPSHOT.get()["@catalog_paths"] = (meta_path, clips_path)
+        return result
+
+
+_catalog.cache_clear = _catalog_bytes_cached.cache_clear
+
+
 def _cat() -> _Catalog:
-    meta_path, clips_path = sync_meta()
-    return _catalog(
-        str(meta_path), str(clips_path),
-        meta_path.stat().st_mtime, clips_path.stat().st_mtime,
-    )
+    snapshot = _SELECTION_SNAPSHOT.get() or {}
+    bound = snapshot.get("@catalog_paths")
+    meta_path, clips_path = bound if bound is not None else sync_meta()
+    return _catalog(str(meta_path), str(clips_path))
 
 
 def _load() -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
@@ -648,6 +751,7 @@ def humanize_window(
     return ns, ne
 
 
+@selection_boundary
 def find_clip(clip_uid: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Localiza um clipe pelo uid. Devolve (linha_clip, metadados_do_video_pai)."""
     cat = _cat()
@@ -748,6 +852,7 @@ def _passes_filter(
     return True
 
 
+@selection_boundary
 def count_clips(
     *,
     scenario: str | None = None,
@@ -766,6 +871,7 @@ def count_clips(
     return n
 
 
+@selection_boundary
 def list_clips(
     *,
     scenario: str | None = None,
@@ -832,14 +938,13 @@ def has_timed_narrations() -> bool:
 
 
 @lru_cache(maxsize=2)
-def _load_timed_narrations_cached(
-    path_str: str, mtime_ns: int, size: int,
+def _timed_bytes_cached(
+    raw: bytes | None,
 ) -> dict[str, tuple[tuple[float, str], ...]]:
     """Narrações com timestamp por vídeo-pai (jsonl). Vazio se o índice não existe."""
-    path = Path(path_str)
     out: dict[str, tuple[tuple[float, str], ...]] = {}
     try:
-        with path.open(encoding="utf-8") as fh:
+        with io.StringIO(raw.decode("utf-8") if raw is not None else "") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -882,19 +987,21 @@ def _load_timed_narrations_cached(
                         deduped.append((when, text))
                     if deduped:
                         out[uid] = tuple(deduped)
-    except OSError:
+    except (UnicodeError, ValueError):
         return {}
     return out
 
 
+def _load_timed_narrations_cached(path_str: str, mtime_ns: int = 0, size: int = 0):
+    return _timed_bytes_cached(_selection_source(Path(path_str))[0])
+
+
+_load_timed_narrations_cached.cache_clear = _timed_bytes_cached.cache_clear
+
+
 def load_timed_narrations() -> dict[str, tuple[tuple[float, str], ...]]:
     path = timed_narrations_path()
-    try:
-        stat = path.stat()
-    except OSError:
-        return {}
-    return _load_timed_narrations_cached(
-        str(path), stat.st_mtime_ns, stat.st_size)
+    return _load_timed_narrations_cached(str(path))
 
 
 def _best_media_source(
@@ -1048,6 +1155,7 @@ def _span_record(video: dict[str, Any], span: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_selection_task_boundary
 def list_task_spans(
     task_name: str,
     *,
@@ -1211,8 +1319,8 @@ def _narration_evidence_for_video(
             for span in task_matching.extract_spans(
                     rule, (), min_s=minimum, max_s=max_dur_s, pad_s=0,
                     video_duration_s=min(end, duration) if duration > 0 else end,
-                    prepared_events=prepared[first:last], task_name=name,
-                    event_task_names=labels[first:last],
+                    prepared_events=prepared[first:last], activity_mode=True,
+                    task_name=name, event_task_names=labels[first:last],
                     competing_task_names=rivals):
                 if not imu_window_is_covered(video, (span["start"], span["end"])):
                     continue
@@ -1223,6 +1331,7 @@ def _narration_evidence_for_video(
     return found
 
 
+@_selection_rank_boundary
 def narration_evidence_clips(
     *,
     min_dur_s: float = WINDOW_MIN_S,
@@ -1261,6 +1370,7 @@ def narration_evidence_clips(
     return buckets
 
 
+@_selection_rank_boundary
 def rank_all_task_spans(
     *,
     min_dur_s: float = WINDOW_MIN_S,
@@ -1386,6 +1496,7 @@ def rank_all_task_spans(
     return buckets
 
 
+@_selection_rank_boundary
 def revalidate_task_windows(
     candidates: dict[str, list[dict[str, Any]] | tuple[dict[str, Any], ...]],
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1472,6 +1583,136 @@ def revalidate_task_windows(
     return dict(result)
 
 
+def _selection_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _selection_candidate(clip: dict[str, Any]) -> dict[str, Any]:
+    window = clip.get("window_s")
+    if window is None and "parent_start_sec" in clip and "parent_end_sec" in clip:
+        window = [clip["parent_start_sec"], clip["parent_end_sec"]]
+    if isinstance(window, (tuple, list)) and len(window) == 2:
+        window = [float(value) for value in window]
+        if not all(math.isfinite(value) for value in window) or window[0] < 0 or window[1] <= window[0]:
+            raise ValueError("Ego4D selection window invalid")
+    else:
+        window = None  # A portable suggestion without a window cannot pass the effect gate.
+    uid = str(clip.get("clip_uid") or clip.get("exported_clip_uid") or "")
+    needs_cut = bool(clip.get("needs_cut"))
+    # Exported MP4 begins at its canonical window start. Parent media begins
+    # at zero unless a generated candidate explicitly selects an exported source.
+    default_offset = window[0] if window is not None and not needs_cut else 0
+    offset = float(clip.get("media_time_offset_s", default_offset) or 0)
+    if not math.isfinite(offset) or offset < 0:
+        raise ValueError("Ego4D selection media offset invalid")
+    parent = str(clip.get("parent_video_uid") or "")
+    duration = float(clip.get("dur_s", window[1] - window[0] if window is not None else 0) or 0)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("Ego4D selection duration invalid")
+    return {"clip_uid": uid, "parent_video_uid": parent,
+            "media_uid": str(clip.get("media_uid") or (parent if needs_cut else uid)), "media_time_offset_s": offset,
+            "window_s": window, "needs_cut": needs_cut,
+            "dur_s": duration, "source": str(clip.get("source") or "ego4d"),
+            "source_s3_sha256": hashlib.sha256(str(clip.get("s3_path") or "").encode("utf-8")).hexdigest()}
+
+
+def _selection_bindings() -> dict[str, dict[str, Any]]:
+    from . import task_matching
+    snapshot = _SELECTION_SNAPSHOT.get() or {}
+    seed = snapshot.get("@rank_seed_path", Path(__file__).with_name("resources") / "ego4d_task_rank_seed.json.gz")
+    cache_key = "@bindings:" + str(seed.absolute())
+    if cache_key in snapshot:
+        return snapshot[cache_key]
+    paths = {"catalog": EGO4D_DIR / "ego4d.json", "clips": EGO4D_DIR / "clips.csv",
+             "actions": EGO4D_DIR / "clip_narrations.json", "timed": timed_narrations_path(),
+             "rules_source": Path(task_matching.__file__), "algorithm_source": Path(__file__),
+             "rank_seed": seed}
+    result = {name: {"name": path.name, "bytes": source[1], "sha256": source[2]}
+              for name, path in paths.items() for source in [_selection_source(path)]}
+    if _SELECTION_SNAPSHOT.get() is not None:
+        _SELECTION_SNAPSHOT.get()[cache_key] = result
+    return result
+
+
+@selection_boundary
+def attach_selection_evidence(clip: dict[str, Any], task_name: str, *,
+                              task_id: str | None = None, registry_key: str | None = None) -> dict[str, Any]:
+    """Attach declared selection provenance, not physical or provider acceptance."""
+    from . import task_matching
+    name = task_matching.canonical_task_name(task_name)
+    rule = task_matching.rule_for(name)
+    evidence = {"schema": 1, "algorithm_version": _SELECTION_VERSION,
+                "task": {"name": name, "id": task_id, "registry_key": registry_key,
+                         "rule_sha256": _selection_digest(vars(rule) if rule is not None else None)},
+                "bindings": _selection_bindings(), "candidate": _selection_candidate(clip),
+                "justification": {"status": "declared_selection", "action_gate": "camera_wearer_task_rule",
+                                  "window_gate": "catalog_or_current_timed_annotation_and_imu_coverage",
+                                  "match_confidence": str(clip.get("match_confidence") or "unvalidated")},
+                "physical_provenance_verified": False}
+    evidence["evidence_sha256"] = _selection_digest(evidence)
+    return {**clip, "selection_evidence": evidence}
+
+
+def revalidate_selection_evidence(clip: dict[str, Any], *, task_name: str | None = None,
+                                  task_id: str | None = None, registry_key: str | None = None) -> dict[str, Any]:
+    """Fresh before-effects gate: verify identity and actual current task evidence."""
+    from . import task_matching
+    error = "Ego4D selection changed or lacks current task evidence"
+    try:
+        saved = clip.get("selection_evidence")
+        if not isinstance(saved, dict) or saved.get("schema") != 1:
+            raise ValueError(error)
+        unsigned = {key: value for key, value in saved.items() if key != "evidence_sha256"}
+        if saved.get("evidence_sha256") != _selection_digest(unsigned):
+            raise ValueError(error)
+        task = saved["task"]
+        name = task_matching.canonical_task_name(task["name"])
+        if task_name is not None and task_matching.canonical_task_name(task_name) != name:
+            raise ValueError(error)
+        for key, value in (("id", task_id), ("registry_key", registry_key)):
+            if value is not None and (not isinstance(value, str) or not value.strip()
+                                      or task.get(key) not in (None, value)):
+                raise ValueError(error)
+        candidate = _selection_candidate(clip)
+        if candidate != saved["candidate"] or candidate["window_s"] is None:
+            raise ValueError(error)
+        with selection_operation(fresh=True):
+            current = attach_selection_evidence(clip, name)["selection_evidence"]
+            if (saved.get("algorithm_version") != current["algorithm_version"]
+                    or saved["bindings"] != current["bindings"]
+                    or task.get("rule_sha256") != current["task"]["rule_sha256"]):
+                raise ValueError(error)
+            if any(current["bindings"][key]["sha256"] == "missing" for key in ("catalog", "clips")):
+                raise ValueError(error)
+            # Effect gates only read local bound bytes; sync_meta can download.
+            cat = _catalog(str(EGO4D_DIR / "ego4d.json"), str(EGO4D_DIR / "clips.csv"))
+            parent = cat.videos.get(candidate["parent_video_uid"])
+            if not parent or parent.get("has_imu") is not True or not imu_window_is_covered(parent, tuple(candidate["window_s"])):
+                raise ValueError(error)
+            official = cat.by_uid.get(candidate["clip_uid"])
+            valid = False
+            if official is not None:
+                actual = _clip_record(official, parent)
+                if (_selection_candidate(actual) == candidate
+                        and task_matching.ranked_clips(name, [actual])):
+                    valid = True
+            if not valid:
+                checked = revalidate_task_windows({name: [clip]}).get(name, ())
+                valid = any(_selection_candidate(item) == candidate for item in checked)
+            if not valid:
+                raise ValueError(error)
+            result = json.loads(json.dumps(saved))
+            for key, value in (("id", task_id), ("registry_key", registry_key)):
+                if value is not None:
+                    result["task"][key] = value
+            result["justification"]["status"] = "locally_revalidated"
+            result["evidence_sha256"] = _selection_digest({key: value for key, value in result.items() if key != "evidence_sha256"})
+            return result
+    except (KeyError, TypeError, OSError, ValueError, OverflowError) as exc:
+        raise ValueError(error) from exc
+
+
 def _narration_for_window(parent_uid: str, start: float, end: float) -> str:
     """Junta as anotações dos clipes oficiais que cruzam a janela."""
     parts: list[str] = []
@@ -1484,6 +1725,7 @@ def _narration_for_window(parent_uid: str, start: float, end: float) -> str:
     return " ".join(parts)
 
 
+@selection_boundary
 def list_windows(
     *,
     min_dur_s: float = WINDOW_MIN_S,

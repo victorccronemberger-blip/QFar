@@ -659,6 +659,15 @@ _PHONE_CAM_RE = re.compile(
 _WATCH_RE = re.compile(
     r"\bwatch(?:es|ing)? tv\b|\bwatching television\b", re.I)
 _ACTOR_RE = re.compile(r"#\s*([co])\b", re.I)
+# Verbo de outra atividade. Continua na conta da prova e pode derrubar o título.
+_FOREIGN_ACTIVITY_RE = re.compile(
+    r"\b(?:walk(?:s|ing)?|runs?|running|plays?|playing|cook(?:s|ing)?|"
+    r"eats?|eating|drinks?|drinking|reads?|reading|writes?|writing|"
+    r"drives?|driving|talks?|talking|speaks?|speaking|wash(?:es|ing)?|"
+    r"cleans?|cleaning|cuts?|cutting|paints?|painting|sews?|sewing|"
+    r"types?|typing|swims?|swimming|cycles?|cycling)\b",
+    re.I,
+)
 
 
 def _camera_wearer_segments(text: str) -> list[str]:
@@ -786,16 +795,21 @@ ON_TASK_RATIO_UNITS = 10
 SPAN_MIN_RATIO = 0.75
 SPAN_MAX_GAP_S = 15.0
 SPAN_PAD_S = 2.0
+# Folga do núcleo denso que autoriza estender um clipe de dez minutos.
 ACTIVITY_TARGET_MAX_GAP_S = 30.0
 LONG_ACTIVITY_MIN_S = 300.0
 LONG_ACTIVITY_CONTEXT_MIN_S = 600.0
 # Explicit human scene labels can support five-minute windows. They do not
 # require the ten-minute threshold used for expanding sparse action evidence.
 SCENARIO_ACTIVITY_MIN_S = 300.0
-LONG_ACTIVITY_ROW_MAX_GAP_S = 120.0
+# Duas falas que já provam a ação podem ficar até três minutos distantes.
 LONG_ACTIVITY_TARGET_MAX_GAP_S = 180.0
 LONG_ACTIVITY_CONTEXT_S = 300.0
 SCENARIO_BOUNDARY_BUFFER_S = 60.0
+# Outra atividade narrada sem pausa por um minuto encerra o take.
+# Um verbo isolado no meio da prova não encerra.
+FOREIGN_ACTIVITY_BURST_S = 60.0
+FOREIGN_ACTIVITY_BURST_GAP_S = 20.0
 
 
 # Relações pai/filho: uma evidência da tarefa ampla não é concorrência para a
@@ -868,14 +882,13 @@ def _activity_spans(
     max_gap_s: float,
     video_duration_s: float | None,
     allowed_intervals: Iterable[tuple[float, float]] | None = None,
+    strict_gaps: bool = False,
 ) -> list[dict[str, Any]]:
     """Isola sessões contínuas entre evidências recorrentes da mesma tarefa.
 
-    Narrações Ego4D não têm cadência fixa. Para pedidos de cinco minutos ou
-    mais, uma pausa sem anotação não pode ser confundida automaticamente com
-    troca de atividade. O modo longo tolera lacunas neutras maiores, mas os
-    limites de higiene e qualquer tarefa concorrente continuam encerrando o
-    trecho imediatamente.
+    A fala que já prova a ação pode ficar até três minutos da próxima. O
+    silêncio nesse intervalo continua a mesma tarefa. Higiene, exclusão e
+    tarefa concorrente continuam encerrando o trecho imediatamente.
     """
     if allowed_intervals is not None:
         # Recorte ANTES de procurar a maior sessão. Se o IMU termina no meio
@@ -903,12 +916,12 @@ def _activity_spans(
                     if start <= t <= end]
             for span in _activity_spans(
                     rule, rows, min_s=min_s, max_s=max_s, max_gap_s=max_gap_s,
-                    video_duration_s=end - start, allowed_intervals=None):
+                    video_duration_s=end - start, allowed_intervals=None,
+                    strict_gaps=strict_gaps):
                 covered.append({**span, "start": span["start"] + start,
                                 "end": span["end"] + start})
         return covered
 
-    long_mode = min_s >= LONG_ACTIVITY_MIN_S
     strict_cores: list[dict[str, Any]] = []
     expand_context = min_s >= LONG_ACTIVITY_CONTEXT_MIN_S
     if expand_context:
@@ -922,14 +935,17 @@ def _activity_spans(
             max_gap_s=max_gap_s,
             video_duration_s=video_duration_s,
             allowed_intervals=None,
+            strict_gaps=True,
         )
 
-    row_gap_limit = max_gap_s
-    target_gap_limit = ACTIVITY_TARGET_MAX_GAP_S
-    if long_mode:
-        row_gap_limit = max(row_gap_limit, LONG_ACTIVITY_ROW_MAX_GAP_S)
-        target_gap_limit = max(
-            target_gap_limit, LONG_ACTIVITY_TARGET_MAX_GAP_S)
+    # O núcleo que autoriza estender o clipe continua denso. O clipe normal
+    # usa a mesma folga de três minutos em qualquer duração de 1 a 30 min.
+    if strict_gaps:
+        row_gap_limit = max_gap_s
+        target_gap_limit = ACTIVITY_TARGET_MAX_GAP_S
+    else:
+        row_gap_limit = LONG_ACTIVITY_TARGET_MAX_GAP_S
+        target_gap_limit = LONG_ACTIVITY_TARGET_MAX_GAP_S
     target_runs: list[list[int]] = []
     current: list[int] = []
     previous_row: int | None = None
@@ -944,8 +960,11 @@ def _activity_spans(
                 target_runs.append(current)
             current = []
             previous_target = None
-            previous_row = idx
-            continue
+            # A higiene ou outra tarefa não inicia o próximo take. A fala que
+            # só chegou depois da folga continua sendo prova da ação.
+            if boundary or not on_task:
+                previous_row = idx
+                continue
         if on_task:
             target_gap = (
                 t - flagged[previous_target][0]
@@ -955,6 +974,13 @@ def _activity_spans(
                     and target_gap > target_gap_limit):
                 if current:
                     target_runs.append(current)
+                current = []
+            elif (previous_target is not None and current
+                    and _sustained_foreign_activity(
+                        flagged, previous_target, idx)):
+                # Um minuto seguido de outra atividade não entra no título,
+                # mesmo quando a prova dos dois lados ainda passaria junta.
+                target_runs.append(current)
                 current = []
             current.append(idx)
             previous_target = idx
@@ -966,40 +992,27 @@ def _activity_spans(
     for targets in target_runs:
         cursor = 0
         while cursor < len(targets):
+            chosen = _longest_proven_target(
+                rule, flagged, targets, cursor, min_s, max_s)
+            if chosen is None:
+                cursor += 1
+                continue
+            pos, score, units = chosen
             a = targets[cursor]
-            best_pos: int | None = None
-            pos = cursor
-            while pos < len(targets):
-                b = targets[pos]
-                duration = flagged[b][0] - flagged[a][0]
-                if duration > max_s + 1e-6:
-                    break
-                if duration >= min_s:
-                    best_pos = pos
-                pos += 1
-            if best_pos is None:
-                break
-            b = targets[best_pos]
+            b = targets[pos]
             start = max(0.0, flagged[a][0])
             end = flagged[b][0]
             if video_duration_s:
                 end = min(end, float(video_duration_s))
-            units = [
-                normed for _t, _text, normed, _on, _boundary
-                in flagged[a:b + 1] if normed
-            ]
-            text = " ".join(units)
-            score = score_action(rule, text, units)
-            if score is not None:
-                spans.append({
-                    "start": start,
-                    "end": end,
-                    "action_text": text,
-                    "action_units": units,
-                    "match_score": score,
-                    "n_events": b - a + 1,
-                })
-            cursor = best_pos + 1
+            spans.append({
+                "start": start,
+                "end": end,
+                "action_text": " ".join(units),
+                "action_units": units,
+                "match_score": score,
+                "n_events": b - a + 1,
+            })
+            cursor = pos + 1
 
     if expand_context:
         # Um núcleo verificado de alguns minutos pode estar dentro de uma
@@ -1148,6 +1161,160 @@ def _unit_on_task(segment: str, rule: TaskRule) -> bool:
         _evidence_group_present(segment, group)
         for group in rule.evidence
     ) >= required
+
+
+def _sustained_foreign_activity(
+    flagged: list[tuple[float, str, str, bool, bool]],
+    left: int,
+    right: int,
+) -> bool:
+    """Verdadeiro quando outra atividade ocupa um minuto entre duas provas."""
+    burst_start: float | None = None
+    last_t: float | None = None
+    for index in range(left + 1, right):
+        t, _text, normed, on_task, boundary = flagged[index]
+        foreign = (
+            not on_task and not boundary and bool(normed)
+            and _FOREIGN_ACTIVITY_RE.search(normed) is not None
+        )
+        if not foreign:
+            burst_start = None
+            last_t = None
+            continue
+        if (burst_start is None or last_t is None
+                or t - last_t > FOREIGN_ACTIVITY_BURST_GAP_S):
+            burst_start = t
+        last_t = t
+        if t - burst_start >= FOREIGN_ACTIVITY_BURST_S:
+            return True
+    return False
+
+
+def _kept_clears_on_task_gate(segments: list[str], rule: TaskRule) -> bool:
+    """O mesmo piso de proporção de score_action, sem recontar a evidência."""
+    if not segments:
+        return False
+    flags = [_unit_on_task(segment, rule) for segment in segments]
+    on_task = sum(flags)
+    count = len(flags)
+    if count >= ON_TASK_RATIO_UNITS:
+        return (_longest_true_run(flags) >= ON_TASK_MIN_STREAK
+                or on_task / count >= ON_TASK_MIN_RATIO)
+    return on_task >= max(1, (count + 1) // 2)
+
+
+def _is_activity_filler(normed: str, rule: TaskRule) -> bool:
+    """Fala que não prova esta tarefa nem descreve outra atividade.
+
+    "Olha em volta" entre duas provas não muda o título. "Caminha" ou
+    "lava" continuam na conta, para um passeio não virar jardinagem.
+    """
+    if not normed or _unit_on_task(normed, rule):
+        return False
+    if any(_evidence_group_present(normed, group) for group in rule.evidence):
+        return False
+    return _FOREIGN_ACTIVITY_RE.search(normed) is None
+
+
+def _activity_span_score(
+    rule: TaskRule, rows: list[tuple[float, str, str, bool, bool]],
+) -> tuple[int | None, list[str]]:
+    """Prova o trecho sem deixar ruído de câmera apagar a ação."""
+    full = [row[2] for row in rows if row[2]]
+    if not full:
+        return None, full
+    full_text = " ".join(full)
+    if any(_term_in(full_text, term) for term in rule.action_excluded):
+        return None, full
+    kept = [unit for unit in full if not _is_activity_filler(unit, rule)]
+    if not kept or not _kept_clears_on_task_gate(kept, rule):
+        return None, full
+    return score_action(rule, " ".join(kept), kept), full
+
+
+def _longest_proven_target(
+    rule: TaskRule,
+    flagged: list[tuple[float, str, str, bool, bool]],
+    targets: list[int],
+    origin: int,
+    min_s: float,
+    max_s: float,
+) -> tuple[int, int, list[str]] | None:
+    """O maior fim que ainda passa na prova. Se o trecho cheio falha, o miolo fica."""
+    start = flagged[targets[origin]][0]
+    hi: int | None = None
+    for pos in range(len(targets) - 1, origin - 1, -1):
+        duration = flagged[targets[pos]][0] - start
+        if duration > max_s + 1e-6:
+            continue
+        hi = pos
+        break
+    if hi is None or flagged[targets[hi]][0] - start < min_s:
+        return None
+    score, units = _activity_span_score(
+        rule, flagged[targets[origin]:targets[hi] + 1])
+    if score is not None:
+        return hi, score, units
+
+    left = targets[origin]
+    limit = targets[hi]
+    for index in range(left, limit + 1):
+        normed = flagged[index][2]
+        if normed and any(_term_in(normed, term) for term in rule.action_excluded):
+            limit = index - 1
+            break
+    while hi > origin and targets[hi] > limit:
+        hi -= 1
+    if flagged[targets[hi]][0] - start < min_s:
+        return None
+
+    on_flags: list[bool] = []
+    kept_at: list[int] = []
+    for index in range(left, targets[hi] + 1):
+        normed = flagged[index][2]
+        if not normed or _is_activity_filler(normed, rule):
+            continue
+        on_flags.append(_unit_on_task(normed, rule))
+        kept_at.append(index)
+    if not on_flags:
+        return None
+    prefix_on: list[int] = []
+    prefix_best: list[int] = []
+    streak = best = on_count = 0
+    for flag in on_flags:
+        if flag:
+            streak += 1
+            on_count += 1
+            best = max(best, streak)
+        else:
+            streak = 0
+        prefix_on.append(on_count)
+        prefix_best.append(best)
+
+    count = len(on_flags)
+    for pos in range(hi, origin - 1, -1):
+        end_index = targets[pos]
+        if flagged[end_index][0] - start < min_s:
+            break
+        while count > 0 and kept_at[count - 1] > end_index:
+            count -= 1
+        if count == 0:
+            continue
+        on_count = prefix_on[count - 1]
+        if count >= ON_TASK_RATIO_UNITS:
+            clears = (prefix_best[count - 1] >= ON_TASK_MIN_STREAK
+                      or on_count / count >= ON_TASK_MIN_RATIO)
+        else:
+            clears = on_count >= max(1, (count + 1) // 2)
+        if not clears:
+            continue
+        score, units = _activity_span_score(
+            rule, flagged[left:end_index + 1])
+        if score is not None:
+            return pos, score, units
+        # Mais evidência não aparece ao encurtar o mesmo começo.
+        return None
+    return None
 
 
 def _longest_true_run(flags: list[bool]) -> int:

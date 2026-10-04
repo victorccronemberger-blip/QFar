@@ -85,7 +85,24 @@ QString normalizedVersion(QString value) {
 }
 }  // namespace
 
-UpdateManager::UpdateManager(QObject* parent) : QObject(parent) {}
+UpdateManager::UpdateManager(QObject* parent)
+    : QObject(parent), _releaseEndpoint(QString::fromLatin1(kLatestRelease)) {}
+
+bool UpdateManager::versionAllowed(const QString& candidate, const QString& current,
+                                   bool allowEqual) {
+  const QRegularExpression numeric(QStringLiteral("^[0-9]+\\.[0-9]+\\.[0-9]+$"));
+  auto strict = [&](const QString& text) {
+    if (text.size() > 32 || !numeric.match(text).hasMatch()) return QVersionNumber();
+    qsizetype suffix = 0;
+    const auto parsed = QVersionNumber::fromString(text, &suffix);
+    return suffix == text.size() && parsed.segmentCount() == 3 ? parsed : QVersionNumber();
+  };
+  const auto offered = strict(candidate);
+  const auto installed = strict(current);
+  if (offered.isNull() || installed.isNull()) return false;
+  const int comparison = QVersionNumber::compare(offered, installed);
+  return comparison > 0 || (allowEqual && comparison == 0);
+}
 
 bool UpdateManager::verifyHashSignature(const QByteArray& hash,
                                         const QByteArray& signature) {
@@ -98,7 +115,7 @@ void UpdateManager::check(bool interactive) {
   _interactive = interactive;
   _repair = false;
   emit statusChanged(QStringLiteral("Verificando atualizações…"));
-  auto* reply = _network.get(requestFor(QUrl(QString::fromLatin1(kLatestRelease))));
+  auto* reply = _network.get(requestFor(_releaseEndpoint));
   connect(reply, &QNetworkReply::finished, this, [this, reply] {
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     const QByteArray payload = reply->readAll();
@@ -135,7 +152,10 @@ void UpdateManager::check(bool interactive) {
 
     const QVersionNumber latest = QVersionNumber::fromString(_version);
     const QVersionNumber current = QVersionNumber::fromString(QCoreApplication::applicationVersion());
-    if (latest.isNull() || QVersionNumber::compare(latest, current) <= 0) {
+    if (!versionAllowed(_version, _version, true)
+        || !versionAllowed(QCoreApplication::applicationVersion(), QCoreApplication::applicationVersion(), true))
+      return fail(QStringLiteral("A versão da atualização é inválida."));
+    if (QVersionNumber::compare(latest, current) <= 0) {
       _busy = false;
       emit statusChanged(QStringLiteral("QMoney está atualizado — versão %1.")
                              .arg(QCoreApplication::applicationVersion()));
@@ -158,7 +178,7 @@ void UpdateManager::repair() {
   _interactive = true;
   _repair = true;
   emit statusChanged(QStringLiteral("Localizando o pacote completo do QMoney…"));
-  auto* reply = _network.get(requestFor(QUrl(QString::fromLatin1(kLatestRelease))));
+  auto* reply = _network.get(requestFor(_releaseEndpoint));
   connect(reply, &QNetworkReply::finished, this, [this, reply] {
     const QByteArray payload = reply->readAll();
     const QString networkError = reply->errorString();
@@ -187,6 +207,8 @@ void UpdateManager::repair() {
       if (name == QString::fromLatin1(kChecksumName)) _checksumUrl = url;
       if (name == QString::fromLatin1(kSignatureName)) _signatureUrl = url;
     }
+    if (!versionAllowed(_version, QCoreApplication::applicationVersion(), true))
+      return fail(QStringLiteral("O reparo foi recusado: versão inválida ou anterior à instalada."));
     if (!_packageUrl.isValid() || !_checksumUrl.isValid() || !_signatureUrl.isValid())
       return fail(QStringLiteral("A versão publicada não contém todos os componentes de reparo."));
     _busy = false;
@@ -198,6 +220,8 @@ void UpdateManager::repair() {
 
 void UpdateManager::downloadAndInstall() {
   if (_busy || !_packageUrl.isValid() || !_checksumUrl.isValid()) return;
+  if (!versionAllowed(_version, QCoreApplication::applicationVersion(), _repair))
+    return fail(QStringLiteral("A atualização foi recusada: versão inválida ou anterior à instalada."));
   _busy = true;
   fetchChecksum();
 }
@@ -236,6 +260,8 @@ void UpdateManager::fetchSignature() {
 }
 
 void UpdateManager::fetchPackage() {
+  if (!versionAllowed(_version, QCoreApplication::applicationVersion(), _repair))
+    return fail(QStringLiteral("A atualização foi recusada: versão inválida ou anterior à instalada."));
   const QString tempDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
                           + QStringLiteral("/QMoneyUpdate");
   QDir().mkpath(tempDir);
@@ -289,9 +315,11 @@ void UpdateManager::fetchPackage() {
       return fail(QStringLiteral("A atualização foi recusada: assinatura RSA não reconhecida."));
     }
 
+    if (!versionAllowed(_version, QCoreApplication::applicationVersion(), _repair))
+      return fail(QStringLiteral("A atualização foi recusada: versão inválida ou anterior à instalada."));
     _busy = false;
     emit statusChanged(QStringLiteral("Atualização autenticada e pronta para instalar."));
-    emit installReady(_packagePath);
+    emit installReady(_packagePath, actual);
   });
 }
 

@@ -27,7 +27,7 @@ class AccountRemovalTests(unittest.TestCase):
         ]
         for patcher in self.patchers:
             patcher.start()
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     def tearDown(self):
         for patcher in reversed(self.patchers):
@@ -119,12 +119,12 @@ class AccountRemovalTests(unittest.TestCase):
             return prefs
 
         def remove():
-            with server.create_app().test_client() as client:
+            with server.create_app(for_testing=True).test_client() as client:
                 return client.delete(f"/api/accounts/{email}").status_code
 
         def update():
             self.assertTrue(read_by_removal.wait(3))
-            with server.create_app().test_client() as client:
+            with server.create_app(for_testing=True).test_client() as client:
                 response = client.put("/api/preferences", json={"theme": "new"})
             preference_saved.set()
             return response.status_code

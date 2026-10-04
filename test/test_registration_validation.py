@@ -112,7 +112,7 @@ class RegistrationValidationTests(unittest.TestCase):
              patch.object(server, "_hostinger_is_configured", return_value=True), \
              patch.object(server, "ORG_MIGRATION", Mock(running=False)), \
              patch.object(server, "_BULK_REGISTER_STATE", {"state": "idle"}):
-            response = server.create_app().test_client().post("/api/accounts/register", json={
+            response = server.create_app(for_testing=True).test_client().post("/api/accounts/register", json={
                 "email": "review@example.invalid", "password": "test-only"})
         self.assertEqual(response.status_code, 400)
         self.assertTrue(response.is_json)

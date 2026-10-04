@@ -1,11 +1,12 @@
 """
-vpn.py — Detecção de VPN (Windows) para a réplica Android.
+vpn.py — Sondagem de adaptadores VPN no Windows.
 
 O app bloqueia TODA chamada autenticada quando há VPN ativa
 (`assertNoVpn` → VpnBlockedError, DETALHAMENTO §4.3). O QMoney roda no
 Windows desktop: aqui checamos os adaptadores de rede por nomes típicos de VPN
 (WireGuard, Wintun, TAP-, TUN-, OpenVPN, Tailscale, NordVPN, ExpressVPN,
-Surfshark, VirtualBox Host-Only, etc.).
+Surfshark, etc.). A heurística por nome não equivale à detecção do Android
+e não certifica a ausência de VPN; falhas de sondagem retornam None.
 
 Uso:
     from moneymin import vpn
@@ -20,9 +21,7 @@ import os
 import subprocess
 import time
 
-# Marcadores nos nomes/descrições dos adaptadores de rede. "virtualbox
-# host-only" não é VPN real, mas o app Android também enxergaria essa rede
-# como não-móvel; mantemos focado em adaptadores de tunelamento real.
+# Marcadores locais de nomes/descrições; não são uma classificação Android.
 _VPN_MARKERS = (
     "wireguard", "wintun", "tap-", "tap ", "tun-", "openvpn", "tailscale",
     "nordvpn", "expressvpn", "surfshark", "protonvpn", "mullvad",

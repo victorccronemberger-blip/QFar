@@ -156,10 +156,40 @@ def main():
     campaign._rank_cache_stamp.cache_clear()
     campaign._load_rank_seed.cache_clear()
     campaign._save_rank_cache(pools)
-    print(json.dumps({"rows": sum(len(c) for c in tasks.values()),
-                      "unique_clips": len({clip["clip_uid"] for clips in tasks.values() for clip in clips}),
-                      "parents": len({clip["parent_video_uid"] for clips in tasks.values() for clip in clips}),
-                      "bytes": len(data)}))
+    by_parent: dict[str, list[tuple[float, float]]] = {}
+    per_task = []
+    for name, clips in tasks.items():
+        if not clips:
+            continue
+        per_task.append((
+            round(sum(float(clip["dur_s"]) for clip in clips) / 3600, 2),
+            len(clips), name))
+        for clip in clips:
+            start, end = clip["window_s"]
+            by_parent.setdefault(str(clip["parent_video_uid"]), []).append(
+                (float(start), float(end)))
+    unique_s = 0.0
+    for intervals in by_parent.values():
+        intervals.sort()
+        merged: list[tuple[float, float]] = []
+        for start, end in intervals:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        unique_s += sum(end - start for start, end in merged)
+    per_task.sort(reverse=True)
+    print(json.dumps({
+        "rows": sum(len(c) for c in tasks.values()),
+        "unique_clips": len({clip["clip_uid"] for clips in tasks.values() for clip in clips}),
+        "parents": len(by_parent),
+        "unique_hours": round(unique_s / 3600, 2),
+        "clip_hours": round(sum(hours for hours, _count, _name in per_task), 2),
+        "filled_tasks": len(per_task),
+        "top_tasks": [
+            {"task": name, "clip_hours": hours, "clips": count}
+            for hours, count, name in per_task[:12]],
+        "bytes": len(data)}))
 
 
 if __name__ == "__main__":

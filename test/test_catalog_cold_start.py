@@ -58,7 +58,7 @@ class PreparedCatalogTests(unittest.TestCase):
         session.all_tasks.return_value = self.tasks
         with patch.object(server.Session, "from_email", return_value=session), \
              patch.object(server, "_resolve_org", return_value="org"):
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             for minimum, maximum in ((300, 1800), (60, 600), (600, 1200)):
                 path = ("/api/tasks?async=1&email=fixture@example.invalid&dataset=ego4d"
                         f"&min_dur_s={minimum}&max_dur_s={maximum}")

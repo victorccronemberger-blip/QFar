@@ -19,7 +19,8 @@ class CampaignReconciliationTests(unittest.TestCase):
         self.item = {"clip_uid": "clip", "registry_key": "key", "duration_ms": 300000}
         self.rows = [{"session_id": "old-session", "chunk_index": 0, "expected_chunk_count": 1,
                       "account_email": self.account.email, "org_key": self.account.org_key,
-                      "task_id": "task", "state": "done", "phase": "done", "finalized": True,
+                      "task_id": "task", "upload_id": "accepted-old-upload",
+                      "state": "done", "phase": "done", "finalized": True,
                       "campaign_context": {"registry_key": "key", "clip_uid": "clip"}}]
         self.stack.enter_context(patch.object(campaign, "list_sidecars", side_effect=lambda: self.rows))
         self.save = self.stack.enter_context(patch.object(campaign, "save_sidecar"))
@@ -61,6 +62,62 @@ class CampaignReconciliationTests(unittest.TestCase):
         result = self.run_upload()
         self.assertTrue(result["ok"])
         self.assertEqual(self.save.call_count, 2)
+
+    def test_required_quality_or_invalid_flags_do_not_confirm_delivery(self):
+        for updates in (
+            {"evaluation_required": True, "evaluation_verified": False},
+            {"evaluation_required": True},
+            {"evaluation_required": "true", "evaluation_verified": True},
+            {"evaluation_verified": False},
+            {"phase": "evaluation_review"},
+        ):
+            with self.subTest(updates=updates):
+                original = dict(self.rows[0])
+                self.rows[0].update(updates)
+                self.assertFalse(self.run_upload()["ok"])
+                self.assertFalse(sent_registry.sent_emails("key", "clip"))
+                self.new.assert_not_called()
+                self.save.assert_not_called()
+                self.rows[0] = original
+
+    def test_verified_quality_allows_reconciliation(self):
+        self.rows[0].update(evaluation_required=True, evaluation_verified=True)
+        self.assertTrue(self.run_upload()["ok"])
+        self.assertEqual(sent_registry.sent_emails("key", "clip"), {self.account.email})
+
+    def test_duplicate_chunk_receipts_do_not_confirm_delivery(self):
+        self.rows.append(dict(self.rows[0]))
+        self.assertFalse(self.run_upload()["ok"])
+        self.assertFalse(sent_registry.load())
+        self.save.assert_not_called()
+
+    def test_each_chunk_requires_integer_count_and_matching_task(self):
+        self.rows[0]["expected_chunk_count"] = 2
+        for updates in ({"expected_chunk_count": 2.0}, {"task_id": "other-task"}):
+            with self.subTest(updates=updates):
+                self.rows[:] = [self.rows[0], {**self.rows[0], "chunk_index": 1, **updates}]
+                self.assertFalse(self.run_upload()["ok"])
+                self.assertFalse(sent_registry.load())
+                self.save.assert_not_called()
+
+    def test_foreign_or_malformed_chunk_of_same_session_prevents_subset_confirmation(self):
+        for updates in ({"chunk_index": "1"}, {"account_email": "other@example.com"},
+                        {"org_key": "another-org"}, {"campaign_reconciled": True, "chunk_index": None}):
+            with self.subTest(updates=updates):
+                self.rows[:] = [self.rows[0], {**self.rows[0], "chunk_index": 1, **updates}]
+                self.assertFalse(self.run_upload()["ok"])
+                self.assertFalse(sent_registry.load())
+                self.save.assert_not_called()
+
+    def test_invalid_reconciled_flag_stays_visible_and_blocks_duplicate_session(self):
+        self.rows[0]["campaign_reconciled"] = "false"
+        self.assertFalse(self.run_upload()["ok"])
+        self.assertFalse(sent_registry.load())
+        self.new.assert_not_called()
+
+    def test_identical_pump_and_persisted_receipt_overlap_is_reconciled_once(self):
+        self.assertTrue(self.run_upload()["ok"])
+        self.assertEqual(self.save.call_count, 1)
 
     def test_crash_after_finalize_before_registry_is_reconciled(self):
         with patch.object(campaign, "pump_pending", return_value=[]):

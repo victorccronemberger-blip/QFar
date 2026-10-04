@@ -11,7 +11,7 @@ from moneymin.web import server
 
 class BackgroundProcessTests(unittest.TestCase):
     def test_health_does_not_launch_tools_or_read_user_data(self):
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         with mock.patch.dict(os.environ, {"QMONEY_APP_VERSION": "1.0.26"}), \
              mock.patch.object(server.readiness, "campaign_readiness") as ready, \
              mock.patch.object(server.readiness, "_binary_works") as binary, \

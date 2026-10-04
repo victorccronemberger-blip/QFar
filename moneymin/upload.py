@@ -6,22 +6,23 @@ Pipeline de 6 etapas (espelha o fluxo nativo do app Android):
   2. POST  /api/v1/storage/sas/blobs                        -> SAS URLs do Azure
   3. PUT   <blob_url>  (x-ms-blob-type: BlockBlob)          -> bytes direto no Azure
   4. PATCH /api/v1/uploads/{id}/complete                    -> confirma conclusão
-  5. POST  /api/v1/organizations/{org}/sessions/{sid}/finalize -> sessão elegível p/ catbear
-  6. POST  /api/v1/uploads/{id}/evaluate  (opcional)         -> roda checklist de qualidade
+  5. POST  /api/v1/uploads/{id}/evaluate  (opcional)         -> verifica qualidade
+  6. POST  /api/v1/organizations/{org}/sessions/{sid}/finalize -> confirma sessão
 
 Comportamento nativo adicional (observado no bundle do app e na spec):
   - PATCH /api/v1/uploads/{id}/fail          -> marca o upload como falho (error_message)
   - GET   /api/v1/uploads/{upload_id}        -> consulta status (upload_status)
-  - suppress_per_chunk_catbear no PATCH complete -> suprime catbear por-chunk (multi-chunk)
-  - auto-retry com backoff em falhas transientes (create/sas, transport, complete)
+  - suppress_per_chunk_catbear=True no PATCH complete em novos envios (APK 1.28.0)
+  - retries limitados nas etapas compatíveis; CREATE sem recibo não é repetido
   - retry-late: após exaurir retries o chunk fica pendente p/ tentativa futura
   - loss record: arquivo local sumiu -> registra perda em vez de abortar
   - sidecar persistente (data/sidecars/<session_id>.json) + fila de retomada
 
 A API nunca toca nos bytes do MP4 — eles vão direto pro Azure Blob Storage
 (figcbapp.blob.core.windows.net). O registro é criado antes da emissão das URLs
-SAS, como no `uploadRecordingImpl` da v1.22. Cada arquivo _N.mp4 é um chunk de
-uma mesma sessionId.
+SAS nos novos envios, conforme driveCreate no bytecode do APK 1.28.0.
+Jornais legados conservam a política de ordem para retomar a etapa pendente.
+Cada arquivo _N.mp4 é um chunk de uma mesma sessionId.
 
 Usa `Session` (refresh automático de token) e `config` (URLs/chaves centralizadas).
 Somente stdlib.
@@ -48,6 +49,7 @@ Exemplo (fila com retomada):
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import random
 import re
@@ -61,7 +63,8 @@ from pathlib import Path
 from typing import Any
 
 from . import config, transport
-from .atomic_io import load_json, save_bytes, save_json
+from .atomic_io import JsonStateError, decode_json_state, load_json_state, save_bytes, save_json
+from .capture_import import CaptureDescriptor, CaptureImportError, inspect_original_capture
 from .device_profile import (
     BACKLOG_CAP_MS,
     DeviceProfile,
@@ -88,6 +91,9 @@ from .upload_types import (
     ChunkResult,
     UploadError,
     UploadResult,
+    is_pending_finalization,
+    journal_delivery_confirmed,
+    journal_flags_valid,
 )
 
 __all__ = [
@@ -243,7 +249,8 @@ def default_network_meta() -> dict[str, Any]:
 # --- HTTP para o Azure Blob (PUT direto, fora da minute-api) -------------------
 
 def _put_blob(blob_url: str, file_bytes: bytes, content_type: str = "video/mp4",
-              timeout: int = 300, resumable: bool | None = None) -> int:
+              timeout: int = 300, resumable: bool | None = None,
+              on_progress: Callable[[int, int, float], None] | None = None) -> int:
     """Faz PUT dos bytes no Azure Blob Storage. Devolve o status HTTP.
 
     O transporte (e o fingerprint de rede) é do `transport.py`: com curl_cffi
@@ -254,6 +261,10 @@ def _put_blob(blob_url: str, file_bytes: bytes, content_type: str = "video/mp4",
     Levanta UploadError se o Azure recusar (status != 201) ou em erro de rede.
     """
     try:
+        if on_progress is not None:
+            return transport.put_blob(blob_url, file_bytes,
+                                      content_type=content_type, timeout=timeout,
+                                      resumable=resumable, on_progress=on_progress)
         return transport.put_blob(blob_url, file_bytes,
                                   content_type=content_type, timeout=timeout,
                                   resumable=resumable)
@@ -275,13 +286,21 @@ def _put_blob(blob_url: str, file_bytes: bytes, content_type: str = "video/mp4",
 def _put_blob_file(blob_url: str, file_path: str | Path,
                    content_type: str = "video/mp4",
                    timeout: int = 300,
-                   on_progress: Callable[[int, int, float], None] | None = None) -> int:
+                   on_progress: Callable[[int, int, float], None] | None = None,
+                   *, expected_sha256: str | None = None) -> int:
     """PUT do vídeo a partir do disco, sem uma cópia integral na RAM."""
     try:
+        if expected_sha256 is not None:
+            return transport.put_blob_file(blob_url, file_path,
+                                           content_type=content_type, timeout=timeout,
+                                           on_progress=on_progress, expected_sha256=expected_sha256)
         return transport.put_blob_file(blob_url, file_path,
                                        content_type=content_type,
                                        timeout=timeout,
                                        on_progress=on_progress)
+    except transport.TransportIntegrityError:
+        raise UploadError("O conteúdo local mudou; o recibo e os arquivos foram preservados para revisão.",
+                          transient=False, phase="transport", review_required=True) from None
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")[:500]
         raise _http_upload_error("PUT Blob", exc.code, body) from exc
@@ -525,10 +544,16 @@ def _http_upload_error(
 ) -> UploadError:
     response_headers = headers or {}
     blocked = _header(response_headers, "X-Blocked-Reason")
-    detail = _error_detail(text)
+    # Create/SAS responses can contain signed URLs. These are temporary
+    # credentials and must not become result.error or persisted journal text.
+    private_response = phase in ("SAS", "POST /uploads")
+    detail = ("o serviço não concluiu esta etapa"
+              if private_response else _error_detail(text))
     message = f"{phase} falhou ({status}): {detail}"
     if blocked:
-        message += f" [bloqueio: {blocked}]"
+        displayed_reason = (blocked if not private_response or re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,63}", blocked) else "não especificado")
+        message += f" [bloqueio: {displayed_reason}]"
     return UploadError(
         message,
         status_code=status,
@@ -599,11 +624,19 @@ def fail_upload(session: Any, upload_id: str, error_message: str) -> dict[str, A
         {"error_message": error_message[:500]},
     )
     if status != 200:
-        raise UploadError(f"PATCH /fail falhou ({status}): {text[:500]}")
+        raise UploadError(f"PATCH /fail falhou ({status}).", status_code=status,
+                          transient=(status == -1 or status in (408, 429) or status >= 500), phase="fail")
     try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise UploadError(f"resposta /fail não-JSON: {text[:300]}") from exc
+        parsed = decode_json_state(text)
+    except JsonStateError:
+        raise UploadError("Resposta de sinalização de falha inválida; recibo preservado para revisão.",
+                          status_code=status, transient=False, phase="fail", review_required=True) from None
+    try:
+        _validate_known_receipt(parsed, upload_id, "fail")
+    except UploadError as exc:
+        exc.status_code = status
+        raise
+    return parsed
 
 
 def delete_upload(session: Any, upload_id: str) -> bool:
@@ -616,7 +649,8 @@ def delete_upload(session: Any, upload_id: str) -> bool:
     status, text = session.request("DELETE", f"/api/v1/uploads/{upload_id}")
     if status == 204:
         return True
-    raise UploadError(f"DELETE /uploads/{upload_id} falhou ({status}): {text[:300]}")
+    raise UploadError(f"DELETE do upload falhou ({status}).", status_code=status,
+                      transient=(status == -1 or status in (408, 429) or status >= 500), phase="delete-upload")
 
 
 def delete_session(session: Any, org_key: str, session_id: str) -> bool:
@@ -631,7 +665,38 @@ def delete_session(session: Any, org_key: str, session_id: str) -> bool:
     if status == 204:
         return True
     raise UploadError(
-        f"DELETE /sessions/{session_id} falhou ({status}): {text[:300]}")
+        f"DELETE da sessão falhou ({status}).", status_code=status,
+        transient=(status == -1 or status in (408, 429) or status >= 500), phase="delete-session")
+
+
+def _validate_known_receipt(data: dict[str, Any], upload_id: str, phase: str) -> None:
+    """An optional legacy ID must still refer to the requested receipt.
+
+    Empty legacy acknowledgements remain supported. This does not implement
+    the complete native UploadOut schema or prove remote acceptance.
+    """
+    if any(data[key] != upload_id or not isinstance(data[key], str)
+           for key in ("id", "uploadId", "upload_id") if key in data):
+        raise UploadError("Resposta referente a outro recibo ou com identidade inválida; "
+                          "envio preservado para revisão.", transient=False,
+                          phase=phase, review_required=True)
+
+
+def _validate_native_upload_out(data: dict[str, Any], phase: str) -> None:
+    """UploadOut as declared in APK 1.28; status is an unrestricted string.
+
+    Preserve finite extra metadata for review. blob_path belongs to meta and,
+    when present, must be a string; an absent field differs from JSON null.
+    A structurally valid response alone does not prove physical capture quality.
+    """
+    meta = data.get("meta")
+    if (not isinstance(data.get("id"), str)
+            or not isinstance(data.get("status"), str)
+            or not isinstance(meta, dict)
+            or ("blob_path" in meta and not isinstance(meta["blob_path"], str))):
+        raise UploadError("Resposta do upload incompleta ou com tipos inválidos; "
+                          "recibo preservado para revisão.", transient=False,
+                          phase=phase, review_required=True)
 
 
 def get_upload(session: Any, upload_id: str) -> dict[str, Any]:
@@ -645,12 +710,102 @@ def get_upload(session: Any, upload_id: str) -> dict[str, Any]:
     if status != 200:
         raise _http_upload_error("GET /uploads", status, text, {})
     try:
-        parsed = json.loads(text)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise UploadError("Resposta de consulta do upload inválida.", transient=False) from exc
-    if not isinstance(parsed, dict):
-        raise UploadError("Resposta de consulta do upload inválida.", transient=False)
+        parsed = decode_json_state(text)
+    except JsonStateError:
+        raise UploadError("Resposta de consulta do upload inválida; envio preservado para revisão.",
+                          transient=False, phase="query", review_required=True) from None
+    _validate_known_receipt(parsed, upload_id, "query")
     return parsed
+
+
+def _require_completion_flags(suppress_per_chunk_catbear: bool,
+                              session_complete: bool = False) -> None:
+    if type(suppress_per_chunk_catbear) is not bool or type(session_complete) is not bool:
+        raise UploadError("Política de conclusão inválida; use valores booleanos.",
+                          transient=False, phase="preflight")
+
+
+def _journal_flag(journal: dict[str, Any], key: str) -> bool:
+    """Absence is the legacy False policy; never coerce an existing value."""
+    value = journal.get(key, False)
+    if type(value) is not bool:
+        raise UploadError("Política do registro de envio inválida; preserve o arquivo para revisão.",
+                          transient=False, phase="recovery")
+    return value
+
+
+def _journal_recorded_at(journal: dict[str, Any]) -> str:
+    value = journal.get("recorded_at")
+    if not isinstance(value, str) or not value.strip() or recorded_at_to_wall_ms(value) is None:
+        raise UploadError("Horário original do envio ausente ou inválido; preserve o arquivo para revisão.",
+                          transient=False, phase="recovery")
+    return value
+
+
+def _journal_has_remote_receipt(journal: dict[str, Any]) -> bool:
+    upload_id = journal.get("upload_id", "")
+    if upload_id is not None and not isinstance(upload_id, str):
+        raise UploadError("Recibo de envio inválido; preserve o arquivo para revisão.",
+                          transient=False, phase="recovery")
+    return (bool(upload_id and upload_id.strip()) or journal.get("state") == STATE_DONE
+            or journal.get("phase") == "done" or journal.get("finalized") is True)
+
+
+def _existing_receipt_error() -> UploadError:
+    return UploadError("Este envio já possui um recibo ou estado de conclusão; use Retomada "
+                       "para as etapas compatíveis ou preserve o registro para revisão. "
+                       "Um novo envio não substituirá o recibo existente.",
+                       transient=False, phase="recovery")
+
+
+def _journal_creation_uncertain(journal: dict[str, Any]) -> bool:
+    """No receipt does not prove that a previously attempted CREATE failed.
+
+    Legacy queued journals precede any remote creation. Other legacy phases
+    lack a durable request marker, so cannot authorize another CREATE safely.
+    Known receipts retain their existing completion/finalization handling.
+    """
+    upload_id = journal.get("upload_id")
+    if isinstance(upload_id, str) and upload_id.strip():
+        return False
+    if journal.get("phase") in {"create_in_flight", "registered"}:
+        return True
+    if "create_attempted" in journal:
+        return journal["create_attempted"] is not False
+    return journal.get("phase") != "queued"
+
+
+def _uncertain_creation_error() -> UploadError:
+    return UploadError("A criação anterior pode ter sido aceita sem um recibo local. "
+                       "O envio foi preservado para revisão; uma nova criação foi bloqueada.",
+                       transient=False, phase="recovery")
+
+
+def _upload_owner(session: Any, profile: DeviceProfile | None) -> str:
+    """Use the session's declared owner, never infer auth from device metadata."""
+    value = getattr(session, "email", None)
+    owner = value.strip().casefold() if isinstance(value, str) else ""
+    profile_value = getattr(profile, "email", None) if profile is not None else None
+    profile_owner = (profile_value.strip().casefold()
+                     if isinstance(profile_value, str) else "")
+    if owner and profile_owner and owner != profile_owner:
+        raise UploadError("O perfil de dispositivo difere da conta da sessão; o envio foi bloqueado.",
+                          transient=False, phase="preflight")
+    return owner
+
+
+def _validate_journal_owner(journal: dict[str, Any], session_owner: str) -> None:
+    value = journal.get("account_email")
+    if value is None:
+        return  # Legacy unknown ownership is preserved, not retrospectively inferred.
+    if not isinstance(value, str):
+        raise UploadError("Dono do registro de envio inválido; preserve o arquivo para revisão.",
+                          transient=False, phase="recovery")
+    owner = value.strip().casefold()
+    if owner and (not session_owner or owner != session_owner):
+        raise UploadError("A conta da sessão não corresponde ao dono do registro de envio; "
+                          "o arquivo foi preservado para revisão.",
+                          transient=False, phase="recovery")
 
 
 def complete_upload(
@@ -658,20 +813,26 @@ def complete_upload(
     upload_id: str,
     size_bytes: int,
     *,
-    suppress_per_chunk_catbear: bool = False,
+    suppress_per_chunk_catbear: bool = True,
     session_complete: bool = False,
+    _native_response_schema: bool = False,
 ) -> dict[str, Any]:
     """Confirma um blob já enviado; operação reutilizável após reinício.
 
-    ``session_complete`` existe no cliente Android para o fluxo que substituirá
-    o endpoint de ``finalize``. O QMoney usa o contrato público e comprovado
-    ``complete -> finalize``; portanto os dois mecanismos não devem ser
-    combinados pelo orquestrador.
+    No APK 1.28.0, ``session_complete`` é condicional e ``finalize`` ainda está
+    implementado. O QMoney usa a estratégia explícita ``complete -> finalize``;
+    o orquestrador não combina as duas formas de conclusão. Novos envios usam
+    supressão True, como a atribuição incondicional observada no helper do APK.
+    False explícito mantém a omissão legada, exceto quando session_complete=True
+    exige True pelo contrato histórico deste helper. Sem prova de aceitação remota.
     """
+    _require_completion_flags(suppress_per_chunk_catbear, session_complete)
+    if type(_native_response_schema) is not bool:
+        raise UploadError("Contrato de resposta inválido; use um valor booleano.",
+                          transient=False, phase="preflight")
     body: dict[str, Any] = {"size_bytes": int(size_bytes)}
-    # O backend atual exige os dois sinais juntos enquanto o endpoint de
-    # finalize ainda existe. O Android sempre envia a supressão, inclusive em
-    # sessões de um único chunk.
+    # O helper Android 1.28.0 envia supressão sempre e session_complete apenas
+    # no ramo condicional. A aceitação do backend não é provada pelo bytecode.
     if suppress_per_chunk_catbear or session_complete:
         body["suppress_per_chunk_catbear"] = True
     if session_complete:
@@ -681,22 +842,32 @@ def complete_upload(
     if status == 409:
         try:
             current = get_upload(session, upload_id)
-        except UploadError:
-            current = {}
+        except UploadError as exc:
+            # A failed/ambiguous GET cannot prove that the conflicting Complete
+            # failed. Retry only a transient lookup; otherwise keep the receipt
+            # for review, without PATCH /fail or repeating transport.
+            raise UploadError("Confirmação conflitante sem consulta confiável; "
+                              "envio preservado para revisão.", status_code=exc.status_code,
+                              transient=exc.retryable, phase="complete",
+                              review_required=not exc.retryable) from None
         current_status = str(
             current.get("status") or current.get("upload_status") or ""
         ).casefold()
         if current_status in {"completed", "complete", "done"}:
+            if _native_response_schema:
+                _validate_native_upload_out(current, "complete")
             return current
     if status not in (200, 204):
         raise _http_upload_error(
             "PATCH /complete", status, text, response_headers)
     try:
-        parsed = json.loads(text) if text.strip() else {}
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise UploadError("Resposta de conclusão do upload inválida.", transient=False) from exc
-    if not isinstance(parsed, dict):
-        raise UploadError("Resposta de conclusão do upload inválida.", transient=False)
+        parsed = decode_json_state(text) if text.strip() else {}
+    except JsonStateError:
+        raise UploadError("Resposta de conclusão do upload inválida; recibo preservado para revisão.",
+                          transient=False, phase="complete", review_required=True) from None
+    _validate_known_receipt(parsed, upload_id, "complete")
+    if _native_response_schema:
+        _validate_native_upload_out(parsed, "complete")
     return parsed
 
 
@@ -719,7 +890,8 @@ def _sidecar_filename(session_id: str, chunk_index: int = 0) -> str:
 
 
 def _sidecar_path(session_id: str, chunk_index: int = 0) -> Path:
-    return sidecars_dir() / _sidecar_filename(session_id, chunk_index)
+    filename = _sidecar_filename(session_id, chunk_index)
+    return sidecars_dir() / filename
 
 
 def _sidecar_archive_path(session_id: str, chunk_index: int = 0) -> Path:
@@ -734,36 +906,134 @@ def _remove_sidecar_archive(session_id: str, chunk_index: int = 0) -> None:
         pass
 
 
+def _sidecar_resume_payload(item: dict[str, Any]) -> bytes:
+    """Bind the original archive to a known uploaded receipt before effects.
+
+    This is an integrity/identity check, not proof of physical sensor origin.
+    Missing historical bindings require review rather than generating new data.
+    """
+    error = UploadError("ZIP original ou vínculo de retomada inválido; preserve os arquivos para revisão.",
+                        transient=False, phase="recovery")
+    sid, index = item.get("session_id"), item.get("chunk_index", 0)
+    _sidecar_filename(sid, index)
+    _response_upload_id({"id": item.get("upload_id")})
+    _journal_recorded_at(item)
+    size, duration = item.get("size_bytes"), item.get("duration_ms")
+    archive_size, archive_hash = item.get("sidecar_size_bytes"), item.get("sidecar_sha256")
+    owner, org = item.get("account_email"), item.get("org_key")
+    if (item.get("transport_artifact") != "sidecar"
+            or item.get("conflict_action") != "complete"
+            or _journal_flag(item, "register_first") is not True
+            or type(size) is not int or size <= 0
+            or type(duration) is not int or duration <= 0
+            or type(archive_size) is not int or archive_size <= 0
+            or not isinstance(archive_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", archive_hash)
+            or not isinstance(owner, str) or not owner.strip()
+            or not isinstance(org, str) or not org.strip()
+            or item.get("log_id") != f"{sid}_{index}"
+            or item.get("filename") != f"{sid}_{index}.mp4"):
+        raise error
+    name = item.get("sidecar_data_path")
+    expected = _sidecar_archive_path(sid, index).resolve()
+    try:
+        if not isinstance(name, str) or Path(name).resolve() != expected:
+            raise error
+        payload = expected.read_bytes()
+    except (OSError, ValueError, RuntimeError):
+        raise error from None
+    if len(payload) != archive_size or hashlib.sha256(payload).hexdigest() != archive_hash:
+        raise error
+    _validate_sidecar_zip(payload, log_id=f"{sid}_{index}", duration_ms=duration)
+    return payload
+
+
 def save_sidecar(sidecar: dict[str, Any]) -> Path:
     """Persiste o estado de um upload em `data/sidecars/<session_id>.json`."""
-    sid = sidecar.get("session_id") or sidecar.get("sessionId") or ""
-    if not sid:
-        raise UploadError("sidecar sem session_id")
-    chunk_index = int(sidecar.get("chunk_index") or 0)
+    if not isinstance(sidecar, dict):
+        raise UploadError("identificador de retomada inválido")
+    candidate = dict(sidecar)
+    sid = candidate.get("session_id", candidate.get("sessionId"))
+    if "sessionId" in candidate and candidate["sessionId"] != sid:
+        raise UploadError("identificador de retomada inválido")
+    # Missing indices belong to the legacy zero-chunk format. Present values
+    # must retain their exact type: coercion can replace a different journal.
+    chunk_index = candidate.get("chunk_index", 0)
+    try:
+        json.dumps(candidate, allow_nan=False)
+    except (ValueError, TypeError, RecursionError):
+        raise UploadError("O novo estado de envio não é um objeto JSON válido; o arquivo anterior foi preservado.",
+                          transient=False, phase="recovery") from None
     path = _sidecar_path(sid, chunk_index)
-    save_json(path, sidecar)
+    from .operation_lease import operation_lease, OperationLeaseError
+    from .media_lifecycle import media_state_lease
+    try:
+        with media_state_lease(wait=True), operation_lease(path.with_suffix('.write.lock')):
+            previous = load_sidecar(sid, chunk_index)
+            if previous is not None and (any(
+                    previous.get(key) is not None and previous.get(key) != candidate.get(key)
+                    for key in ("account_email", "org_key", "task_id", "expected_chunk_count", "campaign_context"))
+                    or (previous.get('create_attempted') is True and candidate.get('create_attempted') is False)
+                    or (isinstance(previous.get('upload_id'),str) and previous['upload_id'].strip()
+                        and previous['upload_id'] != candidate.get('upload_id'))):
+                raise UploadError("A identidade do registro de envio existente não corresponde ao novo estado; preserve o arquivo para revisão.",
+                                  transient=False, phase="recovery")
+            candidate["session_id"] = sid
+            save_json(path, candidate)
+    except OperationLeaseError:
+        raise UploadError('O registro de envio já está em uso; preserve a retomada.',transient=True,phase='recovery') from None
     return path
 
 
-def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None:
-    """Carrega um sidecar pelo session_id (None se não existir)."""
-    path = _sidecar_path(session_id, chunk_index)
-    if not path.exists():
+def _read_sidecar_file(path: Path) -> dict[str, Any] | None:
+    """One authoritative decoder and filename contract for every journal reader."""
+    data = load_json_state(path, None)
+    if data is None:
         return None
-    data = load_json(path, None)
-    return data if isinstance(data, dict) else None
+    if (not isinstance(data, dict)
+            or _sidecar_filename(data.get("session_id"), data.get("chunk_index", 0)) != path.name):
+        raise ValueError("invalid journal identity")
+    return data
+
+
+def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None:
+    """Lê um recibo; somente a ausência real retorna None."""
+    path = _sidecar_path(session_id, chunk_index)
+    try:
+        data = _read_sidecar_file(path)
+        if data is None:
+            return None
+        if (not isinstance(data, dict)
+                or _sidecar_filename(data.get("session_id"), data.get("chunk_index", 0)) != path.name
+                or data.get("session_id") != session_id or data.get("chunk_index", 0) != chunk_index):
+            raise ValueError("invalid journal identity")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, ValueError, UploadError):
+        raise UploadError("Não foi possível validar o registro de envio; preserve o arquivo para revisão.",
+                          transient=False, phase="recovery") from None
+    return data
 
 
 def list_sidecars(state: str | None = None) -> list[dict[str, Any]]:
-    """Lista sidecars persistidos; filtra por estado se informado."""
+    """Valida todos os journals antes de retornar o filtro de estado."""
     out: list[dict[str, Any]] = []
-    for path in sorted(sidecars_dir().glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(data, dict) and (state is None or data.get("state") == state):
-            out.append(data)
+    try:
+        # iterdir reports directory I/O failures; glob can silently omit them.
+        paths = sorted(path for path in sidecars_dir().iterdir() if path.name.lower().endswith(".json"))
+        for path in paths:
+            data = _read_sidecar_file(path)
+            if not isinstance(data, dict):
+                raise ValueError("invalid journal format")
+            expected_name = _sidecar_filename(data.get("session_id"), data.get("chunk_index", 0))
+            if path.name != expected_name:
+                raise ValueError("invalid journal identity")
+            if state is None or data.get("state") == state:
+                out.append(data)
+    except (OSError, UnicodeError, ValueError, UploadError):
+        # Corrupt or unknown receipts must never become proof of no prior upload.
+        # Keep diagnostics independent of filenames, payloads and parser errors.
+        raise UploadError("Não foi possível validar todos os registros de envio; preserve os arquivos para revisão.",
+                          transient=False, phase="recovery") from None
     return out
 
 
@@ -780,6 +1050,8 @@ def _csv_span_ns(
     if len(lines) < 3:
         raise UploadError("sidecar contém CSV sem amostras suficientes", transient=False)
     header = [value.strip() for value in lines[0].split(",")]
+    if len(set(header)) != len(header):
+        raise UploadError("sidecar CSV com colunas duplicadas", transient=False)
     missing = [column for column in required_columns if column not in header]
     if missing:
         raise UploadError(
@@ -788,8 +1060,16 @@ def _csv_span_ns(
         )
     index = header.index(timestamp_column)
     try:
-        first = int(lines[1].split(",")[index])
-        last = int(lines[-1].split(",")[index])
+        stamps = []
+        for line in lines[1:]:
+            cells = line.split(",")
+            if len(cells) != len(header) or not re.fullmatch(r"[0-9]+", cells[index]):
+                raise ValueError
+            stamp = int(cells[index])
+            if stamp > (1 << 63) - 1 or (stamps and stamp <= stamps[-1]):
+                raise ValueError
+            stamps.append(stamp)
+        first, last = stamps[0], stamps[-1]
     except (IndexError, TypeError, ValueError) as exc:
         raise UploadError("sidecar CSV com timestamp inválido", transient=False) from exc
     if last <= first:
@@ -828,18 +1108,25 @@ def _validate_sidecar_zip(
                     "sidecar contém caminhos inesperados", transient=False)
             if sum(info.file_size for info in infos) > 512 * 1024 * 1024:
                 raise UploadError("sidecar descompactado excede 512 MiB", transient=False)
-            metadata = json.loads(archive.read(f"{log_id}.metadata.json"))
+            metadata = decode_json_state(archive.read(f"{log_id}.metadata.json"))
             imu = archive.read(f"{log_id}.imu.csv")
             frames = archive.read(f"{log_id}.frames.csv")
     except UploadError:
         raise
-    except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as exc:
+    except JsonStateError:
+        raise UploadError(
+            "metadata.json do sidecar inválido ou ambíguo; arquivo preservado",
+            transient=False) from None
+    except (OSError, zipfile.BadZipFile, KeyError, UnicodeError, RuntimeError, json.JSONDecodeError) as exc:
         raise UploadError(f"sidecar inválido: {exc}", transient=False) from exc
     if not isinstance(metadata, dict):
         raise UploadError("metadata.json do sidecar não é objeto", transient=False)
     if str(metadata.get("logId") or metadata.get("id") or "") != log_id:
         raise UploadError("sidecar pertence a outro log_id", transient=False)
-    declared = int(metadata.get("durationMs") or 0)
+    declared = metadata.get("durationMs")
+    if type(declared) is not int or declared <= 0:
+        raise UploadError(
+            "durationMs do sidecar deve ser inteiro positivo", transient=False)
     tolerance_ms = max(500, int(duration_ms * 0.01))
     if abs(declared - duration_ms) > tolerance_ms:
         raise UploadError(
@@ -901,54 +1188,112 @@ def _chunk_sidecar(chunk: ChunkResult, session_id: str, org_key: str,
     }
 
 
-def _conflict_upload(text: str) -> dict[str, Any]:
-    """Normaliza 409: reutiliza registro conhecido ou falha de forma permanente."""
+def _response_upload_id(data: Any, *, status: int | None = None) -> str:
+    """Validate an ID without coercing an invalid response into a URL segment."""
+    error = UploadError(
+        "Resposta de registro do upload inválida ou sem identificador válido.",
+        status_code=status, transient=False, phase="create",
+    )
+    if not isinstance(data, dict):
+        raise error
+    values = [data[key] for key in ("id", "uploadId", "upload_id")
+              if key in data and data[key] is not None]
+    if (not values or any(not isinstance(value, str) or not value
+                         or value != value.strip() or value in (".", "..")
+                         or any(char.isspace() or ord(char) < 32 or ord(char) == 127
+                         or char in "/\\?#%" for char in value)
+                         for value in values)
+            or any(value != values[0] for value in values[1:])):
+        raise error
+    return values[0]
+
+
+def _validated_sas_urls(data: Any, filenames: list[str], *,
+                        _native_response_schema: bool = False) -> tuple[dict[str, str], dict[str, str]]:
+    """Require all requested artifacts before starting either PUT operation."""
+    error = UploadError(
+        "Resposta SAS inválida ou incompleta para os arquivos solicitados.",
+        status_code=200, transient=False, phase="sas",
+    )
+    if not isinstance(data, dict):
+        raise error
+    entries = data.get("signed_urls")
+    if not isinstance(entries, list) or not entries:
+        raise error
+    expected = set(filenames)
+    urls: dict[str, str] = {}
+    paths: dict[str, str] = {}
+    resources: set[tuple[str, str, int, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise error
+        filename, url = entry.get("filename"), entry.get("blob_url")
+        # APK 1.28 declares expires_at as a required z.string, without a date
+        # refinement. Do not infer temporal validity from this structural gate.
+        if _native_response_schema and not isinstance(entry.get("expires_at"), str):
+            raise error
+        if (not isinstance(filename, str) or filename not in expected or filename in urls
+                or not isinstance(url, str) or not url or "\\" in url
+                or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
+            raise error
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            valid = (parsed.scheme == "https" and parsed.hostname
+                     and parsed.path and parsed.path != "/"
+                     and parsed.username is None and parsed.password is None
+                     and not parsed.fragment and parsed.port != 0)
+        except ValueError:
+            raise error from None
+        if not valid:
+            raise error
+        resource = (parsed.scheme, parsed.hostname, parsed.port or 443, parsed.path)
+        if resource in resources:
+            raise error
+        resources.add(resource)
+        urls[filename] = url
+        paths[filename] = parsed.path.lstrip("/")
+    if set(urls) != expected:
+        raise error
+    return urls, paths
+
+
+def _conflict_upload(text: str) -> tuple[dict[str, Any], str]:
+    """Read the canonical conflict contract, keeping driver decisions private.
+
+    APK 1.28 requires root upload_id/status and optional string detail. Finite,
+    unambiguous JSON and safe, consistent ID aliases are stronger local guards.
+    A failed receipt remains an identity to review, never a delivery receipt.
+    """
     try:
-        body = json.loads(text)
-    except (json.JSONDecodeError, ValueError) as exc:
+        body = decode_json_state(text)
+    except JsonStateError:
         raise UploadError(
-            f"POST /uploads conflitante sem JSON: {text[:300]}",
+            "POST /uploads conflitante sem JSON válido.",
             status_code=409, transient=False, phase="create",
-        ) from exc
-    if not isinstance(body, dict):
+        ) from None
+
+    status = body.get("status")
+    valid_shape = (
+        isinstance(body.get("upload_id"), str)
+        and isinstance(status, str) and status in ("initiated", "uploaded", "failed")
+        and ("detail" not in body or isinstance(body["detail"], str))
+    )
+    if not valid_shape:
+        # Native safeParse succeeds before consulting this exact fallback.
+        if body.get("detail") == "Session has been deleted":
+            raise UploadError(
+                "POST /uploads: a sessão foi removida pelo servidor",
+                status_code=409, transient=False, phase="create",
+            )
         raise UploadError(
-            "POST /uploads conflitante com corpo inválido",
+            "POST /uploads conflitante com resposta inválida; preserve o registro para revisão.",
             status_code=409, transient=False, phase="create",
         )
 
-    dictionaries = [body]
-    dictionaries.extend(value for value in body.values() if isinstance(value, dict))
-    upload_id = ""
-    for item in dictionaries:
-        upload_id = str(
-            item.get("id") or item.get("uploadId") or item.get("upload_id") or "")
-        if upload_id:
-            break
-    normalized = json.dumps(body, ensure_ascii=False).casefold()
-    # O app compara detail === SESSION_DELETED_DETAIL = 'Session has been
-    # deleted' (bundle:999140). A substring exata é a única confiável.
-    if ("session has been deleted" in normalized
-            or "session-deleted" in normalized
-            or "session_deleted" in normalized):
-        raise UploadError(
-            "POST /uploads: a sessão foi removida pelo servidor",
-            status_code=409, transient=False, phase="create",
-        )
-    if not upload_id:
-        raise UploadError(
-            f"POST /uploads conflitante sem upload_id reutilizável: {text[:300]}",
-            status_code=409, transient=False, phase="create",
-        )
-    if any(word in normalized for word in ('"completed"', '"complete"', '"done"')):
-        action = "done"
-    elif '"uploaded"' in normalized:
-        action = "complete"
-    else:
-        action = "reuse-and-upload"
-    merged = dict(body)
-    merged["id"] = upload_id
-    merged["_conflict_action"] = action
-    return merged
+    upload_id = _response_upload_id(body, status=409)
+    action = {"initiated": "reuse-and-upload", "uploaded": "complete", "failed": "dead-end"}[status]
+    # Unknown fields cannot inject a transition or supply an alternative ID.
+    return {"id": upload_id, "status": status}, action
 
 
 # --- Fluxo de um chunk individual (etapas 1-4) --------------------------------
@@ -969,27 +1314,33 @@ def _upload_single_chunk(
     network_meta: dict[str, Any] | None,
     max_retries: int = 3,
     retry_backoff: float = 1.5,
-    suppress_per_chunk_catbear: bool = False,
+    suppress_per_chunk_catbear: bool = True,
     session_complete: bool = False,
     fail_on_error: bool = True,
     sidecar: bool = True,
     sidecar_data: bytes | None = None,
     ego_meta: dict[str, Any] | None = None,
-    register_first: bool = False,
+    register_first: bool = True,
     on_progress: Callable[..., None] | None = None,
     profile: DeviceProfile | None = None,
     checkpoint: Callable[..., None] | None = None,
+    _resume_sidecar_row: dict[str, Any] | None = None,
+    _native_response_schema: bool = True,
+    _original_capture: CaptureDescriptor | None = None,
+    _expected_video_sha256: str | None = None,
 ) -> ChunkResult:
     """Executa registro -> SAS -> PUT Blob -> PATCH /complete.
 
-    register_first=True replica a ordem confirmada no `uploadRecordingImpl` do
-    app Android v1.22: POST /uploads -> SAS -> transporte -> complete. O modo
-    False preserva o fluxo legado SAS -> transporte -> registro -> complete.
+    Novos envios usam a ordem observada em driveCreate do APK 1.28.0:
+    POST /uploads -> SAS -> transporte -> complete. False é preservado para
+    retomadas explicitamente identificadas com a ordem legada.
 
     Espelha o app nativo:
       - auto-retry com backoff nas etapas transientes (create/sas, transport);
-      - PATCH complete com `suppress_per_chunk_catbear` e `session_complete`
-        em todo chunk de uma sessão aceita (replica `_completeUpload`);
+      - PATCH complete com supressão True nos novos envios; False explícito
+        mantém a omissão legada. `session_complete` só é enviado quando esse
+        parâmetro é True; não há equivalência demonstrada entre o desktop e
+        os estados Android accepted && saveGated (U04 permanece aberto);
       - se o registro foi criado e a confirmação falhar, marca `PATCH /fail`
         (fail_on_error) — comportamento `_failUpload` do app;
       - se o arquivo local sumir, devolve um ChunkResult em estado `loss`
@@ -998,10 +1349,47 @@ def _upload_single_chunk(
         (imu.csv, frames.csv, metadata.json) e envia meta ego
         (source/timebase/cameras/codecActuals) — requisito do evaluate.
 
-    Retorna o ChunkResult com os IDs e metadados.
+    Retorna o ChunkResult com os IDs e metadados. Política de ordem não booleana
+    conserva o contrato de retorno STATE_FAILED e comunica somente o diagnóstico
+    ao callback checkpoint, antes de probe/HTTP. Esse callback é código do
+    chamador e pode produzir efeitos locais. Flags de conclusão não booleanas
+    levantam UploadError antes de qualquer callback.
     """
+    _require_completion_flags(suppress_per_chunk_catbear, session_complete)
+    if _expected_video_sha256 is not None:
+        _verify_video_content_digest(video_path, _expected_video_sha256)
+    if type(_native_response_schema) is not bool:
+        raise UploadError("Contrato de resposta inválido; use um valor booleano.",
+                          transient=False, phase="preflight")
+    resume_row = _resume_sidecar_row
+    if resume_row is not None:
+        _native_response_schema = _journal_flag(resume_row, "native_response_schema")
+        _validate_journal_owner(resume_row, _upload_owner(session, profile))
+        if resume_row.get("video_content_sha256") is not None:
+            persisted_digest = resume_row["video_content_sha256"]
+            if _expected_video_sha256 is not None and persisted_digest != _expected_video_sha256:
+                raise UploadError("O hash do conteúdo difere do registro; preserve os recibos para revisão.",
+                                  transient=False, phase="preflight", review_required=True)
+            _expected_video_sha256 = persisted_digest
+            _verify_video_content_digest(video_path, _expected_video_sha256)
+        sidecar_data = _sidecar_resume_payload(resume_row)
+        if (resume_row.get("session_id") != session_id
+                or resume_row.get("chunk_index", 0) != chunk_index
+                or resume_row.get("org_key") != org_key
+                or resume_row.get("task_id") != task_id
+                or resume_row.get("recorded_at") != recorded_at
+                or register_first is not True or sidecar is not True):
+            raise _existing_receipt_error()
+    if type(register_first) is not bool:
+        error = "Política de ordem do upload inválida; use um valor booleano."
+        if checkpoint:
+            checkpoint(state=STATE_FAILED, phase="preflight", error=error)
+        return ChunkResult(upload_id="", chunk_index=chunk_index,
+                           log_id=f"{session_id}_{chunk_index}", blob_path="",
+                           size_bytes=-1, duration_ms=0, state=STATE_FAILED, error=error)
     _limits = config.recording_limits()
-    file_size = video_path.stat().st_size if video_path.exists() else -1
+    file_size = (resume_row["size_bytes"] if resume_row is not None
+                 else video_path.stat().st_size if video_path.exists() else -1)
     # Padrão nativo: logId = "{sessionId}_{chunk_index}".
     log_id = f"{session_id}_{chunk_index}"
     # Padrão nativo observado no SAS real: filename = "{logId}.mp4" (SEM _preview).
@@ -1009,7 +1397,9 @@ def _upload_single_chunk(
     # exatamente o caminho que o evaluate procura (video.ffprobe_ok).
     file_name = f"{log_id}.mp4"
     sidecar_file_name = f"{log_id}.data.zip"
-    duration_ms = _probe_duration_ms(video_path) if video_path.exists() else 0
+    duration_ms = (resume_row["duration_ms"] if resume_row is not None
+                   else _original_capture.metadata["durationMs"] if _original_capture is not None
+                   else _probe_duration_ms(video_path) if video_path.exists() else 0)
 
     def _emit(phase: str, state: str, attempt: int, **details: Any) -> None:
         if on_progress:
@@ -1020,10 +1410,12 @@ def _upload_single_chunk(
             checkpoint(state=state, phase=phase, **details)
 
     _checkpoint(
-        STATE_CREATING, "preflight", local_video_path=str(video_path.resolve()),
+        STATE_TRANSPORT if resume_row is not None else STATE_CREATING,
+        "sidecar_preflight" if resume_row is not None else "preflight",
+        local_video_path=str(video_path.resolve()),
         size_bytes=file_size, duration_ms=duration_ms,
     )
-    if not video_path.exists():
+    if resume_row is None and not video_path.exists():
         return ChunkResult(
             upload_id="", chunk_index=chunk_index, log_id=log_id, blob_path="",
             size_bytes=-1, duration_ms=0, state=STATE_LOSS,
@@ -1043,7 +1435,7 @@ def _upload_single_chunk(
     # --- 0. sidecar .data.zip (nativo) ------------------------------------
     sidecar_bytes: bytes | None = None
     sidecar_metadata: dict[str, Any] | None = None
-    if sidecar and video_path.exists():
+    if sidecar and (resume_row is not None or video_path.exists()):
         try:
             if sidecar_data is not None:
                 sidecar_bytes = sidecar_data
@@ -1088,23 +1480,32 @@ def _upload_single_chunk(
             _emit("sidecar", STATE_FAILED, 1, error=str(error))
             _checkpoint(STATE_FAILED, "sidecar", error=str(error))
             return ChunkResult(
-                upload_id="", chunk_index=chunk_index, log_id=log_id,
+                upload_id=resume_row["upload_id"] if resume_row is not None else "",
+                chunk_index=chunk_index, log_id=log_id,
                 blob_path="", size_bytes=file_size, duration_ms=duration_ms,
                 state=STATE_FAILED, error=str(error),
             )
         _checkpoint(
-            STATE_CREATING, "sidecar_validated",
+            STATE_TRANSPORT if resume_row is not None else STATE_CREATING,
+            "sidecar_preflight" if resume_row is not None else "sidecar_validated",
             sidecar_size_bytes=len(sidecar_bytes),
+            sidecar_sha256=hashlib.sha256(sidecar_bytes).hexdigest(),
         )
 
-    upload_id = ""
-    create_data: dict[str, Any] = {}
+    upload_id = resume_row["upload_id"] if resume_row is not None else ""
+    create_data: dict[str, Any] = {"id": upload_id} if resume_row is not None else {}
     create_attempts = 1
-    conflict_action = ""
+    conflict_action = "complete" if resume_row is not None else ""
+    transport_sidecar_only = resume_row is not None
 
     # --- 2. POST /api/v1/storage/sas/blobs --------------------------------
+    sas_progress_attempt = 0
+
     def _sas() -> tuple[dict[str, Any], dict[str, str], str, str]:
-        files: list[dict[str, Any]] = [
+        nonlocal sas_progress_attempt
+        sas_progress_attempt += 1
+        _emit("sas", STATE_TRANSPORT, sas_progress_attempt)
+        files: list[dict[str, Any]] = [] if transport_sidecar_only else [
             {"filename": file_name, "content_type": content_type},
         ]
         if sidecar_bytes is not None:
@@ -1119,24 +1520,14 @@ def _upload_single_chunk(
         if status != 200:
             raise _http_upload_error("SAS", status, text, response_headers)
         try:
-            sas_data = json.loads(text)
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise UploadError(f"resposta SAS não-JSON: {text[:300]}") from exc
-        signed_urls = sas_data.get("signed_urls") or []
-        if not signed_urls:
-            raise UploadError(f"nenhuma signed_url na resposta SAS: {text[:300]}")
-
-        urls_by_filename: dict[str, str] = {}
-        paths_by_filename: dict[str, str] = {}
-        for entry in signed_urls:
-            fn = entry.get("filename")
-            url = entry.get("blob_url")
-            if fn and url:
-                urls_by_filename[fn] = url
-                paths_by_filename[fn] = urllib.parse.urlparse(url).path.lstrip("/")
-        if file_name not in urls_by_filename:
-            raise UploadError(f"blob_url do mp4 ausente na resposta SAS: {text[:300]}")
-        return sas_data, urls_by_filename, paths_by_filename[file_name], \
+            sas_data = decode_json_state(text)
+        except JsonStateError:
+            raise UploadError("Resposta SAS sem JSON válido.", status_code=status,
+                              transient=False, phase="sas") from None
+        urls_by_filename, paths_by_filename = _validated_sas_urls(
+            sas_data, [item["filename"] for item in files],
+            _native_response_schema=_native_response_schema and register_first)
+        return sas_data, urls_by_filename, paths_by_filename.get(file_name, ""), \
             paths_by_filename.get(sidecar_file_name, "")
 
     sas_data: dict[str, Any] = {}
@@ -1149,13 +1540,12 @@ def _upload_single_chunk(
     def _request_sas_stage() -> ChunkResult | None:
         nonlocal sas_data, urls_by_filename, blob_path, sidecar_blob_path
         nonlocal blob_url, sas_attempts
-        _emit("sas", STATE_TRANSPORT, 1)
         try:
             sas_result, sas_attempts = _with_retry(
                 _sas, max_retries=max_retries,
                 retry_backoff=retry_backoff, label="SAS")
             sas_data, urls_by_filename, blob_path, sidecar_blob_path = sas_result
-            blob_url = urls_by_filename[file_name]
+            blob_url = urls_by_filename.get(file_name, "")
         except UploadError as exc:
             sas_attempts = exc.attempts or sas_attempts
             failure_state = STATE_RETRY_LATE if exc.retryable else STATE_FAILED
@@ -1168,6 +1558,7 @@ def _upload_single_chunk(
             # permanente pode encerrá-lo no servidor.
             if upload_id and fail_on_error and not exc.retryable:
                 try:
+                    _emit("fail", STATE_FAILED, 1)
                     fail_upload(session, upload_id, f"SAS falhou: {exc}")
                 except UploadError:
                     pass
@@ -1194,7 +1585,7 @@ def _upload_single_chunk(
             return sas_failure
 
     # --- 3. PUT no Azure Blob Storage (mp4 + sidecar) ---------------------
-    if not video_path.exists():
+    if resume_row is None and not video_path.exists():
         # [upload] local file missing -> loss record
         loss = ChunkResult(
             upload_id="", chunk_index=chunk_index, log_id=log_id,
@@ -1204,58 +1595,83 @@ def _upload_single_chunk(
         )
         return loss
 
-    file_size = video_path.stat().st_size
+    if resume_row is None:
+        file_size = video_path.stat().st_size
+    transport_progress_attempt = 0
 
     def _transport() -> int:
-        def _transport_progress(sent: int, total: int, elapsed: float) -> None:
+        nonlocal transport_progress_attempt
+        transport_progress_attempt += 1
+        _emit("transport", STATE_TRANSPORT, transport_progress_attempt)
+
+        def _transport_progress(sent: int, total: int, elapsed: float,
+                                *, artifact: str | None = None) -> None:
             speed_bps = sent / elapsed if elapsed > 0 else 0.0
             remaining = max(0, total - sent)
             eta_s = remaining / speed_bps if speed_bps > 0 else None
             _emit(
-                "transport", STATE_TRANSPORT, 1,
+                "transport", STATE_TRANSPORT, transport_progress_attempt,
                 sent_bytes=sent, total_bytes=total,
                 speed_bps=speed_bps, eta_s=eta_s,
                 percent=(sent * 100.0 / total if total else 100.0),
+                **({"artifact": artifact} if artifact else {}),
             )
 
-        put_status = _put_blob_file(blob_url, video_path,
-                                    content_type=content_type,
-                                    timeout=timeout_blob,
-                                    on_progress=_transport_progress)
+        put_status = 201 if transport_sidecar_only else _put_blob_file(
+            blob_url, video_path, content_type=content_type,
+            timeout=timeout_blob, on_progress=_transport_progress,
+            **({"expected_sha256": _original_capture.media.sha256}
+               if _original_capture is not None else
+               {"expected_sha256": _expected_video_sha256}
+               if _expected_video_sha256 is not None else {}))
         if put_status != 201:
             raise _http_upload_error(
                 "PUT Blob", int(put_status), "status inesperado")
         if sidecar_bytes is not None:
             zip_url = urls_by_filename.get(sidecar_file_name, "")
             if zip_url:
+                _emit("transport", STATE_TRANSPORT, transport_progress_attempt,
+                      artifact="sidecar")
                 # O nativeUploadTransport (AzureBlockUploader) sobe QUALQUER
                 # arquivo em blocos (mp4 e .data.zip) via OkHttp.
                 zip_status = _put_blob(zip_url, sidecar_bytes,
                                        content_type="application/zip",
                                        timeout=timeout_blob,
-                                       resumable=None)
+                                       resumable=None,
+                                       on_progress=lambda sent, total, elapsed: _transport_progress(
+                                           sent, total, elapsed, artifact="sidecar"))
                 if zip_status != 201:
                     raise _http_upload_error(
                         "PUT sidecar", int(zip_status), "status inesperado")
         return put_status
 
     sas_remints = 0
+    sas_remint_error: UploadError | None = None
 
     def _transport_resilient() -> int:
         """Uma SAS expirada é renovada; outros 403 continuam permanentes."""
         nonlocal sas_data, urls_by_filename, blob_path, sidecar_blob_path
-        nonlocal blob_url, sas_attempts, sas_remints
+        nonlocal blob_url, sas_attempts, sas_remints, sas_remint_error
+        # The old authorization was already refused. An exhausted renewal
+        # cannot make those URLs usable; outer retries must retain its cause
+        # rather than turn a transient SAS failure into permanent PUT /fail.
+        if sas_remint_error is not None:
+            raise sas_remint_error
         try:
             return _transport()
         except UploadError as exc:
             if exc.status_code not in (401, 403) or sas_remints >= 1:
                 raise
             sas_remints += 1
-            renewed, remint_attempts = _with_retry(
-                _sas, max_retries=max_retries,
-                retry_backoff=retry_backoff, label="SAS remint")
+            try:
+                renewed, remint_attempts = _with_retry(
+                    _sas, max_retries=max_retries,
+                    retry_backoff=retry_backoff, label="SAS remint")
+            except UploadError as renewal_error:
+                sas_remint_error = renewal_error
+                raise
             sas_data, urls_by_filename, blob_path, sidecar_blob_path = renewed
-            blob_url = urls_by_filename[file_name]
+            blob_url = urls_by_filename.get(file_name, "")
             sas_attempts += remint_attempts
             _checkpoint(
                 STATE_TRANSPORT, "sas_reminted", blob_path=blob_path,
@@ -1269,7 +1685,7 @@ def _upload_single_chunk(
     # app_version (usa appVersion) nem sidecar_blob_path no meta — replicar ISSO
     # (espalhar o metadata.json inteiro) é o que o catbear espera.
     def _register() -> None:
-        nonlocal upload_id, create_data, create_attempts, conflict_action
+        nonlocal upload_id, create_data, create_attempts, conflict_action, transport_sidecar_only
         # O app nativo espalha o metadata.json do sidecar como meta do POST
         # /uploads. Se um .data.zip foi fornecido (sidecar_bytes), extrair o
         # metadata.json dele (fonte de verdade: imu/frames/metadata REAIS) —
@@ -1303,9 +1719,17 @@ def _upload_single_chunk(
         # alimenta os checks de integridade (artifact.metadata_json.*); o POST
         # usa o formato curto.
         # Com perfil: o MODELO SAMSUNG DO APARELHO DA CONTA (S21–S24).
-        meta["device"] = default_device_meta(profile)
-        meta["platform"] = default_platform_meta(profile)
-        meta["appVersion"] = config.APP_VERSION
+        if _original_capture is not None:
+            # Short POST fields come from the reviewed capture. The ZIP bytes
+            # retain the full original device/platform and unknown metadata.
+            meta["device"] = {"model": _original_capture.metadata["device"]["model"]}
+            source_platform = _original_capture.metadata["platform"]
+            meta["platform"] = {"os": source_platform.get("os", source_platform.get("type"))}
+            meta["appVersion"] = _original_capture.metadata["appVersion"]
+        else:
+            meta["device"] = default_device_meta(profile)
+            meta["platform"] = default_platform_meta(profile)
+            meta["appVersion"] = config.APP_VERSION
 
         # QA local: o backend compara o meta do POST com o sidecar
         # (xcheck.metadata_json_matches_upload) — qualquer drift cai aqui.
@@ -1330,63 +1754,123 @@ def _upload_single_chunk(
         }
         if task_id:
             upload_body["task_id"] = task_id
+        create_progress_attempt = 0
 
         def _create_upload() -> dict[str, Any]:
+            nonlocal create_progress_attempt, conflict_action, upload_id, create_data
+            create_progress_attempt += 1
+            _emit("create", STATE_CREATING, create_progress_attempt)
+            if _expected_video_sha256 is not None:
+                _verify_video_content_digest(video_path, _expected_video_sha256)
+            if _original_capture is not None:
+                try:
+                    current = inspect_original_capture(_original_capture.media.path,
+                                                       _original_capture.sidecar.path)
+                    if current != _original_capture:
+                        raise CaptureImportError("source_changed")
+                except (CaptureImportError, OSError):
+                    raise UploadError("A captura original mudou antes do registro; arquivos preservados para revisão.",
+                                      transient=False, phase="preflight", review_required=True) from None
+            # Commit intent before the request: an abrupt process exit may
+            # otherwise leave an accepted remote upload with no local ID.
+            _checkpoint(STATE_CREATING, "create_in_flight",
+                        create_attempted=True, attempts=create_progress_attempt)
             # O app nativo envia o org_key como QUERY PARAM (/uploads?org_key=...),
             # não no corpo — replicar isso é o que associa o upload ao catbear/org.
-            status, text, response_headers = _session_request(
-                session, "POST", f"/api/v1/uploads?org_key={org_key}", upload_body)
+            try:
+                status, text, response_headers = _session_request(
+                    session, "POST", f"/api/v1/uploads?org_key={org_key}", upload_body)
+            except Exception as exc:
+                # Auth failures retain their typed account diagnosis. Adapter
+                # failures may follow an accepted request and must stay private.
+                from .minute_api import AuthError
+                if isinstance(exc, AuthError):
+                    raise
+                typed = isinstance(exc, UploadError)
+                status_code = exc.status_code if typed else _status_from_exception(exc)
+                blocked_reason = exc.blocked_reason if typed else None
+                status_detail = f" ({status_code})" if status_code is not None else ""
+                message = f"CREATE sem confirmação do serviço{status_detail}; preserve o registro para revisão."
+                if blocked_reason:
+                    reason = (blocked_reason if isinstance(blocked_reason, str) and re.fullmatch(
+                        r"[a-z][a-z0-9_-]{0,63}", blocked_reason) else "não especificado")
+                    message += f" [bloqueio: {reason}]"
+                raise UploadError(
+                    message, status_code=status_code,
+                    transient=exc.transient if typed else True,
+                    blocked_reason=blocked_reason, phase="create") from None
             if status == 409:
-                return _conflict_upload(text)
+                data, conflict_action = _conflict_upload(text)
+                return data
             # O schema diz response 201 (Created), não 200.
             if status not in (200, 201):
                 raise _http_upload_error(
                     "POST /uploads", status, text, response_headers)
             try:
-                return json.loads(text)
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise UploadError(f"resposta /uploads não-JSON: {text[:300]}") from exc
+                data = decode_json_state(text)
+            except JsonStateError:
+                raise UploadError("Resposta de registro do upload sem JSON válido.",
+                                  status_code=status, transient=False, phase="create") from None
+            # Keep a trustworthy ID even when the remaining acknowledgement
+            # cannot authorize SAS/transport. Never replace it with a new CREATE.
+            upload_id = _response_upload_id(data, status=status)
+            create_data = data
+            if _native_response_schema and register_first:
+                _validate_native_upload_out(data, "create")
+            return data
 
+        # session_id/log_id are stable request bindings, not a demonstrated
+        # provider idempotency guarantee. A lost acknowledgement cannot safely
+        # authorize another CREATE. Known409 receipts still follow their driver.
         create_data, create_attempts = _with_retry(
-            _create_upload, max_retries=max_retries, retry_backoff=retry_backoff,
+            _create_upload, max_retries=1, retry_backoff=retry_backoff,
             label="create",
         )
         # UploadOut usa "id" como campo do uploadId.
-        upload_id = (
-            create_data.get("id")
-            or create_data.get("uploadId")
-            or create_data.get("upload_id")
-        ) or ""
-        if not upload_id:
-            raise UploadError("uploadId ausente na resposta /uploads")
-        conflict_action = str(create_data.get("_conflict_action") or "")
+        upload_id = _response_upload_id(create_data)
+        # conflict_action is set only by the validated409 parser, never by a
+        # similarly named field in an ordinary server success response.
+        dead_end = conflict_action == "dead-end"
+        transport_sidecar_only = (register_first and conflict_action == "complete"
+                                  and sidecar_bytes is not None)
         _checkpoint(
-            STATE_TRANSPORT, "registered", upload_id=upload_id,
+            STATE_FAILED if dead_end else STATE_TRANSPORT,
+            "create_conflict_dead_end" if dead_end else "registered", upload_id=upload_id,
             conflict_action=conflict_action, attempts=create_attempts,
+            **({"transport_artifact": "sidecar"} if transport_sidecar_only else {}),
         )
+        if dead_end:
+            raise UploadError(
+                "Registro conflitante em estado failed; envio preservado para revisão.",
+                status_code=409, transient=False, phase="create_conflict_dead_end")
 
-    # Ordem Android v1.22: registro -> SAS -> transporte.
+    # Ordem observada em driveCreate do APK 1.28.0: registro -> SAS -> transporte.
     if register_first:
-        _emit("create", STATE_CREATING, 1)
         try:
-            _register()
+            if resume_row is None:
+                _register()
         except UploadError as exc:
             create_attempts = exc.attempts or create_attempts
-            failure_state = STATE_RETRY_LATE if exc.retryable else STATE_FAILED
-            _checkpoint(failure_state, "create", error=str(exc),
+            failure_state = (STATE_QUARANTINE if exc.review_required else
+                             STATE_RETRY_LATE if exc.retryable else STATE_FAILED)
+            _checkpoint(failure_state,
+                        "registration_review" if exc.review_required else
+                        "create_conflict_dead_end" if conflict_action == "dead-end" else "create",
+                        error=str(exc), upload_id=upload_id,
                         attempts=create_attempts)
             return ChunkResult(
-                upload_id="", chunk_index=chunk_index, log_id=log_id, blob_path=blob_path,
+                upload_id=str(upload_id), chunk_index=chunk_index, log_id=log_id, blob_path=blob_path,
                 size_bytes=file_size, duration_ms=duration_ms,
-                state=failure_state, attempts=create_attempts, error=str(exc),
+                raw_create=create_data, state=failure_state,
+                attempts=create_attempts, error=str(exc),
             )
-        if conflict_action not in ("complete", "done"):
+        if conflict_action != "complete" or transport_sidecar_only:
             sas_failure = _request_sas_stage()
             if sas_failure is not None:
                 return sas_failure
 
     put_attempts = 1
-    if conflict_action not in ("complete", "done"):
+    if conflict_action != "complete" or transport_sidecar_only:
         try:
             _, put_attempts = _with_retry(
                 _transport_resilient, max_retries=max_retries,
@@ -1395,15 +1879,17 @@ def _upload_single_chunk(
             )
         except UploadError as exc:
             put_attempts = exc.attempts or 1
-            failure_state = STATE_RETRY_LATE if exc.retryable else STATE_FAILED
+            failure_state = (STATE_QUARANTINE if exc.review_required else
+                             STATE_RETRY_LATE if exc.retryable else STATE_FAILED)
             _checkpoint(
-                failure_state, "transport", upload_id=upload_id,
+                failure_state, "transport_review" if exc.review_required else "transport", upload_id=upload_id,
                 error=str(exc), attempts=put_attempts,
             )
             # Só uma falha permanente deve encerrar o registro no servidor.
             if (register_first and upload_id and fail_on_error
-                    and not exc.retryable):
+                    and not exc.retryable and not exc.review_required):
                 try:
+                    _emit("fail", STATE_FAILED, 1)
                     fail_upload(session, upload_id, f"transport falhou: {exc}")
                 except UploadError:
                     pass
@@ -1422,32 +1908,32 @@ def _upload_single_chunk(
             _register()
         except UploadError as exc:
             create_attempts = exc.attempts or create_attempts
-            failure_state = STATE_RETRY_LATE if exc.retryable else STATE_FAILED
-            _checkpoint(failure_state, "create", error=str(exc),
+            failure_state = (STATE_QUARANTINE if exc.review_required else
+                             STATE_RETRY_LATE if exc.retryable else STATE_FAILED)
+            _checkpoint(failure_state,
+                        "registration_review" if exc.review_required else
+                        "create_conflict_dead_end" if conflict_action == "dead-end" else "create",
+                        error=str(exc), upload_id=upload_id,
                         attempts=create_attempts)
             return ChunkResult(
-                upload_id="", chunk_index=chunk_index, log_id=log_id, blob_path=blob_path,
+                upload_id=str(upload_id), chunk_index=chunk_index, log_id=log_id, blob_path=blob_path,
                 size_bytes=file_size, duration_ms=duration_ms,
-                state=failure_state, attempts=create_attempts, error=str(exc),
+                raw_create=create_data, state=failure_state,
+                attempts=create_attempts, error=str(exc),
             )
 
-    if conflict_action == "done":
-        _checkpoint(STATE_DONE, "done", upload_id=upload_id)
-        return ChunkResult(
-            upload_id=str(upload_id), chunk_index=chunk_index, log_id=log_id,
-            blob_path=blob_path, size_bytes=file_size, duration_ms=duration_ms,
-            raw_create=create_data, state=STATE_DONE,
-            attempts=max(sas_attempts, create_attempts),
-            sidecar_blob_path=sidecar_blob_path,
-            sidecar_size_bytes=len(sidecar_bytes) if sidecar_bytes else 0,
-        )
-
     # --- 4. PATCH /api/v1/uploads/{id}/complete ----------------------------
+    complete_progress_attempt = 0
+
     def _complete() -> dict[str, Any]:
+        nonlocal complete_progress_attempt
+        complete_progress_attempt += 1
+        _emit("complete", STATE_COMPLETING, complete_progress_attempt)
         return complete_upload(
             session, upload_id, file_size,
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
             session_complete=session_complete,
+            _native_response_schema=_native_response_schema and register_first,
         )
 
     complete_attempts = 1
@@ -1461,13 +1947,15 @@ def _upload_single_chunk(
         complete_attempts = exc.attempts or complete_attempts
         error_msg = f"complete falhou após {complete_attempts} tentativas: {exc}"
         # 5xx/rede preservam upload_id e estado para retomar só o complete.
-        failure_state = STATE_COMPLETING if exc.retryable else STATE_FAILED
+        failure_state = (STATE_QUARANTINE if exc.review_required else
+                         STATE_COMPLETING if exc.retryable else STATE_FAILED)
         _checkpoint(
-            failure_state, "complete", upload_id=upload_id,
+            failure_state, "completion_review" if exc.review_required else "complete", upload_id=upload_id,
             error=error_msg, attempts=complete_attempts,
         )
-        if fail_on_error and not exc.retryable:
+        if fail_on_error and not exc.retryable and not exc.review_required:
             try:
+                _emit("fail", STATE_FAILED, 1)
                 fail_upload(session, upload_id, error_msg)
             except UploadError:
                 pass  # melhor esforço — o erro original é o que importa
@@ -1531,12 +2019,17 @@ def evaluate_upload(session: Any, upload_id: str) -> dict[str, Any]:
                           transient=(status == -1 or status in (408, 429) or status >= 500),
                           phase="evaluate")
     try:
-        evaluation = json.loads(text)
-    except (json.JSONDecodeError, ValueError) as exc:
+        evaluation = decode_json_state(text)
+    except JsonStateError:
         raise UploadError("Avaliação devolveu uma resposta inválida.", transient=False,
-                          phase="evaluate") from exc
+                          phase="evaluate") from None
     if (not isinstance(evaluation, dict) or evaluation.get("upload_id") != upload_id
-            or not summarize_checks(evaluation)["valid"]):
+            or not summarize_checks(evaluation)["valid"]
+            or any(not isinstance(check.get("id"), str)
+                   or not isinstance(check.get("label"), str)
+                   or "detail" not in check
+                   or (check["detail"] is not None and not isinstance(check["detail"], str))
+                   for check in evaluation.get("checks", []))):
         raise UploadError("Avaliação incompleta ou referente a outro vídeo; precisa de revisão.",
                           transient=False, phase="evaluate")
     return evaluation
@@ -1623,6 +2116,89 @@ def require_perfect_upload(
 
 # --- Fluxo completo (sessão com 1+ chunks) -----------------------------------
 
+def _original_group_payloads(
+    captures: list[CaptureDescriptor] | tuple[CaptureDescriptor, ...],
+    paths: list[Path], *, session: Any, owner: str, org_key: str, task_id: str | None,
+    session_id: str | None, recorded_at: str | list[str] | None,
+    supplied: bytes | list[bytes] | None,
+) -> tuple[list[CaptureDescriptor], list[bytes], list[int], list[str]]:
+    """Reinspect all parts before journaling/HTTP; never repair source data."""
+    def refuse() -> None:
+        raise UploadError("A captura original não corresponde ao plano revisado; "
+                          "arquivos preservados para revisão.", transient=False,
+                          phase="preflight", review_required=True) from None
+
+    if (not isinstance(captures, (list, tuple)) or not captures
+            or len(captures) != len(paths) or not owner
+            or not isinstance(org_key, str) or not org_key.strip()
+            or not isinstance(task_id, str) or not task_id.strip()
+            or not isinstance(recorded_at, list) or len(recorded_at) != len(paths)):
+        refuse()
+    if any(not isinstance(capture, CaptureDescriptor) for capture in captures):
+        refuse()
+    # The campaign, API and direct uploader share the same pure group policy.
+    # The import is deferred because that validator calls the ZIP validator in
+    # this module; it performs no upload or persistent-state operation.
+    from .original_capture import (OriginalCaptureError, prepare_original_capture_plan,
+                                   validate_original_capture_session_policy)
+    try:
+        fresh = prepare_original_capture_plan(
+            [(capture.media.path, capture.sidecar.path) for capture in captures],
+            account_email=owner, org_key=org_key, task_id=task_id,
+            expected_chunk_count=len(paths), probe=probe_video)
+    except OriginalCaptureError:
+        refuse()
+    if fresh.session_id != session_id or list(fresh.recorded_at) != recorded_at:
+        refuse()
+    observed = list(fresh.captures)
+    payloads: list[bytes] = []
+    for i, (expected, actual, path) in enumerate(zip(captures, observed, paths, strict=True)):
+        try:
+            if actual != expected or path.absolute() != actual.media.path:
+                refuse()
+            meta = actual.metadata
+            source_os = meta["platform"].get("os", meta["platform"].get("type"))
+            with actual.sidecar.path.open("rb") as stream:
+                payload = stream.read(actual.sidecar.bytes + 1)
+            if (len(payload) != actual.sidecar.bytes
+                    or hashlib.sha256(payload).hexdigest() != actual.sidecar.sha256):
+                refuse()
+            declared = meta["durationMs"]
+            from .validate import summarize, validate_upload_meta
+            post_meta = {**meta, "device": {"model": meta["device"]["model"]},
+                         "platform": {"os": source_os},
+                         "chunk_index": i, "size_bytes": actual.media.bytes}
+            if summarize(validate_upload_meta(post_meta, log_id=f"{session_id}_{i}",
+                                              duration_ms=declared))["counts"].get("fail", 0):
+                refuse()
+        except (CaptureImportError, OSError, KeyError, TypeError, ValueError, UploadError):
+            refuse()
+        payloads.append(payload)
+    if supplied is not None:
+        given = supplied if isinstance(supplied, list) else [supplied]
+        if given != payloads:
+            refuse()
+    validate_original_capture_session_policy(fresh, session)
+    return observed, payloads, list(fresh.durations_ms), list(fresh.recorded_at)
+
+
+def _verify_video_content_digest(path: Path, digest: Any) -> None:
+    if type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+        raise UploadError("Hash do conteúdo inválido; novo preparo necessário.",
+                          transient=False, phase="preflight", review_required=True)
+    from .content_provenance import fingerprint
+    try:
+        if fingerprint(path)["sha256"] != digest:
+            raise ValueError("changed")
+    except (OSError, ValueError):
+        raise UploadError("O conteúdo local mudou; novo preparo necessário, arquivos preservados para revisão.",
+                          transient=False, phase="preflight", review_required=True) from None
+
+
+from .upload_protocol_lease import session_protocol, pending_protocol
+
+
+@session_protocol
 def upload_session(
     session: Any,
     video_path: str | Path | list[str | Path],
@@ -1640,7 +2216,7 @@ def upload_session(
     network_meta: dict[str, Any] | None = None,
     max_retries: int = 3,
     retry_backoff: float = 1.5,
-    suppress_per_chunk_catbear: bool = False,
+    suppress_per_chunk_catbear: bool = True,
     fail_on_error: bool = True,
     persist_sidecar: bool = False,
     sidecar: bool = True,
@@ -1648,11 +2224,13 @@ def upload_session(
     ego_meta: dict[str, Any] | None = None,
     require_perfect: bool = False,
     normalize: bool = True,
-    register_first: bool = False,
+    register_first: bool = True,
     on_progress: Callable[..., None] | None = None,
     profile: DeviceProfile | None = None,
     chunk_index_start: int = 0,
     campaign_context: dict[str, Any] | None = None,
+    original_captures: list[CaptureDescriptor] | tuple[CaptureDescriptor, ...] | None = None,
+    expected_video_sha256: str | list[str] | None = None,
 ) -> UploadResult:
     """Executa o upload completo de uma sessão (1+ chunks) ao backend do Minute.
 
@@ -1670,11 +2248,14 @@ def upload_session(
         platform_meta — metadados de plataforma (default: android / app_version).
         video_meta    — metadados de vídeo (default: h264 / 1080p / 30fps).
         network_meta  — metadados de rede (default: wifi).
-        max_retries   — auto-retry por etapa transiente (mimica o app; default 3).
+        max_retries   — limite de tentativas nas etapas compatíveis (default3).
+                      CREATE sem recibo usa uma tentativa; falha mantém o
+                      registro para revisão, sem presumir idempotência remota.
         retry_backoff — multiplicador do backoff entre retries (default 1.5).
-        suppress_per_chunk_catbear — envia true no PATCH complete (default False);
-                      em sessões multi-chunk o app suprime o catbear por-chunk e
-                      deixa a avaliação para o finalize da sessão.
+        suppress_per_chunk_catbear — True em envios novos, como no helper do APK
+                      1.28.0, independentemente da contagem de chunks. False
+                      explícito mantém a omissão legada. Journal existente governa
+                      a política efetiva: valor booleano salvo ou False se ausente.
         fail_on_error — se True, marca PATCH /fail quando o registro já existe
                       e a confirmação falha (comportamento _failUpload do app).
         persist_sidecar — se True, grava data/sidecars/<session_id>.json com o
@@ -1693,20 +2274,139 @@ def upload_session(
                       Samsung padrão de referência (config.NATIVE_*).
         chunk_index_start — índice inicial do chunk; usado pela retomada para
                       manter a identidade original e evitar registros duplicados.
-        on_progress   — callback(phase, state, attempt) por etapa.
+        on_progress   — callback síncrono(phase, state, attempt) no fluxo padrão, antes de
+                      CREATE, SAS, PUT de vídeo/ZIP, COMPLETE, EVALUATE,
+                      FINALIZE e compensação /fail, incluindo novas tentativas
+                      dessas etapas. O chamador pode aguardar Retomar nele.
+                      O progresso do transporte consulta o chamador antes de
+                      cada bloco/tentativa e BlockList, inclusive no ZIP.
+                      Requisições já em andamento podem terminar.
+                      A política require_perfect tem compensações próprias.
 
     Devolve `UploadResult` com os IDs, metadados e status de finalize/evaluate.
     Levanta `UploadError` em qualquer falha.
     """
+    _require_completion_flags(suppress_per_chunk_catbear)
+    if type(register_first) is not bool:
+        raise UploadError("Política de ordem do upload inválida; use um valor booleano.",
+                          transient=False, phase="preflight")
+    if type(chunk_index_start) is not int or chunk_index_start < 0:
+        raise UploadError("Índice inicial do envio inválido.", transient=False, phase="preflight")
+    session_owner = _upload_owner(session, profile)
     # Normaliza video_path para lista de Paths.
     if isinstance(video_path, (str, Path)):
         paths = [Path(video_path)]
     else:
         paths = [Path(p) for p in video_path]
+    expected_digests: list[str] | None = None
+    if expected_video_sha256 is not None:
+        if normalize is not False:
+            raise UploadError("Conteúdo byte-bound exige normalize=False.", transient=False, phase="preflight")
+        expected_digests = ([expected_video_sha256] if type(expected_video_sha256) is str
+                            else expected_video_sha256)
+        if type(expected_digests) is not list or not paths or len(expected_digests) != len(paths):
+            raise UploadError("Grupo de hashes do conteúdo inválido.", transient=False, phase="preflight")
+        # Validate the WHOLE group before any journal, CREATE or normalization.
+        for path, digest in zip(paths, expected_digests, strict=True):
+            _verify_video_content_digest(path, digest)
+
+    original_durations: list[int] | None = None
+    original_sequence: list[str] | None = None
+    if original_captures is not None:
+        if (normalize is not False or register_first is not True or sidecar is not True
+                or persist_sidecar is not True or chunk_index_start != 0
+                or any(type(value) is not bool for value in (evaluate, finalize, require_perfect, fail_on_error))
+                or profile is not None or ego_meta is not None
+                or any(value is not None for value in (device_meta, platform_meta, video_meta, network_meta))):
+            raise UploadError("A captura original exige envio integral sem alteração de arquivos ou metadados.",
+                              transient=False, phase="preflight", review_required=True)
+        original_captures, sidecar_data, original_durations, original_sequence = _original_group_payloads(
+            original_captures, paths, session=session, owner=session_owner, org_key=org_key, task_id=task_id,
+            session_id=session_id, recorded_at=recorded_at, supplied=sidecar_data)
+        if expected_digests is not None and expected_digests != [capture.media.sha256 for capture in original_captures]:
+            raise UploadError("O hash informado difere da captura original.", transient=False, phase="preflight")
+
+    explicit_session_id = session_id is not None
+    session_id = session_id or str(uuid.uuid4())
+    existing_journals: list[dict[str, Any] | None] = []
+    for offset in range(len(paths)):
+        existing = (load_sidecar(session_id, chunk_index_start + offset)
+                    if persist_sidecar or explicit_session_id else None)
+        if existing is not None:
+            if existing.get("video_content_sha256") is not None:
+                persisted_digest = existing["video_content_sha256"]
+                if normalize is not False:
+                    raise UploadError("O registro byte-bound exige normalize=False; preserve os arquivos para revisão.",
+                                      transient=False, phase="recovery", review_required=True)
+                _verify_video_content_digest(paths[offset], persisted_digest)
+                if expected_digests is not None and expected_digests[offset] != persisted_digest:
+                    raise UploadError("O hash do conteúdo difere do registro; preserve os recibos para revisão.",
+                                      transient=False, phase="recovery", review_required=True)
+            if original_captures is not None:
+                # The original campaign core classifies/reconciles existing
+                # receipts. Direct upload never upgrades an unowned legacy row
+                # or replaces a queued attempt with a new CREATE.
+                raise _existing_receipt_error()
+            if not journal_flags_valid(existing):
+                raise UploadError("Política do registro de envio inválida; preserve o arquivo para revisão.",
+                                  transient=False, phase="recovery")
+            if _journal_has_remote_receipt(existing):
+                raise _existing_receipt_error()
+            if _journal_creation_uncertain(existing):
+                raise _uncertain_creation_error()
+            _journal_recorded_at(existing)
+            _journal_flag(existing, "suppress_per_chunk_catbear")
+            _journal_flag(existing, "register_first")
+            _validate_journal_owner(existing, session_owner)
+            # Preserve the binding before normalizing media or replacing state.
+            idx = chunk_index_start + offset
+            expected_identity = {"org_key": org_key, "task_id": task_id,
+                                 "log_id": f"{session_id}_{idx}",
+                                 "filename": f"{session_id}_{idx}.mp4"}
+            if any(existing.get(key) is not None and existing[key] != value
+                   for key, value in expected_identity.items()):
+                raise UploadError("A identidade do envio difere do registro existente; preserve o arquivo para revisão.",
+                                  transient=False, phase="recovery")
+        existing_journals.append(existing)
+
+    # A caller may add a quality gate, but cannot remove one already recorded
+    # for a chunk. Legacy campaign journals follow the same policy as recovery.
+    quality_required = [bool(
+        evaluate or require_perfect or (row is not None and row.get(
+            "evaluation_required", bool(row.get("campaign_context")))))
+        for row in existing_journals]
 
     for p in paths:
         if not p.exists():
             raise UploadError(f"vídeo não encontrado: {p}")
+
+    preserved_sequence: list[str] | None = None
+    if any(row is not None for row in existing_journals):
+        original_durations = original_durations or [_probe_duration_ms(path) for path in paths]
+        if recorded_at is None:
+            if any(row is None for row in existing_journals):
+                raise UploadError("Uma sessão parcialmente registrada exige horários explícitos para os novos chunks; "
+                                  "os horários existentes foram preservados.",
+                                  transient=False, phase="recovery")
+            preserved_sequence = [_journal_recorded_at(row) for row in existing_journals]
+        else:
+            if isinstance(recorded_at, list):
+                candidate_sequence = _normalize_recorded_at_sequence(
+                    [str(value) for value in recorded_at], original_durations)
+            else:
+                candidate_sequence = _recorded_at_sequence_from_base(
+                    str(recorded_at), original_durations)
+            preserved_sequence = list(candidate_sequence)
+            for offset, row in enumerate(existing_journals):
+                if row is None:
+                    continue
+                original_time = _journal_recorded_at(row)
+                if recorded_at_to_wall_ms(candidate_sequence[offset]) != recorded_at_to_wall_ms(original_time):
+                    raise UploadError("O horário solicitado difere do horário original registrado; "
+                                      "preserve o arquivo para revisão.", transient=False, phase="recovery")
+                preserved_sequence[offset] = original_time
+        # Validate bounds/order, but retain the exact original clock text.
+        _normalize_recorded_at_sequence(preserved_sequence, original_durations)
 
     # Reencode full-range (yuvj420p) -> yuv420p antes de subir. Sem isso o
     # backend rejeita o preview (previewStatus "unavailable") e o vídeo não
@@ -1722,23 +2422,29 @@ def upload_session(
         paths = normalized
 
     # Defaults de meta (mimica app nativo) se não fornecidos.
-    if device_meta is None:
+    if device_meta is None and original_captures is None:
         device_meta = default_device_meta(profile)
-    if platform_meta is None:
+    if platform_meta is None and original_captures is None:
         platform_meta = default_platform_meta(profile)
-    if video_meta is None:
+    if video_meta is None and original_captures is None:
         video_meta = default_video_meta()
-    if network_meta is None:
+    if network_meta is None and original_captures is None:
         network_meta = default_network_meta()
 
-    session_id = session_id or str(uuid.uuid4())
     # recorded_at = início da gravação, formato JS toISOString (3 dígitos).
     # Sem valor: a gravação acabou de terminar (agora - duração), dentro do
     # backlog de 4h. Nunca o literal `.000Z` nem 6 dígitos.
-    durations_ms = [_probe_duration_ms(p) for p in paths]
+    durations_ms = original_durations if original_captures is not None else [_probe_duration_ms(p) for p in paths]
     total_ms = sum(durations_ms)
     recorded_at_list: list[str] | None = None
-    if isinstance(recorded_at, list):
+    if original_sequence is not None:
+        recorded_at_list = original_sequence
+        recorded_at = original_sequence[0]
+    elif preserved_sequence is not None:
+        _normalize_recorded_at_sequence(preserved_sequence, durations_ms)
+        recorded_at = preserved_sequence[0]
+        recorded_at_list = preserved_sequence
+    elif isinstance(recorded_at, list):
         recorded_at_list = _normalize_recorded_at_sequence(
             [str(value) for value in recorded_at], durations_ms)
         recorded_at = recorded_at_list[0] if recorded_at_list else ""
@@ -1752,8 +2458,6 @@ def upload_session(
         recorded_at = sequence[0]
         if len(sequence) > 1:
             recorded_at_list = sequence
-    if len(paths) > 1 and not suppress_per_chunk_catbear:
-        suppress_per_chunk_catbear = True
 
     chunks: list[ChunkResult] = []
     total_size = 0
@@ -1771,8 +2475,28 @@ def upload_session(
             stored["updated_at"] = _iso_now()
             save_sidecar(stored)
 
+    def _save_quality_checkpoint(chunk: ChunkResult, **updates: Any) -> None:
+        if not persist_sidecar:
+            return
+        stored = load_sidecar(session_id, chunk.chunk_index)
+        if stored is None:
+            raise UploadError("Registro de qualidade ausente; preserve os recibos para revisão.",
+                              transient=False, phase="evaluate", review_required=True)
+        if updates.get("phase") == "evaluation_review" and "quality_review_origin_phase" not in stored:
+            updates["quality_review_origin_phase"] = stored.get("phase", "")
+        stored.update(updates)
+        stored.update(evaluate_result=chunk.evaluate_result, updated_at=_iso_now())
+        save_sidecar(stored)
+
     for offset, vpath in enumerate(paths):
-        idx = int(chunk_index_start) + offset
+        idx = chunk_index_start + offset
+        existing_row = existing_journals[offset]
+        effective_suppression = (suppress_per_chunk_catbear if existing_row is None
+                                 else _journal_flag(existing_row, "suppress_per_chunk_catbear"))
+        effective_register_first = (register_first if existing_row is None
+                                    else _journal_flag(existing_row, "register_first"))
+        effective_native_schema = (register_first if existing_row is None
+                                   else _journal_flag(existing_row, "native_response_schema"))
         chunk_recorded_at = (
             recorded_at_list[offset]
             if recorded_at_list and offset < len(recorded_at_list)
@@ -1787,8 +2511,9 @@ def upload_session(
         journal: dict[str, Any] | None = None
         checkpoint_callback: Callable[..., None] | None = None
         if persist_sidecar:
-            existing = load_sidecar(session_id, idx) or {}
+            existing = existing_row or {}
             journal = {
+                **existing,
                 "campaign_context": existing.get("campaign_context") or campaign_context,
                 "schema_version": 2,
                 "session_id": session_id,
@@ -1802,24 +2527,35 @@ def upload_session(
                 "recorded_at": chunk_recorded_at,
                 "state": STATE_CREATING,
                 "phase": "queued",
+                "create_attempted": False,
                 "attempts": int(existing.get("attempts") or 0),
                 "crash_resumes": int(existing.get("crash_resumes") or 0),
-                "register_first": bool(
-                    existing.get("register_first", register_first)),
-                "account_email": str(
-                    existing.get("account_email")
-                    or (profile.email if profile is not None else "")),
                 "finalize_requested": bool(
                     existing.get("finalize_requested", finalize)),
-                "evaluation_required": bool(evaluate or require_perfect
-                                            or existing.get("evaluation_required")),
+                "evaluation_required": quality_required[offset],
                 "evaluation_verified": False,
                 "expected_chunk_count": int(
                     existing.get("expected_chunk_count") or len(paths)),
-                "suppress_per_chunk_catbear": bool(existing.get(
-                    "suppress_per_chunk_catbear", suppress_per_chunk_catbear)),
                 "updated_at": _iso_now(),
             }
+            # An absent legacy flag stays absent; changing its spelling/policy
+            # retroactively would change the next recovery operation.
+            if existing_row is None or "register_first" in existing:
+                journal["register_first"] = effective_register_first
+            if existing_row is None or "suppress_per_chunk_catbear" in existing:
+                journal["suppress_per_chunk_catbear"] = effective_suppression
+            if existing_row is None or "native_response_schema" in existing:
+                journal["native_response_schema"] = effective_native_schema
+            if existing_row is None:
+                journal["account_email"] = session_owner
+            if expected_digests is not None:
+                journal["video_content_sha256"] = expected_digests[offset]
+            if original_captures is not None:
+                original = original_captures[offset]
+                journal.update(source_mode="original", original_media_sha256=original.media.sha256,
+                               original_sidecar_sha256=original.sidecar.sha256,
+                               physical_provenance_verified=False,
+                               completion_strategy="explicit_finalize")
             if chunk_sidecar_data is not None:
                 archive_path = _sidecar_archive_path(session_id, idx)
                 save_bytes(archive_path, chunk_sidecar_data)
@@ -1852,19 +2588,24 @@ def upload_session(
             network_meta=network_meta,
             max_retries=max_retries,
             retry_backoff=retry_backoff,
-            suppress_per_chunk_catbear=suppress_per_chunk_catbear,
-            # Enquanto /sessions/{id}/finalize existir, ele continua sendo a
-            # fonte explícita de conclusão usada pelo QMoney. Não combinamos o
-            # contrato estável com o sinal migratório redundante.
+            suppress_per_chunk_catbear=effective_suppression,
+            # Estratégia explícita de conclusão do QMoney. O sinal Android é
+            # condicional a accepted && saveGated, sem equivalência comprovada
+            # com estes estados desktop; não combinamos as duas estratégias.
             session_complete=False,
             fail_on_error=fail_on_error,
             sidecar=sidecar,
             sidecar_data=chunk_sidecar_data,
             ego_meta=ego_meta,
-            register_first=register_first,
+            register_first=effective_register_first,
             on_progress=on_progress,
             profile=profile,
             checkpoint=checkpoint_callback,
+            _native_response_schema=effective_native_schema,
+            **({"_original_capture": original_captures[offset]} if original_captures is not None else {}),
+            **({"_expected_video_sha256": expected_digests[offset]} if expected_digests is not None else
+               {"_expected_video_sha256": existing_row["video_content_sha256"]}
+               if existing_row is not None and existing_row.get("video_content_sha256") is not None else {}),
         )
         chunks.append(chunk)
         total_size += chunk.size_bytes
@@ -1883,13 +2624,21 @@ def upload_session(
                 or chunk.state)
             save_sidecar(final_journal)
 
-        if evaluate and chunk.upload_id:
+        if (chunk.state == STATE_DONE and chunk.upload_id
+                and not require_perfect and (evaluate or quality_required[offset])):
             try:
+                if on_progress:
+                    on_progress("evaluate", STATE_COMPLETING, 1)
                 chunk.evaluate_result = evaluate_upload(session, chunk.upload_id)
             except UploadError as exc:
                 # Keep the original upload for review; an unavailable evaluation
                 # must not be treated as a passed quality check.
                 chunk.evaluate_result = {"error": str(exc), "http_status": exc.status_code}
+
+        if original_captures is not None and chunk.state != STATE_DONE:
+            # Stop creating more parts after an unresolved original receipt.
+            # Recovery must review the whole fixed SID, without a new identity.
+            break
 
     result = UploadResult(
         session_id=session_id,
@@ -1901,10 +2650,11 @@ def upload_session(
         recorded_at=recorded_at,
     )
 
-    if evaluate and not require_perfect:
+    if any(quality_required) and not require_perfect:
         blocked = []
-        for chunk in chunks:
-            if chunk.state != STATE_DONE or is_perfect(chunk.evaluate_result):
+        for offset, chunk in enumerate(chunks):
+            if (not quality_required[offset] or chunk.state != STATE_DONE
+                    or is_perfect(chunk.evaluate_result)):
                 continue
             summary = summarize_checks(chunk.evaluate_result)
             failed = ", ".join(str(c.get("id") or "sem identificação")
@@ -1923,19 +2673,27 @@ def upload_session(
             return result
 
     # --- política perfect-only (se requisitada) ----------------------------
-    # Roda evaluate em cada chunk. Se QUALQUER check falhar, cancela e deleta
-    # (PATCH /fail + DELETE /uploads/{id} + DELETE /sessions/{sid}). A sessão
-    # só é finalizada se TODOS os chunks forem perfeitos.
+    # Evaluate the whole group once before cleanup. An inconclusive sibling
+    # preserves the group for review. Valid rejection still uses the operator's
+    # cleanup policy, with durable terminal journals before any remote write.
     if require_perfect:
         all_perfect = True
+        evaluation_uncertain = False
+        rejected: list[ChunkResult] = []
         for chunk in chunks:
-            if not chunk.upload_id:
+            if not chunk.upload_id or chunk.state != STATE_DONE:
                 all_perfect = False
+                evaluation_uncertain = True
                 continue
             try:
+                if on_progress:
+                    on_progress("evaluate", STATE_COMPLETING, 1)
                 chunk.evaluate_result = evaluate_upload(session, chunk.upload_id)
             except UploadError as exc:
                 chunk.evaluate_result = {"error": str(exc)}
+                chunk.error = str(exc)
+                chunk.state = STATE_QUARANTINE
+                evaluation_uncertain = True
                 all_perfect = False
                 continue
             if not is_perfect(chunk.evaluate_result):
@@ -1945,30 +2703,64 @@ def upload_session(
                 chunk.state = STATE_FAILED
                 chunk.error = f"evaluate reprovado: {failed}"
                 all_perfect = False
-                # marca fail + deleta upload e sessão (política do operador)
-                try:
-                    fail_upload(session, chunk.upload_id, f"reprovado: {failed}")
-                except UploadError:
-                    pass
-                try:
-                    delete_upload(session, chunk.upload_id)
-                    print(f"    [perfect] upload {chunk.upload_id[:8]} DELETADO")
-                except UploadError as exc:
-                    print(f"    [perfect] falha ao deletar upload: {exc}")
-                try:
-                    delete_session(session, org_key, session_id)
-                    print(f"    [perfect] sessão {session_id[:8]} DELETADA")
-                except UploadError as exc:
-                    print(f"    [perfect] falha ao deletar sessão: {exc}")
+                rejected.append(chunk)
+        if evaluation_uncertain:
+            for chunk in chunks:
+                _save_quality_checkpoint(
+                    chunk, state=STATE_QUARANTINE, phase="evaluation_review", finalized=False,
+                    evaluation_required=True, evaluation_verified=False,
+                    error="Avaliação inconclusiva; recibos da sessão preservados para revisão.")
+            return result
+        if rejected:
+            # Commit the whole group's decision before compensation. A crash or
+            # failed DELETE must never make recovery evaluate a deleted receipt.
+            for chunk in chunks:
+                _save_quality_checkpoint(
+                    chunk, state=STATE_QUARANTINE, phase="quality_rejected", finalized=False,
+                    evaluation_required=True, evaluation_verified=False,
+                    error=chunk.error or "Sessão reprovada na política de qualidade perfeita.",
+                    remote_fail_attempted=False, remote_fail_confirmed=False,
+                    upload_delete_attempted=False, upload_delete_confirmed=False,
+                    session_delete_attempted=False, session_delete_confirmed=False)
+            for chunk in rejected:
+                for phase, attempted, confirmed, operation in (
+                    ("fail", "remote_fail_attempted", "remote_fail_confirmed",
+                     lambda current=chunk: fail_upload(session, current.upload_id, current.error or "quality rejected")),
+                    ("delete-upload", "upload_delete_attempted", "upload_delete_confirmed",
+                     lambda current=chunk: delete_upload(session, current.upload_id)),
+                ):
+                    if on_progress:
+                        on_progress(phase, STATE_FAILED, 1)
+                    _save_quality_checkpoint(chunk, **{attempted: True})
+                    try:
+                        operation()
+                    except UploadError as exc:
+                        _save_quality_checkpoint(chunk, **{confirmed: False, phase.replace("-", "_") + "_status": exc.status_code})
+                    else:
+                        _save_quality_checkpoint(chunk, **{confirmed: True, phase.replace("-", "_") + "_status": 200 if phase == "fail" else 204})
+            if on_progress:
+                on_progress("delete-session", STATE_FAILED, 1)
+            for chunk in chunks:
+                _save_quality_checkpoint(chunk, session_delete_attempted=True)
+            try:
+                delete_session(session, org_key, session_id)
+            except UploadError as exc:
+                for chunk in chunks:
+                    _save_quality_checkpoint(chunk, session_delete_confirmed=False, session_delete_status=exc.status_code)
+            else:
+                for chunk in chunks:
+                    _save_quality_checkpoint(chunk, session_delete_confirmed=True, session_delete_status=204)
+            return result
         if all_perfect:
             print(f"    [perfect] todos os {len(chunks)} chunk(s) passaram no evaluate")
         else:
             # não finaliza sessão reprovada
             return result
 
-    if persist_sidecar and (evaluate or require_perfect):
-        for chunk in chunks:
-            if chunk.state != STATE_DONE or not is_perfect(chunk.evaluate_result):
+    if persist_sidecar and any(quality_required):
+        for offset, chunk in enumerate(chunks):
+            if (not quality_required[offset] or chunk.state != STATE_DONE
+                    or not is_perfect(chunk.evaluate_result)):
                 continue
             stored = load_sidecar(session_id, chunk.chunk_index)
             if stored:
@@ -1980,8 +2772,13 @@ def upload_session(
     if finalize and all(c.state == STATE_DONE for c in chunks):
         _update_persisted_journals(
             state=STATE_COMPLETING, phase="finalizing", finalized=False)
+        finalize_progress_attempt = 0
 
         def _finalize() -> int:
+            nonlocal finalize_progress_attempt
+            finalize_progress_attempt += 1
+            if on_progress:
+                on_progress("finalize", STATE_COMPLETING, finalize_progress_attempt)
             ok, status = _finalize_session(
                 session, org_key, session_id,
                 expected_chunk_count=len(chunks),
@@ -2095,6 +2892,49 @@ def enqueue_upload(
     )
 
 
+def _pending_recovery_stage(item: dict[str, Any]) -> str:
+    """Validate a selected journal before effects; shared with recovery UI."""
+    index = item.get("chunk_index", 0)
+    resumes = item.get("crash_resumes", 0)
+    attempts = item.get("attempts", 0)
+    expected = item.get("expected_chunk_count", 1)
+    if (not journal_flags_valid(item) or type(index) is not int or index < 0
+            or type(resumes) is not int or resumes < 0
+            or type(attempts) is not int or attempts < 0
+            or type(expected) is not int or expected < 1):
+        raise UploadError("Registro de retomada inválido; os arquivos foram preservados para revisão.",
+                          transient=False, phase="recovery")
+    _journal_flag(item, "register_first")
+    _journal_flag(item, "suppress_per_chunk_catbear")
+    receipt = _journal_has_remote_receipt(item)
+    if _journal_creation_uncertain(item):
+        raise _uncertain_creation_error()
+    phase = item.get("phase", "")
+    upload_id = item.get("upload_id")
+    has_id = isinstance(upload_id, str) and bool(upload_id.strip())
+    complete_phases = {"transport_done", "completing", "complete"}
+    finalize_phases = {"awaiting_finalize", "finalize", "finalizing"}
+    if has_id and phase in complete_phases:
+        stage = "complete"
+    elif has_id and item.get("finalize_requested") is True and (
+            phase in finalize_phases or is_pending_finalization(item)):
+        stage = "finalize"
+    elif has_id and item.get("transport_artifact") == "sidecar" and phase in {
+            "registered", "sas", "sas_ready", "sas_reminted", "transport", "sidecar_preflight"}:
+        _sidecar_resume_payload(item)
+        stage = "sidecar"
+    else:
+        if receipt or phase in complete_phases | finalize_phases:
+            # A post-transport state without a receipt cannot safely become
+            # another create/PUT. Unknown receipt phases need explicit review.
+            raise _existing_receipt_error()
+        _journal_recorded_at(item)
+        stage = "upload"
+    _sidecar_filename(item.get("session_id"), index)
+    return stage
+
+
+@pending_protocol
 def pump_pending(
     session: Any,
     state: str | None = None,
@@ -2118,13 +2958,22 @@ def pump_pending(
     somente journals daquela conta são processados. Com required_org_key,
     pendências de outras organizações ficam preservadas sem reenvio.
 
+    Recibos conhecidos usam as rotas diretas complete/finalize. Um recibo em
+    fase anterior sem driver de retomada compatível é preservado e recusado
+    antes de checkpoints; não é convertido em um envio novo. Nessas rotas
+    diretas, um horário histórico ausente é conservado sem gerar outro clock.
+
     Retorna a lista de sidecars atualizados (estado final de cada tentativa).
     """
+    on_progress = kwargs.get("on_progress")
+    if on_progress is not None and not callable(on_progress):
+        raise UploadError("Callback de retomada inválido.", transient=False, phase="preflight")
+    all_journals = list_sidecars()
     if state is None:
-        pending = [s for s in list_sidecars() if s.get("state") in TRANSIENT_STATES
-                   or s.get("state") == STATE_LOSS]
+        pending = [s for s in all_journals if (isinstance(s.get("state"), str) and s.get("state") in TRANSIENT_STATES)
+                   or s.get("state") == STATE_LOSS or is_pending_finalization(s)]
     else:
-        pending = list_sidecars(state)
+        pending = [item for item in all_journals if item.get("state") == state]
     session_email = getattr(session, "email", None)
     if isinstance(session_email, str) and session_email.strip():
         if account_email is not None and account_email.strip().casefold() != session_email.strip().casefold():
@@ -2141,6 +2990,33 @@ def pump_pending(
                    if item.get("org_key") == required_org_key]
     if session_ids is not None:
         pending = [item for item in pending if item.get("session_id") in session_ids]
+
+    # Reject malformed selected journals before changing any checkpoint or
+    # calling a service. Coercion can turn bool/string counters into a valid
+    # chunk and resume a different operation than the persisted one.
+    selected_chunks: set[tuple[str, int]] = set()
+    for item in pending:
+        recovery_stage = _pending_recovery_stage(item)
+        if recovery_stage == "sidecar" and account_email is None:
+            raise UploadError("A retomada do ZIP requer uma conta autenticada identificada.",
+                              transient=False, phase="recovery")
+        index = item.get("chunk_index", 0)
+        identity = (item["session_id"], index)
+        if identity in selected_chunks:
+            raise UploadError("Registros de retomada duplicados; os arquivos foram preservados para revisão.",
+                              transient=False, phase="recovery")
+        selected_chunks.add(identity)
+
+    # A sibling marked done/finalized can be absent from the pending filter.
+    # Validate its receipt before spending another chunk's resume budget.
+    selected_sessions = {item[0] for item in selected_chunks}
+    for item in all_journals:
+        if item.get("session_id") in selected_sessions:
+            if item.get("finalized") is True:
+                if not journal_delivery_confirmed(item):
+                    raise _existing_receipt_error()
+            elif item.get("state") == STATE_DONE:
+                _pending_recovery_stage(item)
 
     updated: list[dict[str, Any]] = []
     touched_sessions: set[str] = set()
@@ -2165,23 +3041,35 @@ def pump_pending(
         upload_id = str(sidecar.get("upload_id") or "")
         phase = str(sidecar.get("phase") or "")
         try:
-            if upload_id and sidecar.get("finalize_requested") and phase in {
-                    "awaiting_finalize", "finalize", "finalizing"}:
+            if upload_id and sidecar.get("finalize_requested") is True and (
+                    phase in {"awaiting_finalize", "finalize", "finalizing"}
+                    or is_pending_finalization(sidecar)):
+                # A crash can leave every completed chunk in done before the
+                # session-level checkpoint is written. Preserve its receipt
+                # and continue only evaluation/finalize, without local media.
+                if is_pending_finalization(sidecar):
+                    sidecar.update(state=STATE_COMPLETING, phase="awaiting_finalize")
+                    save_sidecar(sidecar)
                 updated.append(sidecar)
                 continue
             # Blob já chegou: não repete vídeo nem cria outro registro.
             if upload_id and phase in {
                     "transport_done", "completing", "complete"}:
+                complete_progress_attempt = 0
                 def _resume_complete(
                     current_upload_id: str = upload_id,
                     current_size: int = int(sidecar.get("size_bytes") or 0),
-                    suppress: bool = bool(
-                        sidecar.get("suppress_per_chunk_catbear")),
+                    suppress: bool = _journal_flag(sidecar, "suppress_per_chunk_catbear"),
                 ) -> dict[str, Any]:
+                    nonlocal complete_progress_attempt
+                    complete_progress_attempt += 1
+                    if on_progress:
+                        on_progress("complete", STATE_COMPLETING, complete_progress_attempt)
                     return complete_upload(
                         session, current_upload_id, current_size,
                         suppress_per_chunk_catbear=suppress,
                         session_complete=False,
+                        _native_response_schema=_journal_flag(sidecar, "native_response_schema"),
                     )
 
                 complete_data, attempts = _with_retry(
@@ -2202,6 +3090,39 @@ def pump_pending(
                 save_sidecar(sidecar)
                 if not sidecar.get("finalize_requested"):
                     _remove_sidecar_archive(sid, idx)
+                updated.append(sidecar)
+                continue
+
+            if _pending_recovery_stage(sidecar) == "sidecar":
+                def _save_zip_checkpoint(**updates: Any) -> None:
+                    sidecar.update(updates)
+                    sidecar["updated_at"] = _iso_now()
+                    save_sidecar(sidecar)
+
+                chunk = _upload_single_chunk(
+                    session=session, video_path=Path(str(sidecar.get("local_video_path") or "")),
+                    org_key=sidecar["org_key"], session_id=sid, chunk_index=idx,
+                    task_id=sidecar.get("task_id"), content_type="video/mp4",
+                    timeout_blob=kwargs.get("timeout_blob", 300),
+                    recorded_at=sidecar["recorded_at"], device_meta=None,
+                    platform_meta=None, video_meta=None, network_meta=None,
+                    max_retries=max_retries, retry_backoff=retry_backoff,
+                    suppress_per_chunk_catbear=_journal_flag(sidecar, "suppress_per_chunk_catbear"),
+                    register_first=True, sidecar=True,
+                    fail_on_error=kwargs.get("fail_on_error", True),
+                    checkpoint=_save_zip_checkpoint, _resume_sidecar_row=sidecar,
+                    on_progress=on_progress,
+                )
+                if chunk.state == STATE_DONE:
+                    sidecar.update(state=STATE_COMPLETING if sidecar.get("finalize_requested") else STATE_DONE,
+                                   phase="awaiting_finalize" if sidecar.get("finalize_requested") else "done",
+                                   raw_complete=chunk.raw_complete, error=None)
+                    save_sidecar(sidecar)
+                    if not sidecar.get("finalize_requested"):
+                        _remove_sidecar_archive(sid, idx)
+                elif chunk.error:
+                    sidecar.update(state=chunk.state, error=chunk.error)
+                    save_sidecar(sidecar)
                 updated.append(sidecar)
                 continue
 
@@ -2241,9 +3162,8 @@ def pump_pending(
                 content_type="video/mp4",
                 finalize=False,
                 normalize=False,
-                register_first=bool(sidecar.get("register_first")),
-                suppress_per_chunk_catbear=bool(
-                    sidecar.get("suppress_per_chunk_catbear")),
+                register_first=_journal_flag(sidecar, "register_first"),
+                suppress_per_chunk_catbear=_journal_flag(sidecar, "suppress_per_chunk_catbear"),
                 max_retries=max_retries,
                 retry_backoff=retry_backoff,
                 persist_sidecar=True,
@@ -2256,6 +3176,7 @@ def pump_pending(
                     "fail_on_error", "timeout_blob",
                     "device_meta", "platform_meta", "video_meta",
                     "network_meta", "profile",
+                    "on_progress",
                 )},
             )
             chunk = result.chunks[0]
@@ -2266,8 +3187,9 @@ def pump_pending(
             updated.append(current)
         except UploadError as exc:
             sidecar.update({
-                "state": STATE_RETRY_LATE if exc.retryable else STATE_FAILED,
-                "phase": exc.phase or phase or "resume",
+                "state": (STATE_QUARANTINE if exc.review_required else
+                          STATE_RETRY_LATE if exc.retryable else STATE_FAILED),
+                "phase": "completion_review" if exc.review_required else exc.phase or phase or "resume",
                 "error": str(exc),
             })
             save_sidecar(sidecar)
@@ -2281,6 +3203,8 @@ def pump_pending(
                 item.get("org_key") != required_org_key for item in journals):
             continue
         if not journals or not any(item.get("finalize_requested") for item in journals):
+            continue
+        if any(not journal_flags_valid(item) for item in journals):
             continue
         owners = {str(item.get("account_email") or "").strip().casefold()
                   for item in journals}
@@ -2300,7 +3224,7 @@ def pump_pending(
         ready = [item for item in journals if item.get("phase") in {
             "awaiting_finalize", "finalize", "finalizing", "done"}
             and item.get("state") in {STATE_COMPLETING, STATE_RETRY_LATE, STATE_DONE}
-            and item.get("upload_id")]
+            and isinstance(item.get("upload_id"), str) and item["upload_id"].strip()]
         indices = [item.get("chunk_index") for item in ready]
         if (expected < 1 or len(ready) != expected or len(journals) != expected
                 or any(type(index) is not int for index in indices)
@@ -2316,6 +3240,8 @@ def pump_pending(
             if not required or item.get("evaluation_verified") is True:
                 continue
             try:
+                if on_progress:
+                    on_progress("evaluate", STATE_COMPLETING, 1)
                 evaluation = evaluate_upload(session, str(item["upload_id"]))
                 if not is_perfect(evaluation):
                     raise UploadError("Avaliação reprovada; envio preservado para revisão.",
@@ -2331,12 +3257,17 @@ def pump_pending(
             continue
 
         org_key = str(ready[0].get("org_key") or "")
+        finalize_progress_attempt = 0
 
         def _resume_finalize(
             current_org: str = org_key,
             current_sid: str = sid,
             current_expected: int = expected,
         ) -> int:
+            nonlocal finalize_progress_attempt
+            finalize_progress_attempt += 1
+            if on_progress:
+                on_progress("finalize", STATE_COMPLETING, finalize_progress_attempt)
             ok, status = _finalize_session(
                 session, current_org, current_sid, current_expected)
             if not ok:

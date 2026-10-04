@@ -50,7 +50,7 @@ class OrgMigrateTests(unittest.TestCase):
         sess.ensure_auth.return_value = {
             "organizations": [{"name": "Datoric", "resourceKey": "NEWORG"}],
         }
-        sess.data = {"idToken": "id", "refreshToken": "ref", "expires_at": 1}
+        sess.data = {"email": "user@example.com", "idToken": "id", "refreshToken": "ref", "expires_at": 1}
         with mock.patch.object(org_migrate, "session_from_record", return_value=sess), \
              mock.patch.object(org_migrate, "_set_pref_org") as prefs:
             row = org_migrate.migrate_one(record, code="PE8EAR5V", org_key="NEWORG")
@@ -74,7 +74,7 @@ class OrgMigrateTests(unittest.TestCase):
                 {"name": "Datoric", "resourceKey": "NEWORG"},
             ],
         }
-        sess.data = {"idToken": "id", "refreshToken": "ref", "expires_at": 1}
+        sess.data = {"email": "user@example.com", "idToken": "id", "refreshToken": "ref", "expires_at": 1}
         with mock.patch.object(org_migrate, "session_from_record", return_value=sess), \
              mock.patch.object(org_migrate, "_set_pref_org"):
             row = org_migrate.migrate_one(record, code="PE8EAR5V", org_key="NEWORG")
@@ -124,7 +124,7 @@ class OrgMigrateTests(unittest.TestCase):
                     sess.ensure_auth.return_value = {"organizations": []}
                     sess.join_org.return_value = (200, "{}")
                     sess.me.return_value = {"organizations": [{"resourceKey": key}]}
-                    sess.data = {"idToken": "private-token"}
+                    sess.data = {"email": "crow@example.com" if sess is crow else "user@supply.claru.ai", "idToken": "private-token"}
                 if claru_already_joined:
                     claru.ensure_auth.return_value = claru.me.return_value
                 with mock.patch.object(org_migrate, "session_from_record", side_effect=[crow, claru]), \
@@ -158,7 +158,7 @@ class OrgMigrateTests(unittest.TestCase):
         sess.ensure_auth.return_value = {"organizations": []}
         sess.join_org.return_value = (200, "{}")
         sess.me.return_value = {"organizations": [{"resourceKey": "CUSTOMORG"}]}
-        sess.data = {}
+        sess.data = {"email": "user@supply.claru.ai"}
         with mock.patch.object(org_migrate, "session_from_record", return_value=sess), \
              mock.patch.object(org_migrate, "_set_pref_org"):
             report = org_migrate.migrate_file(
@@ -177,7 +177,7 @@ class OrgMigrateTests(unittest.TestCase):
         second.ensure_auth.return_value = {
             "organizations": [{"resourceKey": org_migrate.config.ORG_KEY}],
         }
-        second.data = {"idToken": "private-token"}
+        second.data = {"email": "b@example.com", "idToken": "private-token"}
         progress = mock.Mock()
         with mock.patch.object(org_migrate, "session_from_record", side_effect=[first, second]) as auth, \
              mock.patch.object(org_migrate, "_set_pref_org") as prefs:
@@ -196,8 +196,10 @@ class OrgMigrateTests(unittest.TestCase):
         sess.ensure_auth.return_value = {
             "organizations": [{"resourceKey": org_migrate.config.ORG_KEY}],
         }
-        sess.data = {}
-        with mock.patch.object(org_migrate, "session_from_record", return_value=sess), \
+        def session_from_record(record):
+            sess.data = {"email": record["email"]}
+            return sess
+        with mock.patch.object(org_migrate, "session_from_record", side_effect=session_from_record), \
              mock.patch.object(org_migrate, "_set_pref_org", side_effect=[OSError("disk error"), None]):
             report = org_migrate.migrate_file(self.json_path, delay_s=0)
         self.assertEqual(report["counts"], {"error": 1, "already": 1})

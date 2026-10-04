@@ -203,8 +203,15 @@ class FiveMinuteCoverageTests(unittest.TestCase):
     def test_five_minute_activity_does_not_expand_short_core(self):
         self.assertEqual(self.select(range(300, 361, 5)), [])
 
-    def test_short_requests_keep_the_existing_gap_limit(self):
-        self.assertEqual(self.select(range(0, 321, 40), minimum=60), [])
+    def test_one_minute_request_keeps_proofs_three_minutes_apart(self):
+        spans = self.select(range(0, 321, 40), minimum=60)
+        self.assertTrue(spans)
+        self.assertEqual((spans[0]["start"], spans[0]["end"]), (0, 320))
+
+    def test_proofs_more_than_three_minutes_apart_stay_separate(self):
+        spans = self.select([0, 40, 80, 280, 320, 360], minimum=60)
+        self.assertEqual([(span["start"], span["end"]) for span in spans],
+                         [(0, 80), (280, 360)])
 
     def test_phone_event_prevents_joining_two_short_activities(self):
         rows = [(float(t), "garden", "garden", True, False) for t in range(0, 601, 40)]

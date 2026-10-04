@@ -71,10 +71,14 @@ private:
   void applyStructuralStyle(bool dark);
   void setDarkTheme(bool dark);
   void checkForUpdates(bool interactive = false);
-  void installUpdate(const QString& packagePath);
+  void installUpdate(const QString& packagePath, const QString& verifiedSha256);
 
   void startBackend();
   void stopBackend();
+  void beginCampaignDrain();
+  void completeCampaignDrain();
+  void pollCampaignClose();
+  bool launchPendingUpdate();
   void restartBackend();
   void probeBackend();
   void setBackendReady(bool ready, const QString& message = {});
@@ -85,6 +89,9 @@ private:
                          const QJsonArray& issues, std::function<void()> continueAction = {});
   void submitCampaign(QJsonObject body);
   void preflightCampaign(QJsonObject body, QStringList selectedAccountNames);
+  void chooseOriginalCapture();
+  void preflightOriginalCapture(QJsonObject body);
+  void submitOriginalCapture(QJsonObject body, QJsonObject reviewedSummary);
   void setStatus(const QString& text);
 
   void loadHome();
@@ -114,6 +121,9 @@ private:
   void startCampaign();
   void updateCampaignActions();
   void pollCampaign();
+  bool rememberCampaignStart(const QString& identity);
+  void clearCampaignStart();
+  void lookupCampaignStart();
   void setCampaignIndicator(const QString& title, const QString& detail, const QString& state, bool busy = false);
   void pollCampaignPreviews();
   void loadAccelerator();
@@ -121,6 +131,7 @@ private:
   void startAccelerator();
   void loadAccounts();
   QWidget* credentialCopyActions(const QString& email, bool hasPassword, bool banned = false);
+  void showSavedAccountCredentials(const QString& email, const QString& password);
   void removeAccount(const QString& email, std::function<void()> onRemoved = {});
   void checkAllAccounts();
   void addAccount(bool registerNew);
@@ -175,6 +186,7 @@ private:
   QHash<QString, QJsonObject> _accountChecks;
   UpdateManager _updates;
   QProcess _backend;
+  QString _packagedServiceExecutable;
   QTimer _backendProbe;
   QTimer _campaignPoll;
   QTimer _previewPoll;
@@ -189,6 +201,17 @@ private:
   bool _backendReady{};
   bool _runtimeChecked{};
   bool _closing{};
+  bool _campaignClosePending{};
+  bool _campaignCloseReady{};
+  bool _campaignCloseInFlight{};
+  QTimer _campaignClosePoll;
+  bool _campaignRestartPending{};
+  bool _campaignTransitionCommitted{};
+  bool _campaignExitRequested{};
+  bool _resumeOperationPoll{};
+  QString _pendingLibraryRoot;
+  QString _pendingUpdatePackage;
+  QString _pendingUpdateSha256;
   bool _restartingBackend{};
 
   QListWidget* _navigation{};
@@ -299,6 +322,8 @@ private:
   QSpinBox* _hourStart{};
   QSpinBox* _hourEnd{};
   QPushButton* _campaignStart{};
+  QPushButton* _campaignOriginal{};
+  bool _campaignOriginalDialogPending{};
   QPushButton* _campaignStop{};
   QPushButton* _campaignReset{};
   QProgressBar* _campaignProgress{};
@@ -327,6 +352,7 @@ private:
   bool _campaignStopPending{};
   bool _campaignResetPending{};
   bool _campaignStartUncertain{};
+  bool _campaignStartLookupInFlight{};
   QString _campaignRequestedPreflight;
   bool _campaignPollInFlight{};
   int _campaignPollRevision{};

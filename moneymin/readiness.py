@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from . import config, holo_accelerator, holoassist
+from . import config, holo_accelerator, holoassist, token_store
 from .sidecar import ffmpeg_bin, ffprobe_bin
 
 
@@ -95,22 +95,15 @@ def _valid_account_tokens() -> tuple[int, int]:
     valid = total = 0
     if not config.SECRETS_DIR.exists():
         return valid, total
-    for path in config.SECRETS_DIR.glob("token_*.json"):
-        total += 1
-        try:
-            token = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(token, dict):
-            continue
-        has_identity = bool(token.get("email"))
+    total = len(list(config.SECRETS_DIR.glob("token_*.json")))
+    for _, token in token_store.records(config.SECRETS_DIR).values():
         has_auth = bool(
             token.get("refreshToken")
             or token.get("refresh_token")
             or token.get("idToken")
             or token.get("id_token")
         )
-        if has_identity and has_auth:
+        if has_auth:
             valid += 1
     return valid, total
 

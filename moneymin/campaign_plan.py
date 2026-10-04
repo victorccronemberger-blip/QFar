@@ -55,7 +55,8 @@ def build(config: CampaignConfig) -> tuple[dict, list[dict], str]:
         for clip in candidates:
             uid = clip["clip_uid"]
             identities = [uid, *clip.get("dedup_clip_uids", [])]
-            recorded = set().union(*(set(registry.get(task.registry_key, {}).get(identity, [])) for identity in identities))
+            recorded = set().union(*(sent_registry.recorded_emails(registry, task.registry_key, identity)
+                                     for identity in identities))
             pending = set().union(*(set(config.recovery_exclusions.get(identity, [])) for identity in identities))
             excluded = recorded | pending
             review.append({

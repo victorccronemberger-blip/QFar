@@ -41,7 +41,7 @@ class PreflightContinuationTests(unittest.TestCase):
             'id': 'task', 'name': 'Task', 'scenario': 'task', 'clip_count': 1, 'available_for_duration': True}]))
         self.ready = self.stack.enter_context(patch.object(server.readiness, 'campaign_readiness', return_value={'ready': True, 'checks': []}))
         self.stack.enter_context(patch.object(server, '_storage_snapshot', return_value={'free_bytes': 100 * 1024**3}))
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     def preflight(self):
         response = self.client.post('/api/campaigns/preflight', json=self.body)
@@ -55,7 +55,8 @@ class PreflightContinuationTests(unittest.TestCase):
         before = (self.resolve.call_count, self.catalog.call_count, self.ready.call_count)
         response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, self.ready.call_count))
+        self.assertEqual(before[:2], (self.resolve.call_count, self.catalog.call_count))
+        self.assertEqual(self.ready.call_count, before[2] + 1)
         self.assertEqual([a.email for a in self.runner.start.call_args.args[0].accounts], ['good@example.com'])
         self.assertFalse(server.config.token_path('bad@example.com').exists())
         self.assertIn('bad@example.com', server._removed_accounts())
@@ -76,7 +77,10 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertEqual(attempt.get_json()['counts']['invalid'], 1)
         self.assertFalse(server.config.token_path('bad@example.com').exists())
         replay = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
-        self.assertEqual(replay.status_code, 409)
+        self.assertEqual(replay.status_code, 200)
+        self.assertTrue(replay.get_json()['already_running'])
+        self.runner.start.assert_called_once()
+        self.assertEqual(self.client.get('/api/accounts/banned').get_json()['accounts'][0]['banned_at'], saved_date)
 
     def test_temporary_failure_never_offers_permanent_removal(self):
         self.failure = TimeoutError('timeout')
@@ -187,7 +191,8 @@ class PreflightContinuationTests(unittest.TestCase):
         result = self.preflight()
         (self.root / 'banned_accounts.json').write_text('[]')
         response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
-        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "archived_accounts_unreadable")
         self.assertTrue(server.config.token_path('bad@example.com').exists())
         self.runner.start.assert_not_called()
 

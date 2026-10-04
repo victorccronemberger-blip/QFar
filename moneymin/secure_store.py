@@ -14,7 +14,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
-from .atomic_io import save_bytes
+from .atomic_io import decode_json_state, save_bytes
 
 _LOCK = threading.RLock()
 _DESCRIPTION = "QMoney integrations v1"
@@ -47,6 +47,8 @@ def _crypt(value: bytes, *, protect: bool) -> bytes:
         raise RuntimeError("o cofre de integrações requer o Windows")
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
     source, source_buffer = _input_blob(value)
     entropy, entropy_buffer = _input_blob(_ENTROPY)
     output = _DataBlob()
@@ -88,20 +90,57 @@ def _crypt(value: bytes, *, protect: bool) -> bytes:
             kernel32.LocalFree(description)
 
 
+def protect_json(value: dict[str, Any]) -> bytes:
+    """Protege um objeto JSON pelo usuário Windows, sem fallback em texto puro.
+
+    O blob é aberto e conferido antes de ser devolvido ao gravador. Falhas não
+    incluem dados do payload nem a exceção original em logs/tracebacks.
+    """
+    try:
+        if not isinstance(value, dict):
+            raise TypeError
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                             allow_nan=False)
+        encrypted = _crypt(payload.encode("utf-8"), protect=True)
+        if unprotect_json(encrypted) != value:
+            raise ValueError
+        return encrypted
+    except (OSError, RuntimeError, TypeError, ValueError, RecursionError):
+        raise SecureStoreError(
+            "Não foi possível proteger a credencial local. O arquivo anterior "
+            "foi preservado; use o usuário Windows original e tente novamente."
+        ) from None
+
+
+def unprotect_json(payload: bytes) -> dict[str, Any]:
+    """Abre um objeto protegido sem expor seu conteúdo em mensagens de erro."""
+    try:
+        if not isinstance(payload, bytes) or not payload:
+            raise ValueError
+        value = decode_json_state(_crypt(payload, protect=False).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError
+        return value
+    except (OSError, RuntimeError, TypeError, ValueError, RecursionError):
+        raise SecureStoreError(
+            "Não foi possível abrir a credencial protegida. O arquivo foi "
+            "preservado; use o usuário Windows original ou um backup válido."
+        ) from None
+
+
 def load_secure_settings(path: Path, *, strict: bool = False) -> dict[str, Any]:
     with _LOCK:
         try:
-            payload = _crypt(path.read_bytes(), protect=False)
-            value = json.loads(payload.decode("utf-8"))
+            value = unprotect_json(path.read_bytes())
         except FileNotFoundError:
             return {}
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             if strict:
-                raise SecureStoreError("Não foi possível abrir o cofre de integrações. O arquivo foi preservado; use o usuário Windows original ou restaure um backup válido.") from exc
-            return {}
-        if not isinstance(value, dict):
-            if strict:
-                raise SecureStoreError("O cofre de integrações está inválido. O arquivo foi preservado.")
+                raise SecureStoreError(
+                    "Não foi possível abrir o cofre de integrações. O arquivo "
+                    "foi preservado; use o usuário Windows original ou restaure "
+                    "um backup válido."
+                ) from None
             return {}
         return value
 
@@ -111,12 +150,25 @@ def save_secure_settings(path: Path, value: dict[str, Any]) -> None:
         # Um cofre ilegível não é um cofre vazio. Não apague credenciais
         # existentes após corrupção ou cópia de outro usuário Windows.
         load_secure_settings(path, strict=True)
-        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        save_bytes(path, _crypt(payload.encode("utf-8"), protect=True))
+        # Valide formato, serialização e leitura do candidato protegido antes
+        # de chegar ao replace atômico. Um JSON serializável pode ser uma lista
+        # ou sofrer conversões incompatíveis com o objeto recebido.
+        encrypted = protect_json(value)
+        try:
+            save_bytes(path, encrypted)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise SecureStoreError(
+                "Não foi possível salvar o cofre de integrações. O arquivo "
+                "anterior foi preservado; verifique o acesso local e tente novamente."
+            ) from None
 
 
 def update_secure_section(path: Path, section: str,
                           value: dict[str, Any] | None) -> dict[str, Any]:
+    if (not isinstance(section, str) or not section.strip() or section == "schema"
+            or any(ord(character) < 32 for character in section)
+            or value is not None and not isinstance(value, dict)):
+        raise SecureStoreError("Seção de integração inválida; o cofre anterior foi preservado.") from None
     with _LOCK:
         settings = load_secure_settings(path, strict=True)
         settings["schema"] = 1
@@ -128,4 +180,5 @@ def update_secure_section(path: Path, section: str,
         return settings
 
 
-__all__ = ["load_secure_settings", "save_secure_settings", "update_secure_section"]
+__all__ = ["SecureStoreError", "load_secure_settings", "protect_json",
+           "save_secure_settings", "unprotect_json", "update_secure_section"]

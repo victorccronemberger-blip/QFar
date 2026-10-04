@@ -122,7 +122,7 @@ class AppCheckTests(unittest.TestCase):
     def test_both_session_methods_preserve_appcheck_rejection_without_relogin(self):
         for detailed in (False, True):
             with self.subTest(detailed=detailed), patch.object(api.Session, 'id_token', new_callable=PropertyMock, return_value='firebase-token'):
-                session = api.Session({'idToken': 'fixture'})
+                session = api.Session({'email': 'fixture@example.invalid', 'idToken': 'fixture'})
                 body = '{"detail":{"error":"appcheck_required"}}'
                 result = api.HttpResponse(401, body, {}) if detailed else (401, body)
                 target = '_request_detailed' if detailed else '_request'
@@ -139,7 +139,7 @@ class AppCheckTests(unittest.TestCase):
                 target = '_request_detailed' if detailed else '_request'
                 result = api.HttpResponse(200, '{}', {}) if detailed else (200, '{}')
                 with patch.object(api, target, return_value=result) as request:
-                    s = api.Session({'idToken':'fixture'})
+                    s = api.Session({'email': 'fixture@example.invalid', 'idToken':'fixture'})
                     self.assertEqual((s.request_detailed if detailed else s.request)('GET','/api/v1/users/me'),result)
                     self.assertNotIn('X-Firebase-AppCheck',request.call_args.kwargs['headers'])
         self.open.assert_not_called()

@@ -56,7 +56,7 @@ class AccountDiagnosticEndpointsTests(unittest.TestCase):
         patch = mock.patch.object(server, "_save_account_check")
         patch.start()
         self.addCleanup(patch.stop)
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     def preflight(self, accounts, known, resolve):
         with ExitStack() as stack:

@@ -19,7 +19,7 @@ class CredentialStoreTests(unittest.TestCase):
                  patch.object(server, "_list_accounts", return_value=[{"email": email}]), \
                  patch.object(server, "RUNNER", Mock()), \
                  patch.object(server, "ORG_MIGRATION", Mock(running=False)):
-                client = server.create_app().test_client()
+                client = server.create_app(for_testing=True).test_client()
                 listing = client.get("/api/accounts").get_json()["accounts"][0]
                 self.assertTrue(listing["has_password"])
                 self.assertNotIn("current-password", json.dumps(listing))
@@ -106,7 +106,11 @@ class CredentialStoreTests(unittest.TestCase):
             with patch.object(server.config, "SECRETS_DIR", root), \
                  patch.object(server, "CROWTADO_PW_PATH", legacy):
                 server._save_crowtado_cred("owner@example.invalid", "fixture-password-only")
-                self.assertEqual(server._crowtado_creds()["owner@example.invalid"], "fixture-password-only")
+                self.assertEqual(credential_store.lookup(root, "owner@example.invalid"), "fixture-password-only")
+                # Individual access remains usable; the global merge must not
+                # treat a consulted corrupt legacy source as an empty mirror.
+                with self.assertRaises(ValueError):
+                    server._crowtado_creds()
             self.assertEqual(legacy.read_bytes(), b"{corrupt")
 
     def test_corrupt_individual_record_is_preserved_and_blocks_replacement(self):
@@ -155,7 +159,7 @@ class CredentialStoreTests(unittest.TestCase):
         account = {"email": "owner@example.invalid"}
         with patch.object(server, "_list_accounts", return_value=[account]), \
              patch.object(server, "_crowtado_creds", return_value={}):
-            response = server.create_app().test_client().post(
+            response = server.create_app(for_testing=True).test_client().post(
                 "/api/accounts/export", json={"emails": [account["email"]]})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["accounts"], [account["email"]])
@@ -176,7 +180,7 @@ class CredentialStoreTests(unittest.TestCase):
                     "email": email, "idToken": "fixture-id",
                     "refreshToken": "fixture-refresh", "expires_at": 0,
                 })
-                response = server.create_app().test_client().post(
+                response = server.create_app(for_testing=True).test_client().post(
                     "/api/accounts/export", json={"emails": [email]})
             self.assertEqual(response.status_code, 409)
             self.assertEqual(response.get_json()["accounts"], [email])

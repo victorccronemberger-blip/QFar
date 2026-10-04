@@ -80,12 +80,14 @@ from typing import Any
 
 from flask import Flask, g, jsonify, request
 
+from .. import banned_store
 from .. import (
     campaign, config, crowtado, ego4d, ego4d_library, ego_accelerator, fx, holo_accelerator, holoassist,
     hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store,
 )
-from ..atomic_io import load_json, save_json
-from .. import account_transfer, account_bans
+from ..atomic_io import JsonStateError, decode_json_state, load_json, load_json_state, save_json
+from ..jsonl_history import decode_jsonl_history
+from .. import account_transfer, account_bans, token_store
 from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import SecureStoreError, load_secure_settings, save_secure_settings
@@ -109,7 +111,8 @@ ACCOUNT_HEALTH_PATH = config.DATA_DIR / "account_health.json"
 _BULK_REGISTER_LOCK = threading.Lock()
 _BULK_REGISTER_STATE: dict[str, Any] = {"state": "idle"}
 _HEAVY_RUNNER_LOCK = threading.Lock()
-from .. import recovery
+from .. import recovery, campaign_start_store
+from ..operation_lease import OperationLeaseError
 RECOVERY = recovery.RecoveryRunner()
 _WITHDRAW_LOCK = threading.Lock()
 _PAYOUT_OPERATION_LOCK = threading.Lock()
@@ -143,13 +146,16 @@ def _payout_method_run(creds: dict[str, str], method: str,
                                                  legal_name, destination_email)
             result = {"email": email, "ok": True, "message": "configurado"}
         except Exception as exc:
-            # Respostas remotas podem repetir os dados enviados: não exponha o destino.
-            reason = str(exc).replace(destination_email, "[e-mail]") if destination_email else str(exc)
-            reason = reason.replace(legal_name, "[nome]") if legal_name else reason
-            result = {"email": email, "ok": False, "message": reason[:300]}
+            # A resposta pode repetir senha, token ou URL assinada. Só a
+            # classificação conhecida entra no estado consultado pela UI.
+            issue = account_issue(email, exc, stage="Configuração de saque Crowtado")
+            result = {"email": email, "ok": False, "code": issue["code"],
+                      "message": issue["reason"] + " " + issue["action"]}
             if method == "wise" and (getattr(exc, "account_issue_code", None) == "destination_in_use"
-                                     or "already linked to anoth" in reason.lower()):
+                                     or "already linked to anoth" in str(exc).casefold()):
                 blocked = True
+                result.update(code="destination_in_use",
+                    message="A Crowtado informou que este destino Wise já está vinculado a outra conta.")
         with _PAYOUT_METHOD_LOCK:
             _PAYOUT_METHOD_STATE["results"].append(result)
             _PAYOUT_METHOD_STATE["done"] += 1
@@ -269,22 +275,37 @@ def _withdraw_wise_flow(email: str, password: str, wise: dict[str, str]) -> dict
 
 def _load_withdraw_cooldowns_locked() -> None:
     global _WITHDRAW_COOLDOWN_LOADED
+    saved = load_json_state(_withdraw_cooldown_path(), {})
+    if any(not isinstance(email, str) or not email.strip()
+           or not _finite_state_number(value) or value < 0
+           for email, value in saved.items()):
+        _invalid_local_state()
+    now = time.time()
+    # Future evidence just consulted remains authoritative even after loading.
+    for email, value in saved.items():
+        if value > now:
+            _WITHDRAW_LAST_REQUEST[email] = max(float(value), _WITHDRAW_LAST_REQUEST.get(email, 0.0))
     if _WITHDRAW_COOLDOWN_LOADED:
         return
-    saved = load_json(_withdraw_cooldown_path(), {})
-    if isinstance(saved, dict):
-        now = time.time()
-        for email, value in saved.items():
-            if isinstance(value, (int, float)) and 0 <= now - value < _WITHDRAW_COOLDOWN_S:
-                _WITHDRAW_LAST_REQUEST[str(email)] = float(value)
+    for email, value in saved.items():
+        # A future attempt is unresolved evidence after clock rollback.
+        if now - value < _WITHDRAW_COOLDOWN_S:
+            _WITHDRAW_LAST_REQUEST[email] = float(value)
     _WITHDRAW_COOLDOWN_LOADED = True
 
 
 def _load_withdraw_bulk_locked() -> None:
     global _WITHDRAW_BULK_LOADED
+    saved = load_json_state(_withdraw_bulk_path(), {})
+    if saved and (not isinstance(saved.get("results"), list)
+                  or any(not isinstance(row, dict) for row in saved["results"])
+                  or not isinstance(saved.get("state", "idle"), str)
+                  or saved.get("state", "idle") not in {"idle", "running", "done", "error", "interrupted"}
+                  or any(type(saved.get(field, 0)) is not int or saved.get(field, 0) < 0
+                         for field in ("total", "done"))):
+        _invalid_local_state()
     if _WITHDRAW_BULK_LOADED:
         return
-    saved = load_json(_withdraw_bulk_path(), {})
     if isinstance(saved, dict) and isinstance(saved.get("results"), list):
         try:
             total = max(0, int(saved.get("total") or 0))
@@ -307,6 +328,7 @@ def _load_withdraw_bulk_locked() -> None:
 
 
 def _save_withdraw_bulk_locked() -> None:
+    load_json_state(_withdraw_bulk_path(), {})
     save_json(_withdraw_bulk_path(), _WITHDRAW_BULK_STATE)
 
 
@@ -362,15 +384,21 @@ def _withdraw_paypal_flow(email: str, password: str) -> dict[str, Any]:
 
 def _withdraw_once_locked(email: str, password: str,
                           wise: dict[str, str] | None = None) -> tuple[dict[str, Any], int]:
+    # An unreadable receipt is unresolved evidence, never permission to retry.
+    load_json_state(config.DATA_DIR / "withdraw_last_result.json", {})
+    _load_balances()
     now = time.time()
     with _WITHDRAW_LOCK:
         _load_withdraw_cooldowns_locked()
         for key, value in list(_WITHDRAW_LAST_REQUEST.items()):
-            if not 0 <= now - value < _WITHDRAW_COOLDOWN_S:
+            if now - value >= _WITHDRAW_COOLDOWN_S:
                 del _WITHDRAW_LAST_REQUEST[key]
         if email in _WITHDRAW_IN_FLIGHT:
             return {"email": email, "ok": False, "error": "já há uma solicitação em andamento"}, 409
         elapsed = now - _WITHDRAW_LAST_REQUEST.get(email, 0.0)
+        if email in _WITHDRAW_LAST_REQUEST and elapsed < 0:
+            return {"email": email, "ok": False, "code": "clock_conflict",
+                    "error": "O horário local antecede uma solicitação registrada; confira o relógio antes de solicitar novamente."}, 409
         if elapsed < _WITHDRAW_COOLDOWN_S:
             wait_s = max(1, math.ceil(_WITHDRAW_COOLDOWN_S - elapsed))
             return {"email": email, "ok": False,
@@ -394,7 +422,7 @@ def _withdraw_once_locked(email: str, password: str,
             try:
                 result = crowtado.solicitar_link_saque(email, password)
             except Exception as exc:
-                if getattr(exc, "withdrawal_attempted", False):
+                if getattr(exc, "withdrawal_attempted", None) is not False:
                     result = {"status": "unknown", "failureStage": "request_withdrawal"}
                 else:
                     raise
@@ -402,7 +430,7 @@ def _withdraw_once_locked(email: str, password: str,
         if result.get("status") != "not_requested":
             try:
                 _invalidate_balance_after_withdrawal(email, result)
-            except OSError:
+            except (OSError, JsonStateError):
                 # Provider acceptance must never become a failed/retryable withdrawal.
                 balance_saved = False
         success = result.get("status") in {"ok", "review_required"}
@@ -427,7 +455,9 @@ def _withdraw_once_locked(email: str, password: str,
                 "antes de repetir; nenhuma nova tentativa automática será feita.")}, 400
         if not isinstance(exc, crowtado.CrowtadoError):
             raise
-        return {"email": email, "ok": False, "error": str(exc)}, 400
+        issue = account_issue(email, exc, stage="Solicitação de saque Crowtado")
+        return {"email": email, "ok": False, "code": "withdrawal_not_requested",
+                "error": issue["reason"] + " " + issue["action"], "issue": issue}, 400
     finally:
         with _WITHDRAW_LOCK:
             _WITHDRAW_IN_FLIGHT.discard(email)
@@ -440,6 +470,10 @@ def _withdraw_bulk_snapshot() -> dict[str, Any]:
 
 
 def _start_withdraw_worker(eligible, wise):
+    load_json_state(config.DATA_DIR / "withdraw_last_result.json", {})
+    _load_balances()
+    with _WITHDRAW_LOCK:
+        _load_withdraw_cooldowns_locked()
     with _WITHDRAW_BULK_LOCK:
         _load_withdraw_bulk_locked()
         if _WITHDRAW_BULK_STATE["state"] == "running":
@@ -482,9 +516,10 @@ def _withdraw_bulk_run(creds: dict[str, str], wise: dict[str, str] | None = None
         try:
             result, _ = (_withdraw_once(email, password, wise) if wise
                          else _withdraw_once(email, password))
-        except Exception as exc:  # uma conta não interrompe as demais
+        except Exception:  # Sem recibo, o resultado externo pode ser inconclusivo.
             result = {"email": email, "ok": False,
-                      "error": f"{type(exc).__name__}: {exc}"}
+                      "error": "A solicitação não produziu um resultado confirmado. Confira o histórico na Crowtado antes de repetir.",
+                      "result": {"status": "unknown", "failureStage": "request_withdrawal"}}
         with _WITHDRAW_BULK_LOCK:
             _WITHDRAW_BULK_STATE["results"].append({
                 "email": email, "ok": result["ok"],
@@ -600,7 +635,7 @@ def _remember_banned_withdraw_result(
     """Atualiza só o estado do saque; a restrição Minute permanece intacta."""
     with _PERSISTENCE_LOCK:
         path = config.DATA_DIR / "banned_accounts.json"
-        archive = load_json(path, {"accounts": []})
+        archive = banned_store.load(path, {"accounts": []})
         for row in archive.get("accounts", []):
             if str(row.get("email") or "").strip().casefold() != email:
                 continue
@@ -616,7 +651,7 @@ def _remember_banned_withdraw_result(
                 monitor["balance_status"] = "error"
                 monitor["balance_stale"] = True
             row["monitor"] = monitor
-            save_json(path, archive)
+            banned_store.save(path, archive)
             return
 
 _STEP_LABELS = {
@@ -1093,13 +1128,48 @@ def _storage_snapshot(*, include_path: bool = True) -> dict[str, Any]:
 
 # --- preferências ------------------------------------------------------------
 
+def _finite_state_number(value: Any) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except (ValueError, OverflowError):
+        return False
+
+
+def _invalid_local_state() -> None:
+    raise JsonStateError("Estado local inválido ou ilegível. Preserve o arquivo e restaure um backup válido antes de continuar.") from None
+
+
+def _validate_local_document(value: Any) -> None:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        _invalid_local_state()
+
+
+def _validate_local_prefs(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        _invalid_local_state()
+    if (("org_keys" in value and (not isinstance(value["org_keys"], dict)
+            or any(not isinstance(email, str) or not isinstance(org, str)
+                   for email, org in value["org_keys"].items())))
+            or ("selected_accounts" in value and (not isinstance(value["selected_accounts"], list)
+                or any(not isinstance(email, str) for email in value["selected_accounts"])))
+            or ("holoassist_enabled" in value and type(value["holoassist_enabled"]) is not bool)):
+        _invalid_local_state()
+    return value
+
+
 def _load_prefs() -> dict[str, Any]:
-    value = load_json(PREFS_PATH, {})
-    return value if isinstance(value, dict) else {}
+    return _validate_local_prefs(load_json_state(PREFS_PATH, {}))
 
 
 def _save_prefs(prefs: dict[str, Any]) -> None:
     with _PERSISTENCE_LOCK:
+        _validate_local_document(prefs)
+        _validate_local_prefs(prefs)
+        _load_prefs()
         save_json(PREFS_PATH, prefs)
 
 
@@ -1129,8 +1199,10 @@ def _removed_accounts_path() -> Path:
 
 
 def _removed_accounts() -> set[str]:
-    value = load_json(_removed_accounts_path(), {})
-    emails = value.get("emails", []) if isinstance(value, dict) else []
+    value = load_json_state(_removed_accounts_path(), {})
+    emails = value.get("emails", [])
+    if not isinstance(emails, list) or any(not isinstance(email, str) or not email.strip() for email in emails):
+        _invalid_local_state()
     return {
         str(email).strip().casefold()
         for email in emails
@@ -1419,7 +1491,7 @@ def _integration_snapshot() -> dict[str, Any]:
 
 def _read_campaign_log(path: Path) -> dict[str, Any]:
     """Um arquivo danificado não pode derrubar a lista inteira do histórico."""
-    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data = load_json_state(path, None)
     if not isinstance(data, dict):
         raise ValueError("log inválido")
     for key in ("items", "accounts", "issues"):
@@ -1429,6 +1501,10 @@ def _read_campaign_log(path: Path) -> dict[str, Any]:
         if (not isinstance(item, dict) or not isinstance(item.get("accounts", []), list)
                 or any(not isinstance(account, dict) for account in item.get("accounts", []))):
             raise ValueError("log inválido")
+        for account in item.get("accounts", []):
+            if any(type(account[key]) is not bool for key in ("ok", "finalized", "skipped", "recovered")
+                   if key in account and not (key == "finalized" and account[key] is None)):
+                raise ValueError("confirmação inválida no histórico")
         try:
             duration = float(item.get("duration_ms") or 0)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -1438,7 +1514,7 @@ def _read_campaign_log(path: Path) -> dict[str, Any]:
     return data
 
 
-def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
+def _campaign_log_view(data: dict[str, Any], *, history_name: str | None = None) -> dict[str, Any]:
     """Resumo e evidências permitidas; nunca inclui respostas brutas ou segredos."""
     configured = [str(email) for email in data.get("accounts", []) if email]
     by_account: dict[str, dict[str, Any]] = {
@@ -1446,6 +1522,10 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
         for email in configured
     }
     items: list[dict[str, Any]] = []
+    from ..campaign_evidence import current_groups, current_result
+    groups = current_groups() if history_name is not None else {}
+    current_summary = dict.fromkeys(("confirmed", "pending", "review", "unknown"), 0)
+    delivery_summary = dict(current_summary)
     total_success = total_failed = total_skipped = 0
     total_pending = 0
     for index, raw_item in enumerate(data.get("items", []), 1):
@@ -1485,12 +1565,17 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
                 stats["failed"] += 1
                 total_failed += 1
             identifier = raw_result.get("session_id")
+            current = current_result(raw_item, raw_result, history_name, groups)
+            if status != "skipped":
+                current_summary[current["status"]] += 1
+                delivery_summary[current["status"]] += 1
             results.append({"email": email, "status": status, "detail": detail,
                             "session_id": identifier if isinstance(identifier, str) else None,
                             "confirmation": ("remote_ack" if status == "success" and raw_result.get("finalized") is True
                                              else "legacy_record" if status == "pending" and raw_result.get("finalized") is None
                                              else "not_confirmed"),
-                            "recovered": raw_result.get("recovered") is True})
+                            "recovered": raw_result.get("recovered") is True,
+                            "current_result": current})
         task = str(raw_item.get("task_name") or raw_item.get("task_scenario")
                    or raw_item.get("scenario") or f"Vídeo {index}")
         duration_s = max(0, int(float(raw_item.get("duration_ms") or 0) / 1000))
@@ -1519,6 +1604,8 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
         "accounts": sorted(by_account.values(), key=lambda item: item["email"].lower()),
         "items": items,
         "status": data.get("status"),
+        "current_summary": current_summary,
+        "delivery_summary": delivery_summary,
         "issues": [event for issue in data.get("issues", [])
                    if isinstance(issue, dict)
                    and (event := _public_event(str(issue.get("kind") or ""), issue))],
@@ -1527,28 +1614,56 @@ def _campaign_log_view(data: dict[str, Any]) -> dict[str, Any]:
 
 # --- contas -------------------------------------------------------------------
 
+def _load_account_health_history() -> dict[str, dict[str, Any]]:
+    """Validate every consulted diagnostic before assigning it to an owner."""
+    history = load_json_state(ACCOUNT_HEALTH_PATH, {})
+    normalized = {}
+    for owner, record in history.items():
+        key = owner.strip().casefold()
+        if not key or key in normalized or not isinstance(record, dict):
+            _invalid_local_state()
+        if "email" in record and (not isinstance(record["email"], str)
+                                   or record["email"].strip().casefold() != key):
+            _invalid_local_state()
+        for field in ("status", "status_label", "checked_at"):
+            if field in record and not isinstance(record[field], str):
+                _invalid_local_state()
+        if "attempts" in record and (type(record["attempts"]) is not int or record["attempts"] < 0):
+            _invalid_local_state()
+        if "last_success_at" in record and record["last_success_at"] is not None and not isinstance(record["last_success_at"], str):
+            _invalid_local_state()
+        for field in ("history_saved", "permanently_removed"):
+            if field in record and type(record[field]) is not bool:
+                _invalid_local_state()
+        if "issue" in record:
+            issue = record["issue"]
+            if not isinstance(issue, dict):
+                _invalid_local_state()
+            if "email" in issue and (not isinstance(issue["email"], str)
+                                      or issue["email"].strip().casefold() != key):
+                _invalid_local_state()
+            for field in ("restriction_confirmed", "retryable"):
+                if field in issue and type(issue[field]) is not bool:
+                    _invalid_local_state()
+            for field in ("code", "reason", "action", "stage"):
+                if field in issue and not isinstance(issue[field], str):
+                    _invalid_local_state()
+        normalized[key] = record
+    return normalized
+
+
 def _list_accounts() -> list[dict[str, Any]]:
     """Contas = token_*.json em secrets/ (sem rede). org_key vem do cache de prefs."""
     prefs = _load_prefs()
-    health = load_json(ACCOUNT_HEALTH_PATH, {})
-    if not isinstance(health, dict):
-        health = {}
+    health = _load_account_health_history()
     org_keys = prefs.get("org_keys", {})
     if not isinstance(org_keys, dict):
         org_keys = {}
     removed = _removed_accounts()
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for path in sorted(config.tokens_dir().glob("token_*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        email = data.get("email")
-        if not isinstance(email, str) or not email.strip():
-            continue
+    for key, (path, data) in token_store.records(config.tokens_dir()).items():
+        email = data["email"]
         if str(email).strip().casefold() in removed:
             continue
         key = str(email).strip().casefold()
@@ -1626,15 +1741,16 @@ def _check_account_health(email: str) -> dict[str, Any]:
 
 def _save_account_check(email: str, result: dict[str, Any]) -> None:
     with _PERSISTENCE_LOCK:
-        health = load_json(ACCOUNT_HEALTH_PATH, {})
-        if not isinstance(health, dict):
-            health = {}
-        previous = health.get(email.strip().casefold(), {})
-        result["last_success_at"] = (result["checked_at"] if result["status"] == "active"
-                                     else previous.get("last_success_at") if isinstance(previous, dict) else None)
-        health[email.strip().casefold()] = dict(result)
         try:
+            health = load_json_state(ACCOUNT_HEALTH_PATH, {})
+            previous = health.get(email.strip().casefold(), {})
+            candidate = dict(result)
+            candidate["last_success_at"] = (result["checked_at"] if result["status"] == "active"
+                                           else previous.get("last_success_at") if isinstance(previous, dict) else None)
+            candidate = decode_json_state(json.dumps(candidate))
+            health[email.strip().casefold()] = candidate
             save_json(ACCOUNT_HEALTH_PATH, health)
+            result["last_success_at"] = candidate["last_success_at"]
             if result["status"] == "disabled" and result.get("issue", {}).get("restriction_confirmed"):
                 _ban_accounts([result["issue"]])
                 result["permanently_removed"] = True
@@ -1642,7 +1758,7 @@ def _save_account_check(email: str, result: dict[str, Any]) -> None:
                 prefs = _load_prefs()
                 prefs.setdefault("org_keys", {})[email] = result["org_key"]
                 _save_prefs(prefs)
-        except (OSError, ValueError):
+        except (OSError, TypeError, ValueError, RecursionError):
             # Falha no histórico local não altera o diagnóstico remoto.
             result["history_saved"] = False
 
@@ -1668,12 +1784,19 @@ def _migrate_account_org(email: str) -> dict[str, Any]:
 
 def _load_balances() -> dict[str, Any]:
     """Cache de saldos: {email: {availableCents, ..., updated_at, error?}}."""
-    value = load_json(BALANCES_PATH, {})
-    return value if isinstance(value, dict) else {}
+    value = load_json_state(BALANCES_PATH, {})
+    if any(not isinstance(email, str) or not isinstance(record, dict) for email, record in value.items()):
+        _invalid_local_state()
+    return value
 
 
 def _save_balances(balances: dict[str, Any]) -> None:
     with _PERSISTENCE_LOCK:
+        _validate_local_document(balances)
+        if not isinstance(balances, dict) or any(not isinstance(email, str) or not isinstance(record, dict)
+                                                for email, record in balances.items()):
+            _invalid_local_state()
+        _load_balances()
         save_json(BALANCES_PATH, balances)
 
 
@@ -1689,21 +1812,21 @@ def _crowtado_creds() -> dict[str, str]:
             creds[email.strip().casefold()] = password
 
     for path in sorted(config.DATA_DIR.glob("novas_contas_*.json")):
-        rows = load_json(path, [])
+        rows = load_json_state(path, [], expected_type=list)
         if isinstance(rows, list):
             for rec in rows:
                 collect(rec)
     contas = config.DATA_DIR / "contas.jsonl"
     try:
-        for line in contas.read_bytes().splitlines():
-            try:
-                rec = json.loads(line.decode("utf-8-sig"))
-            except (UnicodeError, json.JSONDecodeError):
-                continue
+        # Complete strict preflight before any source can be promoted. An
+        # unreadable tail leaves the latest known password uncertain.
+        for rec in decode_jsonl_history(contas.read_bytes(), expected_type=dict):
             collect(rec)
-    except OSError:
+    except FileNotFoundError:
         pass
-    stored = load_json(CROWTADO_PW_PATH, {})
+    except OSError:
+        _invalid_local_state()
+    stored = load_json_state(CROWTADO_PW_PATH, {})
     if isinstance(stored, dict):
         creds.update({str(email).strip().casefold(): password
                       for email, password in stored.items()
@@ -1714,13 +1837,20 @@ def _crowtado_creds() -> dict[str, str]:
     return creds
 
 
-def _saved_account_password(email: str, legacy: dict[str, str]) -> str | None:
-    """Prefere a credencial individual e bloqueia cópias antigas se ela estiver corrompida."""
+def _saved_account_password(email: str, legacy: dict[str, str] | None = None) -> str | None:
+    """Consulta legado somente se faltar o registro individual válido.
+
+    Callers com um mapa legado pronto mantêm o contrato anterior. Um registro
+    primário corrompido veta o fallback; nunca consulta o merge por esse erro.
+    """
     try:
         individual = credential_store.lookup(config.SECRETS_DIR, email, strict=True)
     except ValueError:
         return None
-    return individual or legacy.get(email.strip().casefold())
+    if individual is not None:
+        return individual
+    sources = _crowtado_creds() if legacy is None else legacy
+    return sources.get(email.strip().casefold())
 
 
 def _configured_crowtado_creds() -> dict[str, str]:
@@ -1760,46 +1890,24 @@ def _configured_crowtado_creds() -> dict[str, str]:
 
 def _save_crowtado_cred(email: str, password: str) -> None:
     with _PERSISTENCE_LOCK:
-        # O registro individual é obrigatório e é relido antes de continuar.
-        # O JSON compartilhado existe apenas para compatibilidade anterior.
+        # A fonte individual protegida é relida antes de continuar. Arquivos
+        # legados continuam sendo apenas fontes de leitura/migração; criar um
+        # espelho em JSON anularia a proteção da senha por DPAPI.
         credential_store.save(config.SECRETS_DIR, email, password)
-        try:
-            stored = json.loads(CROWTADO_PW_PATH.read_text(encoding="utf-8-sig"))
-        except FileNotFoundError:
-            stored = {}
-        except (OSError, ValueError):
-            # Preserva o arquivo legado inválido: a cópia individual já foi
-            # confirmada e permite exportar a conta normalmente.
-            return
-        if not isinstance(stored, dict) or any(
-                not isinstance(key, str) or not isinstance(value, str)
-                for key, value in stored.items()):
-            return
-        creds = stored
-        normalized = email.strip().casefold()
-        creds = {key: value for key, value in creds.items()
-                 if str(key).strip().casefold() != normalized}
-        creds[normalized] = password
-        try:
-            save_json(CROWTADO_PW_PATH, creds)
-        except OSError:
-            # A fonte primária individual já foi confirmada. O espelho legado
-            # pode estar temporariamente bloqueado sem invalidar a criação.
-            return
 
 
 def _remove_account_data(email: str) -> None:
     """Remove caches editáveis ligados à conta (o cadastro histórico fica intacto)."""
     with _PERSISTENCE_LOCK:
-        # O registro individual é a fonte primária. Remova-o mesmo que o
-        # espelho legado esteja ausente ou corrompido.
-        credential_store.delete(config.SECRETS_DIR, email)
-        stored = load_json(CROWTADO_PW_PATH, {})
+        # Valide o espelho consultado antes de remover a fonte individual ou
+        # regravar outras contas. Corrupção/ambiguidade não significa ausência.
+        stored = load_json_state(CROWTADO_PW_PATH, {})
         creds = stored if isinstance(stored, dict) else {}
         matching_creds = [
             key for key in creds
             if str(key).casefold() == email.casefold()
         ]
+        credential_store.delete(config.SECRETS_DIR, email)
         for key in matching_creds:
             creds.pop(key, None)
         if matching_creds:
@@ -1823,7 +1931,7 @@ def _ban_accounts(issues: list[dict]) -> None:
         raise ValueError("A remoção exige restrição confirmada pela plataforma.")
     with _PERSISTENCE_LOCK:
         path = config.DATA_DIR / "banned_accounts.json"
-        archive = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {"schema": 1, "accounts": []}
+        archive = banned_store.load(path, {"schema": 1, "accounts": []})
         if (not isinstance(archive, dict) or not isinstance(archive.get("accounts"), list)
                 or any(not isinstance(row, dict) or not isinstance(row.get("email"), str)
                        for row in archive.get("accounts", []))):
@@ -1839,11 +1947,11 @@ def _ban_accounts(issues: list[dict]) -> None:
                               "reason": issue.get("reason", "Restrição confirmada pela plataforma."),
                               "stage": issue.get("stage", "Envio"), "restriction_confirmed": True}
         archive["accounts"] = list(records.values())
-        save_json(path, archive)
+        banned_store.save(path, archive)
         for issue in issues:
             email = account_transfer.email_key(issue["email"])
             _set_account_removed(email, True)
-            config.token_path(email).unlink(missing_ok=True)
+            token_store.delete(config.SECRETS_DIR, email)
             prefs = _load_prefs()
             prefs["selected_accounts"] = [e for e in prefs.get("selected_accounts", []) if e.casefold() != email]
             prefs["org_keys"] = {e: key for e, key in prefs.get("org_keys", {}).items() if e.casefold() != email}
@@ -1858,19 +1966,12 @@ def _preflight_fingerprint(emails: list[str]) -> str:
     for email in sorted(set(emails)):
         path = config.token_path(email)
         digest.update(str(path).encode())
-        try:
-            raw = path.read_bytes()
-        except FileNotFoundError:
+        found = token_store.load(config.SECRETS_DIR, email, migrate=False)
+        if found is None:
             digest.update(b"missing")
             continue
-        try:
-            token = json.loads(raw)
-            if not isinstance(token, dict):
-                raise ValueError("invalid token record")
-        except (ValueError, UnicodeError):
-            digest.update(b"invalid:" + raw)
-            continue
-        stable = {"email": str(token.get("email", email)).strip().casefold(),
+        _, token = found
+        stable = {"email": token_store.email_key(token["email"]),
                   "subject": token.get("localId") or token.get("user_id") or token.get("uid"),
                   "organization": {key: token[key] for key in ("org_key", "organization_id", "tenantId") if key in token}}
         # Remover/revogar as credenciais deve invalidar a prévia; renová-las não.
@@ -1943,7 +2044,7 @@ def _last_withdrawal_receipt(configured: set[str]) -> dict[str, Any]:
     Legacy Wise diagnostics are sufficient evidence of acceptance, but never of
     settlement in the recipient's bank. Do not infer success from balance loss.
     """
-    record = load_json(config.DATA_DIR / "withdraw_last_result.json", {})
+    record = load_json_state(config.DATA_DIR / "withdraw_last_result.json", {})
     if not isinstance(record, dict) or record.get("email") not in configured:
         return {}
     result = record.get("result")
@@ -2088,13 +2189,28 @@ def _parse_duration_range(values) -> tuple[float, float]:
     return minimum, maximum
 
 
-def create_app() -> Flask:
-    import hmac
+def _require_local_api_token(*, for_testing: bool = False) -> str:
+    """Require a desktop session; unauthenticated clients are explicit test fixtures."""
+    if type(for_testing) is not bool:
+        raise TypeError("for_testing deve ser booleano.")
     local_api_token = os.environ.get("QMONEY_LOCAL_API_TOKEN", "")
-    if getattr(sys, "frozen", False) and not local_api_token:
+    if not local_api_token and (not for_testing or getattr(sys, "frozen", False)):
         raise RuntimeError("Inicie o serviço pela interface QMoney para proteger o acesso local.")
+    return local_api_token
+
+
+def create_app(*, for_testing: bool = False) -> Flask:
+    import hmac
+    local_api_token = _require_local_api_token(for_testing=for_testing)
     preflights: dict[str, dict] = {}
     preflight_lock = threading.RLock()
+    # Original captures use their own bounded, server-owned receipts. They
+    # cannot fall back to a dataset plan or an unreviewed start.
+    original_preflights: dict[str, dict] = {}
+    original_starts: dict[str, dict] = {}
+    # Per-service close barrier: a request admitted before closing may still
+    # finish its preflight, but must never start another sending worker.
+    campaign_drain = {"requested": False, "requests": 0}
     banned_monitor = BannedMonitor()
     RUNNER.on_restriction = lambda email: _ban_accounts([{
         "email": email, "restriction_confirmed": True, "stage": "Envio da campanha",
@@ -2103,6 +2219,7 @@ def create_app() -> Flask:
     # No QMoney o Flask e apenas o servico local consumido pela interface Qt.
     # Nenhum frontend web e publicado ou usado como fallback.
     app = Flask(__name__, static_folder=None)
+    app.config["QMONEY_LOCAL_API_AUTHENTICATED"] = bool(local_api_token)
     task_catalog = CatalogLoader()
     accelerator_catalog = CatalogLoader()
     recovery_catalog = CatalogLoader(ttl_s=2)
@@ -2115,9 +2232,60 @@ def create_app() -> Flask:
                 local_api_token.encode("utf-8")):
             return jsonify({"error": "Cliente local não autorizado."}), 401
 
+    def campaign_closing_response():
+        return jsonify({"error_code": "campaign_closing", "error": "O aplicativo está encerrando os envios. Nenhuma campanha nova será iniciada."}), 409
+
+    @app.before_request
+    def admit_campaign_request():
+        scoped = (request.path == "/api/campaigns"
+                  or request.path.startswith("/api/campaigns/")
+                  or request.path in {"/api/recovery/resume", "/api/recovery/reconcile"})
+        if (not scoped or request.path == "/api/campaigns/drain"
+                or request.method not in {"POST", "PUT", "PATCH", "DELETE"}):
+            return
+        with _HEAVY_RUNNER_LOCK:
+            if campaign_drain["requested"]:
+                return campaign_closing_response()
+            campaign_drain["requests"] += 1
+            g.campaign_request_admitted = True
+
+    @app.teardown_request
+    def release_campaign_request(_exc):
+        if g.pop("campaign_request_admitted", False):
+            with _HEAVY_RUNNER_LOCK:
+                campaign_drain["requests"] -= 1
+
     @app.errorhandler(SecureStoreError)
     def invalid_secure_store(exc):
         return jsonify({"error": str(exc), "code": "local_vault_unreadable"}), 409
+
+    @app.errorhandler(banned_store.BannedStoreError)
+    def invalid_banned_store(exc):
+        response = jsonify({"error": str(exc), "code": "archived_accounts_unreadable"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 409
+
+    @app.errorhandler(token_store.TokenStoreError)
+    def invalid_token_identity(exc):
+        response = jsonify({"error": "O acesso salvo está inválido ou possui identidade conflitante. Preserve os arquivos e revise o acesso.",
+                            "code": "local_token_identity_conflict"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 409
+
+    @app.errorhandler(JsonStateError)
+    def invalid_authoritative_state(_exc):
+        response = jsonify({"error": "Não foi possível ler o estado local com segurança. Os arquivos foram preservados; revise ou restaure um backup válido antes de continuar.",
+                            "code": "local_state_unreadable"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 409
+
+    @app.before_request
+    def bound_original_request():
+        if request.method == "POST" and request.path in {
+                "/api/campaigns/original", "/api/campaigns/original/preflight"}:
+            # Bound the raw body before the generic JSON reader consumes it.
+            if request.content_length is None or request.content_length > 1024 * 1024:
+                return original_error("original_invalid_request")
 
     @app.before_request
     def validate_json_body():
@@ -2150,8 +2318,10 @@ def create_app() -> Flask:
             _INTEGRATION_OPERATION_LOCK.acquire()
             g.integration_operation_locked = True
         account_write = request.path.startswith("/api/accounts") and request.method != "GET"
-        campaign_start = request.path in ("/api/campaigns", "/api/campaigns/preflight") and request.method == "POST"
-        synchronous_tasks = request.path == "/api/tasks" and request.args.get("async") != "1"
+        campaign_start = request.path in ("/api/campaigns", "/api/campaigns/preflight",
+                                         "/api/campaigns/original", "/api/campaigns/original/preflight") and request.method == "POST"
+        synchronous_tasks = ((request.path == "/api/tasks" and request.args.get("async") != "1")
+                             or request.path == "/api/campaigns/original/tasks")
         if account_write or campaign_start or synchronous_tasks:
             _ACCOUNT_OPERATION_LOCK.acquire()
             g.account_operation_locked = True
@@ -2191,7 +2361,7 @@ def create_app() -> Flask:
             if not any(str(account["email"]).strip().casefold() == email
                        for account in _list_accounts()):
                 return jsonify({"error": "conta não encontrada"}), 404
-            password = _saved_account_password(email, _crowtado_creds())
+            password = _saved_account_password(email)
         if not password:
             return jsonify({"error": "esta conta não possui senha salva"}), 404
         response = jsonify({"email": email, "password": password})
@@ -2227,14 +2397,14 @@ def create_app() -> Flask:
 
     @app.get("/api/accounts/banned/monitor")
     def banned_monitor_snapshot():
-        archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+        archive = banned_store.load(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
         passwords = _crowtado_creds()
         rows = []
         for row in archive.get("accounts", []):
             eligible, reason = _banned_withdraw_eligibility(row)
             email = str(row.get("email") or "").strip().casefold()
             rows.append({"email": row["email"], "banned_at": row.get("banned_at") or row.get("removed_at"),
-                         "has_password": bool(row.get("password") or passwords.get(email)),
+                         "has_password": bool(row.get("password") or _saved_account_password(email, passwords)),
                          "monitor": row.get("monitor", {}),
                          "withdraw_eligible": eligible, "withdraw_reason": reason})
         return jsonify({"accounts": rows, "runner": banned_monitor.snapshot()})
@@ -2247,12 +2417,12 @@ def create_app() -> Flask:
         if not email:
             return jsonify({"error": "informe a conta banida"}), 400
         with _PERSISTENCE_LOCK:
-            archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+            archive = banned_store.load(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
             row = next((item for item in archive.get("accounts", [])
                         if str(item.get("email") or "").strip().casefold() == email), None)
             if row is None:
                 return jsonify({"error": "conta não encontrada no registro de banidas"}), 404
-            password = row.get("password") or _crowtado_creds().get(email)
+            password = row.get("password") or _saved_account_password(email)
         if not password:
             return jsonify({"error": "esta conta não possui senha salva"}), 404
         response = jsonify({"email": email, "password": password})
@@ -2267,7 +2437,7 @@ def create_app() -> Flask:
         if not email:
             return jsonify({"error": "informe a conta banida"}), 400
         with _PERSISTENCE_LOCK:
-            archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+            archive = banned_store.load(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
             row = next((item for item in archive.get("accounts", [])
                         if str(item.get("email") or "").strip().casefold() == email), None)
             row = dict(row) if row is not None else None
@@ -2287,14 +2457,14 @@ def create_app() -> Flask:
             message = f"não foi possível confirmar o saldo na Crowtado: {reason}"
             try:
                 _remember_banned_withdraw_result(email, "balance_error", message, balance_error=True)
-            except OSError:
+            except (OSError, banned_store.BannedStoreError):
                 pass
             return jsonify({"error": message}), 400
         if not _confirmed_available_balance(balance):
             try:
                 _remember_banned_withdraw_result(
                     email, "no_balance", "O saldo aprovado deve ser superior a US$ 25,00 para saque na Crowtado.", balance=balance)
-            except OSError:
+            except (OSError, banned_store.BannedStoreError):
                 pass
             return jsonify({"error": "o saldo aprovado deve ser superior a US$ 25,00 para saque na Crowtado"}), 400
         result, status = _withdraw_once(email, row["password"])
@@ -2306,25 +2476,25 @@ def create_app() -> Flask:
                     result.get("message") if provider_status else
                     "Não foi possível solicitar o saque; atualize o saldo antes de tentar novamente.",
                     balance=balance)
-            except OSError:
+            except (OSError, banned_store.BannedStoreError):
                 pass  # A solicitação externa já ocorreu; não a repetir por falha local.
         return jsonify(result), status
 
     @app.post("/api/accounts/banned/refresh")
     def refresh_banned_monitor():
         with _PERSISTENCE_LOCK:
-            archive = load_json(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
+            archive = banned_store.load(config.DATA_DIR / "banned_accounts.json", {"accounts": []})
             rows = archive.get("accounts", [])
             if not rows:
                 return jsonify({"error": "Não há contas banidas registradas."}), 400
             def save(email, result):
                 with _PERSISTENCE_LOCK:
                     path = config.DATA_DIR / "banned_accounts.json"
-                    current = load_json(path, {"accounts": []})
+                    current = banned_store.load(path, {"accounts": []})
                     for row in current.get("accounts", []):
                         if row.get("email", "").casefold() == email.casefold():
                             row["monitor"] = result
-                    save_json(path, current)
+                    banned_store.save(path, current)
             try:
                 banned_monitor.start(rows, save)
             except RuntimeError as exc:
@@ -2335,19 +2505,21 @@ def create_app() -> Flask:
     def banned_accounts():
         with _PERSISTENCE_LOCK:
             path = config.DATA_DIR / "banned_accounts.json"
-            archive = load_json(path, {"schema": 1, "accounts": []})
+            archive = banned_store.load(path, {"schema": 1, "accounts": []})
             passwords = _crowtado_creds()
             changed = False
             for row in archive.get("accounts", []):
                 email = str(row.get("email", "")).strip().casefold()
-                for key, value in (("password", row.get("password") or passwords.get(email)),
+                for key, value in (("password", row.get("password") or _saved_account_password(email, passwords)),
                                    ("banned_at", row.get("banned_at") or row.get("removed_at"))):
                     if key not in row or row[key] != value:
                         row[key] = value
                         changed = True
             if changed:
-                save_json(path, archive)
-            return jsonify(archive)
+                banned_store.save(path, archive)
+            response = jsonify(archive)
+            response.headers["Cache-Control"] = "no-store"
+            return response
 
     @app.post("/api/accounts/import")
     def import_accounts():
@@ -2363,6 +2535,8 @@ def create_app() -> Flask:
                 result = account_transfer.import_accounts(body["content"], apply=body.get("apply", False),
                     passwords_path=CROWTADO_PW_PATH, removed_path=_removed_accounts_path())
             return jsonify(result)
+        except (JsonStateError, token_store.TokenStoreError):
+            raise
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         except OSError:
@@ -2414,6 +2588,8 @@ def create_app() -> Flask:
             response = jsonify(result)
             response.headers["Cache-Control"] = "no-store"
             return response
+        except (JsonStateError, token_store.TokenStoreError):
+            raise
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         except OSError:
@@ -2422,8 +2598,11 @@ def create_app() -> Flask:
     @app.post("/api/accounts")
     def add_account():
         body = request.get_json(silent=True) or {}
-        email = str(body.get("email", "")).strip()
-        password = str(body.get("password", ""))
+        email = body.get("email", "")
+        password = body.get("password", "")
+        if not isinstance(email, str) or not isinstance(password, str):
+            return jsonify({"error": "email e senha devem ser texto", "code": "invalid_credentials"}), 400
+        email = email.strip()
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
         try:
@@ -2432,14 +2611,18 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
         try:
             login(email, password)
-        except (RuntimeError, OSError) as exc:
-            return jsonify({"error": str(exc)}), 400
+        except (RuntimeError, OSError, AuthError) as exc:
+            issue = account_issue(email, exc, stage="Login Minute")
+            return jsonify({"error": issue["reason"] + " " + issue["action"],
+                            "code": "account_login_failed", "issue": issue}), 400
         try:
             # Reconectar também é um gate de organização: uma conta Crowtado
             # antiga só volta a ficar ativa depois de confirmar PE8EAR5V.
             _resolve_org(email)
         except (RuntimeError, OSError, AuthError) as exc:
-            return jsonify({"error": str(exc)}), 400
+            issue = account_issue(email, exc, stage="Confirmação de organização Minute")
+            return jsonify({"error": issue["reason"] + " " + issue["action"],
+                            "code": "account_organization_unconfirmed", "issue": issue}), 400
         try:
             _save_crowtado_cred(email, password)
             _set_account_removed(email, False)
@@ -2457,8 +2640,11 @@ def create_app() -> Flask:
         → vínculo → salva. Retorna o dict de steps.
         """
         body = request.get_json(silent=True) or {}
-        email = str(body.get("email", "")).strip()
-        password = str(body.get("password", ""))
+        email = body.get("email", "")
+        password = body.get("password", "")
+        if not isinstance(email, str) or not isinstance(password, str):
+            return jsonify({"error": "email e senha devem ser texto", "code": "invalid_credentials"}), 400
+        email = email.strip()
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
         if not _hostinger_is_configured():
@@ -2639,15 +2825,15 @@ def create_app() -> Flask:
             normalized = account_transfer.email_key(email)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        path = config.token_path(email)
+        found = token_store.load(config.SECRETS_DIR, normalized, migrate=False)
         credential_path = credential_store.record_path(config.SECRETS_DIR, normalized)
-        if not path.exists() and not credential_path.exists():
+        if found is None and not credential_path.exists():
             return jsonify({"error": f"conta não encontrada: {email}"}), 404
         # Grave primeiro a intenção. Mesmo se o Windows interromper a remoção
         # física, a conta já não reaparece nem volta para uma campanha.
         _set_account_removed(email, True)
         try:
-            path.unlink(missing_ok=True)
+            token_store.delete(config.SECRETS_DIR, normalized)
             with _PERSISTENCE_LOCK:
                 prefs = _load_prefs()
                 normalized = email.casefold()
@@ -2728,12 +2914,14 @@ def create_app() -> Flask:
             content_mode = campaign.normalize_content_mode(
                 request.args.get("content_mode")
             )
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except ValueError:
+            return jsonify({"error": "Dataset ou modo de conteúdo inválido.",
+                            "code": "invalid_task_selection"}), 400
         try:
             min_dur_s, max_dur_s = _parse_duration_range(request.args)
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except ValueError:
+            return jsonify({"error": "Informe um intervalo de duração válido.",
+                            "code": "invalid_task_duration"}), 400
         if request.args.get("async") == "1":
             def load(progress):
                 try:
@@ -2759,7 +2947,8 @@ def create_app() -> Flask:
                     return {"error": issue["reason"] + " " + issue["action"], "issue": issue}, 400
 
             result, status = task_catalog.get(
-                (email, dataset_provider, content_mode, min_dur_s, max_dur_s), load,
+                (email, dataset_provider, content_mode, min_dur_s, max_dur_s,
+                 _preflight_fingerprint([email])), load,
                 scope="campaign-tasks")
             return jsonify(result), status
         try:
@@ -2775,16 +2964,16 @@ def create_app() -> Flask:
         except json.JSONDecodeError:
             return jsonify({
                 "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
+                "code": "task_response_invalid",
             }), 400
-        except AuthError as exc:
-            app.logger.warning("GET /api/tasks auth %s: %s", email, exc)
-            return jsonify({"error": str(exc)}), 400
-        except (RuntimeError, OSError) as exc:
-            app.logger.warning("GET /api/tasks %s: %s", email, exc)
-            msg = str(exc)
-            if "Expecting value" in msg:
-                msg = "a API devolveu resposta vazia (não-JSON). Tente de novo."
-            return jsonify({"error": msg}), 400
+        except AuthError:
+            app.logger.warning("GET /api/tasks: task_auth_failed")
+            return jsonify({"error": "Não foi possível validar o acesso da conta. Reconecte a conta e tente novamente.",
+                            "code": "task_auth_failed"}), 400
+        except (RuntimeError, OSError):
+            app.logger.warning("GET /api/tasks: task_catalog_unavailable")
+            return jsonify({"error": "Não foi possível carregar as categorias. Confira o acesso da conta e a biblioteca local.",
+                            "code": "task_catalog_unavailable"}), 400
         return jsonify({"email": email, "org_key": org_key,
                         "dataset": dataset_provider, "content_mode": content_mode,
                         "tasks": tasks,
@@ -3059,9 +3248,13 @@ def create_app() -> Flask:
             provider = _local_dataset_provider(
                 request.args.get("dataset")
             )
+        except ValueError:
+            return jsonify({"error": "Dataset inválido.", "code": "invalid_dataset"}), 400
+        try:
             result = readiness.campaign_readiness(provider)
-        except (ValueError, OSError, RuntimeError) as exc:
-            return jsonify({"error": str(exc)}), 400
+        except (ValueError, OSError, RuntimeError):
+            return jsonify({"error": "Não foi possível verificar a prontidão. Confira a biblioteca local e as ferramentas configuradas.",
+                            "code": "readiness_unavailable"}), 400
         result["storage"] = _storage_snapshot(include_path=False)
         return jsonify(result)
 
@@ -3397,10 +3590,342 @@ def create_app() -> Flask:
                 return jsonify({
                     "error": "pare a campanha e o acelerador antes de limpar a mídia",
                 }), 409
-            result = campaign.cleanup_media_cache(config.MEDIA_DATA_DIR / "ego4d", provider=provider)
+            try:
+                result = campaign.cleanup_media_cache(config.MEDIA_DATA_DIR / "ego4d", provider=provider)
+            except (ValueError,OSError):
+                return jsonify({"error_code":"cleanup_state_unreadable",
+                                "error":"Os registros de envio precisam ser revisados antes de limpar a mídia."}),409
         return jsonify({"ok": not result["errors"], "provider": provider, **result})
 
     # -- campanha ---------------------------------------------------------------
+    class OriginalAdmissionError(ValueError):
+        def __init__(self, code, status=400):
+            self.code, self.status = code, status
+
+    def original_error(code, status=400):
+        # Neither OS/auth exceptions nor paths, metadata or provider bodies
+        # are suitable public explanations for an admission failure.
+        return jsonify({"ok": False, "error_code": code,
+                        "error": "A captura original não foi admitida. Revise os arquivos, a conta e a verificação antes de continuar."}), status
+
+    @app.get("/api/campaigns/starts/<start_id>")
+    def campaign_start_status(start_id):
+        try:
+            data=campaign_start_store.public_status(start_id)
+            row=campaign_start_store.lookup(start_id)
+            if row is not None:
+                from ..start_execution import execution_evidence
+                snap=RUNNER.snapshot()
+                running_id=snap.get('start_request_id') if isinstance(snap,dict) else None
+                data.update(execution_evidence(row,running_id=running_id,thread_running=RUNNER.running is True))
+            else:
+                data.update(execution_state='review',terminal=False,log_name=None,delivery_confirmed=False)
+            return jsonify(data)
+        except (ValueError, OSError):
+            return jsonify({"ok":False,"error_code":"start_state_unreadable",
+                            "error":"Preserve o estado local e revise o registro de início."}), 409
+
+    def original_body(*, starting=False):
+        try:
+            body = decode_json_state(request.get_data(cache=True))
+            allowed = {"account_email", "task_id", "file_pairs", "expected_chunk_count",
+                       "evaluate", "finalize", "start_request_id"}
+            if starting:
+                allowed.add("preflight_id")
+            if set(body) - allowed:
+                raise ValueError
+            email = token_store.email_key(body.get("account_email"))
+            task_id, start_id = body.get("task_id"), body.get("start_request_id")
+            if (not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", task_id)
+                    or not isinstance(start_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", start_id)
+                    or body.get("evaluate") is not True or body.get("finalize") is not True):
+                raise ValueError
+            pairs = body.get("file_pairs")
+            if not isinstance(pairs, list) or not 1 <= len(pairs) <= 64:
+                raise ValueError
+            for pair in pairs:
+                if (not isinstance(pair, dict) or set(pair) != {"video_path", "sidecar_path"}
+                        or any(not isinstance(value, str) or not value.strip() or len(value) > 4096
+                               for value in pair.values())):
+                    raise ValueError
+            if "expected_chunk_count" in body and (type(body["expected_chunk_count"]) is not int
+                                                    or body["expected_chunk_count"] != len(pairs)):
+                raise ValueError
+            result = dict(body, account_email=email)
+            receipt_id = result.pop("preflight_id", None)
+            if starting and (not isinstance(receipt_id, str) or not receipt_id
+                             or len(receipt_id) > 160):
+                raise OriginalAdmissionError("original_preflight_missing")
+            return result, receipt_id
+        except OriginalAdmissionError:
+            raise
+        except (ValueError, TypeError, token_store.TokenStoreError):
+            raise OriginalAdmissionError("original_invalid_request") from None
+
+    def original_pairs(body):
+        return [(Path(pair["video_path"]), Path(pair["sidecar_path"])) for pair in body["file_pairs"]]
+
+    def original_local_inspection(body):
+        from ..original_capture import inspect_original_capture_group
+        try:
+            return inspect_original_capture_group(original_pairs(body), account_email=body["account_email"],
+                                                  task_id=body["task_id"], expected_chunk_count=body.get("expected_chunk_count"),
+                                                  now=time.time())
+        except (ValueError, OSError, RuntimeError):
+            raise OriginalAdmissionError("original_capture_invalid") from None
+
+    def original_session(email):
+        try:
+            if email not in {token_store.email_key(row["email"]) for row in _list_accounts()}:
+                raise OriginalAdmissionError("original_account_unavailable")
+            session = Session.from_email(email)
+            if token_store.email_key(session.email) != email:
+                raise OriginalAdmissionError("original_account_unavailable")
+            org_key = _resolve_org(email, session=session)
+            session.ensure_auth(org_key=org_key)
+            return session, org_key
+        except OriginalAdmissionError:
+            raise
+        except (AuthError, ValueError, OSError, RuntimeError):
+            raise OriginalAdmissionError("original_policy_unavailable") from None
+
+    def original_tasks(session, org_key):
+        try:
+            source = session.all_tasks(org_key)
+            if not isinstance(source, list) or len(source) > 4096:
+                raise ValueError
+            result, ids = [], set()
+            for row in source:
+                if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", row["id"]):
+                    raise ValueError
+                if row["id"] in ids:
+                    raise ValueError
+                ids.add(row["id"])
+                if any(key in row and not isinstance(row[key], str) for key in ("name", "description")):
+                    raise ValueError
+                result.append({"id": row["id"], "name": (row.get("name", "").strip() or row["id"])[:256],
+                               "description": row.get("description", "")[:2000]})
+            return result
+        except (AuthError, ValueError, OSError, RuntimeError):
+            raise OriginalAdmissionError("original_catalog_unavailable") from None
+
+    def original_task(session, org_key, task_id):
+        for task in original_tasks(session, org_key):
+            if task["id"] == task_id:
+                return task
+        raise OriginalAdmissionError("original_task_unavailable")
+
+    def original_policy(plan, session):
+        from ..original_capture import validate_original_capture_session_policy
+        from ..service_policy import RecordingPolicy
+        try:
+            # Shared with direct delivery: exact original CREATE bodies and
+            # real policy reads, without CREATE, PUT or journal effects.
+            validate_original_capture_session_policy(plan, session)
+            if not isinstance(session.recording_policy, RecordingPolicy):
+                raise ValueError
+            return session.recording_policy.limits()
+        except (AuthError, ValueError, OSError, RuntimeError):
+            raise OriginalAdmissionError("original_policy_unavailable") from None
+
+    def original_prepare(body, session, org_key):
+        from ..original_capture import prepare_original_capture_plan
+        from ..service_policy import RecordingPolicy
+        try:
+            if not isinstance(session.recording_policy, RecordingPolicy):
+                raise OriginalAdmissionError("original_policy_unavailable")
+            plan = prepare_original_capture_plan(original_pairs(body), account_email=body["account_email"],
+                                                 org_key=org_key, task_id=body["task_id"],
+                                                 expected_chunk_count=body.get("expected_chunk_count"), now=time.time(),
+                                                 limits=session.recording_policy.limits())
+            limits = original_policy(plan, session)
+            # warmup may have changed recording-config while checking policy.
+            from ..original_capture import verify_original_capture_plan
+            verify_original_capture_plan(plan, account_email=body["account_email"], org_key=org_key,
+                                         task_id=body["task_id"], now=time.time(), limits=limits)
+            return plan, limits
+        except OriginalAdmissionError:
+            raise
+        except (ValueError, OSError, RuntimeError):
+            raise OriginalAdmissionError("original_capture_invalid") from None
+
+    def original_summary(plan, task):
+        return {"source_mode": "original", "completion_policy": "explicit_finalize", "group_count": 1,
+                "chunks": len(plan.captures), "expected_chunk_count": len(plan.captures),
+                "total_duration_ms": sum(plan.durations_ms), "plan_digest": plan.digest,
+                "content_digest": plan.content_digest,
+                "task_binding": {"task_id": task["id"], "name": task["name"], "binding": plan.task_binding},
+                "owner_binding": plan.owner_binding, "org_binding": plan.org_binding,
+                "completeness_binding": plan.completeness_binding,
+                "source_chunk_count_verified": plan.source_chunk_count_verified,
+                "physical_provenance_verified": False, "provider_acceptance_verified": False,
+                "media_probe_verified": True, "csv_temporal_consistency_verified": True,
+                "clock_domains_preserved": True, "cross_clock_conversion_verified": False,
+                "files": [{"media": {"bytes": capture.media.bytes, "sha256": capture.media.sha256},
+                           "sidecar": {"bytes": capture.sidecar.bytes, "sha256": capture.sidecar.sha256}}
+                          for capture in plan.captures]}
+
+    def original_not_busy(email):
+        if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running:
+            raise OriginalAdmissionError("original_busy", 409)
+        try:
+            items = recovery.snapshot()["items"]
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise ValueError
+            if any(item.get("email") == email and item.get("blocks_campaign", True) for item in items):
+                raise OriginalAdmissionError("original_recovery_pending", 409)
+            return items
+        except OriginalAdmissionError:
+            raise
+        except (ValueError, OSError, RuntimeError):
+            raise OriginalAdmissionError("original_recovery_pending", 409) from None
+
+    def original_receipt_current(receipt_id, receipt, body):
+        if original_preflights.get(receipt_id) is not receipt:
+            raise OriginalAdmissionError("original_preflight_missing", 409)
+        if receipt["body"] != body:
+            raise OriginalAdmissionError("original_request_changed", 409)
+        if receipt["expires"] <= time.monotonic():
+            raise OriginalAdmissionError("original_preflight_expired", 409)
+        if receipt["fingerprint"] != _preflight_fingerprint([body["account_email"]]):
+            raise OriginalAdmissionError("original_identity_changed", 409)
+
+    def original_verify(receipt, body, *, limits=None):
+        from ..original_capture import verify_original_capture_plan
+        try:
+            verify_original_capture_plan(receipt["plan"], account_email=body["account_email"],
+                                         org_key=receipt["org_key"], task_id=body["task_id"], now=time.time(),
+                                         limits=receipt["limits"] if limits is None else limits)
+        except (ValueError, OSError, RuntimeError):
+            raise OriginalAdmissionError("original_source_changed", 409) from None
+
+    @app.get("/api/campaigns/original/tasks")
+    def original_campaign_tasks():
+        try:
+            email = token_store.email_key(request.args.get("account_email"))
+            session, org_key = original_session(email)
+            return jsonify({"ok": True, "account_email": email, "tasks": original_tasks(session, org_key),
+                            "physical_provenance_verified": False})
+        except OriginalAdmissionError as exc:
+            return original_error(exc.code, exc.status)
+        except (ValueError, token_store.TokenStoreError):
+            return original_error("original_invalid_request")
+
+    @app.post("/api/campaigns/original/preflight")
+    def original_campaign_preflight():
+        try:
+            body, _ = original_body()
+            original_local_inspection(body)  # All local invariants precede auth.
+            session, org_key = original_session(body["account_email"])
+            task = original_task(session, org_key, body["task_id"])
+            plan, limits = original_prepare(body, session, org_key)
+            summary = original_summary(plan, task)
+            with _HEAVY_RUNNER_LOCK:
+                if campaign_drain["requested"]:
+                    return campaign_closing_response()
+                original_not_busy(body["account_email"])
+                with preflight_lock:
+                    now = time.monotonic()
+                    for key in list(original_preflights):
+                        if original_preflights[key]["expires"] <= now:
+                            original_preflights.pop(key)
+                    if len(original_preflights) >= 32 or len(original_starts) >= 256:
+                        raise OriginalAdmissionError("original_busy", 409)
+                    receipt_id = uuid.uuid4().hex
+                    original_preflights[receipt_id] = {"body": body, "plan": plan, "task": task,
+                        "org_key": org_key, "limits": limits, "summary": summary,
+                        "fingerprint": _preflight_fingerprint([body["account_email"]]), "expires": now + 600}
+            return jsonify({"ok": True, "preflight_id": receipt_id, "receipt": receipt_id,
+                            "account_email": body["account_email"], "task_id": body["task_id"],
+                            "start_request_id": body["start_request_id"], "original_summary": summary,
+                            "completion_policy": "explicit_finalize", "readiness": {"ready": True}})
+        except OriginalAdmissionError as exc:
+            return original_error(exc.code, exc.status)
+
+    @app.post("/api/campaigns/original")
+    def start_original_campaign():
+        try:
+            body, receipt_id = original_body(starting=True)
+            with preflight_lock:
+                prior = campaign_start_store.lookup(body["start_request_id"], kind="original",
+                                                    receipt_id=receipt_id, body=body)
+                if prior is not None:
+                    if prior["phase"] == "claimed":
+                        return original_error("original_start_outcome_unknown", 500)
+                    return jsonify({**prior["reply"], "already_running": True})
+                receipt = original_preflights.get(receipt_id)
+                if receipt is None:
+                    raise OriginalAdmissionError("original_preflight_missing", 409)
+                original_receipt_current(receipt_id, receipt, body)
+            original_verify(receipt, body)  # Changed local files fail before auth.
+            session, org_key = original_session(body["account_email"])
+            if org_key != receipt["org_key"]:
+                raise OriginalAdmissionError("original_identity_changed", 409)
+            original_task(session, org_key, body["task_id"])
+            original_policy(receipt["plan"], session)
+            with _HEAVY_RUNNER_LOCK:
+                if campaign_drain["requested"]:
+                    return campaign_closing_response()
+                items = original_not_busy(body["account_email"])
+                with preflight_lock:
+                    original_receipt_current(receipt_id, receipt, body)
+                    # Recheck identity, organization, policy and source bytes at
+                    # admission, after waiting for the shared runner barrier.
+                    if (token_store.email_key(session.email) != body["account_email"]
+                            or _resolve_org(body["account_email"], session=session) != org_key):
+                        raise OriginalAdmissionError("original_identity_changed", 409)
+                    # Availability can change while waiting; the reviewed
+                    # label and plan remain frozen after this membership read.
+                    original_task(session, org_key, body["task_id"])
+                    limits = original_policy(receipt["plan"], session)
+                    original_verify(receipt, body, limits=limits)
+                    plan, task = receipt["plan"], receipt["task"]
+                    cfg = CampaignConfig(accounts=[AccountSpec(body["account_email"], org_key)],
+                        tasks=[TaskSpec(task_id=task["id"], scenario="original", min_dur_s=sum(plan.durations_ms)/1000,
+                                        max_dur_s=sum(plan.durations_ms)/1000, task_name=task["name"],
+                                        task_label=task["name"], task_description=task["description"], count=1)],
+                        work_dir=config.MEDIA_DATA_DIR / "original", evaluate=True, finalize=True, account_workers=1,
+                        account_max_attempts=1, shuffle_schedule=False, share_clips=False, unique_video=False,
+                        allow_new_accounts=False, cleanup_after_upload=False, realistic_timeline=False,
+                        dataset_provider="original", start_request_id=body["start_request_id"],
+                        original_capture_plan=plan, recovery_exclusions=recovery.campaign_exclusions(items))
+                    reply = {"ok": True, "already_running": False, "start_request_id": body["start_request_id"],
+                             "preflight_id": receipt_id, "receipt": receipt_id, "account_email": body["account_email"],
+                             "task_id": body["task_id"], "total_sends": 1, "accounts": [body["account_email"]],
+                             "selected_tasks": [{"task_id": task["id"]}], "original_summary": receipt["summary"]}
+                    # Claim the UUID before invoking a collaborator that may
+                    # accept work and then fail to return a response.
+                    # Hashing/probing and policy reads can be slow. Recheck the
+                    # monotonic TTL and owner fingerprint immediately at start.
+                    original_receipt_current(receipt_id, receipt, body)
+                    claimed, prior = campaign_start_store.claim(body["start_request_id"], kind="original",
+                        receipt_id=receipt_id, body=body,
+                        bindings={"accounts":[{"email":body["account_email"],"org_key":org_key}],
+                                  "tasks":[task["id"]],"session_id":plan.session_id,
+                                  "plan_digest":plan.digest,"content_digest":plan.content_digest,
+                                  "expected_chunk_count":len(plan.captures)},
+                        protected_assets=[{"path":str(asset.path),"sha256":asset.sha256}
+                                          for capture in plan.captures for asset in (capture.media,capture.sidecar)])
+                    if not claimed:
+                        if prior["phase"] == "claimed":
+                            return original_error("original_start_outcome_unknown",500)
+                        return jsonify({**prior["reply"],"already_running":True})
+                    try:
+                        RUNNER.start(cfg)
+                    except Exception:
+                        # A lost/exceptional start outcome is not proof of
+                        # rejection. The caller must poll this UUID, never repost.
+                        return original_error("original_start_outcome_unknown", 500)
+                    original_preflights.pop(receipt_id, None)
+                    campaign_start_store.acknowledge(body["start_request_id"],reply)
+            return jsonify(reply)
+        except campaign_start_store.StartConflictError:
+            return original_error("original_start_conflict",409)
+        except (campaign_start_store.StartStoreError, OperationLeaseError, OSError):
+            return original_error("original_start_outcome_unknown",500)
+        except OriginalAdmissionError as exc:
+            return original_error(exc.code, exc.status)
+
     @app.post("/api/campaigns/preflight")
     def campaign_preflight():
         """Valida a operação inteira sem baixar, preparar ou enviar mídia."""
@@ -3541,8 +4066,9 @@ def create_app() -> Flask:
             estimated_sends = len(selected) * count * len(accounts)
         try:
             ready = readiness.campaign_readiness(provider, content_mode=content_mode)
-        except Exception as exc:  # noqa: BLE001 — ainda devolve os outros checks
-            ready = {"ready": False, "checks": [], "error": str(exc)}
+        except Exception:  # Os outros checks continuam sem exportar dados da exceção.
+            ready = {"ready": False, "checks": [], "error": "Não foi possível verificar a prontidão local.",
+                     "code": "readiness_unavailable"}
         readiness_errors = [
             item for item in ready.get("checks", [])
             if item.get("status") == "error"
@@ -3652,6 +4178,26 @@ def create_app() -> Flask:
 
     @app.post("/api/campaigns")
     def start_campaign():
+        # Legacy callers have no durable correlation key, but a broken
+        # authoritative ledger still cannot authorize a fresh operation.
+        try:
+            campaign_start_store.lookup('local-state-integrity-check')
+        except (ValueError,OSError):
+            return jsonify({"error_code":"start_state_unreadable","error":"Preserve o registro local de início para revisão."}),409
+        retry_body = request.get_json(silent=True)
+        if isinstance(retry_body, dict) and retry_body.get("preflight_id"):
+            retry_id = retry_body["preflight_id"]
+            frozen_request = {k:v for k,v in retry_body.items() if k not in {"preflight_id", "remove_restricted"}}
+            try:
+                prior = campaign_start_store.lookup(retry_id, kind="dataset", receipt_id=retry_id, body=frozen_request)
+            except campaign_start_store.StartConflictError:
+                return jsonify({"error_code":"start_request_conflict","error":"O identificador de início pertence a outra operação."}),409
+            except (ValueError,OSError):
+                return jsonify({"error_code":"start_state_unreadable","error":"Preserve o registro local de início para revisão."}),409
+            if prior is not None:
+                if prior["phase"] == "claimed":
+                    return jsonify({"error_code":"start_outcome_unknown","error":"O início exige consulta e revisão; não reenvie a operação."}),500
+                return jsonify({**prior["reply"],"already_running":True})
         if RUNNER.running:
             return jsonify({
                 "ok": True,
@@ -3750,29 +4296,30 @@ def create_app() -> Flask:
         # O POST público continua seguro mesmo se um cliente antigo pular o
         # preflight. Sem ferramentas, índices ou credenciais da origem, iniciar
         # uma thread apenas produziria uma falha tardia depois do download.
+        # Recheck mutable local prerequisites even with an unexpired receipt.
+        # The reviewed server-owned catalog and candidate plan stay frozen.
+        try:
+            environment = readiness.campaign_readiness(
+                dataset_provider, content_mode=content_mode)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return jsonify({"error": f"não foi possível validar a prontidão: {exc}"}), 400
+        if not isinstance(environment, dict) or environment.get("ready") is not True:
+            return jsonify({"error": "ambiente não está pronto; execute o preflight novamente."}), 400
+        environment_errors = [
+            item for item in environment.get("checks", [])
+            if item.get("status") == "error"
+        ]
+        if environment_errors:
+            details = "; ".join(
+                f"{item.get('name')}: {item.get('detail')}"
+                for item in environment_errors
+            )
+            return jsonify({"error": "ambiente não está pronto: " + details}), 400
         if receipt:
             accounts = receipt["accounts"]
             available = receipt["catalog"]
             skipped = []
         else:
-            try:
-                environment = readiness.campaign_readiness(
-                    dataset_provider, content_mode=content_mode)
-            except (ValueError, OSError, RuntimeError) as exc:
-                return jsonify({"error": f"não foi possível validar a prontidão: {exc}"}), 400
-            if environment.get("ready") is False:
-                return jsonify({"error": "ambiente não está pronto; execute o preflight novamente."}), 400
-            environment_errors = [
-                item for item in environment.get("checks", [])
-                if item.get("status") == "error"
-            ]
-            if environment_errors:
-                details = "; ".join(
-                    f"{item.get('name')}: {item.get('detail')}"
-                    for item in environment_errors
-                )
-                return jsonify({"error": "ambiente não está pronto: " + details}), 400
-
             resolved: list[AccountSpec | None] = [None] * len(emails)
             skipped: list[str] = []
             workers = max(1, min(8, len(emails)))
@@ -3925,6 +4472,8 @@ def create_app() -> Flask:
                              candidate_plan=receipt.get("candidate_plan") if receipt else None,
                              active_hours=active_hours)
         with _HEAVY_RUNNER_LOCK:
+            if campaign_drain["requested"]:
+                return campaign_closing_response()
             if receipt and receipt.get("sent_fingerprint") is not None:
                 from .. import campaign_plan
                 if receipt["sent_fingerprint"] != campaign_plan.registry_fingerprint():
@@ -3945,29 +4494,54 @@ def create_app() -> Flask:
                 return jsonify({
                     "error": "pare o acelerador antes de iniciar a campanha",
                 }), 409
-            if receipt and receipt["issues"]:
-                if BALANCES_RUNNER.running:
-                    return jsonify({"error": "Aguarde a consulta de saldos terminar."}), 409
+            # Readiness and recovery may take time. Validate the same reviewed
+            # operation at admission, before its first local effect. Keep its
+            # store entry protected until successful start consumes it.
+            with preflight_lock:
+                if receipt:
+                    if preflights.get(str(receipt_id)) is not receipt:
+                        return jsonify({"error_code": "preflight_missing", "error": "A prévia não está mais disponível. Revise a campanha novamente."}), 409
+                    if receipt["fingerprint"] != _preflight_fingerprint(receipt["body"].get("accounts", [])):
+                        return jsonify({"error_code": "preflight_accounts_changed", "error": "O acesso ou a identidade de uma conta mudou. Revise a nova verificação."}), 409
+                    if receipt["expires"] <= time.monotonic():
+                        return jsonify({"error_code": "preflight_expired", "error": "A prévia passou de 10 minutos. Atualize e revise antes de iniciar."}), 409
+                if receipt and receipt["issues"]:
+                    if BALANCES_RUNNER.running:
+                        return jsonify({"error": "Aguarde a consulta de saldos terminar."}), 409
+                    try:
+                        _ban_accounts(receipt["issues"])
+                    except (OSError, ValueError) as exc:
+                        return jsonify({"error": "Não foi possível registrar e remover as contas. A campanha não iniciou."}), 500
                 try:
-                    _ban_accounts(receipt["issues"])
-                except (OSError, ValueError) as exc:
-                    return jsonify({"error": "Não foi possível registrar e remover as contas. A campanha não iniciou."}), 500
-            try:
-                RUNNER.start(cfg)
-                if receipt_id:
-                    with preflight_lock:
+                    if receipt_id:
+                        claimed,prior = campaign_start_store.claim(str(receipt_id),kind="dataset",receipt_id=str(receipt_id),
+                            body=receipt["body"], bindings={"accounts":[{"email":a.email,"org_key":a.org_key} for a in accounts],
+                                                          "tasks":[t.task_id for t in tasks]})
+                        if not claimed:
+                            if prior["phase"] == "claimed":
+                                return jsonify({"error_code":"start_outcome_unknown","error":"O início exige consulta e revisão; não reenvie a operação."}),500
+                            return jsonify({**prior["reply"],"already_running":True})
+                    RUNNER.start(cfg)
+                    if receipt_id:
                         preflights.pop(str(receipt_id), None)
-            except RuntimeError as exc:
-                # Corrida entre dois cliques/abas: se o outro request venceu e
-                # iniciou, este POST também é sucesso idempotente, nunca erro 409.
-                if RUNNER.running:
-                    return jsonify({
-                        "ok": True,
-                        "already_running": True,
-                        "state": RUNNER.state,
-                        "total_sends": RUNNER.total_sends,
-                    })
-                return jsonify({"error": str(exc)}), 409
+                except RuntimeError as exc:
+                    if receipt_id:
+                        return jsonify({"error_code":"start_outcome_unknown","error":"O início exige consulta e revisão; não reenvie a operação."}),500
+                    # Existing running-operation retries never start again.
+                    if RUNNER.running:
+                        return jsonify({
+                            "ok": True,
+                            "already_running": True,
+                            "state": RUNNER.state,
+                            "total_sends": RUNNER.total_sends,
+                        })
+                    return jsonify({"error": str(exc)}), 409
+                except (campaign_start_store.StartStoreError,OperationLeaseError,OSError):
+                    return jsonify({"error_code":"start_state_unreadable","error":"Preserve o registro local de início para revisão."}),409
+                except Exception:
+                    if receipt_id:
+                        return jsonify({"error_code":"start_outcome_unknown","error":"O início exige consulta e revisão; não reenvie a operação."}),500
+                    raise
         payload = {
             "ok": True,
             "total_sends": RUNNER.total_sends,
@@ -3980,6 +4554,13 @@ def create_app() -> Flask:
         }
         if skipped:
             payload["skipped_accounts"] = skipped
+        if receipt_id:
+            payload["start_request_id"] = str(receipt_id)
+            payload["preflight_id"] = str(receipt_id)
+            try:
+                campaign_start_store.acknowledge(str(receipt_id),payload)
+            except (ValueError,OSError):
+                return jsonify({"error_code":"start_outcome_unknown","error":"O início exige consulta e revisão; não reenvie a operação."}),500
         return jsonify(payload)
 
     @app.get("/api/campaigns/current")
@@ -4020,6 +4601,8 @@ def create_app() -> Flask:
     def reconcile_recovery():
         from .. import recovery
         with _HEAVY_RUNNER_LOCK:
+            if campaign_drain["requested"]:
+                return campaign_closing_response()
             if RUNNER.running or RECOVERY.running:
                 return jsonify({"error": "Aguarde a campanha encerrar antes de reconciliar seus registros."}), 409
             try:
@@ -4034,6 +4617,8 @@ def create_app() -> Flask:
         if body.get("confirmed") is not True or not isinstance(email, str) or not email:
             return jsonify({"error": "Confirme a conta e a retomada dos envios existentes."}), 400
         with _HEAVY_RUNNER_LOCK:
+            if campaign_drain["requested"]:
+                return campaign_closing_response()
             if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running:
                 return jsonify({"error": "Aguarde a operação em andamento terminar."}), 409
             try:
@@ -4059,6 +4644,20 @@ def create_app() -> Flask:
         RUNNER.stop()
         return jsonify({"ok": True, "state": RUNNER.state})
 
+    @app.post("/api/campaigns/drain")
+    def campaign_close_drain():
+        # The HTTP acknowledgement is not a worker-completion receipt. Keep
+        # the owned service alive until engine cleanup and local commits return.
+        with _HEAVY_RUNNER_LOCK:
+            campaign_drain["requested"] = True
+            RUNNER.stop()
+            recovery_thread = getattr(RECOVERY, "_thread", None)
+            recovery_active = (RECOVERY.running
+                               or (recovery_thread is not None and recovery_thread.is_alive()))
+            ready = (not RUNNER.running and not recovery_active
+                     and campaign_drain["requests"] == 0)
+            return jsonify({"ok": True, "draining": True, "ready": bool(ready)})
+
     # -- histórico ----------------------------------------------------------------
     @app.get("/api/logs")
     def get_logs():
@@ -4077,7 +4676,7 @@ def create_app() -> Flask:
                 "accounts": data.get("accounts", []),
                 "items": len(items),
                 "sends": len(sends),
-                "ok": sum(1 for s in sends if s.get("ok")),
+                "ok": sum(1 for s in sends if s.get("ok") is True and s.get("finalized") is True),
             })
         return jsonify({"logs": out})
 
@@ -4088,7 +4687,7 @@ def create_app() -> Flask:
             return jsonify({"error": "log não encontrado"}), 404
         try:
             raw = _read_campaign_log(path)
-            return jsonify(_campaign_log_view(raw))
+            return jsonify(_campaign_log_view(raw, history_name=path.name))
         except (OSError, ValueError):
             return jsonify({"error": "log ilegível (JSON vazio/corrompido)"}), 400
 
@@ -4142,9 +4741,11 @@ def create_app() -> Flask:
             try:
                 sess = Session.from_email(email)
             except (AuthError, RuntimeError, OSError) as exc:
+                issue = account_issue(email, exc, stage="Consulta de sessões Minute")
                 return output + [
                     {"session_id": sid, "email": email,
-                     "status": f"erro: {exc}", "expected_files": expected}
+                     "status": "erro: acesso indisponível", "code": "session_access_unavailable",
+                     "issue": issue, "expected_files": expected}
                     for _, sid, expected in valid]
             for org, sid, expected in valid:
                 try:
@@ -4153,8 +4754,10 @@ def create_app() -> Flask:
                     result["expected_files"] = expected
                     output.append(result)
                 except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+                    issue = account_issue(email, exc, stage="Consulta de sessões Minute")
                     output.append({"session_id": sid, "email": email,
-                                   "status": f"erro: {exc}",
+                                   "status": "erro: consulta indisponível", "code": "session_status_unavailable",
+                                   "issue": issue,
                                    "expected_files": expected})
             return output
 
@@ -4206,6 +4809,9 @@ def create_app() -> Flask:
                     errors += missing
         return jsonify({
             "results": results,
+            "attempt_status": data.get("status"),
+            "delivery_summary": (delivery := _campaign_log_view(data, history_name=path.name)["delivery_summary"]),
+            "all_deliveries_confirmed": bool(sum(delivery.values())) and delivery["confirmed"] == sum(delivery.values()),
             "summary": {
                 "total": total, "ready": ready, "pending": pending,
                 "unavailable": unavailable, "errors": errors,
@@ -4363,6 +4969,7 @@ def create_app() -> Flask:
         if (not isinstance(body, dict) or not isinstance(body.get("emails", []), list)
                 or any(not isinstance(email, str) for email in body.get("emails", []))):
             return jsonify({"error": "informe uma lista de e-mails para consultar"}), 400
+        _load_balances()
         configured = {
             a["email"] for a in _list_accounts()
             if org_policy.account_kind(str(a["email"])) == "crowtado"
@@ -4471,8 +5078,11 @@ def create_app() -> Flask:
     @app.put("/api/balances/credentials")
     def put_balance_credentials():
         body = request.get_json(silent=True) or {}
-        email = str(body.get("email", "")).strip()
-        password = str(body.get("password", ""))
+        email = body.get("email", "")
+        password = body.get("password", "")
+        if not isinstance(email, str) or not isinstance(password, str):
+            return jsonify({"error": "email e senha devem ser texto", "code": "invalid_credentials"}), 400
+        email = email.strip()
         if not email or not password:
             return jsonify({"error": "informe email e senha"}), 400
         try:
@@ -4487,10 +5097,16 @@ def create_app() -> Flask:
         try:
             crowtado.login(email, password)
         except (crowtado.CrowtadoError, RuntimeError, OSError) as exc:
+            issue = account_issue(email, exc, stage="Login Crowtado")
             return jsonify({
-                "error": f"o Crowtado não aceitou esse acesso: {exc}",
+                "error": issue["reason"] + " " + issue["action"],
+                "code": "crowtado_login_failed", "issue": issue,
             }), 400
-        _save_crowtado_cred(email, password)
+        try:
+            _save_crowtado_cred(email, password)
+        except (OSError, ValueError):
+            return jsonify({"ok": False, "partial": True, "code": "local_credential_save_failed",
+                            "error": "O acesso Crowtado foi confirmado, mas a senha não foi salva. Confira o armazenamento local antes de tentar novamente."}), 500
         return jsonify({
             "ok": True,
             "email": email,

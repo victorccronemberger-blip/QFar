@@ -44,6 +44,21 @@ class AccountTransferTests(unittest.TestCase):
         self.assertEqual(result["counts"]["duplicate"], 1)
         self.assertEqual(len(transfer.token_accounts()), 1)
 
+    def test_import_keeps_legacy_password_bytes_and_exports_protected_current_password(self):
+        original = b'{"test@example.com": "old-password", "legacy@example.com": "kept"}'
+        self.passwords.write_bytes(original)
+        self.assertEqual(self.run_import([self.account()])["counts"]["imported"], 1)
+        self.assertEqual(self.passwords.read_bytes(), original)
+        self.assertEqual(credential_store.lookup(self.root, "test@example.com"), "fixture-password")
+        exported = transfer.export_accounts(None, load_json(self.passwords, {}), set())
+        self.assertEqual(exported["accounts"][0]["password"], "fixture-password")
+
+    def test_corrupt_protected_credential_blocks_export_with_stale_legacy_password(self):
+        self.run_import([self.account()])
+        credential_store.record_path(self.root, "test@example.com").write_bytes(b"corrupt-protected-record")
+        with self.assertRaises(ValueError):
+            transfer.export_accounts(None, {"test@example.com": "old-password"}, set())
+
     def test_case_whitespace_and_repeated_rows_preserve_existing_credentials(self):
         self.run_import([self.account()])
         changed = self.account(" TEST@EXAMPLE.COM ")
@@ -52,10 +67,11 @@ class AccountTransferTests(unittest.TestCase):
         self.assertEqual(result["counts"]["duplicate"], 2)
         self.assertEqual(next(iter(transfer.token_accounts().values()))[1]["idToken"], "fixture-id")
 
-    def test_file_name_collision_does_not_overwrite_other_account(self):
+    def test_former_file_name_collision_now_imports_two_isolated_accounts(self):
         result = self.run_import([self.account("a.b@example.com"), self.account("a_b@example.com")])
-        self.assertEqual(result["counts"]["imported"], 1)
-        self.assertEqual(result["counts"]["invalid"], 1)
+        self.assertEqual(result["counts"]["imported"], 2)
+        self.assertEqual(result["counts"]["invalid"], 0)
+        self.assertEqual(set(transfer.token_accounts()), {"a.b@example.com", "a_b@example.com"})
 
     def test_mixed_invalid_records_are_reported_without_secrets(self):
         bad = self.account(); bad["token"]["email"] = "other@example.com"
@@ -71,15 +87,18 @@ class AccountTransferTests(unittest.TestCase):
         self.assertEqual(result["counts"]["invalid"], 1)
         self.assertEqual(result["counts"]["imported"], 1)
 
-    def test_password_only_login_failure_rolls_back_and_continues(self):
+    def test_password_only_login_failure_preserves_unconfirmed_record_and_continues(self):
+        written = {}
         def failed(email, password):
             save_json(transfer.config.token_path(email), {"email": email})
+            written[email] = transfer.config.token_path(email).read_bytes()
             raise RuntimeError("contains private credential")
         with patch.object(transfer.minute_api, "login", side_effect=failed):
             result = self.run_import([{"email": "bad@example.com", "password": "secret"}, self.account()])
         self.assertEqual(result["counts"]["error"], 1)
         self.assertEqual(result["counts"]["imported"], 1)
-        self.assertFalse(transfer.config.token_path("bad@example.com").exists())
+        self.assertEqual(transfer.config.token_path("bad@example.com").read_bytes(),
+                         written["bad@example.com"])
         self.assertNotIn("private credential", json.dumps(result))
 
     def test_save_failure_restores_all_files(self):
@@ -172,7 +191,7 @@ class AccountTransferTests(unittest.TestCase):
              patch.object(server, "PREFS_PATH", self.root / "prefs.json"), \
              patch.object(server.RUNNER.__class__, "running", new_callable=PropertyMock, return_value=False), \
              patch.object(server.BALANCES_RUNNER.__class__, "running", new_callable=PropertyMock, return_value=False):
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             content = json.dumps([self.account()])
             self.assertEqual(client.post('/api/accounts/import', json={'content': content}).json['counts']['new'], 1)
             result = client.post('/api/accounts/import', json={'content': content, 'apply': True})
@@ -185,7 +204,7 @@ class AccountTransferTests(unittest.TestCase):
 
     def test_http_running_campaign_blocks_import(self):
         with patch.object(server.RUNNER.__class__, "running", new_callable=PropertyMock, return_value=True):
-            response = server.create_app().test_client().post('/api/accounts/import',
+            response = server.create_app(for_testing=True).test_client().post('/api/accounts/import',
                 json={'content': json.dumps([self.account()]), 'apply': True})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(transfer.token_accounts(), {})
@@ -218,7 +237,8 @@ class AccountTransferTests(unittest.TestCase):
         self.assertEqual(result['counts']['imported'], 1)
         self.assertEqual(result['counts']['duplicate'], 1)
         authenticate.assert_called_once()
-        self.assertEqual(load_json(self.passwords, {})['new@example.com'], ' keep spaces ')
+        self.assertEqual(credential_store.lookup(self.root, 'new@example.com'), ' keep spaces ')
+        self.assertFalse(self.passwords.exists())
 
 
 if __name__ == "__main__":

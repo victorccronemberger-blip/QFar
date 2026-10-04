@@ -56,6 +56,7 @@ class CampaignEndToEndTests(unittest.TestCase):
     def test_recovered_upload_finishes_campaign_without_new_remote_session(self):
         rows = [{"session_id": f"old-{index}", "chunk_index": 0, "expected_chunk_count": 1,
                  "account_email": email, "org_key": "org", "task_id": "task",
+                 "upload_id": f"accepted-old-upload-{index}",
                  "state": "done", "phase": "done", "finalized": True,
                  "campaign_context": {"registry_key": "key", "clip_uid": "clip"}}
                 for index, email in enumerate(self.emails)]
@@ -112,7 +113,7 @@ class CampaignEndToEndTests(unittest.TestCase):
             replace(cfg, realistic_timeline=False, allow_new_accounts=True, shuffle_schedule=False,
                     account_workers=1, account_retry_s=0), **kw)))
         self.stack.enter_context(patch.object(minute_api, "_request", side_effect=AssertionError("network forbidden")))
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
         self.body = {"accounts": self.emails, "tasks": [{"task_id": "task"}], "dataset": "ego4d"}
 
     def finish(self):
@@ -688,6 +689,80 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 1)
         self.cleanup.assert_not_called()
         self.assertFalse(any(e["kind"] == "campaign_done" for e in snap["events"]))
+
+    def test_pause_holds_next_account_slot_until_resume(self):
+        entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+
+        def send(item, account, *args, **kwargs):
+            if account.email == self.emails[0]:
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test release timeout")
+                completed.set()
+            return {"email": account.email, "ok": True, "finalized": True}
+
+        self.send.side_effect = send
+        started = self.client.post("/api/campaigns", json=self.body)
+        self.assertEqual(started.status_code, 200)
+        try:
+            self.assertTrue(entered.wait(5))
+            paused = self.client.post("/api/campaigns/pause")
+            self.assertEqual(paused.status_code, 200)
+            release.set()
+            self.assertTrue(completed.wait(5), "in-flight fixture may finish while paused")
+            self.assertEqual(self.send.call_count, 1)
+            self.assertTrue(self.instance._thread.is_alive())
+            self.assertTrue(self.client.get("/api/campaigns/current").get_json()["pause_requested"])
+            self.assertEqual(self.client.post("/api/campaigns/resume").status_code, 200)
+        finally:
+            release.set()
+            if self.instance.pause_requested:
+                self.instance.resume()
+            self.instance._thread.join(5)
+        snapshot, history = self.finish()
+        self.assertEqual((snapshot["state"], history["status"]), ("done", "done"))
+        self.assertEqual(self.send.call_count, 2)
+        self.assertEqual(snapshot["totals"]["ok_sends"], 2)
+
+    def test_stop_drains_two_active_workers_and_keeps_third_account_queued(self):
+        self.emails.append("queued@example.invalid")
+        entered, release = threading.Event(), threading.Event()
+        guard = threading.Lock()
+        active = []
+
+        def send(item, account, *args, **kwargs):
+            with guard:
+                active.append(account.email)
+                if len(active) == 2:
+                    entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test release timeout")
+            return {"email": account.email, "ok": True, "finalized": True}
+
+        self.send.side_effect = send
+        with patch.object(server, "_list_accounts", return_value=[{"email": email} for email in self.emails]), \
+             patch.object(runner, "run_campaign", side_effect=lambda cfg, **kw: campaign.run_campaign(
+                 replace(cfg, realistic_timeline=False, allow_new_accounts=True, shuffle_schedule=False,
+                         account_workers=2, account_gap_s=0, account_retry_s=0), **kw)):
+            started = self.client.post("/api/campaigns", json=self.body)
+            self.assertEqual(started.status_code, 200)
+            try:
+                self.assertTrue(entered.wait(5))
+                stopping = self.client.post("/api/campaigns/stop")
+                self.assertEqual(stopping.status_code, 200)
+                self.assertEqual(stopping.get_json()["state"], "stopping")
+            finally:
+                release.set()
+                self.instance._thread.join(5)
+            snapshot, history = self.finish()
+        self.assertEqual((snapshot["state"], history["status"]), ("stopped", "stopped"))
+        self.assertEqual(set(active), set(self.emails[:2]))
+        self.assertEqual(self.send.call_count, 2)
+        self.assertEqual({row["email"] for row in history["items"][0]["accounts"]}, set(self.emails[:2]))
+        self.assertEqual(snapshot["totals"]["ok_sends"], 2)
+        self.assertEqual(self.mark.call_count, 2)
+        self.cleanup.assert_not_called()
+        self.assertFalse(any(event["kind"] == "campaign_done" for event in snapshot["events"]))
 
     def test_invalid_input_is_rejected_before_start_or_provider_access(self):
         for path in ("/api/campaigns", "/api/campaigns/preflight"):

@@ -50,6 +50,11 @@ jobs:
           & $ffmpeg.FullName -version
           if ($LASTEXITCODE -ne 0) { throw "FFmpeg não pôde iniciar." }
           $ffmpeg.Directory.FullName >> $env:GITHUB_PATH
+          # Os testes com MP4 real usam o mesmo caminho do runtime distribuído.
+          $ffprobe = Join-Path $ffmpeg.Directory.FullName 'ffprobe.exe'
+          if (-not (Test-Path -LiteralPath $ffprobe)) { throw "FFprobe não encontrado." }
+          New-Item -ItemType Directory -Force dist/QMoney/runtime/tools/ffmpeg/bin | Out-Null
+          Copy-Item $ffmpeg.FullName, $ffprobe dist/QMoney/runtime/tools/ffmpeg/bin/
 
       - name: Testar backend
         run: python scripts/run_tests.py

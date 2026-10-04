@@ -31,6 +31,7 @@ class EgoCacheStateTests(unittest.TestCase):
         row = _row()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            _imu(root / 'parent-1_imu.csv')  # Present inert sensor bytes; only video is missing.
             video = {"has_imu": True}
             with patch.object(campaign.ego4d, "imu_window_is_covered", return_value=True), \
                  patch.object(campaign.ego4d, "_valid_imu_cache", return_value=True), \
@@ -57,7 +58,7 @@ class EgoCacheStateTests(unittest.TestCase):
                 native.write_bytes(b"\0" * (1024 * 1024 + 8))
                 marker = native.with_name(native.name + ".source.json")
                 marker.write_text(json.dumps(
-                    campaign._native_cache_key(source, plan["norm_start"], plan["dur_s"]),
+                    campaign._native_cache_marker(source, native, plan["norm_start"], plan["dur_s"]),
                     sort_keys=True,
                 ), encoding="utf-8")
                 self.assertEqual(campaign.ego_clip_cache_state(row, root), "ready")
@@ -182,8 +183,8 @@ class EgoBudgetTests(unittest.TestCase):
             self.assertFalse(marker.exists())
 
             native.write_bytes(b"n" * (1024 * 1024 + 1))
-            marker.write_text(json.dumps(campaign._native_cache_key(
-                source, plan["norm_start"], plan["dur_s"])), encoding="utf-8")
+            marker.write_text(json.dumps(campaign._native_cache_marker(
+                source, native, plan["norm_start"], plan["dur_s"])), encoding="utf-8")
             with patch.object(ego_accelerator, "catalog_installed", return_value=True), \
                  patch.object(campaign, "_ego_clip_inputs", return_value=(row, {"video_uid": "parent-1"})):
                 kept = ego_accelerator.reclaim_stale_native(root)
@@ -518,7 +519,7 @@ class EgoStorageLimitTests(unittest.TestCase):
         self.assertEqual(result["cache_mode"], "provider")
 
     def test_old_settings_migrate_from_blocks(self):
-        with patch.object(ego_accelerator, "load_json", return_value={"blocks": 2}):
+        with patch.object(ego_accelerator, "load_json_state", return_value={"blocks": 2}):
             self.assertEqual(ego_accelerator.configured_budget_gb(), 1000)
 
     def test_custom_budget_is_persisted_in_gb(self):
@@ -543,7 +544,7 @@ class EgoCacheApiTests(unittest.TestCase):
     def setUp(self):
         from moneymin.web import server
         self.server = server
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     def test_invalid_sizes_are_rejected(self):
         for value in (-1, 2.5, True, "nan", "inf"):
@@ -610,7 +611,7 @@ class AcceleratorLifecycleRegressionTests(unittest.TestCase):
              patch.object(server, "RECOVERY", Mock(running=False)), \
              patch.object(server, "HOLO_CACHE_RUNNER", Mock(running=False)) as runner:
             runner.snapshot.return_value = {"state": "running", "phase": "catalog"}
-            response = server.create_app().test_client().post("/api/holo-cache/start", json={"provider": "ego4d", "budget_gb": 5})
+            response = server.create_app(for_testing=True).test_client().post("/api/holo-cache/start", json={"provider": "ego4d", "budget_gb": 5})
             self.assertEqual(response.status_code, 200)
             runner.start.assert_called_once()
 
@@ -619,7 +620,7 @@ class AcceleratorLifecycleRegressionTests(unittest.TestCase):
         with patch.object(server, "RUNNER", Mock(running=True)), \
              patch.object(ego_accelerator, "cache_status") as catalog, \
              patch.object(ego_accelerator, "storage_limits") as storage:
-            response = server.create_app().test_client().post("/api/holo-cache/start", json={"provider": "ego4d", "budget_gb": 5})
+            response = server.create_app(for_testing=True).test_client().post("/api/holo-cache/start", json={"provider": "ego4d", "budget_gb": 5})
             self.assertEqual(response.status_code, 409)
             catalog.assert_not_called()
             storage.assert_not_called()
@@ -631,7 +632,7 @@ class AcceleratorLifecycleRegressionTests(unittest.TestCase):
              patch.object(ego_accelerator, "cache_status", return_value={"ready": 0}) as catalog, \
              patch.object(server, "load_json", return_value={}):
             runner.snapshot.side_effect = lambda: dict(snapshot)
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             path = "/api/holo-cache?async=1&provider=ego4d&budget_gb=5"
             for _ in range(100):
                 response = client.get(path)

@@ -1,23 +1,101 @@
 """Inspect persisted uploads and reconcile confirmed receipts without network I/O."""
 from __future__ import annotations
 
-import json
 import threading
+from pathlib import Path
 
 from . import campaign, sent_registry, upload
 from .atomic_io import save_json
+from .upload_types import (is_pending_finalization, journal_delivery_confirmed,
+                           journal_evaluation_confirmed, journal_flags_valid)
+
+_UNREAD_PUBLICATION = object()
 
 
-def _groups(directory=None) -> list[list[dict]]:
+def media_cleanup_protection() -> dict:
+    """Read every authoritative journal, including hidden/acknowledged rows.
+
+    Unfinished groups and original source reservations survive cleanup. A bad
+    store is an error, never an empty protection list. No journal is rewritten.
+    """
+    from . import campaign_start_store, original_capture
+    groups = _groups(include_reconciled=True)
+    paths, hashes = set(), set()
+    for rows in groups:
+        if any(not journal_flags_valid(row) for row in rows):
+            raise ValueError('Registros de envio inválidos impedem a limpeza segura.')
+        # Local ACK is not enough to discard bytes before the immutable
+        # attempt/history has a corresponding published group.
+        releasable = (_complete_chunk_group(rows) and all(
+            journal_delivery_confirmed(row) and row.get('campaign_reconciled') is True for row in rows))
+        if releasable:
+            from .campaign_evidence import publication_index, publication_registered
+            releasable = publication_registered(rows, publication_index())
+        if not releasable:
+            for row in rows:
+                context = row.get('campaign_context')
+                provenance = context.get('content_provenance') if isinstance(context,dict) else None
+                if provenance is not None:
+                    try:
+                        from .content_provenance import canonical_digest
+                        expected = provenance['delivery_binding_sha256']
+                        if canonical_digest({k:v for k,v in provenance.items() if k!='delivery_binding_sha256'}) != expected:
+                            raise ValueError
+                        assets = provenance['content']['assets']
+                        for asset in assets.values():
+                            digest = asset['sha256']
+                            if not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):
+                                raise ValueError
+                            hashes.add(digest)
+                    except (KeyError,TypeError,ValueError):
+                        raise ValueError('Vínculo de conteúdo inválido impede a limpeza segura.') from None
+                for key in ('video_path', 'sidecar_data_path'):
+                    value = row.get(key)
+                    if value is not None:
+                        if not isinstance(value,str) or not value or not Path(value).is_absolute():
+                            raise ValueError('Vínculo de mídia inválido impede a limpeza segura.')
+                        paths.add(Path(value).resolve())
+                archive = upload._sidecar_archive_path(row['session_id'], row.get('chunk_index',0))
+                paths.add(archive.resolve())
+    reservations = original_capture._read_reservations()
+    for row in reservations['bindings'].values():
+        hashes.update(row['media_sha256']);hashes.update(row['sidecar_sha256'])
+    paths.update(Path(value).resolve() for value in campaign_start_store.protected_paths())
+    return {'paths': paths, 'sha256': hashes}
+
+
+def _complete_chunk_group(rows: list[dict]) -> bool:
+    if not rows:
+        return False
+    expected = rows[0].get("expected_chunk_count", 1)
+    indexes = [row.get("chunk_index") for row in rows]
+    return (type(expected) is int and expected > 0
+            and all(journal_flags_valid(row) for row in rows)
+            and all(type(row.get("expected_chunk_count", 1)) is int
+                    and row.get("expected_chunk_count", 1) == expected for row in rows)
+            and all(type(index) is int for index in indexes)
+            and len(rows) == expected and set(indexes) == set(range(expected)))
+
+
+def _groups(directory=None, *, include_reconciled=False,
+            publication_index=_UNREAD_PUBLICATION) -> list[list[dict]]:
     groups: dict[tuple[str, str, str], list[dict]] = {}
     owners: dict[str, tuple[str, str]] = {}
-    for path in sorted((directory or upload.sidecars_dir()).glob("*.json")):
+    try:
+        paths = sorted(path for path in (directory or upload.sidecars_dir()).iterdir()
+                       if path.name.lower().endswith(".json"))
+    except OSError:
+        raise ValueError("Não foi possível ler todos os registros de envio; preserve os dados e revise a recuperação.") from None
+    for path in paths:
         try:
-            row = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError("Um registro de envio está ilegível. Preserve os dados e revise a recuperação.") from exc
+            row = upload._read_sidecar_file(path)
+        except (OSError, UnicodeError, ValueError, upload.UploadError):
+            raise ValueError("Um registro de envio está ilegível. Preserve os dados e revise a recuperação.") from None
         if not isinstance(row, dict):
             raise ValueError("Um registro de envio tem formato inválido.")
+        # Legacy zero-chunk journals are normalized only in memory. Listing
+        # must not rewrite the original bytes merely to inspect recovery.
+        row = {**row, "chunk_index": row.get("chunk_index", 0)}
         key = tuple(row.get(field) for field in ("account_email", "org_key", "session_id"))
         if any(not isinstance(value, str) or not value for value in key):
             raise ValueError("Um registro de envio não identifica a conta, organização ou sessão.")
@@ -31,10 +109,34 @@ def _groups(directory=None) -> list[list[dict]]:
             raise ValueError("Uma sessão de envio tem identidades conflitantes.")
         owners[key[2]] = key[:2]
         groups.setdefault(key, []).append(row)
-    return [rows for rows in groups.values() if not all(row.get("campaign_reconciled") is True for row in rows)]
+    if include_reconciled:
+        return list(groups.values())
+    if publication_index is _UNREAD_PUBLICATION:
+        publication_index = _read_required_publications(list(groups.values()))
+    return _visible_groups(list(groups.values()), publication_index)
 
 
-def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_checker=None) -> dict | None:
+def _read_required_publications(groups: list[list[dict]]):
+    # A batch of unacknowledged legacy receipts already reads histories once
+    # to resolve its context. No publication lookup is needed until ACK exists.
+    if not any(_complete_chunk_group(rows) and all(
+            row.get('campaign_reconciled') is True and journal_delivery_confirmed(row)
+            for row in rows) for rows in groups):
+        return None
+    from .campaign_evidence import publication_index
+    return publication_index()
+
+
+def _visible_groups(groups: list[list[dict]], publications):
+    from .campaign_evidence import publication_registered
+    return [rows for rows in groups if not (
+        _complete_chunk_group(rows)
+        and all(row.get("campaign_reconciled") is True and journal_delivery_confirmed(row) for row in rows)
+        and publication_registered(rows, publications))]
+
+
+def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_checker=None,
+              publication_index=_UNREAD_PUBLICATION) -> dict | None:
     first = rows[0]
     sid, email = first["session_id"], first["account_email"]
     context = first.get("campaign_context") or (legacy_contexts.get((sid, email))
@@ -48,23 +150,41 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
                                          context.get("history_name", "") if identified else ""):
         return None
     expected = first.get("expected_chunk_count", 1)
-    indexes = [row.get("chunk_index") for row in rows]
-    confirmed = (identified and type(expected) is int and expected > 0
-                 and all(type(index) is int for index in indexes)
-                 and len(rows) == expected and set(indexes) == set(range(expected))
-                 and all(row.get("state") == "done" and row.get("finalized") is True
-                         and row.get("expected_chunk_count", 1) == expected
+    complete_group = _complete_chunk_group(rows)
+    confirmed = (identified and complete_group
+                 and all(journal_delivery_confirmed(row)
                          and row.get("campaign_context") == first.get("campaign_context")
                          for row in rows))
-    resumable = (identified and not confirmed and type(expected) is int and expected > 0
-                 and all(type(index) is int for index in indexes)
-                 and len(rows) == expected and set(indexes) == set(range(expected))
+    index_reconciled = all(row.get('campaign_reconciled') is True for row in rows)
+    publication_pending = False
+    if confirmed and index_reconciled:
+        from .campaign_evidence import publication_index as read_publications, publication_registered
+        if publication_index is _UNREAD_PUBLICATION:
+            publication_index = read_publications()
+        publication_pending = not publication_registered(rows, publication_index)
+    resumable = (identified and not confirmed and complete_group
                  and all(row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
-                         and row.get("expected_chunk_count", 1) == expected
+                         and (row.get("finalized") is not True or journal_delivery_confirmed(row))
                          and row.get("task_id") == first.get("task_id")
                          and row.get("campaign_context") == first.get("campaign_context")
                          for row in rows)
-                 and any(row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS} for row in rows))
+                 and any(row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS}
+                         or is_pending_finalization(row) for row in rows))
+    if resumable:
+        for row in rows:
+            if row.get("state") == "done" and row.get("finalized") is True:
+                continue
+            if (row.get("state") not in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
+                    and not is_pending_finalization(row)):
+                continue
+            try:
+                upload._pending_recovery_stage(row)
+                if row.get("crash_resumes", 0) >= upload.MAX_CRASH_RESUMES:
+                    resumable = False
+                    break
+            except upload.UploadError:
+                resumable = False
+                break
     return {
         "email": email, "session_id": sid,
         "clip_uid": context.get("clip_uid") if identified else None,
@@ -72,21 +192,28 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
         "blocks_campaign": not identified,
         "can_resume": bool(resumable),
         "chunks_found": len(rows), "chunks_expected": expected if type(expected) is int else None,
-        "detail": "Finalização registrada; falta reconciliar a lista local." if confirmed else
+        "index_reconciled": index_reconciled,
+        "publication_pending": publication_pending,
+        "detail": ("Envio finalizado e índice reconciliado; falta conferir o registro correspondente no Histórico. Os recibos foram preservados."
+                   if publication_pending else "Finalização registrada; falta reconciliar a lista local.") if confirmed else
                   "Envio interrompido; preserve a sessão existente antes de tentar novamente." if resumable else
                   "Registro incompleto ou sem retomada automática; preserve os arquivos e revise o histórico.",
     }
 
 
 def snapshot() -> dict:
-    groups = _groups()
+    groups = _groups(include_reconciled=True)
+    publications = _read_required_publications(groups)
+    groups = _visible_groups(groups, publications)
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
                if not rows[0].get("campaign_context")}
     contexts = campaign._legacy_upload_contexts(missing, [row for rows in groups for row in rows]) if missing else {}
     reset_checker = sent_registry.recovery_reset_checker()
-    items = [item for rows in groups if (item := _describe(rows, contexts, reset_checker)) is not None]
+    items = [item for rows in groups if (item := _describe(rows, contexts, reset_checker, publications)) is not None]
     return {"items": items, "pending": sum(item["status"] in {"pending", "needs_review"} for item in items),
-            "confirmed": sum(item["status"] == "confirmed" for item in items)}
+            "confirmed": sum(item["status"] == "confirmed" for item in items),
+            "reconciliation_pending": sum(item['status'] == 'confirmed' and not item['index_reconciled'] for item in items),
+            "publication_pending": sum(item['publication_pending'] for item in items)}
 
 
 def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
@@ -100,20 +227,23 @@ def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
 
 def reconcile_confirmed() -> dict:
     directory = upload.sidecars_dir()
-    groups = _groups(directory)
+    groups = _groups(directory, include_reconciled=True)
+    publications = _read_required_publications(groups)
+    groups = _visible_groups(groups, publications)
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
                if not rows[0].get("campaign_context")}
     contexts = campaign._legacy_upload_contexts(missing, [row for rows in groups for row in rows]) if missing else {}
     confirmed = []
     deliveries = []
     for rows in groups:
-        item = _describe(rows, contexts)
+        item = _describe(rows, contexts, publication_index=publications)
         if item is None or item["status"] != "confirmed":
             continue
         first = rows[0]
         context = first.get("campaign_context") or contexts[(item["session_id"], item["email"])]
         deliveries.append((context["registry_key"], item["clip_uid"], item["email"]))
-        confirmed.append(rows)
+        if any(row.get('campaign_reconciled') is not True for row in rows):
+            confirmed.append(rows)
     # Commit the complete sent index first. An interrupted acknowledgment can
     # safely repeat; it never forgets a completed delivery or starts an upload.
     sent_registry.mark_sent_many(deliveries)
@@ -123,7 +253,11 @@ def reconcile_confirmed() -> dict:
                 continue
             save_json(directory / upload._sidecar_filename(row["session_id"], row["chunk_index"]),
                       {**row, "campaign_reconciled": True})
-    return {"reconciled": len(confirmed), **snapshot()}
+    return {"reconciled": len(confirmed), "reconciled_sessions": [
+        {"email": rows[0]["account_email"], "session_id": rows[0]["session_id"],
+         "clip_uid": (rows[0].get("campaign_context") or contexts[
+             (rows[0]["session_id"], rows[0]["account_email"])])["clip_uid"]}
+        for rows in confirmed], **snapshot()}
 
 
 def resume_account(email: str, resolve_org) -> dict:
@@ -176,8 +310,12 @@ class RecoveryRunner:
     def _run(self, email, resolve_org):
         try:
             result = resume_account(email, resolve_org)
-            remains = any(item["email"] == email for item in result["items"])
-            terminal = {"state": "pending" if remains else "done", "email": email, "error": None}
+            owned = [item for item in result['items'] if item['email'] == email]
+            remains = any(item['status'] != 'confirmed' or not item.get('index_reconciled') for item in owned)
+            terminal = {"state": "pending" if remains else "done", "email": email, "error": None,
+                        "result": {"reconciled": result.get("reconciled", 0),
+                                   "reconciled_sessions": result.get("reconciled_sessions", []),
+                                   "publication_pending": sum(item.get('publication_pending') is True for item in owned)}}
         except Exception:
             terminal = {"state": "error", "email": email,
                         "error": "A retomada não foi concluída. Confira o acesso da conta, a organização e os arquivos locais; os registros foram preservados."}

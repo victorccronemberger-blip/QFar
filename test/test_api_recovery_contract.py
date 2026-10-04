@@ -1,6 +1,8 @@
 import json
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -36,7 +38,10 @@ class AuthContractTests(unittest.TestCase):
         token = {"refreshToken": "old", "email": "test@example.com"}
         with mock.patch.object(api, "_request", return_value=(200, json.dumps({
                 "id_token": "new", "refresh_token": "new-refresh", "expires_in": "3600"}))):
-            self.assertIs(api._refresh(token), token)
+            updated = api._refresh(token)
+            self.assertIsNot(updated, token)
+        self.assertEqual(token, {"refreshToken": "old", "email": "test@example.com"})
+        token = updated
         self.assertEqual(token["idToken"], "new")
         self.assertEqual(token["email"], "test@example.com")
         self.assertGreater(token["expires_at"], time.time())
@@ -44,7 +49,7 @@ class AuthContractTests(unittest.TestCase):
     def test_version_gate_is_observed_after_each_auth_retry(self):
         for detailed in (False, True):
             for statuses in ([401, 403], [401, 401, 403]):
-                session = api.Session({"idToken": "old", "expires_at": time.time() + 3600})
+                session = api.Session({'email': 'fixture@example.invalid', "idToken": "old", "expires_at": time.time() + 3600})
                 session._live = True
                 responses = [api.HttpResponse(code, "gate", {}) if detailed else (code, "gate")
                              for code in statuses]
@@ -56,9 +61,13 @@ class AuthContractTests(unittest.TestCase):
                      mock.patch.object(api, "_request_detailed" if detailed else "_request",
                                        side_effect=responses) as request:
                     result = (session.request_detailed if detailed else session.request)("GET", "/test")
-                    self.assertEqual(result.status if detailed else result[0], 403)
-                    gate.assert_called_once_with("gate")
-                    self.assertEqual(request.call_count, len(statuses))
+                    expected_status = statuses[min(2, len(statuses)) - 1]
+                    self.assertEqual(result.status if detailed else result[0], expected_status)
+                    if expected_status == 403:
+                        gate.assert_called_once_with("gate")
+                    else:
+                        gate.assert_not_called()  # The unreachable third response is not observed.
+                    self.assertEqual(request.call_count, min(2, len(statuses)))
                     self.assertFalse(session._refreshing)
 
 
@@ -116,6 +125,92 @@ class RecoveryContractTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(result[0]["campaign_context"], context)
 
+    def test_crash_after_chunk_complete_resumes_only_session_finalization(self):
+        for finalized in (False, None):
+            with self.subTest(finalized=finalized):
+                journal = self.journal(state=upload.STATE_DONE, phase="done")
+                if finalized is not None:
+                    journal["finalized"] = finalized
+                result, calls = self.pump([journal])
+                self.assertEqual(calls, 1)
+                self.assertTrue(result[0]["finalized"])
+
+    def test_already_finalized_chunks_are_not_reprocessed(self):
+        result, calls = self.pump([self.journal(
+            state=upload.STATE_DONE, phase="done", finalized=True)])
+        self.assertEqual(result, [])
+        self.assertEqual(calls, 0)
+
+    def test_malformed_resume_fields_do_not_mutate_or_call_services(self):
+        for changes in ({"chunk_index": True}, {"chunk_index": "0"},
+                        {"crash_resumes": "0"}, {"attempts": "0"},
+                        {"finalize_requested": "true"}):
+            with self.subTest(changes=changes), \
+                 mock.patch.object(upload, "list_sidecars", return_value=[self.journal(**changes)]), \
+                 mock.patch.object(upload, "save_sidecar") as save, \
+                 mock.patch.object(upload, "_finalize_session") as finalize:
+                with self.assertRaises(upload.UploadError):
+                    upload.pump_pending(SimpleNamespace(email="a@example.com"))
+                save.assert_not_called()
+                finalize.assert_not_called()
+
+    def test_invalid_count_before_transport_cannot_be_normalized_or_sent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "local.mp4"
+            video.write_bytes(b"local-video")
+            for count in ("1", "invalid", 1.0, True, False, 0, -1, None, [], {}):
+                journal = self.journal(state=upload.STATE_CREATING, phase="queued",
+                                       local_video_path=str(video), expected_chunk_count=count)
+                with self.subTest(count=count), \
+                     mock.patch.object(upload, "list_sidecars", return_value=[journal]), \
+                     mock.patch.object(upload, "save_sidecar") as save, \
+                     mock.patch.object(upload, "upload_session") as send, \
+                     mock.patch.object(upload, "complete_upload") as complete, \
+                     mock.patch.object(upload, "_finalize_session") as finalize:
+                    with self.assertRaises(upload.UploadError):
+                        upload.pump_pending(SimpleNamespace(email="a@example.com"))
+                    save.assert_not_called()
+                    send.assert_not_called()
+                    complete.assert_not_called()
+                    finalize.assert_not_called()
+                self.assertEqual(journal["expected_chunk_count"], count)
+
+    def test_missing_legacy_counts_and_attempts_still_allow_finalize(self):
+        journal = self.journal()
+        journal.pop("expected_chunk_count")
+        result, calls = self.pump([journal])
+        self.assertEqual(calls, 1)
+        self.assertTrue(result[0]["finalized"])
+
+    def test_duplicate_selected_chunks_cannot_mutate_or_repeat_services(self):
+        for phase in ("queued", "transport_done", "awaiting_finalize"):
+            journals = [self.journal(state=upload.STATE_CREATING, phase=phase),
+                        self.journal(state=upload.STATE_CREATING, phase=phase)]
+            originals = [row.copy() for row in journals]
+            with self.subTest(phase=phase), \
+                 mock.patch.object(upload, "list_sidecars", return_value=journals), \
+                 mock.patch.object(upload, "save_sidecar") as save, \
+                 mock.patch.object(upload, "upload_session") as send, \
+                 mock.patch.object(upload, "complete_upload") as complete, \
+                 mock.patch.object(upload, "_finalize_session") as finalize:
+                with self.assertRaises(upload.UploadError):
+                    upload.pump_pending(SimpleNamespace(email="a@example.com"))
+                self.assertEqual(journals, originals)
+                save.assert_not_called()
+                send.assert_not_called()
+                complete.assert_not_called()
+                finalize.assert_not_called()
+
+    def test_duplicate_other_account_journals_do_not_block_selected_owner(self):
+        journals = [self.journal(), self.journal(account_email="b@example.com"),
+                    self.journal(account_email="b@example.com")]
+        result, calls = self.pump(journals)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(calls, 0)  # mixed ownership still prevents finalization
+        self.assertEqual(journals[0]["crash_resumes"], 1)
+        self.assertNotIn("crash_resumes", journals[1])
+        self.assertNotIn("crash_resumes", journals[2])
+
     def test_mixed_owners_or_orgs_cannot_finalize_together(self):
         for changes in ({"account_email": "b@example.com"}, {"org_key": "other"}):
             with self.subTest(changes=changes):
@@ -133,9 +228,7 @@ class RecoveryContractTests(unittest.TestCase):
 
     def test_missing_duplicate_or_failed_chunks_prevent_finalize(self):
         cases = [[self.journal(expected_chunk_count=2)],
-                 [self.journal(expected_chunk_count="invalid")],
                  [self.journal(expected_chunk_count=2), self.journal(chunk_index=1, expected_chunk_count=3)],
-                 [self.journal(expected_chunk_count=2), self.journal(expected_chunk_count=2)],
                  [self.journal(expected_chunk_count=2), self.journal(
                      chunk_index=1, expected_chunk_count=2, state=upload.STATE_FAILED, phase="finalize")]]
         for journals in cases:

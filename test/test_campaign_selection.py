@@ -160,7 +160,7 @@ class CampaignSelectionTests(unittest.TestCase):
         self.assertEqual([i["kind"] for i in saved["issues"]], ["task_empty", "task_empty"])
         self.assertEqual(snap["state"], "error")
         self.assertEqual(snap["totals"]["ok_sends"], 0)
-        self.assertEqual(snap["events"][-1]["title"], "Campanha encerrada sem envios")
+        self.assertEqual(snap["events"][-1]["title"], "Campanha encerrada sem finalizações confirmadas")
         self.assertEqual(snap["events"][-1]["level"], "error")
         view = _campaign_log_view(saved)
         self.assertEqual(len(view["issues"]), 2)

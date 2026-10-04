@@ -115,17 +115,17 @@ class HealthResilienceTests(unittest.TestCase):
 
 class AuthEvidenceTests(unittest.TestCase):
     def test_malformed_refresh_does_not_partially_replace_saved_credentials(self):
-        token = {"idToken": "old-id", "refreshToken": "old-refresh"}
+        token = {"email": "fixture@example.invalid", "idToken": "old-id", "refreshToken": "old-refresh"}
         for payload in ({"id_token": "new-id"},
                         {"id_token": "new-id", "refresh_token": "new-refresh", "expires_in": "bad"}):
             with mock.patch.object(minute_api, "_request", return_value=(200, json.dumps(payload))):
                 with self.assertRaises(AuthError) as caught:
                     minute_api._refresh(token)
                 self.assertEqual(caught.exception.account_issue_code, "invalid_response")
-                self.assertEqual(token, {"idToken": "old-id", "refreshToken": "old-refresh"})
+                self.assertEqual(token, {"email": "fixture@example.invalid", "idToken": "old-id", "refreshToken": "old-refresh"})
 
     def test_refresh_outage_does_not_attempt_password_login(self):
-        sess = Session({"idToken": "fake", "refreshToken": "fake"})
+        sess = Session({'email': 'fixture@example.invalid', "idToken": "fake", "refreshToken": "fake"})
         with mock.patch.object(minute_api, "_refresh", side_effect=AuthError("HTTP 503", code="service")), \
              mock.patch.object(sess, "_relogin") as login:
             with self.assertRaises(AuthError) as caught:
@@ -134,7 +134,7 @@ class AuthEvidenceTests(unittest.TestCase):
         login.assert_not_called()
 
     def test_retry_after_401_preserves_refresh_network_failure(self):
-        sess = Session({"idToken": "fake", "expires_at": time.time() + 9999})
+        sess = Session({'email': 'fixture@example.invalid', "idToken": "fake", "expires_at": time.time() + 9999})
         sess._live = True
         with mock.patch.object(minute_api, "_request", return_value=(401, "unauthorized")), \
              mock.patch.object(sess, "refresh", side_effect=AuthError("HTTP 503", code="service")):
@@ -143,7 +143,7 @@ class AuthEvidenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.account_issue_code, "service")
 
     def test_profile_errors_are_classified_by_response_not_generic_login_advice(self):
-        sess = Session({"idToken": "fake"})
+        sess = Session({'email': 'fixture@example.invalid', "idToken": "fake"})
         sess._live = True
         for status, body, code in ((503, "disabled", "service"), (403, "inactive", "forbidden"),
                                     (-1, "timeout", "timeout"), (429, "rate limit", "rate_limit"),
@@ -155,7 +155,7 @@ class AuthEvidenceTests(unittest.TestCase):
                 self.assertEqual(caught.exception.account_issue_code, code)
 
     def test_only_explicit_disabled_field_confirms_profile_restriction(self):
-        sess = Session({"idToken": "fake"})
+        sess = Session({'email': 'fixture@example.invalid', "idToken": "fake"})
         sess._live = True
         with mock.patch.object(sess, "request_detailed", return_value=minute_api.HttpResponse(200, json.dumps({"disabled": True, "organizations": []}), {})), \
              mock.patch.object(sess, "version_gate", return_value=None):
@@ -164,7 +164,7 @@ class AuthEvidenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.account_issue_code, "restricted")
 
     def test_disabled_profile_blocks_org_upload_before_secondary_queries(self):
-        sess = Session({"idToken": "fake"})
+        sess = Session({'email': 'fixture@example.invalid', "idToken": "fake"})
         sess._live = True
         with mock.patch.object(sess, "request_detailed", return_value=minute_api.HttpResponse(
                 200, json.dumps({"disabled": True, "organizations": []}), {})), \

@@ -24,7 +24,28 @@ class OriginalLibraryApiTests(unittest.TestCase):
         self.config_patch = patch.object(server.config, 'MEDIA_DATA_DIR', self.media)
         self.config_patch.start()
         self.addCleanup(self.config_patch.stop)
-        self.client = server.create_app().test_client()
+        self.workers = []
+        real_thread = threading.Thread
+        def tracked_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            if worker.name == 'qmoney-task-catalog':
+                self.workers.append(worker)
+            return worker
+        self.thread_patch = patch('moneymin.web.catalog_loader.threading.Thread',
+                                  side_effect=tracked_thread)
+        self.thread_patch.start()
+        self.addCleanup(self.thread_patch.stop)
+        # An HTTP 200 can come from the newly published index before the
+        # background worker finishes its read-only summary. Join it before
+        # restoring configuration or removing the Windows SQLite fixture.
+        self.addCleanup(self.join_workers)
+        self.client = server.create_app(for_testing=True).test_client()
+
+    def join_workers(self):
+        for worker in self.workers:
+            if worker.ident is not None:
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), 'catalog worker outlived its fixture')
 
     def index(self):
         return ego4d_library.index_library(self.root, self.root / 'library.sqlite3')
@@ -102,6 +123,33 @@ class OriginalLibraryApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(self.client.get('/api/library/ego4d/videos').json['total'], 2)
             self.assertEqual(build.call_count, 1)
+
+    def test_http_ready_can_precede_background_summary_connection_close(self):
+        entered, release = threading.Event(), threading.Event()
+        real_connect = sqlite3.connect
+        class PausedReadConnection(sqlite3.Connection):
+            def execute(connection, sql, *args, **kwargs):
+                result = super().execute(sql, *args, **kwargs)
+                if (sql == 'PRAGMA user_version'
+                        and threading.current_thread().name == 'qmoney-task-catalog'):
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError('summary reader was not released')
+                return result
+        def connect(*args, **kwargs):
+            return real_connect(*args, **kwargs, factory=PausedReadConnection)
+        with patch.object(sqlite3, 'connect', side_effect=connect):
+            try:
+                self.assertEqual(self.client.post('/api/library/ego4d/index').status_code, 202)
+                self.assertTrue(entered.wait(1))
+                # This synchronous reader sees the index while the real worker
+                # remains paused with its SQLite connection open.
+                self.assertEqual(self.client.post('/api/library/ego4d/index').status_code, 200)
+                self.assertTrue(any(worker.is_alive() for worker in self.workers))
+            finally:
+                release.set()
+                self.join_workers()
+        self.assertEqual(self.client.get('/api/library/ego4d/videos').json['total'], 2)
 
     def test_failed_build_keeps_original_files_and_reports_recoverable_error(self):
         original = (self.root / 'ego4d.json').read_bytes()

@@ -398,17 +398,17 @@ class UploadContractTests(unittest.TestCase):
                         "signed_urls": [
                             {
                                 "filename": item["filename"],
-                                "blob_url": f"https://blob.invalid/{item['filename']}",
+                                "blob_url": f"https://blob.invalid/{item['filename']}", 'expires_at': '2030-01-01T00:00:00Z',
                             }
                             for item in body["files"]
                         ],
                     })
                 if path.startswith("/api/v1/uploads?"):
                     self.upload_bodies.append(body)
-                    return 201, json.dumps({"id": f"upload-{len(self.upload_bodies)}"})
+                    return 201, json.dumps({"id": f"upload-{len(self.upload_bodies)}", "status": "initiated", "meta": {}})
                 if path.endswith("/complete"):
                     self.complete_bodies.append(body)
-                    return 200, "{}"
+                    return 200, json.dumps({'id': path.split('/')[-2], 'status': 'uploaded', 'meta': {}})
                 if path.endswith("/finalize"):
                     return 204, ""
                 raise AssertionError(f"chamada inesperada: {method} {path}")
@@ -464,16 +464,16 @@ class UploadContractTests(unittest.TestCase):
                         "signed_urls": [
                             {
                                 "filename": item["filename"],
-                                "blob_url": f"https://blob.invalid/{item['filename']}",
+                                "blob_url": f"https://blob.invalid/{item['filename']}", 'expires_at': '2030-01-01T00:00:00Z',
                             }
                             for item in body["files"]
                         ],
                     })
                 if path.startswith("/api/v1/uploads?"):
                     self.upload_bodies.append(body)
-                    return 201, json.dumps({"id": f"upload-{len(self.upload_bodies)}"})
+                    return 201, json.dumps({"id": f"upload-{len(self.upload_bodies)}", "status": "initiated", "meta": {}})
                 if path.endswith("/complete"):
-                    return 200, "{}"
+                    return 200, json.dumps({'id': path.split('/')[-2], 'status': 'uploaded', 'meta': {}})
                 if path.endswith("/finalize"):
                     return 204, ""
                 raise AssertionError(f"chamada inesperada: {method} {path}")
@@ -585,6 +585,9 @@ class SensorFidelityTests(unittest.TestCase):
                     "testsrc=duration=2:size=160x120:rate=30",
                     "-c:v", "libx264", "-preset", "ultrafast",
                     "-g", "6", "-keyint_min", "6", "-pix_fmt", "yuv420p",
+                    # This fixture exercises the limited stts/stss reader.
+                    # Edit lists and composition offsets require ffprobe.
+                    "-bf", "0", "-use_editlist", "0",
                     "-r", "30", str(video),
                 ], capture_output=True, text=True, timeout=120)
             except Exception:
@@ -801,7 +804,7 @@ class ValidatorRegressionTests(unittest.TestCase):
             "imuDiagnostics.sampleCount",
             [f["id"] for f in summary["failures"]])
 
-    def test_frame_clock_mismatch_is_a_fail(self) -> None:
+    def test_frame_clock_mismatch_warns_but_impossible_duration_fails(self) -> None:
         from moneymin.validate import summarize, validate_sidecar_zip
         inner = self._inner(self._zip())
         name = "val-session_0.frames.csv"
@@ -814,6 +817,9 @@ class ValidatorRegressionTests(unittest.TestCase):
             self._repack(inner), log_id="val-session_0", duration_ms=60_000))
         self.assertIn(
             "xcheck.frames_timebase",
+            [warning["id"] for warning in summary["warnings"]])
+        self.assertIn(
+            "xcheck.duration_consistency.frame_timestamps",
             [f["id"] for f in summary["failures"]])
 
     def test_invalid_distortion_layout_is_a_fail(self) -> None:
@@ -839,8 +845,18 @@ class ValidatorRegressionTests(unittest.TestCase):
 
 
 class GatesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root = tempfile.TemporaryDirectory(prefix="qmoney-gate-contract-")
+        self.addCleanup(root.cleanup)
+        data_dir = mock.patch.object(config, "DATA_DIR", Path(root.name))
+        data_dir.start()
+        self.addCleanup(data_dir.stop)
+        memory = mock.patch.object(minute_api, "_VERSION_GATE_MEMORY", {})
+        memory.start()
+        self.addCleanup(memory.stop)
+
     def _session(self, responder) -> minute_api.Session:
-        sess = minute_api.Session({"idToken": "token"}, email="gate@example.com")
+        sess = minute_api.Session({'email': 'gate@example.com', "idToken": "token"}, email="gate@example.com")
         sess._live = True
         sess.request = responder  # type: ignore[method-assign]
         return sess
@@ -936,7 +952,8 @@ class GatesTests(unittest.TestCase):
                 sess._check_write_policy("POST", "/api/v1/organizations/join", {})
             self.assertEqual(caught.exception.account_issue_code, "version")
         finally:
-            minute_api._maybe_latch_version_gate("", clear=True)
+            with mock.patch.object(config, "APP_VERSION", "9.9.9"):
+                minute_api._maybe_latch_version_gate("", clear=True)
 
     def test_403_latches_through_session_request(self) -> None:
         def _jwt() -> str:
@@ -947,7 +964,7 @@ class GatesTests(unittest.TestCase):
             return enc({"alg": "none"}) + "." + enc(
                 {"exp": 4_000_000_000}) + ".sig"
 
-        sess = minute_api.Session({"idToken": _jwt()}, email="gate@example.com")
+        sess = minute_api.Session({'email': 'gate@example.com', "idToken": _jwt()}, email="gate@example.com")
         sess._live = True
         try:
             with mock.patch.object(
@@ -963,7 +980,8 @@ class GatesTests(unittest.TestCase):
             data = json.loads(gate.read_text(encoding="utf-8"))
             self.assertEqual(data["minVersion"], "2.0.0")
         finally:
-            minute_api._maybe_latch_version_gate("", clear=True)
+            with mock.patch.object(config, "APP_VERSION", "9.9.9"):
+                minute_api._maybe_latch_version_gate("", clear=True)
 
     def test_camera_policy_allow_and_deny(self) -> None:
         # Allow list no fio já vem normalizada (como o includes() do Hermes espera).

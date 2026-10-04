@@ -104,7 +104,11 @@ class MigrationTests(unittest.TestCase):
         original = b'{"state": "\xff"}'
         self.report.write_bytes(original)
         restarted = OrgMigrationRunner(self.report)
-        self.assertEqual(restarted.snapshot()["state"], "idle")
+        self.assertEqual(restarted.snapshot()["state"], "needs_review")
+        migrate = mock.Mock()
+        with self.assertRaises(ValueError):
+            restarted.start(["a@example.com"], migrate)
+        migrate.assert_not_called()
         self.assertEqual(self.report.read_bytes(), original)
 
     def test_no_remote_change_when_initial_report_cannot_be_saved(self):
@@ -126,7 +130,7 @@ class MigrationTests(unittest.TestCase):
              mock.patch.object(server.Session, "from_email", return_value=sess) as auth, \
              mock.patch.object(server, "_load_prefs", return_value={}), \
              mock.patch.object(server, "_save_prefs"):
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             response = client.post("/api/accounts/migration", json={})
             self.assertEqual(response.status_code, 202)
             self.wait()
@@ -140,7 +144,7 @@ class MigrationTests(unittest.TestCase):
              mock.patch.object(server, "BALANCES_RUNNER", mock.Mock(running=False)), \
              mock.patch.object(server, "_list_accounts", return_value=[{"email": "a@example.com"}]), \
              mock.patch.object(server, "_migrate_account_org") as migrate:
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             self.assertEqual(client.post("/api/accounts/migration", json={"emails": ["unknown@example.com"]}).status_code, 400)
             campaign.running = True
             self.assertEqual(client.post("/api/accounts/migration", json={}).status_code, 409)
@@ -148,7 +152,7 @@ class MigrationTests(unittest.TestCase):
 
     def test_account_and_campaign_changes_blocked_during_migration(self):
         with mock.patch.object(server, "ORG_MIGRATION", mock.Mock(running=True)):
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             for route in ("/api/accounts/migration", "/api/accounts/check-all", "/api/accounts/import", "/api/campaigns"):
                 with self.subTest(route=route):
                     self.assertEqual(client.post(route, json={}).status_code, 409)

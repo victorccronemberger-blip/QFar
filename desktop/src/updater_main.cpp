@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include <windows.h>
+#include "VerifiedUpdatePackage.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -249,15 +250,24 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (!argv) return 2;
   const fs::path package = argument(argc, argv, L"--package");
+  const std::wstring expectedSha256 = argument(argc, argv, L"--sha256");
   const fs::path target = argument(argc, argv, L"--target");
   const std::wstring pidText = argument(argc, argv, L"--pid");
   const std::wstring launch = argument(argc, argv, L"--launch");
   const bool silent = hasFlag(argc, argv, L"--silent");
   LocalFree(argv);
-  if (package.empty() || target.empty() || pidText.empty() || launch.empty()) return 2;
+  if (package.empty() || target.empty() || pidText.empty() || launch.empty() || expectedSha256.empty()) return 2;
 
   const DWORD pid = parseProcessId(pidText);
   if (!pid) return 2;
+  qmoney::VerifiedUpdatePackage verifiedPackage;
+  if (!verifiedPackage.open(package, expectedSha256)) {
+    logLine(target, L"O pacote mudou ou não pôde ser verificado; atualização cancelada antes da extração.");
+    if (!silent)
+      MessageBoxW(nullptr, L"O pacote de atualização não passou pela verificação. Baixe novamente a atualização.",
+                  L"QMoney", MB_OK | MB_ICONERROR);
+    return 7;
+  }
   if (!waitForParentExit(pid)) {
     logLine(target, L"O aplicativo não encerrou; atualização cancelada antes de alterar arquivos.");
     if (!silent)

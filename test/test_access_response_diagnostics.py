@@ -8,7 +8,7 @@ from moneymin.web.account_issues import account_issue
 
 class AccessResponseDiagnosticsTests(unittest.TestCase):
     def test_profile_verification_preserves_block_header_without_inventing_disabled(self):
-        session = Session({"idToken": "fake"})
+        session = Session({'email': 'fixture@example.invalid', "idToken": "fake"})
         session._live = True
         reply = HttpResponse(403, '{"detail":"Forbidden"}',
                              {"x-blocked-reason": "user", "Authorization": "secret-token"})

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config, ego4d, task_matching
-from .atomic_io import load_json, save_json
+from .atomic_io import JsonStateError, load_json, load_json_state, save_json
 
 DEFAULT_TASK = "Furniture Assembly"
 MAX_BUDGET_GB = 2_147_483_647
@@ -62,17 +62,24 @@ def remember_budget(budget_gb: int) -> dict[str, Any]:
 
 def configured_budget_gb(default: int = 0) -> int:
     """0 quando a campanha ainda deve usar só o recorte estrito."""
-    payload = load_json(budget_path(), {"budget_gb": default})
-    if not isinstance(payload, dict):
-        return 0
+    payload = load_json_state(budget_path(), {"budget_gb": default})
     try:
-        raw = payload["budget_gb"] if "budget_gb" in payload else int(payload.get("blocks") or 0) * 500
+        if "budget_gb" in payload:
+            raw = payload["budget_gb"]
+        elif "blocks" in payload:
+            blocks = payload["blocks"]
+            if type(blocks) is not int or blocks < 0:
+                raise ValueError
+            raw = blocks * 500
+        else:
+            raise ValueError
         budget_bytes(raw)
         budget_gb = int(raw)
     except (TypeError, ValueError, OverflowError):
-        return 0
-    if not 1 <= budget_gb <= MAX_BUDGET_GB:
-        return 0
+        raise JsonStateError(
+            "Estado local inválido ou ilegível. O arquivo foi preservado; "
+            "revise ou restaure um backup válido antes de continuar."
+        ) from None
     return budget_gb
 
 
@@ -130,7 +137,8 @@ def used_bytes(work_dir: Path | None = None) -> int:
 
 def reclaim_stale_native(work_dir: Path | None = None) -> dict[str, int]:
     """Remove somente nativos Ego4D cujo marcador não vale mais para a fonte."""
-    from .campaign import _ego_clip_inputs, _ego_prepare_plan, _native_cache_key
+    from .campaign import (_ego_clip_inputs, _ego_prepare_plan,
+                           _native_cache_guard, _native_cache_marker_matches)
 
     work = Path(work_dir or data_dir())
     result = {"files": 0, "bytes": 0}
@@ -150,13 +158,15 @@ def reclaim_stale_native(work_dir: Path | None = None) -> dict[str, int]:
             source = work / plan["source_name"]
             if not source.is_file() or source.stat().st_size <= 1024 * 1024:
                 continue
-            marker = native.with_name(native.name + ".source.json")
-            saved = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else None
-            if saved == _native_cache_key(source, plan["norm_start"], plan["dur_s"]):
-                continue
-            size = native.stat().st_size
-            native.unlink()
-            marker.unlink(missing_ok=True)
+            with _native_cache_guard(native):
+                marker = native.with_name(native.name + ".source.json")
+                saved = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else None
+                if _native_cache_marker_matches(
+                        saved, source, native, plan["norm_start"], plan["dur_s"]):
+                    continue
+                size = native.stat().st_size
+                native.unlink()
+                marker.unlink(missing_ok=True)
         except (OSError, RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             continue
         result["files"] += 1

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import sys
 import threading
 
-from .server import create_app
-from .. import campaign, tls
+from .server import create_app, _require_local_api_token
+from .. import campaign, config, tls
+from ..state_lease import service_state_lease
 
 
 class _SafeStream:
@@ -99,9 +101,34 @@ def _watch_parent(parent_pid: int | None) -> None:
                      name="qmoney-parent-watch").start()
 
 
+def _validate_local_binding(host: str, port: int) -> tuple[str, int]:
+    """Accept only a literal loopback address and an explicit valid TCP port."""
+    if not isinstance(host, str):
+        raise ValueError("O serviço local deve usar um endereço de loopback.")
+    if host == "localhost":
+        host = "127.0.0.1"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise ValueError("O serviço local deve usar um endereço de loopback.") from None
+    if not address.is_loopback:
+        raise ValueError("O serviço local deve usar um endereço de loopback.")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("A porta local deve ser um inteiro entre 1 e 65535.")
+    return str(address), port
+
+
 def run_webui(host: str = "127.0.0.1", port: int = 8876,
               open_browser: bool = False, parent_pid: int | None = None) -> None:
     """Sobe o servico local. ``open_browser`` e mantido apenas por compatibilidade."""
+    host, port = _validate_local_binding(host, port)
+    _require_local_api_token()
+    with service_state_lease(config.DATA_DIR):
+        _run_claimed_service(host, port, parent_pid)
+
+
+def _run_claimed_service(host: str, port: int, parent_pid: int | None) -> None:
+    """Start jobs and serve only while the OS state lease is held."""
     _harden_stdio()
     tls.configure_environment()
     _watch_parent(parent_pid)
@@ -123,6 +150,10 @@ def run_webui(host: str = "127.0.0.1", port: int = 8876,
 
 
 def _serve(app, host: str, port: int, open_browser: bool) -> None:
+    host, port = _validate_local_binding(host, port)
+    _require_local_api_token()
+    if app.config.get("QMONEY_LOCAL_API_AUTHENTICATED") is not True:
+        raise RuntimeError("Uma fixture sem autenticação não pode iniciar o serviço local.")
     import webbrowser
 
     url = f"http://{host}:{port}"

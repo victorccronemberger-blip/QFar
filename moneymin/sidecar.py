@@ -1,5 +1,9 @@
 """
-sidecar.py — Gera o sidecar `.data.zip` replicando EXATAMENTE o app Android 1.22.0.
+sidecar.py — Preparação de `.data.zip` com um modelo histórico de metadados.
+
+O builder contém valores derivados e fallbacks sintéticos. A comparação por
+métodos do APK 1.28.0 encontrou diferenças em plataforma, relógios, diagnóstico
+IMU, calibração e codec; este módulo não comprova aquisição nativa de sensores.
 
 O contrato abaixo foi extraído da decomposição do APK Android (`jadx_out`):
 `EgoSidecar.kt` (metadata.json + zip), `EgoCodecActuals.kt`, `EgoImu.kt`
@@ -378,7 +382,7 @@ def build_metadata_json(
     calib: dict[str, Any] | None = None,
     uptime_ns: int | None = None,
 ) -> dict[str, Any]:
-    """Monta o metadata.json ego na estrutura EXATA do app Android 1.22.0.
+    """Monta metadata.json com o modelo histórico desta integração.
 
     Contrato verificado contra o jadx (EgoSidecar.buildMetadata):
       - id/logId top-level; platform {type,version}; device com systemName
@@ -516,7 +520,7 @@ def build_metadata_json(
 def build_imu_csv(duration_ms: int,
                   sample_rate_hz: int = config.ANDROID_IMU_SAMPLE_RATE_HZ,
                   seed: str | int = "moneymin.imu:2026") -> str:
-    """Gera imu.csv no formato EXATO do app Android 1.22.0.
+    """Gera IMU sintética com as colunas do CSV histórico desta integração.
 
     Header: t,ax,ay,az,wx,wy,wz.
       - t: timestamp monotônico em nanossegundos (500 Hz, SAMPLING_PERIOD_US=2000)
@@ -597,7 +601,7 @@ def build_imu_csv(duration_ms: int,
 def build_frames_csv(duration_ms: int, fps: float = 30.0,
                      gop: int | None = None,
                      offset_ns: int = 0) -> str:
-    """Gera frames.csv no formato EXATO do app Android 1.22.0.
+    """Gera frames sintéticos com as colunas do CSV histórico desta integração.
 
     Header: i,ptsNs,dtNs,tNs,key.
       - i: índice sequencial (0..n-1)
@@ -711,9 +715,10 @@ def _mp4_u32(data: bytes, at: int) -> int:
 def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
     """Lê stts (deltas → PTS) e stss (sync samples → keyframes) da trilha vídeo.
 
-    Mesma informação que o MediaExtractor expõe (sampleTime em µs*1000 →
-    nsón: aqui direto em ns via timescale). Sem edit lists (elst) e sem
-    B-frames (ctts), o PTS é a acumulação dos deltas do stts a partir de 0.
+    Este leitor limitado só interpreta trilhas sem edit lists (elst) e sem
+    offsets de composição (ctts). Nessas trilhas, o PTS é a acumulação dos
+    deltas de stts a partir de 0. Outras trilhas exigem o leitor ffprobe;
+    retornar vazio evita tratar tempo de decodificação como apresentação.
     """
     try:
         data = Path(video_path).read_bytes()
@@ -731,7 +736,8 @@ def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
 
     def _parse_stbl(stbl_start: int, stbl_end: int) -> dict[str, Any]:
         stts_runs: list[tuple[int, int]] = []
-        stss: set[int] = set()
+        stss: set[int] | None = None
+        has_composition_offsets = False
         for btype, bs, be in _mp4_boxes(data, stbl_start, stbl_end):
             if btype == "stts" and bs + 12 <= be:
                 # FullBox (version+flags) + entry_count
@@ -742,21 +748,30 @@ def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
                     delta = _mp4_u32(data, pos + 4)
                     stts_runs.append((runs, delta))
                     pos += 8
-            elif btype == "stss" and bs + 12 <= be:
-                # FullBox(4: version+flags) + entry_count(4) [+4]
+            elif btype == "ctts":
+                has_composition_offsets = True
+            elif btype == "stss" and bs + 8 <= be:
+                stss = set()
+                # FullBox(4: version+flags) + entry_count(4).
                 count = _mp4_u32(data, bs + 4)
                 pos = bs + 8
                 for _ in range(min(count, (be - pos) // 4)):
                     stss.add(_mp4_u32(data, pos))
                     pos += 4
-        return {"stts_runs": stts_runs, "stss": stss}
+        return {"stts_runs": stts_runs, "stss": stss,
+                "has_composition_offsets": has_composition_offsets}
 
     def _stbl_minf_mdia(trak_start: int, trak_end: int) -> dict[str, Any] | None:
         hdlr_is_video = False
         timescale = 0
         stbl: dict[str, Any] | None = None
+        has_edit_list = False
         for ttype, ts, te in _mp4_boxes(data, trak_start, trak_end):
-            if ttype == "mdia":
+            if ttype == "edts":
+                has_edit_list = any(
+                    etype == "elst" for etype, _, _ in _mp4_boxes(data, ts, te)
+                ) or has_edit_list
+            elif ttype == "mdia":
                 for mtype, ms, me in _mp4_boxes(data, ts, te):
                     if mtype == "hdlr" and ms + 12 <= me:
                         # FullBox(4) + pre_defined(4) + handler_type(4)
@@ -778,6 +793,7 @@ def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
         if not hdlr_is_video or stbl is None or not timescale:
             return None
         stbl["timescale"] = timescale
+        stbl["has_edit_list"] = has_edit_list
         return stbl
 
     video_track = None
@@ -789,17 +805,20 @@ def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
                 break
     if video_track is None or not video_track.get("timescale"):
         return []
+    if video_track.get("has_edit_list") or video_track.get("has_composition_offsets"):
+        return []
     timescale = int(video_track["timescale"])
     if timescale <= 0:
         return []
-    stss = video_track.get("stss") or set()
+    # A ausência de stss declara todos os samples como sync samples.
+    stss = video_track.get("stss")
     frames: list[tuple[int, bool]] = []
     pts_ts = 0
     index = 0  # 0-based; stss é 1-based
     for sample_count, delta in video_track.get("stts_runs") or []:
         for _ in range(sample_count):
             pts_ns = int(round(pts_ts * 1_000_000_000.0 / timescale))
-            frames.append((pts_ns, (index + 1) in stss))
+            frames.append((pts_ns, stss is None or (index + 1) in stss))
             pts_ts += delta
             index += 1
     return frames
@@ -812,6 +831,7 @@ def build_frames_csv_from_video(
     fps: float = 30.0,
     gop: int | None = None,
     offset_ns: int = 0,
+    require_measured_pts: bool = False,
 ) -> str:
     """frames.csv derivado do MP4 REAL (PTS + keyframes) — como o EgoSidecar.
 
@@ -820,10 +840,15 @@ def build_frames_csv_from_video(
     do CSV batem exatamente com o vídeo enviado (item nº1 de realismo).
     `tNs = ptsNs + offset_ns` (offset = elapsedRealtimeNanos do 1º frame).
 
-    Se o probe falhar (sem ffprobe/vídeo inválido), cai no gerador sintético.
+    O fallback sintético legado permanece disponível por padrão. Quando
+    `require_measured_pts=True`, ausência de PTS interrompe o preparo.
     """
+    if type(require_measured_pts) is not bool:
+        raise ValueError('require_measured_pts deve ser booleano.')
     frames = _extract_frame_pts(video_path)
     if not frames:
+        if require_measured_pts:
+            raise ValueError('Vídeo sem PTS medidos; preparo interrompido.')
         return build_frames_csv(duration_ms, fps=fps, gop=gop, offset_ns=offset_ns)
     offset_ns = int(offset_ns) if offset_ns else 0
     if frames and frames[0][0] != 0:
@@ -925,6 +950,7 @@ def build_sidecar_zip_custom(
     calib: dict[str, Any] | None = None,
     uptime_ns: int | None = None,
     frames_gop: int | None = None,
+    derived_diagnostics: dict[str, Any] | None = None,
 ) -> bytes:
     """Monta o `.data.zip` nativo permitindo INJETAR imu.csv/frames.csv REAIS.
 
@@ -941,6 +967,11 @@ def build_sidecar_zip_custom(
     Contrato real do app (EgoSidecar.zipArtifacts): membros na raiz com o
     prefixo `{log_id}.`.
     """
+    if derived_diagnostics is not None:
+        # Local dataset observations do not attest Android gyro-anchored
+        # events, hardware clocks or receiver support for a derived envelope.
+        from .content_provenance import require_dataset_native_delivery_support
+        require_dataset_native_delivery_support(derived_diagnostics)
     uptime_ns = (DEFAULT_ANDROID_UPTIME_NS if uptime_ns is None
                  else int(uptime_ns))
     if log_id is None:

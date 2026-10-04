@@ -49,7 +49,7 @@ class CampaignPauseTests(unittest.TestCase):
 
     def test_api_reports_pause_resume_and_conflict(self):
         with patch.object(server, "RUNNER", self.instance):
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             self.assertEqual(client.post("/api/campaigns/pause").status_code, 200)
             self.assertTrue(client.get("/api/campaigns/current").get_json()["pause_requested"])
             self.assertEqual(client.post("/api/campaigns/resume").status_code, 200)

@@ -13,7 +13,7 @@ from moneymin.web.account_issues import account_issue
 
 class EvaluationContractTests(unittest.TestCase):
     def evaluation(self, status="pass", uid="u"):
-        return {"upload_id": uid, "checks": [{"id": "quality", "label": "Quality", "status": status}]}
+        return {"upload_id": uid, "checks": [{"id": "quality", "label": "Quality", "status": status, "detail": None}]}
 
     def test_missing_pending_and_malformed_checks_are_not_perfect(self):
         for payload in ({}, None, [], {"error": "timeout"}, {"checks": []},
@@ -49,8 +49,20 @@ class SessionQualityGateTests(unittest.TestCase):
             stack.enter_context(patch.object(upload, "_upload_single_chunk", side_effect=[
                 upload.ChunkResult(f"u{i}", i, f"s_{i}", "blob", 7, 1000) for i in range(2)]))
             stack.enter_context(patch.object(upload, "evaluate_upload", side_effect=evaluation))
-            stack.enter_context(patch.object(upload, "save_sidecar"))
-            stack.enter_context(patch.object(upload, "load_sidecar", return_value={"session_id": "s"}))
+            # These are new sends, followed by stateful quality checkpoints.
+            # An incomplete preexisting journal is no longer a valid fixture
+            # for that flow: it must preserve its original recording time.
+            journals = {}
+
+            def save_journal(row):
+                journals[(row["session_id"], row.get("chunk_index", 0))] = dict(row)
+
+            def load_journal(sid, index=0):
+                row = journals.get((sid, index))
+                return dict(row) if row is not None else None
+
+            stack.enter_context(patch.object(upload, "save_sidecar", side_effect=save_journal))
+            stack.enter_context(patch.object(upload, "load_sidecar", side_effect=load_journal))
             final = stack.enter_context(patch.object(upload, "_finalize_session", return_value=(True, 204)))
             remove = stack.enter_context(patch.object(upload, "_remove_sidecar_archive"))
             fail = stack.enter_context(patch.object(upload, "fail_upload"))

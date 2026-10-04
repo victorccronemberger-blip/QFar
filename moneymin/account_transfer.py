@@ -9,8 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import config, credential_store, minute_api, account_bans, org_policy
-from .atomic_io import load_json, save_json, save_bytes
+from . import config, credential_store, minute_api, account_bans, org_policy, token_store
+from .atomic_io import load_json_state, save_json, save_bytes
 
 LOCK = threading.RLock()
 MAX_BYTES = 10 * 1024 * 1024
@@ -23,10 +23,7 @@ class ImportRecoveryError(RuntimeError):
 
 
 def _mapping(path: Path) -> dict:
-    value = load_json(path, None) if path.exists() else {}
-    if not isinstance(value, dict):
-        raise ValueError("Um arquivo local de contas está inválido. Nenhum dado será substituído.")
-    return value
+    return load_json_state(path, {})
 
 
 def email_key(value: Any) -> str:
@@ -39,17 +36,7 @@ def email_key(value: Any) -> str:
 
 
 def token_accounts() -> dict[str, tuple[Path, dict]]:
-    result = {}
-    for path in sorted(config.tokens_dir().glob("token_*.json")):
-        data = load_json(path, None)
-        if not isinstance(data, dict):
-            continue
-        try:
-            email = email_key(data.get("email"))
-        except ValueError:
-            continue
-        result.setdefault(email, (path, data))
-    return result
+    return token_store.records(config.tokens_dir(), strict=True)
 
 
 def decode_document(raw: str) -> list:
@@ -85,10 +72,11 @@ def clean_record(raw: Any) -> dict:
     source = raw.get("token", raw if "refreshToken" in raw or "refresh_token" in raw else None)
     token = None
     if source is not None:
-        if not isinstance(source, dict) or email_key(source.get("email", email)) != email:
+        if not isinstance(source, dict) or email_key(source.get("email")) != email:
             raise ValueError("O e-mail do token não corresponde à conta.")
+        token_store.validated(source, email)
         token = {"email": email}
-        for key in ("idToken", "refreshToken", "localId", "expiresIn"):
+        for key in ("idToken", "refreshToken", "localId", "user_id", "uid", "expiresIn"):
             alias = {"idToken": "id_token", "refreshToken": "refresh_token"}.get(key, key)
             value = source.get(key, source.get(alias))
             if value is not None:
@@ -170,22 +158,26 @@ def import_accounts(raw: str, *, apply: bool, passwords_path: Path, removed_path
 
 
 def _save_record(record: dict, token_path: Path, passwords_path: Path, removed_path: Path) -> None:
-    paths = [token_path, passwords_path, removed_path]
+    # Session writers take path lock -> token lock; preserve that ordering here.
+    with minute_api._lock_for(token_path), token_store.transaction():
+        _save_record_transaction(record, token_path, passwords_path, removed_path)
+
+
+def _save_record_transaction(record: dict, token_path: Path, passwords_path: Path, removed_path: Path) -> None:
+    paths = [token_path, removed_path]
     if record["password"]:
-        # A credencial individual faz parte da mesma transação dos arquivos
-        # legados. Se qualquer etapa falhar, ela também precisa ser restaurada.
+        # A credencial protegida faz parte da mesma transação. O mapa legado
+        # de senhas é somente leitura e não recebe novas cópias em texto puro.
         paths.append(credential_store.record_path(config.SECRETS_DIR, record["email"]))
     before = {p: p.read_bytes() if p.exists() else None for p in paths}
+    token_written = False
     try:
         email = record["email"]
         if record["token"]:
-            save_json(token_path, record["token"])
+            token_store.save(config.SECRETS_DIR, email, record["token"])
         else:
             minute_api.login(email, record["password"])
-        if record["password"]:
-            passwords = _mapping(passwords_path)
-            passwords[email] = record["password"]
-            save_json(passwords_path, passwords)
+        token_written = True
         removed = _mapping(removed_path)
         removed["emails"] = [e for e in removed.get("emails", []) if str(e).casefold() != email]
         removed["schema"] = 1
@@ -193,6 +185,10 @@ def _save_record(record: dict, token_path: Path, passwords_path: Path, removed_p
         if record["password"]:
             credential_store.save(config.SECRETS_DIR, email, record["password"])
     except Exception:
+        if not token_written:
+            # A failed token/login call does not prove what it published.
+            # Preserve every consulted destination and the original error.
+            raise
         failed = False
         for path, content in before.items():
             try:
@@ -219,8 +215,15 @@ def export_accounts(emails: list[str] | None, passwords: dict, removed: set[str]
         records = []
         for email in sorted(selected):
             raw = {"email": email, "token": existing[email]}
-            if passwords.get(email):
-                raw["password"] = passwords[email]
+            # A ausência permite fallback legado. Corrupção/proteção
+            # indisponível não pode produzir um backup com senha antiga.
+            password = credential_store.lookup(config.SECRETS_DIR, email, strict=True)
+            if password is None:
+                password = passwords.get(email)
+            if password:
+                raw["password"] = password
+            if org_policy.account_kind(email) != "claru" and not password:
+                raise ValueError("Exportação cancelada: há conta Crowtado sem senha local; nenhum backup incompleto foi criado.")
             record = clean_record(raw)
             records.append({k: v for k, v in record.items() if v is not None})
         return {"format": FORMAT, "version": 1,

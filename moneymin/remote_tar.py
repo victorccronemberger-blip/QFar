@@ -155,23 +155,59 @@ class RemoteTar:
     def _next_position(member: TarMember) -> int:
         return member.offset + math.ceil(member.size / 512) * 512
 
-    def _load_index(self, etag: str) -> tuple[int, dict[str, TarMember]]:
+    def _load_index(self, etag: str, archive_size: int) -> tuple[int, dict[str, TarMember]]:
         raw = load_json(self.index_path, {})
         if not isinstance(raw, dict) or raw.get("url") != self.url or raw.get("etag") != etag:
             return 0, {}
-        members = {
-            name: TarMember(**value)
-            for name, value in (raw.get("members") or {}).items()
-            if isinstance(value, dict)
-        }
-        return int(raw.get("cursor") or 0), members
+        cursor, records = raw.get("cursor"), raw.get("members")
+        if (type(cursor) is not int or not 0 <= cursor <= archive_size or cursor % 512
+                or not isinstance(records, dict) or (cursor > 0 and not records)):
+            return 0, {}
+        # Legacy public seeds do not have a stored archive size. Their bounds
+        # still use the current reader size and selected header verification.
+        if "size" in raw and (type(raw["size"]) is not int or raw["size"] != archive_size):
+            return 0, {}
+        members = {}
+        for name, value in records.items():
+            if (not isinstance(name, str) or not name or not isinstance(value, dict)
+                    or set(value) != {"name", "offset", "size", "typeflag"}
+                    or value["name"] != name or not isinstance(value["name"], str)
+                    or type(value["offset"]) is not int or value["offset"] < 512
+                    or value["offset"] % 512 or type(value["size"]) is not int
+                    or value["size"] < 0 or value["offset"] + value["size"] > archive_size
+                    or not isinstance(value["typeflag"], str) or len(value["typeflag"]) != 1):
+                return 0, {}
+            members[name] = TarMember(**value)
+        # Zero deliberately restarts scanning. A positive resume cursor cannot
+        # point inside the header/payload/padding of a member already known.
+        if cursor and any(cursor < member.offset + ((member.size + 511) // 512) * 512
+                          for member in members.values()):
+            return 0, {}
+        return cursor, members
 
-    def _save_index(self, etag: str, cursor: int, members: dict[str, TarMember]) -> None:
+    @staticmethod
+    def _selected_header_matches(reader: HttpRangeReader, member: TarMember) -> bool:
+        position = member.offset - 512
+        header = reader.read(position, 512)
+        try:
+            actual = parse_header(header, position)
+        except ValueError:
+            # A cached offset may point into payload rather than a TAR header.
+            return False
+        if actual is None:
+            return False
+        regular = {"0", "\0"}
+        return (actual.name == member.name and actual.offset == member.offset
+                and actual.size == member.size and (actual.typeflag == member.typeflag
+                    or actual.typeflag in regular and member.typeflag in regular))
+
+    def _save_index(self, etag: str, cursor: int, members: dict[str, TarMember], archive_size: int) -> None:
         save_json(
             self.index_path,
             {
                 "url": self.url,
                 "etag": etag,
+                "size": archive_size,
                 "cursor": cursor,
                 "members": {name: asdict(member) for name, member in members.items()},
             },
@@ -192,7 +228,8 @@ class RemoteTar:
         except FileNotFoundError:
             pass
         raw = load_json(self.index_path, {})
-        return len((raw or {}).get("members") or {}) if isinstance(raw, dict) else 0
+        members = raw.get("members") if isinstance(raw, dict) else None
+        return len(members) if isinstance(members, dict) else 0
 
     def find(
         self,
@@ -202,10 +239,13 @@ class RemoteTar:
     ) -> TarMember:
         """Localiza um membro, retomando do último cabeçalho já indexado."""
         with HttpRangeReader(self.url) as reader:
-            cursor, members = self._load_index(reader.etag)
+            cursor, members = self._load_index(reader.etag, reader.size)
             for member in members.values():
                 if predicate(member):
-                    return member
+                    if self._selected_header_matches(reader, member):
+                        return member
+                    cursor, members = 0, {}
+                    break
 
             block_start = -1
             block = b""
@@ -217,20 +257,20 @@ class RemoteTar:
                 local = cursor - block_start
                 member = parse_header(block[local : local + 512], cursor)
                 if member is None:
-                    self._save_index(reader.etag, cursor, members)
+                    self._save_index(reader.etag, cursor, members, reader.size)
                     break
                 cursor = self._next_position(member)
                 # Cabeçalhos PAX têm nome sintético e não são dados do usuário.
                 if member.typeflag not in ("x", "g"):
                     members[member.name] = member
                     if predicate(member):
-                        self._save_index(reader.etag, cursor, members)
+                        self._save_index(reader.etag, cursor, members, reader.size)
                         return member
                 scanned += 1
                 if progress and scanned % 100 == 0:
                     progress(cursor, reader.size)
                 if scanned % 500 == 0:
-                    self._save_index(reader.etag, cursor, members)
+                    self._save_index(reader.etag, cursor, members, reader.size)
         raise FileNotFoundError("membro não encontrado no TAR remoto")
 
     def extract(

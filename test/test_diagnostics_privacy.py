@@ -16,7 +16,7 @@ class DiagnosticsPrivacyTests(unittest.TestCase):
                  patch.object(server, "_list_accounts", return_value=[{"email": "private@example.com"}]), \
                  patch.object(server, "_storage_snapshot", return_value={"data_files": 2}) as storage, \
                  patch.object(server.campaign, "list_campaign_logs", return_value=[]):
-                response = server.create_app().test_client().get("/api/diagnostics")
+                response = server.create_app(for_testing=True).test_client().get("/api/diagnostics")
                 self.assertEqual(response.status_code, 200)
                 body = response.get_data(as_text=True)
                 for marker in ("SECRET_TOKEN", "private@example.com", "private.invalid", "C:/private"):

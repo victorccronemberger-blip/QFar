@@ -4,17 +4,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import config, credential_store
+from . import banned_store, config, credential_store, token_store
 from .atomic_io import save_json
+from .jsonl_history import JsonlSyntaxError, decode_json_history_document, decode_jsonl_history
 
 
 def banned_emails() -> set[str]:
     path = config.DATA_DIR / "banned_accounts.json"
-    if not path.exists():
-        return set()
-    doc = json.loads(path.read_text(encoding="utf-8-sig"))
-    if not isinstance(doc, dict) or not isinstance(doc.get("accounts"), list):
-        raise ValueError("Registro de contas banidas inválido.")
+    doc = banned_store.load(path, {"schema": 1, "accounts": []})
     return {str(row["email"]).strip().casefold() for row in doc["accounts"]}
 
 
@@ -48,9 +45,14 @@ def _scrub(value, emails):
 
 def purge_local_records(emails: set[str]) -> None:
     """Purga registros e backups geridos pelo app; mantém apenas banlist/tombstones."""
+    roots = {config.ROOT, config.LIBRARY_ROOT}
+    # Token ownership and canonical-name conflicts must be checked by the store;
+    # generic recursive scrubbing could otherwise erase a conflicting primary.
+    for directory in {config.SECRETS_DIR, *(root / "secrets" for root in roots)}:
+        for email in emails:
+            token_store.delete(directory, email)
     for email in emails:
         credential_store.delete(config.SECRETS_DIR, email)
-    roots = {config.ROOT, config.LIBRARY_ROOT}
     paths = set()
     for root in roots:
         for directory in (root / "data", root / "secrets"):
@@ -63,7 +65,24 @@ def purge_local_records(emails: set[str]) -> None:
     for path in sorted(paths):
         if path.name in {"banned_accounts.json", "removed_accounts.json"}:
             continue
+        if path.name.startswith("token_") and path.suffix == ".json":
+            continue
         try:
+            if path.suffix == ".jsonl":
+                try:
+                    # Preserve generic JSON roots and Unicode string contents.
+                    # Preflight original bytes: decode only one initial BOM.
+                    # Strict ambiguity errors propagate before this file is
+                    # rewritten; unreadable legacy files stay intact as before.
+                    rows = decode_jsonl_history(path.read_bytes())
+                except JsonlSyntaxError:
+                    continue
+                clean = _scrub(rows, emails)
+                if clean != rows:
+                    temporary = path.with_name(path.name + ".tmp")
+                    temporary.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in clean), encoding="utf-8")
+                    temporary.replace(path)
+                continue
             raw = path.read_text(encoding="utf-8-sig")
             if path.suffix == ".txt":
                 clean = "\n".join(line for line in raw.splitlines()
@@ -71,15 +90,10 @@ def purge_local_records(emails: set[str]) -> None:
                 if clean != raw.rstrip("\n"):
                     path.write_text(clean + "\n", encoding="utf-8")
                 continue
-            if path.suffix == ".jsonl":
-                rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
-                clean = _scrub(rows, emails)
-                if clean != rows:
-                    temporary = path.with_name(path.name + ".tmp")
-                    temporary.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in clean), encoding="utf-8")
-                    temporary.replace(path)
+            try:
+                value = decode_json_history_document(raw)
+            except JsonlSyntaxError:
                 continue
-            value = json.loads(raw)
             clean = _scrub(value, emails)
             if clean is _DROP:
                 path.unlink()

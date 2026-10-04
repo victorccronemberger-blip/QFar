@@ -6,7 +6,7 @@ from moneymin.web import server
 
 class RequestValidationTests(unittest.TestCase):
     def test_invalid_json_cannot_reset_sent_history(self):
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         for body, content_type in (("{broken", "application/json"), ("null", "application/json"),
                                    ("[]", "application/json"), ("{}", "text/plain")):
             with self.subTest(body=body, content_type=content_type), \
@@ -17,7 +17,7 @@ class RequestValidationTests(unittest.TestCase):
                 reset.assert_not_called()
 
     def test_all_json_mutation_routes_reject_non_object_bodies(self):
-        app = server.create_app()
+        app = server.create_app(for_testing=True)
         client = app.test_client()
         for rule in app.url_map.iter_rules():
             if rule.arguments or not rule.rule.startswith("/api/"):

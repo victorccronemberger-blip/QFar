@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import threading
 import time
@@ -27,8 +28,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit, parse_qs
 
-from . import config, credential_store, device_profile, transport
-from .atomic_io import save_json
+from . import config, credential_store, device_profile, transport, token_store
+from .atomic_io import JsonStateError, load_json_state, save_json
 from .service_policy import RecordingPolicy
 
 # Folga antes do exp do JWT: PUT de blob pode passar de 2 min; 10 min evita
@@ -36,6 +37,8 @@ from .service_policy import RecordingPolicy
 _REFRESH_SKEW_S = 10 * 60
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
+_VERSION_GATE_LOCK = threading.RLock()
+_VERSION_GATE_MEMORY: dict[str, dict[str, Any]] = {}
 
 # --- Endpoints Firebase / Google Identity Toolkit ---------------------------
 _SIGNIN_URL = (
@@ -51,6 +54,28 @@ class AuthError(RuntimeError):
     def __init__(self, message: str, *, code: str | None = None):
         super().__init__(message)
         self.account_issue_code = code
+
+
+def validate_task_catalog(rows: Any) -> list[dict[str, Any]]:
+    """Validate fields consumed by selection without echoing remote content."""
+    invalid = AuthError("Catálogo retornou campos de tarefa inválidos.",
+                        code="invalid_response")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise invalid
+    for row in rows:
+        if any(row.get(key) is not None and not isinstance(row[key], str)
+               for key in ("name", "description")):
+            raise invalid
+        categories = row.get("categories")
+        if categories is None:
+            continue
+        if not isinstance(categories, list) or any(not isinstance(item, dict) for item in categories):
+            raise invalid
+        for item in categories:
+            if any(item.get(key) is not None and not isinstance(item[key], str)
+                   for key in ("slug", "label")):
+                raise invalid
+    return rows
 
 
 def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False,
@@ -165,12 +190,13 @@ def _request(
 
 
 def _is_geo_route(path: str) -> bool:
-    """Rotas em que o app manda `X-Device-Location` (quota/elegibilidade geo).
+    """Filtro legado de quota/elegibilidade sem texto de query ou fragmento.
 
-    O app Android envia o header de localização SÓ nessas (DETALHAMENTO §2.1),
-    não em toda chamada autenticada.
+    O APK 1.28.0 também busca localização em createUpload e SAS. A revisão
+    de método/caminho e de amostra real está registrada no roadmap; este
+    helper não representa o conjunto completo de callsites nativos.
     """
-    lower = path.casefold()
+    lower = path.split("?", 1)[0].split("#", 1)[0].casefold()
     return ("quota" in lower or "eligibility" in lower)
 
 
@@ -186,7 +212,6 @@ _BLOCKED_DETAIL_ERRORS = {
 
 
 def _version_gate_file() -> Path:
-    config.DATA_DIR.mkdir(exist_ok=True, parents=True)
     return config.DATA_DIR / "version-gate.json"
 
 
@@ -236,29 +261,97 @@ def _parse_semver_or_none(value: Any) -> tuple[int, int, int] | None:
     return major, minor, patch
 
 
-def _maybe_latch_version_gate(text: str, *, clear: bool = False) -> None:
-    """Persiste `min_version` só no contrato do APK (`maybeLatchVersionGate`).
+def _version_gate_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
 
-    Trava apenas quando `detail.error === app_version_too_old` e
-    `detail.min_version` é um semver parseável. `clear=True` remove a trava.
-    """
+def _validated_version_gate(value: Any) -> dict[str, Any]:
+    if (not isinstance(value, dict)
+            or _parse_semver_or_none(value.get("minVersion")) is None
+            or ("appVersion" in value and _parse_semver_or_none(value["appVersion"]) is None)
+            or ("latchedAt" in value and (type(value["latchedAt"]) is not int or value["latchedAt"] < 0))):
+        raise ValueError
+    return dict(value)
+
+def _read_version_gate_locked(path: Path) -> dict[str, Any] | None:
+    try:
+        if path.is_symlink():
+            raise ValueError
+        value = load_json_state(path, None)
+        return None if value is None else _validated_version_gate(value)
+    except (JsonStateError, OSError, UnicodeError, ValueError):
+        raise AuthError(
+            "A trava de versão local está inválida ou ilegível. Preserve o arquivo e restaure um estado válido antes de continuar.",
+            code="version",
+        ) from None
+
+def _version_gate_state() -> dict[str, Any] | None:
+    path = _version_gate_file()
+    key = _version_gate_key(path)
+    with _VERSION_GATE_LOCK:
+        stored = _read_version_gate_locked(path)
+        observed = _VERSION_GATE_MEMORY.get(key)
+        if observed is None:
+            return stored
+        if stored is not None and _parse_semver_or_none(stored["minVersion"]) >= _parse_semver_or_none(observed["minVersion"]):
+            return stored
+        return dict(observed)
+
+def _clear_version_gate() -> None:
+    path = _version_gate_file()
+    key = _version_gate_key(path)
+    with _VERSION_GATE_LOCK:
+        state = _version_gate_state()
+        if state is not None:
+            minimum = _parse_semver_or_none(state["minVersion"])
+            current = _parse_semver_or_none(config.APP_VERSION)
+            if current is None or current < minimum:
+                raise AuthError(
+                    "A versão instalada ainda não atende ao mínimo exigido. Atualize antes de limpar a trava de versão.",
+                    code="version",
+                ) from None
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            raise AuthError(
+                "Não foi possível limpar a trava de versão. O estado anterior foi preservado.", code="version",
+            ) from None
+        _VERSION_GATE_MEMORY.pop(key, None)
+
+def _maybe_latch_version_gate(text: str, *, clear: bool = False) -> None:
+    """Keep an observed minimum in this process even when persistence fails."""
     if clear:
-        _version_gate_file().unlink(missing_ok=True)
+        _clear_version_gate()
         return
     detail = _parse_blocked_detail(text)
     if not detail or detail.get("error") != _APP_VERSION_TOO_OLD:
         return
-    min_version = detail.get("min_version")
-    if _parse_semver_or_none(min_version) is None:
+    minimum = _parse_semver_or_none(detail.get("min_version"))
+    if minimum is None:
         return
-    try:
-        _version_gate_file().write_text(json.dumps({
-            "minVersion": str(min_version).strip(),
-            "appVersion": config.APP_VERSION,
-            "latchedAt": int(time.time()),
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    path = _version_gate_file()
+    key = _version_gate_key(path)
+    candidate = {"minVersion": detail["min_version"], "appVersion": config.APP_VERSION,
+                 "latchedAt": int(time.time())}
+    with _VERSION_GATE_LOCK:
+        observed = _VERSION_GATE_MEMORY.get(key)
+        if observed is None or minimum > _parse_semver_or_none(observed["minVersion"]):
+            _VERSION_GATE_MEMORY[key] = dict(candidate, persistence_pending=True)
+        else:
+            candidate = {name: value for name, value in observed.items() if name != "persistence_pending"}
+        try:
+            stored = _read_version_gate_locked(path)
+            if stored is not None and _parse_semver_or_none(stored["minVersion"]) >= _parse_semver_or_none(candidate["minVersion"]):
+                _VERSION_GATE_MEMORY[key] = dict(stored)
+                return
+            # Existing ambiguous/unreadable state is never overwritten to heal it.
+            candidate = _validated_version_gate(candidate)
+            save_json(path, candidate)
+        except (AuthError, OSError, ValueError, UnicodeError):
+            # Return the original 403. The authoritative reader will report disk
+            # failure later and the observed minimum remains bound to this root.
+            _VERSION_GATE_MEMORY[key]["persistence_pending"] = True
+            return
+        _VERSION_GATE_MEMORY[key] = dict(candidate)
 
 
 def _semver_tuple(value: str) -> tuple[int, int, int]:
@@ -267,19 +360,13 @@ def _semver_tuple(value: str) -> tuple[int, int, int]:
 
 
 def _version_gate_blocks() -> bool:
-    """True se a trava local exige versão maior que a do cliente."""
-    path = _version_gate_file()
-    if not path.exists():
+    state = _version_gate_state()
+    if state is None:
         return False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError, OSError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    minimum = _parse_semver_or_none(data.get("minVersion"))
     current = _parse_semver_or_none(config.APP_VERSION)
-    return minimum is not None and current is not None and current < minimum
+    if current is None:
+        raise AuthError("Não foi possível validar a versão instalada antes de continuar.", code="version") from None
+    return current < _parse_semver_or_none(state["minVersion"])
 
 
 def _normalize_camera_model(model: Any) -> str:
@@ -339,11 +426,15 @@ def _validate_token_response(data: Any, token_key: str, refresh_key: str,
     return seconds
 
 
-def login(email: str, password: str) -> dict[str, Any]:
-    """Autentica no Firebase e grava `secrets/token_<email>.json`.
+def _owned_tokens(data: Any, email: object | None = None, *, uid: str | None = None) -> dict:
+    try:
+        return token_store.validated(data, email, uid=uid)
+    except token_store.TokenStoreError:
+        raise AuthError("A identidade do acesso salvo não pôde ser confirmada. Preserve os arquivos e revise o acesso.", code="identity") from None
 
-    Devolve o dict do token. Levanta RuntimeError se o login falhar.
-    """
+
+def _password_login_data(email: str, password: str) -> dict[str, Any]:
+    """Validate the provider's demonstrated owner before any token persistence."""
     from .account_bans import require_not_banned
     require_not_banned(email)
     status, body = _request(
@@ -359,12 +450,30 @@ def login(email: str, password: str) -> dict[str, Any]:
         raise AuthError("Login devolveu resposta inválida.", code="invalid_response") from exc
 
     expires_in = _validate_token_response(data, "idToken", "refreshToken", "expiresIn")
+    data = _owned_tokens(data, email)
     data["expires_at"] = _expiry_from_token(
         data["idToken"], expires_in
     )
-    path = config.token_path(email)
-    save_json(path, data)
     return data
+
+
+def login(email: str, password: str) -> dict[str, Any]:
+    """Autentica e grava apenas o primário hash da identidade demonstrada."""
+    try:
+        email = token_store.email_key(email)
+    except token_store.TokenStoreError:
+        raise AuthError("O acesso primário está inválido ou conflitante; preserve-o antes de reconectar.", code="identity") from None
+    with _lock_for(token_store.record_path(config.SECRETS_DIR, email)):
+        try:
+            token_store.preflight_write(config.SECRETS_DIR, email)
+        except token_store.TokenStoreError:
+            raise AuthError("O acesso primário está inválido ou conflitante; preserve-o antes de reconectar.", code="identity") from None
+        data = _password_login_data(email, password)
+        try:
+            token_store.save(config.SECRETS_DIR, email, data)
+        except token_store.TokenStoreError:
+            raise AuthError("A identidade do acesso não pôde ser salva com segurança; os registros anteriores foram preservados.", code="identity") from None
+        return data
 
 
 def register(email: str, password: str, code: str | None = None) -> dict[str, Any]:
@@ -385,6 +494,11 @@ def register(email: str, password: str, code: str | None = None) -> dict[str, An
     """
     from .account_bans import require_not_banned
     from .org_policy import target_invite
+    try:
+        email = token_store.email_key(email)
+        token_store.preflight_write(config.SECRETS_DIR, email)
+    except token_store.TokenStoreError:
+        raise AuthError("O acesso primário está inválido ou conflitante; preserve-o antes de registrar.", code="identity") from None
     require_not_banned(email)
     expected_code = target_invite(email)
     effective_code = str(code or expected_code).strip().upper()
@@ -513,6 +627,8 @@ def _refresh(token_data: dict[str, Any]) -> dict[str, Any]:
     Levanta AuthError se não houver refreshToken ou se o Firebase recusar
     (refresh token expirado/revogado) — nesse caso é preciso refazer o login.
     """
+    token_data = _owned_tokens(token_data)
+    original_uid = token_store.identity_uid(token_data)
     refresh_token = token_data.get("refreshToken") or token_data.get("refresh_token")
     if not refresh_token:
         raise AuthError("sem refreshToken no arquivo — reconecte o acesso.", code="authentication")
@@ -535,9 +651,17 @@ def _refresh(token_data: dict[str, Any]) -> dict[str, Any]:
             f"refresh devolveu resposta vazia/não-JSON ({status}).", code="invalid_response",
         ) from exc
     expires_in = _validate_token_response(resp, "id_token", "refresh_token", "expires_in")
+    try:
+        returned_uid = token_store.identity_uid(resp)
+        if original_uid is not None and returned_uid != original_uid:
+            raise token_store.TokenStoreError
+    except token_store.TokenStoreError:
+        raise AuthError("A renovação não confirmou a mesma identidade. O acesso anterior foi preservado.", code="identity") from None
     expires_at = _expiry_from_token(resp["id_token"], expires_in)
     token_data.update(idToken=resp["id_token"], refreshToken=resp["refresh_token"],
                       expiresIn=str(expires_in), expires_at=expires_at)
+    if original_uid is None and returned_uid is not None:
+        token_data["user_id"] = returned_uid
     return token_data
 
 
@@ -547,12 +671,20 @@ class Session:
 
     def __init__(self, token_data: dict[str, Any], token_file: Path | None = None,
                  email: str | None = None):
+        token_data = _owned_tokens(token_data, email)
         if "idToken" not in token_data and "id_token" in token_data:
             token_data["idToken"] = token_data["id_token"]
         self.data = token_data
         self.token_file = Path(token_file) if token_file else None
+        if self.token_file:
+            try:
+                token_store.validate_path(self.token_file, token_data["email"])
+            except token_store.TokenStoreError:
+                raise AuthError("O caminho primário não corresponde à identidade demonstrada.", code="identity") from None
         # e-mail da conta (para o perfil de aparelho: X-Device-Id, UA, uptime)
-        self.email = email or token_data.get("email") or None
+        self.email = token_store.email_key(token_data["email"])
+        self._identity_email = self.email
+        self._identity_uid = token_store.identity_uid(token_data)
         # False até um refresh/login nesta instância — o idToken do disco
         # nunca é enviado à API sem troca no Firebase.
         self._live = False
@@ -575,16 +707,9 @@ class Session:
         """
         path = Path(token_file)
         try:
-            raw = path.read_text(encoding="utf-8-sig").strip()
-            data = json.loads(raw) if raw else None
-        except (OSError, json.JSONDecodeError) as exc:
-            raise AuthError(
-                f"token ilegível em {path.name} — refaça o login."
-            ) from exc
-        if not isinstance(data, dict):
-            raise AuthError(
-                f"token vazio ou corrompido em {path.name} — refaça o login."
-            )
+            data = token_store.read_file(path)
+        except token_store.TokenStoreError:
+            raise AuthError("O acesso salvo está inválido ou sem identidade demonstrada. Preserve o arquivo e revise o acesso.", code="identity") from None
         sess = cls(data, path)
         if live:
             sess.refresh()
@@ -592,13 +717,17 @@ class Session:
 
     @classmethod
     def from_email(cls, email: str, *, live: bool = True) -> Session:
-        path = config.token_path(email)
-        if not path.exists():
+        try:
+            found = token_store.load(config.SECRETS_DIR, email)
+        except token_store.TokenStoreError:
+            raise AuthError("O acesso salvo está inválido ou possui identidade conflitante. Os arquivos foram preservados.", code="identity") from None
+        if found is None:
             raise AuthError(
                 f"nenhum acesso salvo para {email}; adicione ou reautentique "
                 "a conta pela aba Contas do QMoney"
             )
-        sess = cls.from_file(path, live=False).with_email(email)
+        path, data = found
+        sess = cls(data, path, email=email)
         if live:
             sess.refresh()
         return sess
@@ -606,25 +735,27 @@ class Session:
     def with_email(self, email: str) -> Session:
         """Fixa o e-mail da conta (fonte do perfil de aparelho)."""
         with self._lock:
-            if str(self.email or "").casefold() != email.casefold():
-                self.recording_policy = None
-                self.recording_config = {}
-                self.device_camera_allowed = None
-                self.initialization_errors = {}
-                self._initialization_causes = {}
-                self._recording_checked_at = None
-                self._recording_retry_at = 0.0
-                self._initialization_failures = 0
-                self._quota_cache = {}
-                self._app_opened_published = False
-            self.email = email
+            self._check_identity()
+            _owned_tokens(self.data, email, uid=self._identity_uid)
+            if self._identity_email != token_store.email_key(email):
+                raise AuthError("A sessão não pode ser vinculada a outra identidade.", code="identity") from None
+            self.email = token_store.email_key(email)
         return self
 
     def _who(self) -> str:
         return self.email or self.data.get("email") or "esta conta"
 
     def _bearer(self) -> str:
+        self._check_identity()
         return str(self.data.get("idToken") or self.data.get("id_token") or "")
+
+    def _check_identity(self) -> None:
+        _owned_tokens(self.data, self._identity_email, uid=self._identity_uid)
+        try:
+            if token_store.email_key(self.email) != self._identity_email:
+                raise token_store.TokenStoreError("identity")
+        except token_store.TokenStoreError:
+            raise AuthError("A sessão não confirmou a identidade original.", code="identity") from None
 
     @property
     def id_token(self) -> str:
@@ -644,14 +775,13 @@ class Session:
 
     def _reload_from_disk(self) -> None:
         """Outra thread pode ter rotacionado o refreshToken no mesmo arquivo."""
-        if not self.token_file or not self.token_file.exists():
+        self._check_identity()
+        if not self.token_file or not (self.token_file.exists() or self.token_file.is_symlink()):
             return
         try:
-            disk = json.loads(self.token_file.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(disk, dict):
-            return
+            disk = token_store.read_file(self.token_file, self._identity_email, uid=self._identity_uid)
+        except token_store.TokenStoreError:
+            raise AuthError("O acesso em disco não confirmou a identidade da sessão. Memória e arquivo foram preservados.", code="identity") from None
         if disk.get("refreshToken") or disk.get("refresh_token"):
             if "idToken" not in disk and "id_token" in disk:
                 disk["idToken"] = disk["id_token"]
@@ -659,9 +789,16 @@ class Session:
             if not self.email:
                 self.email = disk.get("email")
 
-    def _persist(self) -> None:
+    def _persist(self, candidate: dict | None = None) -> None:
+        self._check_identity()
+        candidate = _owned_tokens(self.data if candidate is None else candidate, self._identity_email,
+                                  uid=self._identity_uid)
         if self.token_file:
-            save_json(self.token_file, self.data)
+            try:
+                token_store.save_file(self.token_file, candidate, self.email,
+                                      uid=self._identity_uid)
+            except token_store.TokenStoreError:
+                raise AuthError("O acesso não pôde ser persistido com a mesma identidade. O arquivo anterior foi preservado.", code="identity") from None
 
     # -- chamadas genéricas --------------------------------------------------
     def request(self, method: str, path: str, body: Any = None) -> tuple[int, str]:
@@ -671,10 +808,10 @@ class Session:
             "Accept": "*/*",
             "Accept-Language": config.ACCEPT_LANGUAGE,
         }
-        # Identidade de APARELHO da conta (contrato anterior do app 1.22.0: X-Device-Id
-        # `android.ssaid:...` em toda chamada; o UA carrega o Android daquele
-        # aparelho — anti-colusão). A localização (X-Device-Location) só vai
-        # nas rotas de quota/geo, como no app.
+        # Perfil local histórico; não comprova identidade de aparelho físico.
+        # O filtro legado abaixo limita localização a quota/elegibilidade.
+        # O APK 1.28.0 também busca localização em createUpload e SAS; a
+        # correção depende de amostra real com proveniência, sem inventar GPS.
         if self.email:
             headers.update(device_profile.get_profile(self.email).headers(
                 include_location=_is_geo_route(path)))
@@ -684,6 +821,8 @@ class Session:
         # App Check opcional, somente com configuração autorizada pelo administrador.
         from . import appcheck
         headers.update(appcheck.get_app_check_header())
+        self._check_write_policy(method, path, body)
+        headers["Authorization"] = f"Bearer {self._bearer()}"
         status, text = _request(config.BASE_URL + path, method, headers=headers, body=body)
         if status == 403:
             # Kill-switch de versão mínima: o app trava qualquer 403 que pareça
@@ -691,30 +830,21 @@ class Session:
             _maybe_latch_version_gate(text)
         if status != 401 or appcheck.is_app_check_rejection(text) or getattr(self, "_refreshing", False):
             return status, text
-        # Rede de segurança: o Minute recusou o Bearer. Troca no Firebase;
-        # se o token novo também cair 401, re-login com a senha salva.
+        # authedFetch do APK 1.28.0 repete uma vez após renovar o Bearer.
+        # O segundo 401 permanece uma rejeição; não autoriza outro pedido.
         self._refreshing = True
         try:
             try:
                 self.refresh()
             except AuthError:
                 raise
+            self._check_write_policy(method, path, body)
             headers["Authorization"] = f"Bearer {self._bearer()}"
             status2, text2 = _request(
                 config.BASE_URL + path, method, headers=headers, body=body)
             if status2 == 403:
                 _maybe_latch_version_gate(text2)
-            if status2 != 401 or appcheck.is_app_check_rejection(text2):
-                return status2, text2
-            try:
-                self._relogin()
-            except AuthError:
-                raise
-            headers["Authorization"] = f"Bearer {self._bearer()}"
-            status3, text3 = _request(config.BASE_URL + path, method, headers=headers, body=body)
-            if status3 == 403:
-                _maybe_latch_version_gate(text3)
-            return status3, text3
+            return status2, text2
         finally:
             self._refreshing = False
 
@@ -738,6 +868,8 @@ class Session:
         from . import appcheck
         headers.update(appcheck.get_app_check_header())
 
+        self._check_write_policy(method, path, body)
+        headers["Authorization"] = f"Bearer {self._bearer()}"
         response = _request_detailed(
             config.BASE_URL + path, method, headers=headers, body=body)
         if response.status == 403:
@@ -750,23 +882,13 @@ class Session:
                 self.refresh()
             except AuthError:
                 raise
+            self._check_write_policy(method, path, body)
             headers["Authorization"] = f"Bearer {self._bearer()}"
             refreshed = _request_detailed(
                 config.BASE_URL + path, method, headers=headers, body=body)
             if refreshed.status == 403:
                 _maybe_latch_version_gate(refreshed.text)
-            if refreshed.status != 401 or appcheck.is_app_check_rejection(refreshed.text):
-                return refreshed
-            try:
-                self._relogin()
-            except AuthError:
-                raise
-            headers["Authorization"] = f"Bearer {self._bearer()}"
-            relogged = _request_detailed(
-                config.BASE_URL + path, method, headers=headers, body=body)
-            if relogged.status == 403:
-                _maybe_latch_version_gate(relogged.text)
-            return relogged
+            return refreshed
         finally:
             self._refreshing = False
 
@@ -866,19 +988,12 @@ class Session:
 
     # -- gates do app (qualidade/versão/dispositivo) -------------------------
     def version_gate(self) -> dict[str, Any] | None:
-        """Trava de versão mínima latched localmente (replica MMKV `version-gate`)."""
-        path = _version_gate_file()
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError, OSError):
-            return None
-        return data if isinstance(data, dict) else None
+        """Read the effective root-bound latch; corrupt state is visible."""
+        return _version_gate_state()
 
     def clear_version_gate(self) -> None:
-        """Reverte a trava de versão (ex.: após atualizar o QMoney)."""
-        _maybe_latch_version_gate("", clear=True)
+        """Clear only after the installed version satisfies the known minimum."""
+        _clear_version_gate()
 
     def quality_state(self, org_key: str) -> dict[str, Any]:
         """Estado de qualidade do próprio usuário autenticado.
@@ -955,7 +1070,7 @@ class Session:
         return data
 
     def camera_model_allowed(self, model: str) -> bool | None:
-        """Réplica de `getNativeCameraDecision` (Android) do app 1.22.0.
+        """Implementação local de política de câmera derivada da referência histórica.
 
         Sempre normaliza o modelo (trim + lower + colapso de espaços), compara
         com `androidAllowModels` crus e aplica `RegExp(pattern).test(model)`
@@ -982,6 +1097,12 @@ class Session:
         email = self._who()
         lock = _lock_for(self.token_file) if self.token_file else self._lock
         with lock:
+            self._check_identity()
+            if self.token_file and (self.token_file.exists() or self.token_file.is_symlink()):
+                try:
+                    token_store.read_file(self.token_file, email, uid=self._identity_uid)
+                except token_store.TokenStoreError:
+                    raise AuthError("O acesso em disco não confirmou a mesma identidade. Preserve os registros.", code="identity") from None
             password = _lookup_password(email)
             if not password:
                 raise AuthError(
@@ -989,14 +1110,16 @@ class Session:
                     "(secrets/crowtado_passwords.json).", code="missing_access",
                 )
             try:
-                self.data = login(email, password)
+                candidate = _password_login_data(email, password)
             except AuthError:
                 raise
             except RuntimeError as login_exc:
                 raise AuthError(
                     f"{email}: login com senha salva falhou: {login_exc}"
                 ) from login_exc
-            self._persist()
+            self._persist(candidate)
+            self.data = candidate
+            self._identity_uid = self._identity_uid or token_store.identity_uid(candidate)
             self._live = True
         return self
 
@@ -1010,18 +1133,25 @@ class Session:
         email = self._who()
         lock = _lock_for(self.token_file) if self.token_file else self._lock
         with lock:
-            self._reload_from_disk()
+            previous_data, previous_live = self.data, self._live
             try:
-                self.data = _refresh(self.data)
-            except AuthError as exc:
-                if exc.account_issue_code and exc.account_issue_code != "authentication":
-                    raise
+                self._reload_from_disk()
                 try:
-                    self._relogin()
-                except AuthError as login_exc:
-                    raise login_exc from exc
-            self._persist()
-            self._live = True
+                    candidate = _refresh(self.data)
+                except AuthError as exc:
+                    if exc.account_issue_code and exc.account_issue_code != "authentication":
+                        raise
+                    try:
+                        return self._relogin()
+                    except AuthError as login_exc:
+                        raise login_exc from exc
+                self._persist(candidate)
+                self.data = candidate
+                self._identity_uid = self._identity_uid or token_store.identity_uid(candidate)
+                self._live = True
+            except Exception:
+                self.data, self._live = previous_data, previous_live
+                raise
         return self
 
     def ensure_auth(self, *, org_key: str | None = None) -> dict[str, Any]:
@@ -1090,7 +1220,7 @@ class Session:
         lang = config.ACCEPT_LANGUAGE.split(",", 1)[0].strip()
         query = f"?lang={lang}" if lang else ""
         body = self._catalog_json(f"/api/v1/orgs/{org_key}/tasks{query}")
-        return _as_list(body)
+        return validate_task_catalog(_as_list(body))
 
     # -- telemetria (comportamento de app aberto) ----------------------------
     def app_opened(self, auth_method: str = "SESSION_RESUMED",

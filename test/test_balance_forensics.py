@@ -39,7 +39,7 @@ class BalanceForensicsTests(unittest.TestCase):
         self.assertEqual(instance.snapshot()["fallbacks"], 1)
 
     def test_refresh_rejects_malformed_email_selection(self):
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         for body in (["unexpected"], {"emails": "a@example.com"}, {"emails": [None]}):
             with self.subTest(body=body), patch.object(server.BALANCES_RUNNER, "start") as start:
                 response = client.post("/api/balances/refresh", json=body)
@@ -144,12 +144,14 @@ class BalanceForensicsTests(unittest.TestCase):
             self.assertNotIn("inTransitReplaceable", saved)
             self.assertFalse(server._confirmed_available_balance(saved))
 
-    def test_one_corrupted_record_does_not_abort_valid_result(self):
+    def test_corrupt_record_requires_review_before_replacing_history(self):
         with tempfile.TemporaryDirectory() as folder, \
              patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):
-            server._save_balances({"a": "broken"})
-            server._on_balance_result("a", SUMMARY, None)
-            self.assertFalse(server._load_balances()["a"]["stale"])
+            original = b'{"a":"broken"}'
+            server.BALANCES_PATH.write_bytes(original)
+            with self.assertRaises(ValueError):
+                server._on_balance_result("a", SUMMARY, None)
+            self.assertEqual(server.BALANCES_PATH.read_bytes(), original)
 
     def test_runner_reports_per_account_failures_without_opening_browser(self):
         instance = runner.BalancesRunner()

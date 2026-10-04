@@ -8,6 +8,8 @@
 #include "OperationWidgets.hpp"
 #include "TableEmptyState.hpp"
 #include "CampaignReviewDialog.hpp"
+#include "OriginalCaptureDialog.hpp"
+#include "OwnedServiceProcesses.hpp"
 #include <QMenu>
 #include <QPointer>
 #include <QResizeEvent>
@@ -209,37 +211,83 @@ QString provisionEmbeddedService() {
 #endif
 }
 
-void terminatePackagedServiceTree() {
+void terminateOwnedServiceTree(qint64 rootPid, const QString& expectedExecutable) {
 #ifdef Q_OS_WIN
-  // Uma distribuição PyInstaller --onefile mantém um processo filho vivo. As
-  // primeiras versões do QMoney encerravam apenas o bootloader durante a
-  // atualização; o filho antigo continuava atendendo a porta 8876 e a nova
-  // interface acabava conectada ao motor errado. Como a interface é de
-  // instância única, não existe outro serviço legítimo que deva sobreviver.
+  if (rootPid <= 0 || expectedExecutable.isEmpty()) return;
+  auto identity = [](HANDLE process, quint32 pid, quint32 parent) {
+    qmoney::service::ProcessFact fact;
+    fact.pid = pid;
+    fact.parentPid = parent;
+    wchar_t path[32768];
+    DWORD length = DWORD(std::size(path));
+    FILETIME created{}, exited{}, kernel{}, user{};
+    HANDLE token = nullptr;
+    if (!QueryFullProcessImageNameW(process, 0, path, &length)
+        || !GetProcessTimes(process, &created, &exited, &kernel, &user)
+        || !OpenProcessToken(process, TOKEN_QUERY, &token)) return fact;
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    QByteArray data(int(bytes), Qt::Uninitialized);
+    const bool ownerKnown = bytes > 0 && GetTokenInformation(
+        token, TokenUser, data.data(), bytes, &bytes);
+    CloseHandle(token);
+    if (!ownerKnown) return fact;
+    auto* owner = reinterpret_cast<TOKEN_USER*>(data.data());
+    if (!IsValidSid(owner->User.Sid)) return fact;
+    fact.owner = QByteArray(static_cast<const char*>(owner->User.Sid),
+                           int(GetLengthSid(owner->User.Sid)));
+    fact.executable = QDir::cleanPath(QDir::fromNativeSeparators(
+        QString::fromWCharArray(path, int(length))));
+    fact.created = (quint64(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    fact.identityKnown = true;
+    return fact;
+  };
+  const quint32 appPid = GetCurrentProcessId();
+  const auto app = identity(GetCurrentProcess(), appPid, 0);
+  const QString expected = QDir::cleanPath(QDir::fromNativeSeparators(
+      QFileInfo(expectedExecutable).canonicalFilePath()));
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snapshot == INVALID_HANDLE_VALUE) return;
+  if (snapshot == INVALID_HANDLE_VALUE || !app.identityKnown || expected.isEmpty()) {
+    if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
+    qWarning() << "QMoney: árvore do motor preservada; propriedade não comprovada";
+    return;
+  }
   PROCESSENTRY32W entry{};
   entry.dwSize = sizeof(entry);
-  int terminated = 0;
+  QVector<qmoney::service::ProcessFact> facts;
   if (Process32FirstW(snapshot, &entry)) {
     do {
-      const QString name = QString::fromWCharArray(entry.szExeFile);
-      if (!name.startsWith(QStringLiteral("QMoneyService"), Qt::CaseInsensitive)
-          || !name.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive))
-        continue;
-      HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
-                                   entry.th32ProcessID);
-      if (!process) continue;
-      if (TerminateProcess(process, 0)) {
-        WaitForSingleObject(process, 3000);
-        ++terminated;
-      }
-      CloseHandle(process);
+      HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+      auto fact = process ? identity(process, entry.th32ProcessID, entry.th32ParentProcessID)
+                          : qmoney::service::ProcessFact{};
+      if (!process) { fact.pid = entry.th32ProcessID; fact.parentPid = entry.th32ParentProcessID; }
+      facts.append(fact);
+      if (process) CloseHandle(process);
     } while (Process32NextW(snapshot, &entry));
   }
   CloseHandle(snapshot);
-  if (terminated > 0)
-    qInfo() << "QMoney: processos antigos do motor encerrados" << terminated;
+  const auto selected = qmoney::service::selectOwnedServiceTree(
+      facts, quint32(rootPid), appPid, app.created, app.owner, expected);
+  if (selected.isEmpty()) {
+    qWarning() << "QMoney: árvore do motor preservada; propriedade não comprovada";
+    return;
+  }
+  for (const auto& fact : selected) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
+                                 | SYNCHRONIZE, FALSE, fact.pid);
+    if (!process) continue;
+    // Revalidate the open handle after selection: PID reuse must never turn
+    // a previously owned process into permission to terminate its successor.
+    const auto now = identity(process, fact.pid, fact.parentPid);
+    if (now.identityKnown && now.created == fact.created && now.owner == fact.owner
+        && now.executable.compare(fact.executable, Qt::CaseInsensitive) == 0) {
+      if (TerminateProcess(process, 0)) WaitForSingleObject(process, 3000);
+    }
+      CloseHandle(process);
+  }
+#else
+  Q_UNUSED(rootPid)
+  Q_UNUSED(expectedExecutable)
 #endif
 }
 
@@ -458,11 +506,28 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+  _campaignExitRequested = true;
+  _campaignRestartPending = false;
+  _pendingLibraryRoot.clear();
+  if (_campaignCloseReady && !_pendingUpdatePackage.isEmpty()
+      && !_campaignTransitionCommitted) {
+    event->ignore();
+    completeCampaignDrain();
+    return;
+  }
+  if (!_campaignCloseReady && (_campaignClosePending || _backendReady
+      || _campaignActive || _campaignStartPending || _campaignPreflightPending
+      || _campaignStartUncertain || _backend.state() != QProcess::NotRunning)) {
+    event->ignore();
+    beginCampaignDrain();
+    return;
+  }
   if (_campaignDraftSave.isActive()) {
     _campaignDraftSave.stop();
     saveCampaignDraft();
   }
   _closing = true;
+  _campaignCloseReady = true;
   _campaignPoll.stop();
   _previewPoll.stop();
   _cachePoll.stop();
@@ -471,6 +536,108 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   _backendProbe.stop();
   stopBackend();
   QMainWindow::closeEvent(event);
+}
+
+void MainWindow::beginCampaignDrain() {
+  if (!_campaignClosePending) {
+    _campaignTransitionCommitted = false;
+    _campaignClosePending = true;
+    _closing = true;
+    _resumeOperationPoll = _operationPoll.isActive();
+    _operationPoll.stop();
+    _backendProbe.stop();
+    _campaignPoll.stop();
+    _previewPoll.stop();
+    _cachePoll.stop();
+    _orgMigrationPoll.stop();
+    _balancePoll.stop();
+    if (centralWidget()) centralWidget()->setEnabled(false);
+    connect(&_campaignClosePoll, &QTimer::timeout, this, &MainWindow::pollCampaignClose,
+            Qt::UniqueConnection);
+    _campaignClosePoll.start(1000);
+    setStatus(QStringLiteral("Aguardando os envios iniciados e a gravação dos resultados…"));
+  }
+  pollCampaignClose();
+}
+
+void MainWindow::pollCampaignClose() {
+  if (!_campaignClosePending || _campaignCloseReady || _campaignCloseInFlight) return;
+  _campaignCloseInFlight = true;
+  _api.post(QStringLiteral("/api/campaigns/drain"), {},
+            [this](bool ok, const QJsonDocument& document, const QString&) {
+    if (!_campaignClosePending || _campaignCloseReady) return;
+    _campaignCloseInFlight = false;
+    const auto result = document.object();
+    const bool valid = ok && result.value(QStringLiteral("ok")) == QJsonValue(true)
+        && result.value(QStringLiteral("draining")) == QJsonValue(true)
+        && result.value(QStringLiteral("ready")).isBool();
+    const bool serviceExited = !_backend.program().isEmpty()
+        && _backend.state() == QProcess::NotRunning;
+    if ((valid && result.value(QStringLiteral("ready")) == QJsonValue(true)) || serviceExited) {
+      _campaignCloseReady = true;
+      _campaignClosePoll.stop();
+      QTimer::singleShot(0, this, &MainWindow::completeCampaignDrain);
+      return;
+    }
+    if (!valid)
+      setStatus(QStringLiteral("Não foi possível confirmar o encerramento dos envios. Tentando novamente; o aplicativo permanecerá aberto."));
+  });
+}
+
+void MainWindow::completeCampaignDrain() {
+  if (!_campaignCloseReady || _campaignTransitionCommitted) return;
+  _campaignTransitionCommitted = true;
+  if (!_pendingUpdatePackage.isEmpty()) {
+    if (launchPendingUpdate()) {
+      _pendingUpdatePackage.clear();
+      _pendingUpdateSha256.clear();
+      close();
+      return;
+    }
+    // The old service has accepted a monotonic drain barrier. A fresh service
+    // is necessary before the window can admit another campaign.
+    _pendingUpdatePackage.clear();
+    _pendingUpdateSha256.clear();
+    if (_campaignExitRequested) {
+      close();
+      return;
+    }
+    _campaignRestartPending = true;
+  }
+  if (!_campaignRestartPending) {
+    close();
+    return;
+  }
+  if (_campaignDraftSave.isActive()) {
+    _campaignDraftSave.stop();
+    saveCampaignDraft();
+  }
+  if (!_pendingLibraryRoot.isEmpty()) {
+    QSettings().setValue(QStringLiteral("libraryRoot"), _pendingLibraryRoot);
+    _pendingLibraryRoot.clear();
+  }
+  _backendReady = false;
+  _backendRestarts = 0;
+  _restartingBackend = true;
+  stopBackend();
+  QTimer::singleShot(350, this, [this] {
+    if (!_campaignRestartPending) return;
+    _campaignRestartPending = false;
+    _campaignClosePending = false;
+    _campaignCloseReady = false;
+    _campaignCloseInFlight = false;
+    _campaignTransitionCommitted = false;
+    _campaignExitRequested = false;
+    _campaignActive = false;
+    _campaignStartPending = false;
+    _campaignPreflightPending = false;
+    _campaignStartUncertain = !_campaignRequestedPreflight.isEmpty();
+    _closing = false;
+    _restartingBackend = false;
+    if (centralWidget()) centralWidget()->setEnabled(true);
+    if (_resumeOperationPoll) _operationPoll.start();
+    startBackend();
+  });
 }
 
 void MainWindow::resizeEvent(QResizeEvent* event) {
@@ -1756,6 +1923,11 @@ QWidget* MainWindow::buildCampaignPage() {
     });
   });
   actions->addWidget(_campaignStop);
+  _campaignOriginal = new QPushButton(QStringLiteral("Usar captura original"));
+  _campaignOriginal->setAccessibleName(QStringLiteral("Selecionar captura original MP4 e ZIP para uma conta"));
+  _campaignOriginal->setToolTip(QStringLiteral("Revisa arquivos originais preservando seus bytes, identificadores e clocks."));
+  connect(_campaignOriginal, &QPushButton::clicked, this, &MainWindow::chooseOriginalCapture);
+  actions->addWidget(_campaignOriginal);
   _campaignStart = primaryButton(QStringLiteral("Iniciar campanha"));
   connect(_campaignStart, &QPushButton::clicked, this, &MainWindow::startCampaign);
   actions->addWidget(_campaignStart);
@@ -1822,6 +1994,19 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_accountWorkers, &QComboBox::currentIndexChanged, this, scheduleDraft);
   connect(_cleanupAfter, &QCheckBox::toggled, this, scheduleDraft);
   connect(_activeHours, &QCheckBox::toggled, this, scheduleDraft);
+
+  const auto pendingStart = QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray();
+  if (!pendingStart.isEmpty()) {
+    const auto saved = QJsonDocument::fromJson(pendingStart).object();
+    const auto identity = saved.value(QStringLiteral("start_request_id")).toString();
+    if (saved.value(QStringLiteral("schema_version")) == QJsonValue(1)
+        && QRegularExpression(QStringLiteral("^[A-Za-z0-9_-]{1,160}$")).match(identity).hasMatch())
+      _campaignRequestedPreflight = identity;
+    _campaignStartUncertain = true;
+    updateCampaignActions();
+    setCampaignIndicator(QStringLiteral("Início anterior requer consulta"),
+        QStringLiteral("O identificador salvo será consultado antes de permitir outro início."), QStringLiteral("unknown"));
+  }
 
   return pageShell(QStringLiteral("Nova campanha"),
                    QStringLiteral("Escolha o conteúdo, calibre a operação e acompanhe cada envio."), body);
@@ -2759,13 +2944,30 @@ QWidget* MainWindow::buildHistoryPage() {
       const auto root = doc.object();
       const auto summary = root.value(QStringLiteral("summary")).toObject();
       _historyEvidence->setRowCount(0);
+      int currentConfirmed=0, currentPending=0, currentReview=0, currentUnknown=0;
       for(const auto itemValue:root.value("items").toArray()) {
         const auto item=itemValue.toObject();
         for(const auto resultValue:item.value("accounts").toArray()) {
           const auto result=resultValue.toObject();
           const auto confirmation=result.value("confirmation").toString();
           const auto status=result.value("status").toString();
-          const QString proof=confirmation=="remote_ack"?QStringLiteral("Finalização confirmada"):
+          const auto current=result.value("current_result").toObject();
+          const auto found=current.value("chunks_found");
+          const auto expected=current.value("chunks_expected");
+          const bool confirmedNow=current.value("status").toString()=="confirmed"
+              && current.value("evidence_source").toString()=="journal"
+              && current.value("reconciled").isBool() && found.isDouble() && expected.isDouble()
+              && expected.toDouble()>0 && std::floor(expected.toDouble())==expected.toDouble()
+              && found.toDouble()==expected.toDouble() && !result.value("session_id").toString().isEmpty()
+              && !result.value("email").toString().isEmpty() && !item.value("clip_uid").toString().isEmpty();
+          if(status!="skipped") {
+            if(confirmedNow) ++currentConfirmed;
+            else if(current.value("status").toString()=="pending") ++currentPending;
+            else if(current.value("status").toString()=="review") ++currentReview;
+            else ++currentUnknown;
+          }
+          const QString proof=confirmedNow?QStringLiteral("Recibo atual confirmado"):
+              confirmation=="remote_ack"?QStringLiteral("Confirmado na tentativa original"):
               confirmation=="legacy_record"?QStringLiteral("Registro legado"):
               status=="skipped"?QStringLiteral("Pulado"):
               status=="failed"?QStringLiteral("Falhou"):QStringLiteral("Sem confirmação");
@@ -2774,14 +2976,15 @@ QWidget* MainWindow::buildHistoryPage() {
           const QStringList values{result.value("email").toString(),item.value("clip_uid").toString(QStringLiteral("Não registrado")),result.value("session_id").toString(QStringLiteral("Não registrada")),proof};
           for(int column=0;column<values.size();++column) {
             auto* value=new QTableWidgetItem(values[column]);
-            value->setToolTip(values[column]+QStringLiteral("\n")+result.value("detail").toString());
+            value->setToolTip(values[column]+QStringLiteral("\nTentativa original: ")+result.value("detail").toString()
+                +QStringLiteral("\nRecibo atual: ")+current.value("detail").toString());
             _historyEvidence->setItem(row,column,value);
           }
           _historyEvidence->setRowHeight(row,48);
         }
       }
       QStringList lines;
-      lines << QStringLiteral("RESULTADO DA CAMPANHA")
+      lines << QStringLiteral("RESULTADO DA TENTATIVA ORIGINAL")
             << friendlyDate(root.value(QStringLiteral("started_at")).toString())
             << QString()
             << QStringLiteral("%1 envio(s) sem confirmação de finalização").arg(summary.value("pending").toInt())
@@ -2791,6 +2994,11 @@ QWidget* MainWindow::buildHistoryPage() {
                    .arg(summary.value(QStringLiteral("success")).toInt())
                    .arg(summary.value(QStringLiteral("skipped")).toInt())
                    .arg(summary.value(QStringLiteral("failed")).toInt())
+            << QString();
+      lines << QStringLiteral("SITUAÇÃO ATUAL DOS RECIBOS")
+            << QStringLiteral("%1 confirmado(s) · %2 pendente(s) · %3 para revisar · %4 sem recibo atual")
+                .arg(currentConfirmed).arg(currentPending).arg(currentReview).arg(currentUnknown)
+            << QStringLiteral("A confirmação posterior não reescreve o resultado da tentativa original.")
             << QString();
       const auto issues = root.value(QStringLiteral("issues")).toArray();
       if (!issues.isEmpty()) {
@@ -3038,7 +3246,14 @@ void MainWindow::checkForUpdates(bool interactive) {
   _updates.check(interactive);
 }
 
-void MainWindow::installUpdate(const QString& packagePath) {
+void MainWindow::installUpdate(const QString& packagePath, const QString& verifiedSha256) {
+  if (_closing || _campaignClosePending) return;
+  const QRegularExpression digest(QStringLiteral("^[a-f0-9]{64}$"));
+  if (verifiedSha256.size() != 64 || !digest.match(verifiedSha256).hasMatch()) {
+    _updateButton->setEnabled(true);
+    return showError(QStringLiteral("Atualização"),
+                     QStringLiteral("A verificação do pacote de atualização não foi concluída."));
+  }
   const QString appDir = QCoreApplication::applicationDirPath();
   const QString updater = appDir + QStringLiteral("/QMoneyUpdater.exe");
   if (!QFileInfo::exists(updater)) {
@@ -3047,21 +3262,40 @@ void MainWindow::installUpdate(const QString& packagePath) {
     return showError(QStringLiteral("Atualização"),
                      QStringLiteral("O componente QMoneyUpdater.exe não foi encontrado."));
   }
+  _pendingUpdatePackage = packagePath;
+  _pendingUpdateSha256 = verifiedSha256;
+  beginCampaignDrain();
+}
+
+bool MainWindow::launchPendingUpdate() {
+  const QString appDir = QCoreApplication::applicationDirPath();
+  const QString updater = appDir + QStringLiteral("/QMoneyUpdater.exe");
+  const QRegularExpression digest(QStringLiteral("^[a-f0-9]{64}$"));
+  if (_pendingUpdateSha256.size() != 64 || !digest.match(_pendingUpdateSha256).hasMatch()
+      || !QFileInfo::exists(updater)) {
+    _updateButton->setEnabled(true);
+    showError(QStringLiteral("Atualização"),
+              QStringLiteral("O instalador ou a verificação do pacote não está disponível."));
+    return false;
+  }
   const QStringList arguments = {
-      QStringLiteral("--package"), packagePath,
+      QStringLiteral("--package"), _pendingUpdatePackage,
+      QStringLiteral("--sha256"), _pendingUpdateSha256,
       QStringLiteral("--target"), appDir,
       QStringLiteral("--pid"), QString::number(QCoreApplication::applicationPid()),
       QStringLiteral("--launch"), QStringLiteral("QMoney.exe")};
   if (!QProcess::startDetached(updater, arguments, appDir)) {
     _updateButton->setEnabled(true);
-    return showError(QStringLiteral("Atualização"),
-                     QStringLiteral("Não foi possível iniciar o instalador da atualização."));
+    showError(QStringLiteral("Atualização"),
+              QStringLiteral("Não foi possível iniciar o instalador da atualização."));
+    return false;
   }
   setStatus(QStringLiteral("Fechando para instalar a atualização…"));
-  QTimer::singleShot(150, qApp, &QCoreApplication::quit);
+  return true;
 }
 
 void MainWindow::startBackend() {
+  if (_closing || _campaignClosePending) return;
   ++_probeGeneration;
   _probeInFlight = false;
   const QString appDir = QCoreApplication::applicationDirPath();
@@ -3073,7 +3307,7 @@ void MainWindow::startBackend() {
   QString workingDirectory;
   QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
   if (QFileInfo::exists(packagedService)) {
-    terminatePackagedServiceTree();
+    _packagedServiceExecutable = QFileInfo(packagedService).canonicalFilePath();
     program = packagedService;
     arguments = {QStringLiteral("--no-browser"), QStringLiteral("--porta"),
                  QStringLiteral("8876"), QStringLiteral("--parent-pid"),
@@ -3118,6 +3352,7 @@ void MainWindow::startBackend() {
     environment.insert(QStringLiteral("PLAYWRIGHT_BROWSERS_PATH"),
                        appDir + QStringLiteral("/runtime/ms-playwright"));
   } else {
+    _packagedServiceExecutable.clear();
     const QString root = QString::fromUtf8(QMONEY_PROJECT_ROOT);
     program = root + QStringLiteral("/.venv/Scripts/python.exe");
     if (!QFileInfo::exists(program)) program = QStringLiteral("python");
@@ -3170,6 +3405,7 @@ void MainWindow::stopBackend() {
   ++_probeGeneration;
   _probeInFlight = false;
   if (_backend.state() != QProcess::NotRunning) {
+    terminateOwnedServiceTree(_backend.processId(), _backend.program());
     _backend.terminate();
     if (!_backend.waitForFinished(1800)) {
       _backend.kill();
@@ -3179,14 +3415,10 @@ void MainWindow::stopBackend() {
 }
 
 void MainWindow::restartBackend() {
-  _backendReady = false;
-  _backendRestarts = 0;
+  if (_closing || _campaignClosePending) return;
+  _campaignRestartPending = true;
   _restartingBackend = true;
-  stopBackend();
-  QTimer::singleShot(350, this, [this] {
-    _restartingBackend = false;
-    startBackend();
-  });
+  beginCampaignDrain();
 }
 
 void MainWindow::probeBackend() {
@@ -3221,7 +3453,8 @@ void MainWindow::probeBackend() {
         }
       });
       refreshCurrentPage();
-      if (!_runtimeChecked && _backend.program().endsWith(QStringLiteral("QMoneyService.exe"), Qt::CaseInsensitive)) {
+      if (!_runtimeChecked && qmoney::service::isExpectedServiceExecutable(
+              QFileInfo(_backend.program()).canonicalFilePath(), _packagedServiceExecutable)) {
         _runtimeChecked = true;
         _api.get(QStringLiteral("/api/runtime"),
                  [this, generation](bool checked, const QJsonDocument& result, const QString&) {
@@ -3269,6 +3502,10 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
       _previewLogName = QFileInfo(savedPreview).fileName();
       _previewPoll.start();
       QTimer::singleShot(0, this, &MainWindow::pollCampaignPreviews);
+    }
+    if (_campaignStartUncertain) {
+      _campaignPoll.start();
+      QTimer::singleShot(0, this, &MainWindow::pollCampaign);
     }
   }
 }
@@ -3455,7 +3692,8 @@ void MainWindow::openRecovery() {
     for (int row = 0; row < items.size(); ++row) {
       const auto item = items[row].toObject();
       if (item.value("can_resume").toBool()) resumable.insert(item.value("email").toString());
-      const QString status = item.value("status").toString() == "confirmed" ? QStringLiteral("Confirmado; reconciliar") :
+      const QString status = item.value("status").toString() == "confirmed" ?
+                             (item.value("publication_pending").toBool() ? QStringLiteral("Confirmado; revisar histórico") : QStringLiteral("Confirmado; reconciliar")) :
                              item.value("status").toString() == "pending" ? QStringLiteral("Envio pendente") : QStringLiteral("Revisar histórico");
       const QStringList values{item.value("email").toString(), item.value("clip_uid").toString(QStringLiteral("Não identificado")), item.value("session_id").toString(), status};
       for (int column = 0; column < values.size(); ++column) {
@@ -3467,8 +3705,10 @@ void MainWindow::openRecovery() {
         table->setItem(row, column, value);
       }
     }
+    const int reconciliationPending = data.contains("reconciliation_pending") ? data.value("reconciliation_pending").toInt() : data.value("confirmed").toInt();
+    const int publicationPending = data.value("publication_pending").toInt();
     summary->setText(QStringLiteral("%1 sessão(ões) pendente(s) · %2 confirmação(ões) para reconciliar")
-        .arg(data.value("pending").toInt()).arg(data.value("confirmed").toInt()));
+        .arg(data.value("pending").toInt()).arg(reconciliationPending));
     QStringList accountNames(resumable.begin(), resumable.end());
     accountNames.sort();
     resumeAccount->addItems(accountNames);
@@ -3481,8 +3721,21 @@ void MainWindow::openRecovery() {
     } else {
       poll->stop();
       if (!worker.value("error").toString().isEmpty()) summary->setText(worker.value("error").toString());
+      else if (worker.value("state").toString()=="done") {
+        const auto result=worker.value("result").toObject();
+        summary->setText(QStringLiteral("Retomada concluída · %1 sessão(ões) reconciliada(s). Consulte os recibos atuais no Histórico.")
+            .arg(result.value("reconciled").toInt()));
+      } else if (worker.value("state").toString()=="pending") {
+        summary->setText(QStringLiteral("Retomada encerrada com registros que ainda precisam de atenção. Consulte os recibos atuais no Histórico."));
+      } else if (data.value("reconciled").toInt()>0) {
+        summary->setText(QStringLiteral("%1 sessão(ões) reconciliada(s). A tentativa original permanece registrada no Histórico.")
+            .arg(data.value("reconciled").toInt()));
+      }
     }
-    reconcile->setEnabled(!running && data.value("confirmed").toInt() > 0);
+    if (publicationPending > 0) {
+      summary->setText(summary->text() + QStringLiteral(" · %1 confirmação(ões) preservada(s) nesta tela; revise o registro pendente no Histórico.").arg(publicationPending));
+    }
+    reconcile->setEnabled(!running && reconciliationPending > 0);
     resume->setEnabled(!running && !accountNames.isEmpty());
     resumeAccount->setEnabled(!running);
   };
@@ -3963,9 +4216,10 @@ void MainWindow::removeHostingerIntegration() {
 }
 
 void MainWindow::chooseLibrary() {
+  if (_closing || _campaignClosePending) return;
   const QString selected = QFileDialog::getExistingDirectory(
       this, QStringLiteral("Escolher raiz da biblioteca QMoney"), _currentLibraryRoot);
-  if (selected.isEmpty()) return;
+  if (selected.isEmpty() || _closing || _campaignClosePending) return;
   const QDir root(selected);
   const bool hasCatalog = QFileInfo::exists(root.filePath(QStringLiteral("data/ego4d/timed_narrations.jsonl")))
                        || QFileInfo::exists(root.filePath(QStringLiteral("data/ego4d/clip_narrations.json")))
@@ -3974,8 +4228,7 @@ void MainWindow::chooseLibrary() {
     return showError(QStringLiteral("Biblioteca não reconhecida"),
                      QStringLiteral("Escolha a pasta raiz que contém data\\ego4d ou data\\holoassist."));
   }
-  QSettings().setValue(QStringLiteral("libraryRoot"), QDir::cleanPath(selected));
-  setStatus(QStringLiteral("Reiniciando o motor com a biblioteca selecionada…"));
+  _pendingLibraryRoot = QDir::cleanPath(selected);
   restartBackend();
 }
 
@@ -4011,12 +4264,14 @@ void MainWindow::updateCampaignActions() {
         && !item->data(Qt::UserRole).toString().isEmpty();
   }
   const bool busy = _campaignActive || _campaignPreflightPending || _campaignStartPending
-      || _campaignStartUncertain || _campaignResetPending;
+      || _campaignStartUncertain || _campaignResetPending || _campaignOriginalDialogPending;
   const bool balancesReady = !_campaignAccountMode->currentData().toString().startsWith(QStringLiteral("balance_"))
       || _campaignBalancesLoaded;
   _campaignStart->setEnabled(!busy && accounts && tasks && balancesReady
       && !_taskRequestPending && !_taskReload.isActive());
   _campaignReset->setEnabled(!busy);
+  if (_campaignOriginal) _campaignOriginal->setEnabled(!busy && !_closing && !_campaignClosePending
+      && _backendReady && _campaignAccounts->count() > 0);
 }
 
 void MainWindow::loadCampaignData() {
@@ -4178,6 +4433,148 @@ void MainWindow::loadTasks() {
   });
 }
 
+void MainWindow::chooseOriginalCapture() {
+  if (_closing || _campaignClosePending || !_backendReady || _campaignActive || _campaignPreflightPending
+      || _campaignStartPending || _campaignStartUncertain || _campaignResetPending || _campaignOriginalDialogPending) return;
+  QStringList accounts;
+  for (int i = 0; i < _campaignAccounts->count(); ++i) {
+    const auto email = _campaignAccounts->item(i)->data(Qt::UserRole).toString();
+    if (!email.trimmed().isEmpty() && !accounts.contains(email)) accounts << email;
+  }
+  if (accounts.isEmpty()) return showError(QStringLiteral("Conta necessária"), QStringLiteral("Conecte uma conta antes de selecionar uma captura original."));
+  _campaignOriginalDialogPending = true;
+  updateCampaignActions();
+  const auto finishSelection = qScopeGuard([this] { _campaignOriginalDialogPending = false; updateCampaignActions(); });
+  OriginalCaptureSelectionDialog dialog(accounts, [this](const QString& email, OriginalCaptureSelectionDialog::TaskReply reply) {
+    _api.get(QStringLiteral("/api/campaigns/original/tasks?account_email=%1").arg(encoded(email)),
+      [reply = std::move(reply)](bool ok, const QJsonDocument& doc, const QString& error) {
+        reply(ok && doc.isObject(), doc.object(), error);
+      });
+  }, this);
+  if (dialog.exec() != QDialog::Accepted || _closing || _campaignClosePending) return;
+  preflightOriginalCapture(dialog.requestBody());
+}
+
+void MainWindow::preflightOriginalCapture(QJsonObject body) {
+  if (_closing || _campaignClosePending || !_backendReady || _campaignActive || _campaignPreflightPending
+      || _campaignStartPending || _campaignStartUncertain || _campaignResetPending) return;
+  _campaignPreflightPending = true;
+  ++_campaignPollRevision;
+  updateCampaignActions();
+  setCampaignIndicator(QStringLiteral("Verificando captura original"),
+      QStringLiteral("Conferindo grupo, hashes e vínculos. Nenhum envio iniciado."), QStringLiteral("starting"), true);
+  _api.post(QStringLiteral("/api/campaigns/original/preflight"), body,
+    [this, body](bool ok, const QJsonDocument& doc, const QString& error) {
+      const auto finish = qScopeGuard([this] { _campaignPreflightPending = false; updateCampaignActions(); });
+      if (_closing || _campaignClosePending) return;
+      const auto result = doc.object();
+      const auto receipt = result.value(QStringLiteral("preflight_id"));
+      const auto summary = result.value(QStringLiteral("original_summary")).toObject();
+      const bool valid = ok && doc.isObject() && result.value(QStringLiteral("ok")) == QJsonValue(true)
+          && receipt.isString() && !receipt.toString().trimmed().isEmpty() && receipt.toString() == receipt.toString().trimmed()
+          && result.value(QStringLiteral("receipt")) == receipt
+            && result.value(QStringLiteral("account_email")).isString()
+            && result.value(QStringLiteral("account_email")) == body.value(QStringLiteral("account_email"))
+            && result.value(QStringLiteral("task_id")).isString()
+            && result.value(QStringLiteral("task_id")) == body.value(QStringLiteral("task_id"))
+            && result.value(QStringLiteral("start_request_id")).isString()
+            && result.value(QStringLiteral("start_request_id")) == body.value(QStringLiteral("start_request_id"))
+          && result.value(QStringLiteral("completion_policy")) == QJsonValue(QStringLiteral("explicit_finalize"))
+          && result.value(QStringLiteral("readiness")).toObject().value(QStringLiteral("ready")) == QJsonValue(true)
+          && originalCaptureSummaryValid(summary, body);
+      if (!valid) {
+        const auto message = ok ? QStringLiteral("O serviço não confirmou uma prévia válida da captura original. Revise os arquivos e tente novamente.") : error;
+        setCampaignIndicator(QStringLiteral("Captura original não iniciada"), message, QStringLiteral("error"));
+        return showError(QStringLiteral("Captura original não iniciada"), message);
+      }
+      OriginalCaptureReviewDialog review(summary, body, this);
+      setCampaignIndicator(QStringLiteral("Revisar captura original"),
+          QStringLiteral("Confira o grupo e a conta. Origem física não comprovada pela validação local."), QStringLiteral("idle"));
+      if (review.exec() != QDialog::Accepted) {
+        setCampaignIndicator(QStringLiteral("Captura original não iniciada"), QStringLiteral("Revisão cancelada. Nenhum envio iniciado."), QStringLiteral("idle"));
+        return;
+      }
+      auto approved = body;
+      approved.insert(QStringLiteral("preflight_id"), receipt);
+      submitOriginalCapture(approved, summary);
+    });
+}
+
+void MainWindow::submitOriginalCapture(QJsonObject body, QJsonObject reviewedSummary) {
+  if (_closing || _campaignClosePending || !_backendReady || _campaignActive || _campaignStartPending || _campaignStartUncertain || _campaignResetPending) return;
+  const auto receipt = body.value(QStringLiteral("preflight_id"));
+  const auto operation = body.value(QStringLiteral("start_request_id"));
+  if (!receipt.isString() || receipt.toString().trimmed().isEmpty() || receipt.toString() != receipt.toString().trimmed()
+      || !operation.isString() || QUuid(operation.toString()).isNull()
+      || body.value(QStringLiteral("evaluate")) != QJsonValue(true) || body.value(QStringLiteral("finalize")) != QJsonValue(true)
+      || !originalCaptureSummaryValid(reviewedSummary, body)) {
+    return showError(QStringLiteral("Captura original não iniciada"), QStringLiteral("A revisão original não está disponível. Revise novamente antes de enviar."));
+  }
+  if (!rememberCampaignStart(operation.toString())) return;
+  ++_campaignPollRevision;
+  _campaignStartPending = true;
+  _lastCampaignSeq = 0;
+  updateCampaignActions();
+  _campaignTabs->setCurrentIndex(2);
+  _campaignProgress->setRange(0, 0);
+  _campaignStage->setText(QStringLiteral("Iniciando captura original…"));
+  _campaignCurrent->setText(QStringLiteral("Aguardando confirmação da operação original, sem alterar seus arquivos."));
+  setCampaignIndicator(QStringLiteral("Iniciando captura original…"), _campaignCurrent->text(), QStringLiteral("starting"), true);
+  _api.post(QStringLiteral("/api/campaigns/original"), body,
+    [this, body, reviewedSummary](bool ok, const QJsonDocument& doc, const QString& error) {
+      _campaignStartPending = false;
+      if (_closing || _campaignClosePending) return;
+      const auto result = doc.object();
+      const auto accounts = result.value(QStringLiteral("accounts")).toArray();
+        const auto tasks = result.value(QStringLiteral("selected_tasks")).toArray();
+        const auto sends = result.value(QStringLiteral("total_sends"));
+      const bool valid = ok && doc.isObject() && result.value(QStringLiteral("ok")) == QJsonValue(true)
+          && result.value(QStringLiteral("already_running")).isBool()
+          && result.value(QStringLiteral("start_request_id")) == body.value(QStringLiteral("start_request_id"))
+          && result.value(QStringLiteral("preflight_id")) == body.value(QStringLiteral("preflight_id"))
+          && accounts.size() == 1 && accounts[0] == body.value(QStringLiteral("account_email"))
+            && tasks.size() == 1 && tasks[0].isObject()
+            && tasks[0].toObject().value(QStringLiteral("task_id")) == body.value(QStringLiteral("task_id"))
+            && sends.isDouble() && std::isfinite(sends.toDouble()) && sends.toDouble() > 0 && sends.toDouble() == std::floor(sends.toDouble())
+          && originalCaptureSummaryValid(result.value(QStringLiteral("original_summary")).toObject(), body)
+            && result.value(QStringLiteral("original_summary")).toObject().value(QStringLiteral("plan_digest")) == reviewedSummary.value(QStringLiteral("plan_digest"))
+            && result.value(QStringLiteral("original_summary")).toObject().value(QStringLiteral("content_digest")) == reviewedSummary.value(QStringLiteral("content_digest"));
+      if (!valid) {
+        const auto code = result.value(QStringLiteral("error_code")).toString();
+          const QStringList rejectedCodes{QStringLiteral("original_invalid_request"), QStringLiteral("original_capture_invalid"),
+              QStringLiteral("original_account_unavailable"), QStringLiteral("original_identity_changed"),
+              QStringLiteral("original_policy_unavailable"), QStringLiteral("original_catalog_unavailable"),
+              QStringLiteral("original_task_unavailable"), QStringLiteral("original_preflight_missing"),
+              QStringLiteral("original_preflight_expired"), QStringLiteral("original_request_changed"),
+              QStringLiteral("original_source_changed"), QStringLiteral("original_busy"),
+              QStringLiteral("original_recovery_pending"), QStringLiteral("original_start_conflict"), QStringLiteral("campaign_closing")};
+          const bool safelyRejected = !ok && result.value(QStringLiteral("ok")) == QJsonValue(false) && rejectedCodes.contains(code);
+        if (safelyRejected) {
+          clearCampaignStart();
+          _campaignProgress->setRange(0, 100);
+          setCampaignIndicator(QStringLiteral("Captura original não iniciada"), error, QStringLiteral("error"));
+          updateCampaignActions();
+          return showError(QStringLiteral("Captura original não iniciada"), error);
+        }
+        _campaignStartUncertain = true;
+        _campaignProgress->setRange(0, 100);
+        _campaignStage->setText(QStringLiteral("Início original não confirmado"));
+        _campaignCurrent->setText(QStringLiteral("A operação pode ter sido aceita. Consultando o mesmo identificador sem solicitar outro início."));
+        setCampaignIndicator(QStringLiteral("Início original não confirmado"), _campaignCurrent->text(), QStringLiteral("unknown"));
+        updateCampaignActions();_campaignPoll.start();pollCampaign();return;
+      }
+      _campaignActive = true;
+      _campaignStop->setEnabled(true);
+      _previewPoll.stop();_previewLogName.clear();_previewCheckActive = false;
+      QSettings().remove(QStringLiteral("previewLogName"));
+        if (!result.value(QStringLiteral("already_running")).toBool()) _campaignFeed->clear();
+      _campaignStart->setText(QStringLiteral("Campanha em andamento"));
+      setCampaignIndicator(QStringLiteral("Captura original em andamento"),
+          QStringLiteral("Operação confirmada; recebimento e qualidade serão acompanhados separadamente."), QStringLiteral("running"), true);
+      updateCampaignActions();_campaignPoll.start();pollCampaign();
+    });
+}
+
 void MainWindow::startCampaign() {
   if (_campaignActive || _campaignPreflightPending || _campaignStartPending
       || _campaignStartUncertain || _campaignResetPending) return;
@@ -4260,6 +4657,7 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
       if (!_campaignStartPending) _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       updateCampaignActions();
     });
+    if (_closing) return;
     if (!ok) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       updateCampaignActions();
@@ -4267,6 +4665,19 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
       return showError(QStringLiteral("Verificação não concluída"), error);
     }
     const auto result = doc.object();
+    const auto receipt = result.value(QStringLiteral("preflight_id"));
+    const bool canContinue = result.value(QStringLiteral("can_remove_and_continue")).toBool();
+    const bool actionable = result.value(QStringLiteral("ok")).toBool() || canContinue;
+    const bool receiptValid = receipt.isString() && !receipt.toString().trimmed().isEmpty()
+        && receipt.toString() == receipt.toString().trimmed();
+    if (!doc.isObject() || !result.value(QStringLiteral("ok")).isBool()
+        || (result.contains(QStringLiteral("can_remove_and_continue"))
+            && !result.value(QStringLiteral("can_remove_and_continue")).isBool())
+        || (actionable && !receiptValid)) {
+      const QString message = QStringLiteral("O serviço não confirmou uma prévia válida. Revise a campanha novamente antes de iniciar.");
+      setCampaignIndicator(QStringLiteral("Verificação não concluída"), message, QStringLiteral("error"));
+      return showError(QStringLiteral("Verificação não concluída"), message);
+    }
     const auto blockers = result.value(QStringLiteral("blockers")).toArray();
     QStringList blockerLines;
     for (const auto& value : blockers) blockerLines << QStringLiteral("• ") + value.toString();
@@ -4342,7 +4753,16 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
 }
 
 void MainWindow::submitCampaign(QJsonObject body) {
-  _campaignRequestedPreflight = body.value(QStringLiteral("preflight_id")).toString();
+  if (_closing) return;
+  const auto receipt = body.value(QStringLiteral("preflight_id"));
+  if (!receipt.isString() || receipt.toString().trimmed().isEmpty()
+      || receipt.toString() != receipt.toString().trimmed()) {
+    const QString message = QStringLiteral("A prévia da campanha não está disponível. Revise novamente antes de iniciar.");
+    setCampaignIndicator(QStringLiteral("Campanha não iniciada"), message, QStringLiteral("error"));
+    updateCampaignActions();
+    return showError(QStringLiteral("Campanha não iniciada"), message);
+  }
+  if (!rememberCampaignStart(body.value(QStringLiteral("preflight_id")).toString())) return;
   ++_campaignPollRevision;
   _campaignStartPending = true;
   _campaignStage->setText(QStringLiteral("Iniciando campanha…"));
@@ -4356,13 +4776,15 @@ void MainWindow::submitCampaign(QJsonObject body) {
     _api.post(QStringLiteral("/api/campaigns"), body,
               [this, body](bool started, const QJsonDocument& startDoc, const QString& startError) {
       _campaignStartPending = false;
+      if (_closing) return;
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       if (!started) {
         setCampaignIndicator(QStringLiteral("Não foi possível confirmar o início"), startError, QStringLiteral("error"));
         updateCampaignActions();
         const auto code = startDoc.object().value(QStringLiteral("error_code")).toString();
         _campaignProgress->setRange(0, 100);
-        if (code == "request_outcome_unknown") {
+        if (code == "request_outcome_unknown" || code == "start_outcome_unknown"
+            || code == "start_state_unreadable" || code == "start_request_conflict") {
           _campaignStartUncertain = true;
           _campaignStart->setEnabled(false);
           _campaignStart->setText(QStringLiteral("Início não confirmado"));
@@ -4373,6 +4795,7 @@ void MainWindow::submitCampaign(QJsonObject body) {
           pollCampaign();
           return;
         }
+        clearCampaignStart();
         _campaignStage->setText(QStringLiteral("Campanha não iniciada"));
         _campaignCurrent->setText(startError);
         if (code == "recovery_unidentified") {
@@ -4455,6 +4878,85 @@ void MainWindow::setCampaignIndicator(const QString& title, const QString& detai
     _campaignTabs->setTabText(2, state == "running" ? QStringLiteral("Acompanhamento · em andamento") : QStringLiteral("Acompanhamento"));
 }
 
+bool MainWindow::rememberCampaignStart(const QString& identity) {
+  if (!QRegularExpression(QStringLiteral("^[A-Za-z0-9_-]{1,160}$")).match(identity).hasMatch()) return false;
+  if (!_campaignRequestedPreflight.isEmpty() && _campaignRequestedPreflight != identity) {
+    // A new identity cannot replace a start whose outcome still needs review.
+    _campaignStartUncertain = true;
+    updateCampaignActions();
+    _campaignPoll.start();
+    pollCampaign();
+    return false;
+  }
+  QSettings settings;
+  settings.setValue(QStringLiteral("campaign/pendingStart"), QJsonDocument(QJsonObject{
+      {QStringLiteral("schema_version"), 1}, {QStringLiteral("start_request_id"), identity}
+  }).toJson(QJsonDocument::Compact));
+  settings.sync();
+  if (settings.status() != QSettings::NoError) {
+    _campaignStartUncertain = true;
+    updateCampaignActions();
+    showError(QStringLiteral("Campanha não iniciada"),
+        QStringLiteral("Não foi possível salvar o identificador para recuperação. Preserve os dados e revise o armazenamento local."));
+    return false;
+  }
+  _campaignRequestedPreflight = identity;
+  return true;
+}
+
+void MainWindow::clearCampaignStart() {
+  QSettings settings;
+  settings.remove(QStringLiteral("campaign/pendingStart"));
+  settings.sync();
+  _campaignRequestedPreflight.clear();
+  _campaignStartUncertain = settings.status() != QSettings::NoError;
+}
+
+void MainWindow::lookupCampaignStart() {
+  if (_campaignStartLookupInFlight || _campaignRequestedPreflight.isEmpty()) return;
+  _campaignStartLookupInFlight = true;
+  const auto identity = _campaignRequestedPreflight;
+  const int revision = _campaignPollRevision;
+  _api.get(QStringLiteral("/api/campaigns/starts/%1").arg(identity),
+      [this, identity, revision](bool ok, const QJsonDocument& doc, const QString&) {
+    _campaignStartLookupInFlight = false;
+    if (revision != _campaignPollRevision || identity != _campaignRequestedPreflight) return;
+    const auto result = doc.object();
+    const auto status = result.value(QStringLiteral("status")).toString();
+    const bool valid = ok && doc.isObject() && result.value(QStringLiteral("ok")) == QJsonValue(true)
+        && result.value(QStringLiteral("start_request_id")) == QJsonValue(identity)
+        && result.value(QStringLiteral("may_start")) == QJsonValue(false)
+        && result.value(QStringLiteral("found")).isBool()
+        && QStringList{"admitted", "review", "not_found"}.contains(status);
+    const auto execution = result.value(QStringLiteral("execution_state")).toString();
+    const auto logName = result.value(QStringLiteral("log_name")).toString();
+    const bool resolved = valid && result.value(QStringLiteral("found")) == QJsonValue(true)
+        && result.value(QStringLiteral("terminal")) == QJsonValue(true)
+        && result.value(QStringLiteral("delivery_confirmed")).isBool()
+        && QStringList{"done", "partial", "stopped", "error"}.contains(execution)
+        && QRegularExpression(QStringLiteral("^campaign_[A-Za-z0-9_-]+\\.json$")).match(logName).hasMatch();
+    if (resolved) {
+      clearCampaignStart();
+      _pendingHistoryFocus = logName;
+      setCampaignIndicator(QStringLiteral("Execução anterior identificada no Histórico"),
+          result.value(QStringLiteral("delivery_confirmed")).toBool()
+            ? QStringLiteral("O Histórico e os recibos confirmam a entrega anterior.")
+            : QStringLiteral("A execução anterior terminou. Consulte o Histórico e a Recuperação para os resultados e pendências."),
+          execution == QStringLiteral("error") || execution == QStringLiteral("partial") ? QStringLiteral("error") : QStringLiteral("done"));
+      updateCampaignActions();
+      if (!_campaignActive) _campaignPoll.stop();
+      return;
+    }
+    const auto detail = !valid ? QStringLiteral("O registro de início não pôde ser confirmado. Preserve os dados locais e consulte a Recuperação.")
+      : status == QStringLiteral("admitted") ? QStringLiteral("O serviço confirma a admissão desta solicitação. Consulte o Histórico e a Recuperação para confirmar o resultado dos envios.")
+      : status == QStringLiteral("not_found") ? QStringLiteral("Este identificador não consta no registro consultado. A ausência não confirma que nada foi enviado; revise o Histórico e a Recuperação.")
+      : QStringLiteral("A solicitação foi registrada e seu resultado exige revisão na Recuperação. Ela não será repetida automaticamente.");
+    setCampaignIndicator(QStringLiteral("Início anterior requer revisão"), detail, QStringLiteral("unknown"));
+    _campaignCurrent->setText(detail);
+    updateCampaignActions();
+  });
+}
+
 void MainWindow::pollCampaign() {
   if (_campaignPreflightPending || _campaignStartPending || _campaignPollInFlight) return;
   _campaignPollInFlight = true;
@@ -4477,12 +4979,21 @@ void MainWindow::pollCampaign() {
     const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
     const bool requestedOperation = !_campaignRequestedPreflight.isEmpty()
         && snap.value(QStringLiteral("start_request_id")).toString() == _campaignRequestedPreflight;
-    if (_campaignStartUncertain && !running && !requestedOperation) {
+    if ((_campaignStartUncertain || !_campaignRequestedPreflight.isEmpty()) && !requestedOperation) {
+      // A restarted service's idle/foreign snapshot cannot resolve this UUID.
+      _campaignStartUncertain = true;
+      _campaignActive = running;
+      _campaignStop->setEnabled(running && state != QStringLiteral("stopping") && !_campaignStopPending);
+      updateCampaignActions();
       setCampaignIndicator(QStringLiteral("Início não confirmado"),
-          QStringLiteral("O serviço ainda não confirmou a execução solicitada. A solicitação não será repetida automaticamente. Se persistir, encerre e reabra o aplicativo antes de tentar novamente."), QStringLiteral("unknown"));
+          running ? QStringLiteral("Há outra campanha em execução no serviço. O identificador desta solicitação ainda não foi confirmado. Ela não será repetida automaticamente.")
+                  : QStringLiteral("Consultando o registro persistente desta solicitação. Ela não será repetida automaticamente."), QStringLiteral("unknown"));
+      lookupCampaignStart();
+      _campaignPoll.start();
       return;
     }
     _campaignStartUncertain = false;
+    if (requestedOperation && !running) clearCampaignStart();
     _campaignProgress->setRange(0, 100);
 
     _campaignActive = running;
@@ -4612,11 +5123,38 @@ void MainWindow::pollCampaignPreviews() {
       }
       _campaignStage->setText(QStringLiteral("Aguardando o Minute"));
       _campaignCurrent->setText(QStringLiteral(
-          "Os vídeos foram enviados. A consulta das prévias será repetida automaticamente."));
+          "Não foi possível consultar as prévias. A consulta será repetida automaticamente; confira os recibos no Histórico."));
       setStatus(QStringLiteral("Minute ainda não respondeu sobre as prévias: %1").arg(error));
       return;
     }
     const auto summary = doc.object().value(QStringLiteral("summary")).toObject();
+    const auto validCount = [](const QJsonValue& value) {
+      return value.isDouble() && value.toDouble()>=0 && value.toDouble()<=2147483647.
+          && std::floor(value.toDouble())==value.toDouble();
+    };
+    bool validPreview=true;
+    for (const auto* key : {"total", "ready", "pending", "unavailable", "errors", "transient_errors"})
+      validPreview=validPreview && validCount(summary.value(QLatin1String(key)));
+    if (!validPreview || summary.value("transient_errors").toInt()>summary.value("errors").toInt()
+        || qint64(summary.value("ready").toInt())+summary.value("pending").toInt()
+            +summary.value("unavailable").toInt()+summary.value("errors").toInt()!=summary.value("total").toInt()) {
+      _campaignStage->setText(QStringLiteral("Consulta de prévias não confirmada"));
+      _campaignCurrent->setText(QStringLiteral("A resposta sobre as prévias está incompleta ou inválida. A consulta será repetida; os resultados de envio permanecem no Histórico."));
+      setStatus(QStringLiteral("Não foi possível validar o progresso das prévias."));
+      return;
+    }
+    const auto deliveries=doc.object().value("delivery_summary").toObject();
+    bool validDelivery=true;
+    for (const auto* key : {"confirmed", "pending", "review", "unknown"})
+      validDelivery=validDelivery && validCount(deliveries.value(QLatin1String(key)));
+    const qint64 deliveryTotal=qint64(deliveries.value("confirmed").toInt())+deliveries.value("pending").toInt()
+        +deliveries.value("review").toInt()+deliveries.value("unknown").toInt();
+    const bool allConfirmed=validDelivery && deliveryTotal>0 && deliveryTotal==deliveries.value("confirmed").toInt();
+    const QString deliveryDetail=validDelivery
+        ? QStringLiteral("Recibos atuais: %1 confirmado(s), %2 pendente(s), %3 para revisar, %4 sem recibo atual.")
+            .arg(deliveries.value("confirmed").toInt()).arg(deliveries.value("pending").toInt())
+            .arg(deliveries.value("review").toInt()).arg(deliveries.value("unknown").toInt())
+        : QStringLiteral("Não foi possível validar os recibos atuais nesta consulta. Confira o Histórico.");
     const int total = summary.value(QStringLiteral("total")).toInt();
     const int ready = summary.value(QStringLiteral("ready")).toInt();
     const int pending = summary.value(QStringLiteral("pending")).toInt();
@@ -4625,11 +5163,11 @@ void MainWindow::pollCampaignPreviews() {
     const int transientErrors = summary.value(QStringLiteral("transient_errors")).toInt();
     const int terminalErrors = qMax(0, errors - transientErrors);
     const int finished = ready + unavailable + terminalErrors;
-    const int percent = total > 0 ? qBound(0, finished * 100 / total, 100) : 100;
+    const int percent = total > 0 ? qBound(0, int(qint64(finished) * 100 / total), 100) : 100;
     _campaignProgress->setValue(percent);
     _campaignProgress->setFormat(total > 0
         ? QStringLiteral("%1 de %2 prévias prontas · %p%").arg(ready).arg(total)
-        : QStringLiteral("Nenhuma sessão enviada"));
+        : QStringLiteral("Sem prévias para acompanhar"));
     _campaignStats->setText(QStringLiteral(
         "%1 prontas · %2 processando · %3 falhas")
         .arg(ready).arg(pending).arg(unavailable + errors));
@@ -4638,10 +5176,11 @@ void MainWindow::pollCampaignPreviews() {
       _previewPoll.stop();
       _previewLogName.clear();
       QSettings().remove(QStringLiteral("previewLogName"));
-      _campaignStage->setText(QStringLiteral("Nenhum envio confirmado"));
+      _campaignStage->setText(QStringLiteral("Sem prévias para acompanhar"));
       _campaignCurrent->setText(QStringLiteral(
-          "A campanha terminou sem uma sessão remota para acompanhar. Veja o Histórico para identificar o motivo."));
-      setStatus(QStringLiteral("A campanha não possui arquivos enviados ao Minute."));
+          "A consulta não identificou prévias para acompanhar. Confira os resultados de envio no Histórico.")
+          +QStringLiteral("\n")+deliveryDetail);
+      setStatus(QStringLiteral("Não há prévias nesta consulta."));
       return;
     }
 
@@ -4649,13 +5188,13 @@ void MainWindow::pollCampaignPreviews() {
       _campaignStage->setText(transientErrors > 0
           ? QStringLiteral("Confirmando no Minute")
           : QStringLiteral("Processamento no Minute"));
-      _campaignCurrent->setText(transientErrors > 0
+      _campaignCurrent->setText((transientErrors > 0
           ? QStringLiteral(
-                "%1 de %2 arquivos publicados. %3 consulta(s) falharam temporariamente e serão repetidas automaticamente.")
+                "%1 de %2 prévias disponíveis. %3 consulta(s) falharam temporariamente e serão repetidas automaticamente.")
                 .arg(ready).arg(total).arg(transientErrors)
           : QStringLiteral(
-                "%1 de %2 arquivos publicados. Os vídeos já foram recebidos; o Minute está processando o restante.")
-                .arg(ready).arg(total));
+                "%1 de %2 prévias disponíveis. O Minute ainda está processando o restante.")
+                .arg(ready).arg(total))+QStringLiteral("\n")+deliveryDetail);
       setStatus(QStringLiteral("Prévias no Minute: %1 prontas, %2 processando, %3 consultas pendentes.")
                     .arg(ready).arg(pending).arg(transientErrors));
       return;
@@ -4668,17 +5207,21 @@ void MainWindow::pollCampaignPreviews() {
       _campaignStage->setText(QStringLiteral("Atenção nas prévias"));
       _campaignCurrent->setText(QStringLiteral(
           "%1 prévia(s) pronta(s); %2 precisam de atenção. Veja os detalhes no Histórico.")
-          .arg(ready).arg(unavailable + errors));
+          .arg(ready).arg(unavailable + errors)+QStringLiteral("\n")+deliveryDetail);
       _campaignFeed->appendPlainText(QStringLiteral(
           "!   Minute concluiu a fila com %1 prévia(s) que precisam de atenção.")
           .arg(unavailable + errors));
     } else {
-      _campaignStage->setText(QStringLiteral("Concluída"));
+      const QString title=allConfirmed?QStringLiteral("Prévias prontas"):
+          QStringLiteral("Prévias prontas · envios com pendências");
+      _campaignStage->setText(title);
       _campaignCurrent->setText(QStringLiteral(
-          "Todas as %1 prévias foram publicadas no Minute.").arg(ready));
+          "Todas as %1 prévias desta consulta estão disponíveis no Minute.").arg(ready)
+          +QStringLiteral("\n")+deliveryDetail);
+      setCampaignIndicator(title, _campaignCurrent->text(), allConfirmed?QStringLiteral("done"):QStringLiteral("error"));
       _campaignFeed->appendPlainText(QStringLiteral(
           "✓   Minute publicou todas as %1 prévias.").arg(ready));
-      setStatus(QStringLiteral("Campanha concluída: todas as prévias estão prontas no Minute."));
+      setStatus(title+QStringLiteral(". Confira o resultado da tentativa original e os recibos atuais no Histórico."));
     }
   });
 }
@@ -5475,6 +6018,7 @@ void MainWindow::loadAccounts() {
       actionsLayout->addWidget(reveal);
       actionsLayout->addWidget(remove);
       _accountsTable->setCellWidget(row, 3, actions);
+      _accountsTable->setColumnWidth(3, std::max(_accountsTable->columnWidth(3), actions->sizeHint().width() + 12));
       ++row;
     }
     setAccountTransferBusy(_accountTransferBusy);
@@ -5490,16 +6034,27 @@ QWidget* MainWindow::credentialCopyActions(const QString& email, bool hasPasswor
   layout->setSpacing(7);
   auto* copyEmail = new QPushButton(QStringLiteral("Copiar e-mail"), widget);
   auto* copyPassword = new QPushButton(QStringLiteral("Copiar senha"), widget);
+  auto* viewCredentials = new QPushButton(QStringLiteral("Ver acesso"), widget);
+  copyEmail->setObjectName(QStringLiteral("copyEmailButton"));
+  copyPassword->setObjectName(QStringLiteral("copyPasswordButton"));
+  viewCredentials->setObjectName(QStringLiteral("viewCredentialsButton"));
   copyEmail->setMinimumHeight(32);
   copyPassword->setMinimumHeight(32);
+  viewCredentials->setMinimumHeight(32);
   copyEmail->setAccessibleName(QStringLiteral("Copiar e-mail de %1").arg(email));
   copyPassword->setAccessibleName(QStringLiteral("Copiar senha de %1").arg(email));
+  viewCredentials->setAccessibleName(QStringLiteral("Ver e-mail e senha de %1").arg(email));
   copyPassword->setEnabled(hasPassword);
+  viewCredentials->setEnabled(hasPassword);
   copyPassword->setToolTip(hasPassword
       ? QStringLiteral("Copiar a senha salva sem exibi-la na tela.")
       : QStringLiteral("Esta conta não possui senha salva."));
+  viewCredentials->setToolTip(hasPassword
+      ? QStringLiteral("Mostrar o e-mail e a senha salva desta conta.")
+      : QStringLiteral("Esta conta não possui senha salva."));
   layout->addWidget(copyEmail);
   layout->addWidget(copyPassword);
+  layout->addWidget(viewCredentials);
   const auto feedback = [this](QPushButton* button, const QString& label, const QString& message) {
     button->setText(QStringLiteral("Copiado!"));
     setStatus(message);
@@ -5516,11 +6071,15 @@ QWidget* MainWindow::credentialCopyActions(const QString& email, bool hasPasswor
     _api.post(banned ? QStringLiteral("/api/accounts/banned/password")
                      : QStringLiteral("/api/accounts/password"),
               {{QStringLiteral("email"), email}},
-              [this, guard, feedback](bool ok, const QJsonDocument& doc, const QString&) {
+              [this, email, guard, feedback](bool ok, const QJsonDocument& doc, const QString&) {
       if (!guard) return;
       guard->setEnabled(true);
-      const QString password = doc.object().value(QStringLiteral("password")).toString();
-      if (!ok || password.isEmpty()) {
+      const auto record = doc.object();
+      const auto ownerValue = record.value(QStringLiteral("email"));
+      const QString savedEmail = ownerValue.toString().trimmed();
+      const QString password = record.value(QStringLiteral("password")).toString();
+      if (!ok || !ownerValue.isString() || savedEmail.isEmpty() || password.isEmpty()
+          || savedEmail.compare(email.trimmed(), Qt::CaseInsensitive) != 0) {
         guard->setText(QStringLiteral("Copiar senha"));
         setStatus(QStringLiteral("Não foi possível copiar a senha. Tente novamente."));
         return;
@@ -5529,7 +6088,72 @@ QWidget* MainWindow::credentialCopyActions(const QString& email, bool hasPasswor
       feedback(guard, QStringLiteral("Copiar senha"), QStringLiteral("Senha copiada."));
     });
   });
+  connect(viewCredentials, &QPushButton::clicked, widget, [this, email, banned, viewCredentials] {
+    viewCredentials->setEnabled(false);
+    viewCredentials->setText(QStringLiteral("Abrindo…"));
+    const QPointer<QPushButton> guard(viewCredentials);
+    _api.post(banned ? QStringLiteral("/api/accounts/banned/password")
+                     : QStringLiteral("/api/accounts/password"),
+              {{QStringLiteral("email"), email}},
+              [this, email, guard](bool ok, const QJsonDocument& doc, const QString&) {
+      if (!guard) return;
+      guard->setEnabled(true);
+      guard->setText(QStringLiteral("Ver acesso"));
+      const auto record = doc.object();
+      const QString savedEmail = record.value(QStringLiteral("email")).toString().trimmed();
+      const QString password = record.value(QStringLiteral("password")).toString();
+      if (!ok || password.isEmpty() || savedEmail.compare(email.trimmed(), Qt::CaseInsensitive) != 0) {
+        setStatus(QStringLiteral("Não foi possível consultar a senha salva desta conta."));
+        return;
+      }
+      showSavedAccountCredentials(savedEmail, password);
+    });
+  });
   return widget;
+}
+
+void MainWindow::showSavedAccountCredentials(const QString& email, const QString& password) {
+  auto* dialog = new QDialog(this);
+  dialog->setObjectName(QStringLiteral("savedAccountCredentialsDialog"));
+  dialog->setWindowTitle(QStringLiteral("Acesso salvo"));
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setWindowModality(Qt::WindowModal);
+  dialog->resize(540, 240);
+  auto* layout = new QVBoxLayout(dialog);
+  layout->setContentsMargins(24, 20, 24, 20);
+  layout->setSpacing(14);
+  auto* help = new QLabel(QStringLiteral("Você pode selecionar os campos para copiar."), dialog);
+  help->setWordWrap(true);
+  layout->addWidget(help);
+  auto* form = new QFormLayout;
+  form->setSpacing(12);
+  auto* emailField = new QLineEdit(email, dialog);
+  emailField->setObjectName(QStringLiteral("savedAccountEmail"));
+  emailField->setReadOnly(true);
+  emailField->setAccessibleName(QStringLiteral("E-mail salvo"));
+  auto* passwordField = new QLineEdit(password, dialog);
+  passwordField->setObjectName(QStringLiteral("savedAccountPassword"));
+  passwordField->setReadOnly(true);
+  passwordField->setEchoMode(QLineEdit::Normal);
+  passwordField->setAccessibleName(QStringLiteral("Senha salva"));
+  form->addRow(QStringLiteral("E-mail"), emailField);
+  form->addRow(QStringLiteral("Senha"), passwordField);
+  layout->addLayout(form);
+  auto* hidePassword = new QCheckBox(QStringLiteral("Ocultar senha"), dialog);
+  hidePassword->setObjectName(QStringLiteral("hideSavedAccountPassword"));
+  connect(hidePassword, &QCheckBox::toggled, passwordField, [passwordField](bool hide) {
+    passwordField->setEchoMode(hide ? QLineEdit::Password : QLineEdit::Normal);
+  });
+  layout->addWidget(hidePassword);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+  buttons->button(QDialogButtonBox::Close)->setText(QStringLiteral("Fechar"));
+  connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+  connect(dialog, &QDialog::finished, dialog, [emailField, passwordField] {
+    emailField->clear();
+    passwordField->clear();
+  });
+  layout->addWidget(buttons);
+  dialog->open();
 }
 
 void MainWindow::removeAccount(const QString& email, std::function<void()> onRemoved) {
@@ -6257,6 +6881,7 @@ void MainWindow::loadBalances() {
       });
       actionsLayout->addWidget(withdraw);
       _balancesTable->setCellWidget(row, 4, actions);
+      _balancesTable->setColumnWidth(4, std::max(_balancesTable->columnWidth(4), actions->sizeHint().width() + 12));
       ++row;
     }
     applyBalanceFilter();

@@ -13,7 +13,7 @@ from moneymin.web import server
 
 class CrowtadoCredentialTests(unittest.TestCase):
     def setUp(self):
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     def test_connecting_existing_identity_also_keeps_balance_password(self):
         with mock.patch.object(server, "login"), \
@@ -190,7 +190,7 @@ class CrowtadoCredentialTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(start.call_args.args[0], {'New@example.com': ' kept spaces '})
 
-    def test_invalid_legacy_line_does_not_hide_valid_credentials(self):
+    def test_unreadable_legacy_line_blocks_global_credentials_and_preserves_bytes(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             original = (b'\xef\xbb\xbf{"email":"first@example.com","senha":"first"}\n'
@@ -201,11 +201,16 @@ class CrowtadoCredentialTests(unittest.TestCase):
             with mock.patch.object(server.config, "DATA_DIR", root), \
                  mock.patch.object(server.config, "SECRETS_DIR", root), \
                  mock.patch.object(server, "CROWTADO_PW_PATH", root / "passwords.json"):
-                self.assertEqual(server._crowtado_creds(), {
-                    "first@example.com": "first", "last@example.com": "last"})
+                from moneymin.atomic_io import JsonStateError
+                with self.assertRaises(JsonStateError) as failure:
+                    server._crowtado_creds()
+                self.assertNotIn("first@example.com", str(failure.exception))
+                self.assertNotIn("bad@example.com", str(failure.exception))
+                self.assertNotIn("last@example.com", str(failure.exception))
+                self.assertNotIn(str(root), str(failure.exception))
             self.assertEqual(legacy.read_bytes(), original)
 
-    def test_explicit_saved_password_wins_and_case_variants_are_replaced(self):
+    def test_explicit_saved_password_wins_without_rewriting_legacy_plaintext(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); pw = root / 'passwords.json'
             (root / 'novas_contas_20260916.json').write_text(json.dumps([
@@ -216,7 +221,20 @@ class CrowtadoCredentialTests(unittest.TestCase):
                  mock.patch.object(server, 'CROWTADO_PW_PATH', pw):
                 self.assertEqual(server._crowtado_creds()['test@example.com'], 'current')
                 server._save_crowtado_cred(' Test@example.com ', 'replacement')
-                self.assertEqual(json.loads(pw.read_text()), {'test@example.com': 'replacement'})
+                self.assertEqual(server._crowtado_creds()['test@example.com'], 'replacement')
+                self.assertEqual(json.loads(pw.read_text()), {'TEST@example.com': 'current'})
+
+
+class ProtectedCredentialPersistenceTests(unittest.TestCase):
+    def test_new_save_does_not_create_legacy_password_mirror(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            legacy = root / "passwords.json"
+            with mock.patch.object(server.config, "SECRETS_DIR", root), \
+                 mock.patch.object(server, "CROWTADO_PW_PATH", legacy):
+                server._save_crowtado_cred("fixture@example.invalid", "fixture-secret")
+                self.assertEqual(server._crowtado_creds()["fixture@example.invalid"], "fixture-secret")
+            self.assertFalse(legacy.exists())
 
 
 if __name__ == "__main__":

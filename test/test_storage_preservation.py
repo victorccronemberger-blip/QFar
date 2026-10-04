@@ -33,7 +33,7 @@ class StoragePreservationTests(unittest.TestCase):
     def test_unreadable_vault_returns_actionable_json(self):
         with patch.object(server, "_migrate_legacy_integrations",
                           side_effect=secure_store.SecureStoreError("Cofre preservado.")):
-            response = server.create_app().test_client().get("/api/integrations")
+            response = server.create_app(for_testing=True).test_client().get("/api/integrations")
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["code"], "local_vault_unreadable")
 
@@ -42,7 +42,7 @@ class StoragePreservationTests(unittest.TestCase):
              patch.object(server, "_resolve_org", return_value=server.config.ORG_KEY), \
              patch.object(server, "_save_crowtado_cred", side_effect=ValueError("bad file")), \
              patch.object(server, "_set_account_removed") as restore:
-            response = server.create_app().test_client().post("/api/accounts", json={
+            response = server.create_app(for_testing=True).test_client().post("/api/accounts", json={
                 "email": "fixture@example.invalid", "password": "test-only"})
         self.assertEqual(response.status_code, 500)
         self.assertTrue(response.get_json()["partial"])

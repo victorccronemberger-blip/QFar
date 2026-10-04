@@ -231,7 +231,7 @@ class MailCleanupTests(unittest.TestCase):
         self.assertEqual(cleanup.snapshot()['state'], 'cancelled')
 
     def test_api_requires_confirmation_and_cannot_supply_destination_or_token(self):
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         with patch.object(c, 'CLEANUP', c.Cleanup()), patch.object(c.mail, 'configured_connections', return_value=[]):
             self.assertEqual(client.post('/api/mail-cleanup/apply', json={'uids': [1]}).status_code, 400)
             self.assertEqual(client.post('/api/mail-cleanup/preview', json={'profile_id': 'bad'}).status_code, 400)

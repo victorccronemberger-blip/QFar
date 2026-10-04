@@ -38,6 +38,9 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   // Operações de escrita podem incluir cadastro remoto e não são repetidas aqui.
   if (method == "GET")
     req.setTransferTimeout(path == QStringLiteral("/api/health") ? 3000 : 60000);
+  if (method == "POST" && (path == QStringLiteral("/api/accounts/password")
+                           || path == QStringLiteral("/api/accounts/banned/password")))
+    req.setTransferTimeout(60000);
   if (method == "POST" && path == QStringLiteral("/api/campaigns"))
     req.setTransferTimeout(60000);
   if (method == "POST" && path == QStringLiteral("/api/library/ego4d/index"))

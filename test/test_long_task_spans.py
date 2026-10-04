@@ -109,7 +109,7 @@ class LongTaskSpanTests(unittest.TestCase):
 
         self.assertEqual(spans, [])
 
-    def test_short_mode_keeps_strict_narration_gaps(self) -> None:
+    def test_one_minute_window_joins_proven_lines_up_to_three_minutes(self) -> None:
         spans = _activity_spans(
             self.rule,
             self.rows([0, 20, 40, 60, 80]),
@@ -119,7 +119,97 @@ class LongTaskSpanTests(unittest.TestCase):
             video_duration_s=120,
         )
 
+        self.assertEqual([(span["start"], span["end"]) for span in spans], [(0, 80)])
+
+    def test_silence_beyond_three_minutes_starts_another_take(self) -> None:
+        spans = _activity_spans(
+            self.rule,
+            self.rows([0, 30, 60, 250, 280, 310]),
+            min_s=60,
+            max_s=1800,
+            max_gap_s=15,
+            video_duration_s=400,
+        )
+
+        self.assertEqual(
+            [(span["start"], span["end"]) for span in spans],
+            [(0, 60), (250, 310)],
+        )
+
+    def test_camera_filler_between_proofs_does_not_erase_the_task(self) -> None:
+        rows = [(float(t), "looks around", "looks around", False, False)
+                for t in range(0, 91, 10)]
+        for time in (0, 90):
+            rows.append((float(time), "garden", "garden", True, False))
+        rows.sort(key=lambda row: row[0])
+
+        spans = _activity_spans(
+            self.rule, rows, min_s=60, max_s=1800, max_gap_s=15,
+            video_duration_s=120,
+        )
+
+        self.assertEqual([(span["start"], span["end"]) for span in spans], [(0, 90)])
+
+    def test_walking_with_a_few_task_mentions_is_not_gardening(self) -> None:
+        rows = []
+        for time in range(0, 91, 5):
+            if time in (0, 30, 60, 90):
+                rows.append((float(time), "garden", "garden", True, False))
+            else:
+                rows.append((float(time), "walks along", "walks along", False, False))
+
+        spans = _activity_spans(
+            self.rule, rows, min_s=60, max_s=1800, max_gap_s=15,
+            video_duration_s=120,
+        )
+
         self.assertEqual(spans, [])
+
+    def test_a_short_walk_between_proofs_stays_in_the_take(self) -> None:
+        rows = self.rows(list(range(0, 41, 10)) + list(range(60, 101, 10)))
+        rows.append((50.0, "walks to the shed", "walks to the shed", False, False))
+        rows.sort(key=lambda row: row[0])
+
+        spans = _activity_spans(
+            self.rule, rows, min_s=60, max_s=1800, max_gap_s=15,
+            video_duration_s=120,
+        )
+
+        self.assertEqual([(span["start"], span["end"]) for span in spans], [(0, 100)])
+
+    def test_failed_long_window_keeps_the_proven_core_and_the_later_take(self) -> None:
+        rows = self.rows(list(range(0, 81, 10)))
+        rows.extend((float(time), "plays basketball", "plays basketball", False, False)
+                    for time in range(90, 201, 10))
+        rows.extend(self.rows(list(range(210, 281, 10))))
+
+        spans = _activity_spans(
+            self.rule, rows, min_s=60, max_s=1800, max_gap_s=15,
+            video_duration_s=300,
+        )
+
+        self.assertEqual(
+            [(span["start"], span["end"]) for span in spans],
+            [(0, 80), (210, 280)],
+        )
+        self.assertTrue(all("basketball" not in span["action_text"] for span in spans))
+
+    def test_later_unrelated_narration_stays_outside_the_proven_take(self) -> None:
+        rows = self.rows([0, 30, 60, 90])
+        rows.extend((time, "plays basketball", "plays basketball", False, False)
+                    for time in range(200, 280, 20))
+
+        spans = _activity_spans(
+            self.rule,
+            rows,
+            min_s=60,
+            max_s=1800,
+            max_gap_s=15,
+            video_duration_s=400,
+        )
+
+        self.assertEqual([(span["start"], span["end"]) for span in spans], [(0, 90)])
+        self.assertNotIn("basketball", spans[0]["action_text"])
 
     def test_unsure_object_is_neutral_not_a_safety_boundary(self) -> None:
         prepared = prepare_span_events([

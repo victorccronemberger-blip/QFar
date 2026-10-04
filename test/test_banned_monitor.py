@@ -82,7 +82,7 @@ class BannedMonitorTests(unittest.TestCase):
              patch.object(server, 'ORG_MIGRATION', Mock(running=False)):
             (Path(tmp) / 'banned_accounts.json').write_text(json.dumps({'schema': 1, 'accounts': [
                 {'email': 'banned@example.com', 'password': 'private-password', 'banned_at': 'yesterday'}]}))
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             snapshot = client.get('/api/accounts/banned/monitor').get_json()
             self.assertNotIn('private-password', json.dumps(snapshot))
             self.assertTrue(snapshot['accounts'][0]['has_password'])
@@ -96,7 +96,7 @@ class BannedMonitorTests(unittest.TestCase):
              patch.object(server, 'ORG_MIGRATION', Mock(running=False)):
             (Path(tmp) / 'banned_accounts.json').write_text(json.dumps({'accounts': [
                 {'email': 'banned@example.com', 'password': 'private-password'}]}))
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             response = client.post('/api/accounts/banned/password', json={'email': 'BANNED@example.com'})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.get_json()['password'], 'private-password')
@@ -132,7 +132,7 @@ class BannedMonitorTests(unittest.TestCase):
                             'balance_status': 'ok', 'balance_stale': False,
                             'balance_updated_at': datetime.now(timezone.utc).isoformat(),
                             'balance': {'availableCents': 3000}}}]}))
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             snapshot = client.get('/api/accounts/banned/monitor').get_json()
             self.assertTrue(snapshot['accounts'][0]['withdraw_eligible'])
             self.assertNotIn('private-password', json.dumps(snapshot))
@@ -156,7 +156,7 @@ class BannedMonitorTests(unittest.TestCase):
                 'balance_updated_at': datetime.now(timezone.utc).isoformat(),
                 'balance': {'availableCents': 3000}}}
             path.write_text(json.dumps({'schema': 1, 'accounts': [row]}))
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             response = client.post('/api/accounts/banned/withdraw', json={'email': email})
             self.assertEqual(response.status_code, 400)
             withdraw.assert_not_called()

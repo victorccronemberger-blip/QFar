@@ -35,7 +35,7 @@ class CampaignHistoryIntegrityTests(unittest.TestCase):
             root = Path(directory)
             (root / "campaign_good.json").write_text(json.dumps({"items": [], "accounts": [], "status": "done"}))
             bad = root / "campaign_bad.json"
-            client = server.create_app().test_client()
+            client = server.create_app(for_testing=True).test_client()
             values = [[], {"items": None}, {"items": [None]},
                       {"items": [{"accounts": [None]}]},
                       {"items": [{"duration_ms": "nan"}]}, {"accounts": None}, {"issues": None}]
@@ -54,7 +54,7 @@ class CampaignHistoryIntegrityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(config, "DATA_DIR", Path(directory)):
             path = Path(directory) / "sent_videos.json"
             path.write_bytes(b"broken")
-            response = server.create_app().test_client().get("/api/sent")
+            response = server.create_app(for_testing=True).test_client().get("/api/sent")
             self.assertEqual(response.status_code, 409)
             self.assertIn("Registro de envios", response.get_json()["error"])
             self.assertEqual(path.read_bytes(), b"broken")

@@ -50,7 +50,7 @@ def sensors_ready(clip: dict[str, Any]) -> bool:
 
 
 def clip_ready(clip: dict[str, Any], work_dir: Path | None = None) -> bool:
-    from .campaign import _native_cache_key
+    from .campaign import _native_cache_guard, _native_cache_marker_matches
 
     source = source_path(clip)
     native = native_path(clip, work_dir)
@@ -59,9 +59,10 @@ def clip_ready(clip: dict[str, Any], work_dir: Path | None = None) -> bool:
                 or not native.is_file() or native.stat().st_size <= 1024 * 1024
                 or not sensors_ready(clip)):
             return False
-        marker = native.with_name(native.name + ".source.json")
-        return json.loads(marker.read_text(encoding="utf-8")) == _native_cache_key(
-            source, None, None)
+        with _native_cache_guard(native):
+            marker = native.with_name(native.name + ".source.json")
+            return _native_cache_marker_matches(
+                json.loads(marker.read_text(encoding="utf-8")), source, native, None, None)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
 

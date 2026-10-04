@@ -21,7 +21,7 @@ class BulkRegisterTests(unittest.TestCase):
         self.context.enter_context(patch.object(server, "_list_accounts", return_value=[]))
         self.context.enter_context(patch.object(server.identity, "gerar_identidade", return_value=self.identity))
         self.thread = self.context.enter_context(patch.object(server.threading, "Thread"))
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     def start(self, domain="example.invalid", count=1):
         return self.client.post("/api/accounts/bulk-register", json={"domain": domain, "count": count})

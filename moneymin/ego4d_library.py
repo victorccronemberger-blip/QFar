@@ -6,7 +6,7 @@ submit media, infer task approval, fabricate sensors, or download recordings.
 from __future__ import annotations
 
 import csv
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import math
@@ -61,14 +61,60 @@ def number(value):
         return None
 
 
+_CATALOG_SOURCES = ('ego4d.json', 'clips.csv', 'timed_narrations.jsonl')
+_SOURCE_BINDING_REVISION = 1
+
+
+def _source_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@contextmanager
+def _catalog_input_snapshot(directory: Path, output: Path):
+    """Parse only immutable, owned copies; never remove original inputs."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name('.' + output.name + '.' + uuid.uuid4().hex + '.inputs')
+    temporary.mkdir()
+    snapshots = {}
+    owned = []
+    try:
+        for name in _CATALOG_SOURCES:
+            source = directory / name
+            if name == 'timed_narrations.jsonl' and not source.exists():
+                continue
+            destination = temporary / name
+            owned.append(destination)
+            digest = hashlib.sha256()
+            size = 0
+            with source.open('rb') as incoming, destination.open('xb') as outgoing:
+                for chunk in iter(lambda: incoming.read(1024 * 1024), b''):
+                    outgoing.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            snapshots[name] = (destination, digest.hexdigest(), size)
+        yield snapshots
+    finally:
+        # This directory is uniquely created here. Clean only its three known
+        # files; no recursive deletion or glob over user-owned source files.
+        for path in owned:
+            path.unlink(missing_ok=True)
+        temporary.rmdir()
+
+
 def index_library(directory: Path, output: Path, progress=None) -> dict:
     directory, output = Path(directory), Path(output)
     if output.suffix != '.sqlite3':
         raise ValueError('O índice deve ser um arquivo .sqlite3 separado das fontes.')
-    metadata = directory / 'ego4d.json'
-    source_paths = (metadata, directory / 'clips.csv', directory / 'timed_narrations.jsonl')
-    stamps = {path.name: (path.stat().st_size, path.stat().st_mtime_ns)
-              for path in source_paths if path.exists()}
+    with _catalog_input_snapshot(directory, output) as snapshots:
+        return _index_library_snapshot(directory, output, snapshots, progress)
+
+
+def _index_library_snapshot(directory: Path, output: Path, snapshots: dict, progress=None) -> dict:
+    metadata = snapshots['ego4d.json'][0]
     if progress:
         progress('Lendo metadados originais…')
     source = json.loads(metadata.read_text(encoding='utf-8-sig'))
@@ -78,7 +124,8 @@ def index_library(directory: Path, output: Path, progress=None) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + '.' + uuid.uuid4().hex + '.tmp')
     report = {'videos': 0, 'clips': 0, 'annotations': 0, 'local_sensor_files': 0,
-              'issues': {}, 'offline': True, 'dataset_version': source.get('version')}
+              'issues': {}, 'offline': True, 'dataset_version': source.get('version'),
+              'source_binding_revision': _SOURCE_BINDING_REVISION}
 
     def issue(name):
         report['issues'][name] = report['issues'].get(name, 0) + 1
@@ -133,7 +180,7 @@ def index_library(directory: Path, output: Path, progress=None) -> dict:
                 db.execute('INSERT INTO scenario VALUES (?,?)', (uid, scenario))
                 db.execute('INSERT INTO search VALUES (?,?)', (uid, scenario))
             report['videos'] += 1
-        manifest = directory / 'clips.csv'
+        manifest = snapshots['clips.csv'][0]
         with manifest.open(encoding='utf-8-sig', newline='') as stream:
             for clip in csv.DictReader(stream):
                 uid, parent = clip.get('exported_clip_uid'), clip.get('parent_video_uid')
@@ -149,10 +196,10 @@ def index_library(directory: Path, output: Path, progress=None) -> dict:
                 db.execute('INSERT INTO clip VALUES (?,?,?,?,?,?,?)',
                            (uid, parent, start, end, duration, int(valid), json.dumps(clip)))
                 report['clips'] += 1
-        narrations = directory / 'timed_narrations.jsonl'
+        narrations = snapshots.get('timed_narrations.jsonl', (None,))[0]
         if progress:
             progress('Indexando atividades e anotações…')
-        if narrations.exists():
+        if narrations is not None:
             with narrations.open(encoding='utf-8-sig') as stream:
                 for line in stream:
                     if not line.strip():
@@ -170,19 +217,16 @@ def index_library(directory: Path, output: Path, progress=None) -> dict:
                         db.execute('INSERT INTO annotation VALUES (?,?,?)', (uid, when, text))
                         db.execute('INSERT INTO search VALUES (?,?)', (uid, text))
                         report['annotations'] += 1
-        for path in (metadata, manifest, narrations):
-            if path.exists():
-                digest = hashlib.sha256()
-                with path.open('rb') as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                        digest.update(chunk)
-                stamp = path.stat()
-                if stamps.get(path.name) != (stamp.st_size, stamp.st_mtime_ns):
-                    raise ValueError('Metadados mudaram durante a indexação; índice anterior preservado.')
-                db.execute('INSERT INTO source_file VALUES (?,?,?,?)',
-                           (path.name, digest.hexdigest(), stamp.st_size, stamp.st_mtime_ns))
-        if set(stamps) != {path.name for path in source_paths if path.exists()}:
+        if set(snapshots) != {name for name in _CATALOG_SOURCES if (directory / name).exists()}:
             raise ValueError('Fontes mudaram durante a indexação; índice anterior preservado.')
+        for name, (_snapshot, digest, size) in snapshots.items():
+            source = directory / name
+            stamp = source.stat()
+            if (not source.is_file() or stamp.st_size != size
+                    or _source_digest(source) != digest):
+                raise ValueError('Metadados mudaram durante a indexação; índice anterior preservado.')
+            db.execute('INSERT INTO source_file VALUES (?,?,?,?)',
+                       (name, digest, size, stamp.st_mtime_ns))
         db.execute('INSERT INTO index_report VALUES (?)', (json.dumps(report),))
         db.commit()
         db.close()
@@ -200,19 +244,6 @@ def library_summary(path: Path, directory: Path) -> dict:
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as db:
         if db.execute('PRAGMA user_version').fetchone()[0] != 2:
             return {'state': 'outdated', 'needs_index': True}
-        stale = False
-        stored = list(db.execute('SELECT name,bytes,mtime_ns FROM source_file'))
-        if not {'ego4d.json', 'clips.csv'}.issubset({row[0] for row in stored}):
-            raise ValueError('Índice sem proveniência das fontes obrigatórias.')
-        for name, size, mtime in stored:
-            if name not in {'ego4d.json', 'clips.csv', 'timed_narrations.jsonl'}:
-                raise ValueError('Proveniência do índice inválida.')
-            source = Path(directory) / name
-            if not source.is_file() or (source.stat().st_size, source.stat().st_mtime_ns) != (size, mtime):
-                stale = True
-        optional = Path(directory) / 'timed_narrations.jsonl'
-        if optional.exists() and optional.name not in {row[0] for row in stored}:
-            stale = True
         row = db.execute('SELECT json FROM index_report LIMIT 1').fetchone()
         if row is None:
             raise ValueError('Índice sem relatório de construção.')
@@ -220,6 +251,26 @@ def library_summary(path: Path, directory: Path) -> dict:
         if (not isinstance(report, dict) or any(type(report.get(key)) is not int
                 or report[key] < 0 for key in ('videos', 'clips', 'annotations'))):
             raise ValueError('Relatório de construção do índice inválido.')
+        # Schema2 alone cannot attest to immutable input parsing: historical
+        # producers reopened sources to hash them after populating the rows.
+        revision = report.get('source_binding_revision')
+        if type(revision) is not int or revision != _SOURCE_BINDING_REVISION:
+            return {'state': 'outdated', 'needs_index': True}
+        stale = False
+        stored = list(db.execute('SELECT name,bytes,mtime_ns,sha256 FROM source_file'))
+        if not {'ego4d.json', 'clips.csv'}.issubset({row[0] for row in stored}):
+            raise ValueError('Índice sem proveniência das fontes obrigatórias.')
+        for name, size, mtime, digest in stored:
+            if name not in {'ego4d.json', 'clips.csv', 'timed_narrations.jsonl'}:
+                raise ValueError('Proveniência do índice inválida.')
+            source = Path(directory) / name
+            if (not source.is_file()
+                    or (source.stat().st_size, source.stat().st_mtime_ns) != (size, mtime)
+                    or _source_digest(source) != digest):
+                stale = True
+        optional = Path(directory) / 'timed_narrations.jsonl'
+        if optional.exists() and optional.name not in {row[0] for row in stored}:
+            stale = True
         sensors = db.execute('SELECT SUM(has_imu=1),SUM(has_imu IS NULL) FROM video').fetchone()
         local_uids = {p.name.removesuffix('_imu.csv') for p in Path(directory).glob('*_imu.csv')}
         local_count = sum(uid in local_uids for (uid,) in db.execute('SELECT uid FROM video'))

@@ -95,6 +95,8 @@ class CampaignConfig:
     candidate_plan: dict[str, list[dict[str, Any]]] | None = None
     # Server-owned reservations: pending delivery is never a confirmed send.
     recovery_exclusions: dict[str, list[str]] = field(default_factory=dict)
+    # Server-owned opt-in plan; raw API data never constructs this descriptor.
+    original_capture_plan: Any | None = None
 
 
 @dataclass
@@ -104,19 +106,27 @@ class CampaignLog:
     items: list[dict[str, Any]] = field(default_factory=list)
     issues: list[dict[str, Any]] = field(default_factory=list)
     status: str = "running"
+    start_request_id: str | None = None
     _path: Path | None = field(default=None, init=False, repr=False)
 
     def add_item(self, item: dict[str, Any]) -> None:
         self.items.append(item)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "started_at": self.started_at,
             "accounts": self.accounts,
-            "items": self.items,
+            # Runtime lineage paths are private verification carriers. Public
+            # content_provenance/source_provenance contain only names/hashes.
+            "items": [{k: v for k, v in item.items()
+                       if k not in ("_content_inputs", "_content_candidate")}
+                      for item in self.items],
             "issues": self.issues,
             "status": self.status,
         }
+        if self.start_request_id is not None:
+            result['start_request_id'] = self.start_request_id
+        return result
 
     def save(self, path: Path | None = None) -> Path:
         destination = path or self._path
@@ -128,7 +138,7 @@ class CampaignLog:
         # (o motor os usa durante a campanha); só o JSON gravado é relativizado.
         payload["items"] = [
             {k: (_relpath(v) if k in _PATH_KEYS else v) for k, v in item.items()}
-            for item in self.items
+            for item in payload["items"]
         ]
         save_json(destination, payload)
         return destination

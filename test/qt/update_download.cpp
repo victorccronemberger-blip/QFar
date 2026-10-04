@@ -15,6 +15,8 @@ class UpdateManagerTests {
 public:
   static bool downloadFailure(bool breakOutput, bool validChecksum = false) {
     UpdateManager manager;
+    manager._version = QStringLiteral("2.0.27");
+    manager._repair = true;
     QTcpServer server;
     if (!server.listen(QHostAddress::LocalHost, 0)) return false;
     manager._packageUrl = QUrl(QStringLiteral("http://127.0.0.1:%1/package").arg(server.serverPort()));
@@ -52,6 +54,7 @@ public:
 
 int main(int argc, char** argv) {
   QCoreApplication app(argc, argv);
+  app.setApplicationVersion(QStringLiteral("2.0.27"));
   QTemporaryDir root;
   if (!root.isValid()) return 1;
   qputenv("TMP", root.path().toUtf8());

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from ..atomic_io import load_json, save_json
+from ..atomic_io import JsonStateError, load_json_state, save_json
 from ..org_policy import account_kind
 from .account_issues import account_issue
 
@@ -18,9 +18,15 @@ class OrgMigrationRunner:
         self.report_path = report_path
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
-        self._state = load_json(report_path, {})
-        if not isinstance(self._state, dict):
-            self._state = {}
+        try:
+            self._state = load_json_state(report_path, {})
+        except JsonStateError:
+            # Keep the desktop available for reviewing a damaged receipt,
+            # while refusing a new migration until it is explicitly repaired.
+            self._state = {"state": "needs_review", "total": 0, "completed": 0,
+                           "results": [], "counts": {}, "can_start": False,
+                           "error_code": "LOCAL_STATE_REVIEW_REQUIRED",
+                           "error": "Relatório local inválido ou ilegível; preserve o arquivo e restaure um backup válido."}
         if self._state.get("state") == "running":
             self._state["state"] = "interrupted"
 
@@ -37,6 +43,7 @@ class OrgMigrationRunner:
 
     def start(self, emails: list[str], migrate: Callable[[str], dict]) -> dict:
         with self._lock:
+            load_json_state(self.report_path, {})
             if self.running:
                 raise RuntimeError("Uma migração já está em andamento.")
             self._state = {

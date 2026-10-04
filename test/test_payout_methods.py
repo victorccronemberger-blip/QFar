@@ -57,7 +57,7 @@ class PayoutMethodTests(unittest.TestCase):
 
     def test_wise_cannot_be_prelinked_to_every_account(self):
         with patch.object(server.crowtado, "configurar_metodo_saque") as configure:
-            response = server.create_app().test_client().post(
+            response = server.create_app(for_testing=True).test_client().post(
                 "/api/balances/payout-methods/apply-all", json={"method": "wise"})
         self.assertEqual(response.status_code, 400)
         configure.assert_not_called()
@@ -319,7 +319,7 @@ class PayoutMethodTests(unittest.TestCase):
                  "crow@example.com": "pw", "claru@example.com": "pw", "orphan@example.com": "pw"}), \
              patch.object(server.threading, "Thread", ImmediateThread), \
              patch.object(server.crowtado, "configurar_metodo_saque") as configure:
-            response = server.create_app().test_client().post(
+            response = server.create_app(for_testing=True).test_client().post(
                 "/api/balances/payout-methods/apply-all", json={"method": "dots"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["total"], 1)

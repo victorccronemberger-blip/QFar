@@ -22,7 +22,7 @@ class IntegrationConcurrencyTests(unittest.TestCase):
             stored.clear()
             stored.update(copy.deepcopy(data))
 
-        app = server.create_app()
+        app = server.create_app(for_testing=True)
         def ego_request():
             with app.test_client() as client:
                 return client.put("/api/integrations/ego4d", json={

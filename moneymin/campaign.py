@@ -62,7 +62,7 @@ from .campaign_types import (
 )
 from .device_profile import DeviceProfile
 from .content_selection import diverse_order, diversity_summary, parent_key
-from .minute_api import AuthError, Session
+from .minute_api import AuthError, Session, validate_task_catalog
 from .sidecar import (
     build_frames_csv,
     build_frames_csv_from_video,
@@ -79,6 +79,7 @@ from .task_catalog import (
     TASK_TO_SCENARIO,
 )
 from .upload import UploadError, pump_pending, upload_session, list_sidecars, save_sidecar
+from .upload_types import journal_delivery_confirmed
 
 __all__ = [
     "AccountSpec",
@@ -308,92 +309,116 @@ def _normalize_video(src: Path, out_dir: Path, *,
                     start_s: float | None = None,
                     dur_s: float | None = None,
                     stem: str | None = None) -> Path:
-    """Reencoda para 1440x1080 yuv420p + handler Android VideoHandler.
+    """Prepare a bound cache without destroying the prior pair on failure.
 
-    `start_s`/`dur_s` cortam o vídeo-pai no mesmo passo (sem arquivo .cut).
+    Source windows and encoder parameters are unchanged. Publication is
+    serialized for cooperating threads; two-file crash atomicity and external
+    writers are not guaranteed. Legacy v4 caches migrate only after success.
     """
     ff = _ffmpeg_bin()
     out = out_dir / f"{stem or src.stem}_native.mp4"
     marker = out.with_name(out.name + ".source.json")
-    try:
-        cache_key = _native_cache_key(src, start_s, dur_s)
-    except OSError as exc:
-        raise RuntimeError(f"fonte Ego4D inacessível: {src}: {exc}") from exc
-    if out.exists():
-        # cache: o reencode é determinístico (depende só do src) — reutiliza se
-        # o arquivo existente for um vídeo válido; reencoda só se corrompido.
+    with _native_cache_guard(out):
         try:
-            saved_key = json.loads(marker.read_text(encoding="utf-8"))
-            probe = probe_video(out)
-            duration_ok = bool(probe.get("duration_ms"))
-            if dur_s is not None and duration_ok:
-                duration_ok = abs(
-                    int(probe["duration_ms"]) - round(float(dur_s) * 1000)
-                ) <= 1000
-            if saved_key == cache_key and duration_ok:
-                return out
-        except Exception:
-            pass
+            cache_key = _native_cache_key(src, start_s, dur_s)
+        except OSError as exc:
+            raise RuntimeError(f"fonte Ego4D inacessível: {src}: {exc}") from exc
+        if out.exists():
+            try:
+                saved = json.loads(marker.read_text(encoding="utf-8"))
+                if (_native_cache_marker_matches(saved, src, out, start_s, dur_s)
+                        and _native_cache_duration_ok(probe_video(out), dur_s)
+                        and _native_cache_marker_matches(saved, src, out, start_s, dur_s)):
+                    return out
+            except (OSError, ValueError, TypeError, RuntimeError):
+                pass
+        tmp = marker_tmp = None
+        backups: dict[Path, Path | None] = {}
+        published = False
+        restoration_failed = False
         try:
-            out.unlink()
-        except OSError:
-            pass
-        marker.unlink(missing_ok=True)
-    cmd = [*_ffmpeg_head(ff)]
-    # Seek híbrido: -ss no input (rápido) + -ss no output (alinha ao IMU).
-    # Só -ss antes de -i pega keyframe anterior e o catbear vê vídeo ≠ sensor.
-    if start_s is not None and float(start_s) > 0.05:
-        pre = max(0.0, float(start_s) - 2.0)
-        skip = float(start_s) - pre
-        cmd += ["-ss", f"{pre:.3f}", "-i", str(src), "-ss", f"{skip:.3f}"]
-    else:
-        cmd += ["-i", str(src)]
-        if start_s is not None and float(start_s) > 0:
-            cmd += ["-ss", f"{float(start_s):.3f}"]
-    if dur_s is not None:
-        cmd += ["-t", f"{float(dur_s):.3f}"]
-    tmp = out.with_name(f"{out.stem}.tmp.mp4")
-    if tmp.exists():
-        tmp.unlink()
-    input_args = cmd
-    common_args = _native_container_args(tmp)
-
-    use_nvenc = _use_nvenc(ff)
-    cmd = [*input_args, *_native_video_codec_args(nvenc=use_nvenc), *common_args]
-    # O filtro ainda usa CPU, mas NVENC precisa de só dois slots. Isso deixa o
-    # restante da máquina livre para I/O, sidecar e uploads já em andamento.
-    slots = min(2, ACCOUNT_ENCODE_WORKERS) if use_nvenc else ACCOUNT_ENCODE_WORKERS
-    with _cpu_slots(slots):
-        res = _ffmpeg_run(cmd)
-
-    # Encoder anunciado mas indisponível (driver/sessões GPU): refaz em CPU.
-    # A campanha continua funcional mesmo após atualização de driver ou troca
-    # de máquina, sem aceitar um MP4 parcial como cache válido.
-    if res.returncode != 0 and use_nvenc:
-        if tmp.exists():
-            tmp.unlink()
-        cmd = [*input_args, *_native_video_codec_args(nvenc=False), *common_args]
-        with _cpu_slots(ACCOUNT_ENCODE_WORKERS):
-            res = _ffmpeg_run(cmd)
-    if res.returncode != 0:
-        if tmp.exists():
-            tmp.unlink()
-        raise RuntimeError(f"falha ao normalizar vídeo: {res.stderr.strip()[:400]}")
-    if not probe_video(tmp).get("duration_ms"):
-        size = tmp.stat().st_size if tmp.exists() else 0
-        if tmp.exists():
-            tmp.unlink()
-        raise RuntimeError(
-            f"normalize gerou vídeo sem duração (size={size})")
-    tmp.replace(out)
-    marker_tmp = marker.with_name(marker.name + ".tmp")
-    marker_tmp.write_text(
-        json.dumps(cache_key, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    marker_tmp.replace(marker)
-    return out
-
+            cmd = [*_ffmpeg_head(ff)]
+            # Seek híbrido: -ss no input (rápido) + -ss no output (alinha ao IMU).
+            # Só -ss antes de -i pega keyframe anterior e o catbear vê vídeo ≠ sensor.
+            if start_s is not None and float(start_s) > 0.05:
+                pre = max(0.0, float(start_s) - 2.0)
+                skip = float(start_s) - pre
+                cmd += ["-ss", f"{pre:.3f}", "-i", str(src), "-ss", f"{skip:.3f}"]
+            else:
+                cmd += ["-i", str(src)]
+                if start_s is not None and float(start_s) > 0:
+                    cmd += ["-ss", f"{float(start_s):.3f}"]
+            if dur_s is not None:
+                cmd += ["-t", f"{float(dur_s):.3f}"]
+            tmp = _native_cache_temp(out, ".tmp.mp4")
+            input_args = cmd
+            common_args = _native_container_args(tmp)
+            use_nvenc = _use_nvenc(ff)
+            cmd = [*input_args, *_native_video_codec_args(nvenc=use_nvenc), *common_args]
+            slots = min(2, ACCOUNT_ENCODE_WORKERS) if use_nvenc else ACCOUNT_ENCODE_WORKERS
+            with _cpu_slots(slots):
+                res = _ffmpeg_run(cmd)
+            if res.returncode != 0 and use_nvenc:
+                tmp.unlink(missing_ok=True)
+                cmd = [*input_args, *_native_video_codec_args(nvenc=False), *common_args]
+                with _cpu_slots(ACCOUNT_ENCODE_WORKERS):
+                    res = _ffmpeg_run(cmd)
+            if res.returncode != 0:
+                raise RuntimeError(f"falha ao normalizar vídeo: {res.stderr.strip()[:400]}")
+            if not _native_cache_duration_ok(probe_video(tmp), dur_s):
+                raise RuntimeError("normalize gerou vídeo com duração inválida")
+            prepared_size, prepared_hash = _native_cache_fingerprint(tmp)
+            if _native_cache_key(src, start_s, dur_s) != cache_key:
+                raise RuntimeError("fonte alterada durante normalização")
+            saved = {**cache_key, "prepared_size": prepared_size,
+                     "prepared_sha256": prepared_hash}
+            serialized = json.dumps(saved, sort_keys=True, separators=(",", ":"))
+            marker_tmp = _native_cache_temp(marker, ".tmp")
+            marker_tmp.write_text(serialized, encoding="utf-8")
+            if json.loads(marker_tmp.read_text(encoding="utf-8")) != saved:
+                raise RuntimeError("marcador de cache não corresponde ao candidato")
+            if (_native_cache_key(src, start_s, dur_s) != cache_key
+                    or _native_cache_fingerprint(tmp) != (prepared_size, prepared_hash)):
+                raise RuntimeError("fonte ou candidato alterado antes de publicação")
+            # Hardlinks preserve exact old bytes without copying a large MP4.
+            # Failure creating either backup happens before any publication.
+            for path in (out, marker):
+                backups[path] = _native_cache_backup(path)
+            if _native_cache_key(src, start_s, dur_s) != cache_key:
+                raise RuntimeError("fonte alterada antes de publicação")
+            tmp.replace(out)
+            published = True
+            marker_tmp.replace(marker)
+            return out
+        except BaseException as exc:
+            if published:
+                try:
+                    for path in (out, marker):
+                        backup = backups[path]
+                        if backup is None:
+                            path.unlink(missing_ok=True)
+                        elif (not path.exists()
+                              or _native_cache_fingerprint(path, allow_empty=True)
+                              != _native_cache_fingerprint(backup, allow_empty=True)):
+                            os.replace(backup, path)
+                except (OSError, RuntimeError):
+                    restoration_failed = True
+                    exc.add_note("cache rollback incomplete; rollback files retained")
+            raise
+        finally:
+            for path in (tmp, marker_tmp):
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            if not restoration_failed:
+                for backup in backups.values():
+                    if backup is not None:
+                        try:
+                            backup.unlink(missing_ok=True)
+                        except OSError:
+                            pass
 
 def _ffmpeg_bin() -> str:
     return ffmpeg_bin()
@@ -487,21 +512,65 @@ def _ego_clip_inputs(
                 "s3_path": s3_path,
             })
             return row, video
-    return ego4d.find_clip(str(clip_info.get("clip_uid") or ""))
+    clip, video = ego4d.find_clip(str(clip_info.get("clip_uid") or ""))
+    if clip is not None and clip_info.get("selection_evidence") is not None:
+        clip = dict(clip)
+        clip["selection_evidence"] = clip_info["selection_evidence"]
+    return clip, video
 
 
-_NATIVE_CACHE_VERSION = 4
+# v4 stat-only markers cannot prove source/output bytes. They are not reused;
+# failed migration preserves the old pair, successful preparation publishes v5.
+_NATIVE_CACHE_VERSION = 5
+_NATIVE_CACHE_LOCKS: dict[str, Any] = {}
+_NATIVE_CACHE_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _native_cache_guard(native: Path) -> Iterator[None]:
+    """Serialize cooperating threads, including reclaim read/match/delete.
+
+    This is a process-local guard, not a cross-process lock or a crash journal.
+    """
+    key = os.path.normcase(str(Path(native).resolve()))
+    with _NATIVE_CACHE_LOCKS_GUARD:
+        lock = _NATIVE_CACHE_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
+
+
+def _native_cache_fingerprint(path: Path, *, allow_empty: bool = False) -> tuple[int, str]:
+    """Hash actual bytes, rejecting observed replacement/change while reading."""
+    def identity(info: Any) -> tuple[int, int, int, int]:
+        # Windows fstat/stat ctime semantics differ; compare file ID and mtime.
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    digest = hashlib.sha256()
+    size = 0
+    with Path(path).open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+        after = os.fstat(handle.fileno())
+    if ((size == 0 and not allow_empty) or size != before.st_size or identity(before) != identity(after)
+            or identity(after) != identity(Path(path).stat())):
+        raise RuntimeError("arquivo de cache vazio ou alterado durante leitura")
+    return size, digest.hexdigest()
 
 
 def _native_cache_key(
     src: Path, start_s: float | None, dur_s: float | None,
 ) -> dict[str, Any]:
-    """Identidade do `_native.mp4`: mesma janela e mesma fonte do encode."""
+    """Same source bytes and unchanged source-window/encoder identity."""
     source_stat = src.stat()
+    size, digest = _native_cache_fingerprint(src)
+    if source_stat.st_size != size or source_stat.st_mtime_ns != src.stat().st_mtime_ns:
+        raise RuntimeError("fonte alterada durante identificação")
     return {
         "version": _NATIVE_CACHE_VERSION,
-        "source_size": source_stat.st_size,
+        "source_size": size,
         "source_mtime_ns": source_stat.st_mtime_ns,
+        "source_sha256": digest,
         "start_s": None if start_s is None else round(float(start_s), 6),
         "dur_s": None if dur_s is None else round(float(dur_s), 6),
         "width": 1440,
@@ -509,6 +578,53 @@ def _native_cache_key(
         "fps": 30,
     }
 
+
+def _native_cache_marker(
+    src: Path, native: Path, start_s: float | None, dur_s: float | None,
+) -> dict[str, Any]:
+    """Describe current bytes explicitly; does not establish media provenance."""
+    with _native_cache_guard(native):
+        key = _native_cache_key(src, start_s, dur_s)
+        size, digest = _native_cache_fingerprint(native)
+        if _native_cache_key(src, start_s, dur_s) != key:
+            raise RuntimeError("fonte alterada durante validação de cache")
+        return {**key, "prepared_size": size, "prepared_sha256": digest}
+
+
+def _native_cache_marker_matches(
+    saved: Any, src: Path, native: Path,
+    start_s: float | None, dur_s: float | None,
+) -> bool:
+    """Fail closed on v4, malformed markers or changed source/output bytes."""
+    try:
+        expected = _native_cache_marker(src, native, start_s, dur_s)
+        return (type(saved) is dict and saved == expected
+                and all(type(saved[key]) is type(value) for key, value in expected.items()))
+    except (OSError, ValueError, TypeError, RuntimeError, KeyError):
+        return False
+
+
+def _native_cache_duration_ok(probe: dict[str, Any], dur_s: float | None) -> bool:
+    value = probe.get("duration_ms")
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        return False
+    return dur_s is None or abs(value - round(float(dur_s) * 1000)) <= 1000
+
+
+def _native_cache_temp(path: Path, suffix: str) -> Path:
+    candidate = path.with_name(path.name + "." + uuid.uuid4().hex + suffix)
+    # Exclusive creation: never delete a temporary path belonging to a peer.
+    with candidate.open("xb"):
+        pass
+    return candidate
+
+
+def _native_cache_backup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    backup = path.with_name(path.name + "." + uuid.uuid4().hex + ".rollback")
+    os.link(path, backup)
+    return backup
 
 def _ego_prepare_plan(clip: dict[str, Any]) -> dict[str, Any]:
     """Janela e caminhos que `prepare_clip` grava em disco.
@@ -574,8 +690,8 @@ def ego_clip_cache_state(
         if source_ok and native.is_file() and native.stat().st_size > 1024 * 1024:
             marker = native.with_name(native.name + ".source.json")
             saved = json.loads(marker.read_text(encoding="utf-8"))
-            native_ok = saved == _native_cache_key(
-                source, plan["norm_start"], plan["dur_s"])
+            native_ok = _native_cache_marker_matches(
+                saved, source, native, plan["norm_start"], plan["dur_s"])
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         source_ok = imu_ok = native_ok = False
     try:
@@ -598,6 +714,10 @@ def prepare_clip(
     allow_download: bool = True,
 ) -> dict[str, Any]:
     """Baixa clipe + IMU real, normaliza o vídeo e monta o sidecar. (sem upload)"""
+    from . import content_provenance
+    selection_evidence = clip.get("selection_evidence")
+    if selection_evidence is not None:
+        selection_evidence = ego4d.revalidate_selection_evidence(clip)
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     if not isinstance(clip.get("parent_video_uid"), str) or not clip["parent_video_uid"].strip():
@@ -633,6 +753,7 @@ def prepare_clip(
         raise RuntimeError(
             f"clipe {clip_uid} sem IMU real — não enviar (coerência sensor falharia)."
             f" Escolha um clipe com has_imu=true.")
+    original_imu_binding = content_provenance.fingerprint(imu_path)
     _progress("imu_preflight")
     ego4d.build_imu_csv(
         imu_path, window_s, duration_ms=dur_ms, validate_only=True)
@@ -651,6 +772,7 @@ def prepare_clip(
             ego4d.download_clip(source, source_video_path)
     elif allow_download:
         ego4d.download_clip(clip, source_video_path)
+    original_video_binding = content_provenance.fingerprint(source_video_path)
     _progress("encode")
     native = _normalize_video(
         source_video_path, work_dir,
@@ -677,8 +799,24 @@ def prepare_clip(
     n_samples = max(
         1, int(dur_ms / 1000 * config.ANDROID_IMU_SAMPLE_RATE_HZ) + 1)
     frames_csv = _frames_csv(dur_ms, fps=(probe.get("fps") or 30.0))
+    content_provenance.verify_input(original_imu_binding)
+    content_provenance.verify_input(original_video_binding)
+    lineage = content_provenance.prepare_content_provenance(
+        source_video_path, imu_path, native, imu_csv, frames_csv,
+        clip_uid=clip_uid, parent_video_uid=parent_uid,
+        media_uid=str(clip.get("media_uid") or clip_uid), window_s=window_s,
+        # The raw exported clip may already begin at a nonzero canonical
+        # time. Record the actual declared source→window mapping used here.
+        media_offset_s=window_s[0] - float(plan["norm_start"] or 0.0),
+        normalization_start_s=plan["norm_start"], selection_evidence=selection_evidence)
+    n_samples = lineage["derived_diagnostics"]["output"]["sample_count"]
 
     return {
+        **lineage,
+        # Runtime-only selection carrier keeps source location for fresh
+        # validation. History serialization excludes this private structure.
+        "_content_candidate": dict(clip),
+        "task_name_authoritative": (selection_evidence or {}).get("task", {}).get("name"),
         "clip_uid": clip_uid,
         "video_path": str(native),
         "duration_ms": dur_ms,
@@ -694,6 +832,7 @@ def prepare_clip(
         # Local audit/history only. Never relabel third-party footage as a
         # newly captured recording or claim the output grid as the native rate.
         "source_provenance": {
+            **lineage["content_provenance"],
             "dataset": "ego4d", "recording_origin": "third_party_dataset",
             "parent_video_uid": parent_uid, "clip_uid": clip_uid,
             "parent_identity_verified": video.get("video_uid") == parent_uid,
@@ -1052,6 +1191,8 @@ def _build_sidecar(item: dict[str, Any], session_id: str, log_id: str,
         frames_gop=profile.frames_gop,
         device_meta=profile.sidecar_device_meta(),
         platform_meta=profile.sidecar_platform_meta(),
+        **({"derived_diagnostics": item["derived_diagnostics"]}
+           if item.get("source") == "ego4d" and "derived_diagnostics" in item else {}),
     )
 
 
@@ -1364,10 +1505,15 @@ def _within(path: Path, root: Path) -> bool:
         return False
 
 
+from .media_lifecycle import cleanup_operation
+
+
+@cleanup_operation
 def _delete_media_files(
     paths: list[Path],
     *,
     allowed_roots: tuple[Path, ...],
+    protection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Remove somente arquivos validados dentro dos diretórios de mídia.
 
@@ -1375,6 +1521,11 @@ def _delete_media_files(
     Falha de limpeza nunca transforma um upload confirmado em falha.
     """
     roots = tuple(root.resolve() for root in allowed_roots)
+    if protection is None:
+        from .recovery import media_cleanup_protection
+        protection = media_cleanup_protection()
+    protected_keys = {os.path.normcase(str(Path(p).resolve())) for p in protection['paths']}
+    protected_hashes = protection['sha256']
     unique: dict[str, Path] = {}
     skipped = 0
     for raw in paths:
@@ -1387,6 +1538,17 @@ def _delete_media_files(
         if not any(_within(resolved, root) for root in roots):
             skipped += 1
             continue
+        if os.path.normcase(str(resolved)) in protected_keys:
+            skipped += 1
+            continue
+        if protected_hashes and resolved.is_file():
+            try:
+                if _native_cache_fingerprint(resolved, allow_empty=True)[1] in protected_hashes:
+                    skipped += 1
+                    continue
+            except (OSError,RuntimeError,ValueError):
+                skipped += 1
+                continue
         unique[os.path.normcase(str(resolved))] = candidate
 
     removed = freed = 0
@@ -1545,11 +1707,14 @@ def _cleanup_uploaded_item(
     return result
 
 
+@cleanup_operation
 def cleanup_media_cache(work_dir: Path | None = None, *, provider: str = "all") -> dict[str, Any]:
     """Limpa downloads/derivados, preservando catálogos e estado da campanha."""
     if provider not in {"all", "ego4d", "holoassist"}:
         raise ValueError("provedor inválido (ego4d|holoassist|all)")
     work = Path(work_dir or config.MEDIA_DATA_DIR / "ego4d")
+    from .recovery import media_cleanup_protection
+    protection = media_cleanup_protection()  # Validate before deleting one file.
     candidates: list[Path] = []
     if work.is_dir():
         for path in work.iterdir():
@@ -1577,10 +1742,43 @@ def cleanup_media_cache(work_dir: Path | None = None, *, provider: str = "all") 
             path for path in recordings.rglob("*")
             if path.is_file() or path.is_symlink()
         )
-    return _delete_media_files(
-        candidates,
+    # A filename/extension is not proof that a manually supplied file belongs
+    # to this cache. Only a content-bound prepared-cache marker permits manual
+    # cleanup; ambiguous legacy downloads/sensors remain for explicit review.
+    owned = []
+    for path in candidates:
+        if path.suffix.lower() != '.mp4' or path.is_symlink():
+            continue
+        marker = path.with_name(path.name + '.source.json')
+        try:
+            saved = json.loads(marker.read_text(encoding='utf8'))
+            if (type(saved) is not dict or type(saved.get('version')) is not int
+                    or saved['version'] != _NATIVE_CACHE_VERSION
+                    or not isinstance(saved.get('source_sha256'),str)
+                    or not re.fullmatch('[0-9a-f]{64}',saved['source_sha256'])
+                    or type(saved.get('prepared_size')) is not int
+                    or saved['prepared_size'] != path.stat().st_size
+                    or saved.get('prepared_sha256') != _native_cache_fingerprint(path)[1]):
+                continue
+        except (OSError,ValueError,RuntimeError):
+            continue
+        if os.path.normcase(str(path.resolve())) in {os.path.normcase(str(p)) for p in protection['paths']}:
+            continue
+        if saved['prepared_sha256'] in protection['sha256']:
+            continue
+        owned.extend([path,marker])
+        # Delete only owned companions; arbitrary .part/tmp/CSV names do not
+        # establish ownership or link a file to the admitted cache entry.
+        ok = path.with_name(path.name + '.ok')
+        if ok.is_file() and not ok.is_symlink():
+            owned.append(ok)
+    result = _delete_media_files(
+        owned,
         allowed_roots=(work, recordings),
+        protection=protection,
     )
+    result['preserved_unowned'] = len(candidates)-len([p for p in owned if p.suffix.lower()=='.mp4'])
+    return result
 
 
 def _all_pending_uploads_succeeded(
@@ -1662,20 +1860,34 @@ def _legacy_upload_contexts(wanted: set[tuple[str, str]], journals: list[dict] |
 
 def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
                        item: dict[str, Any], task_id: str) -> dict[str, Any] | None:
-    groups: dict[str, dict[int, dict[str, Any]]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
+
+    def owned(row):
+        email = row.get("account_email")
+        return (isinstance(email, str) and email.strip().casefold() == account.email.strip().casefold()
+                and row.get("org_key") == account.org_key)
+
     for row in rows:
-        if (str(row.get("account_email", "")).casefold() != account.email.casefold()
-                or row.get("org_key") != account.org_key or not row.get("session_id")
-                or type(row.get("chunk_index")) is not int):
+        sid = row.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            if owned(row) and row.get("task_id") == task_id:
+                return {"email": account.email, "ok": False, "finalized": False,
+                        "error": "Registro de envio anterior com identidade inválida; preserve os arquivos para revisão."}
             continue
-        groups.setdefault(row["session_id"], {})[row["chunk_index"]] = row
+        # Keep all rows of a session, including malformed or foreign chunks.
+        # A filtered subset must not become evidence of a complete receipt.
+        groups.setdefault(sid, []).append(row)
     matched = None
     for sid, chunks in groups.items():
-        first = next(iter(chunks.values()))
+        first = next((row for row in chunks if owned(row)), None)
+        if first is None:
+            continue
         if sent_registry.recovery_was_reset(sid, ""):
             continue
         context = first.get("campaign_context") or _legacy_upload_context(sid, account.email)
-        if not isinstance(context, dict) or not context.get("registry_key") or not context.get("clip_uid"):
+        if (not isinstance(context, dict)
+                or any(not isinstance(context.get(key), str) or not context[key]
+                       for key in ("registry_key", "clip_uid"))):
             if first.get("task_id") == task_id:
                 matched = {"email": account.email, "ok": False, "session_id": sid,
                            "error": "Envio anterior sem identificação do clipe; confira a sessão antes de reenviar."}
@@ -1683,20 +1895,42 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
         same = context["clip_uid"] == item.get("clip_uid") and first.get("task_id") == task_id
         key = item.get("registry_key") if same else context["registry_key"]
         expected = first.get("expected_chunk_count", 1)
-        complete = (type(expected) is int and expected > 0 and set(chunks) == set(range(expected))
-                    and all(row.get("finalized") is True and row.get("state") == "done"
+        indices = [row.get("chunk_index") for row in chunks]
+        complete = (re.fullmatch(r"[A-Za-z0-9_-]{1,160}", sid) is not None
+                    and type(expected) is int and expected > 0 and len(chunks) == expected
+                    and all(type(index) is int and index >= 0 for index in indices)
+                    and set(indices) == set(range(expected))
+                    and all(owned(row) and journal_delivery_confirmed(row)
+                            and type(row.get("expected_chunk_count", 1)) is int
                             and row.get("expected_chunk_count", 1) == expected
+                            and row.get("task_id") == first.get("task_id")
                             and row.get("campaign_context") == first.get("campaign_context")
-                            for row in chunks.values()))
+                            for row in chunks))
         if complete and sent_registry.recovery_was_reset(sid, context["registry_key"], context.get("history_name", "")):
+            continue
+        if complete and all(row.get("campaign_reconciled") is True for row in chunks):
             continue
         if complete:
             sent_registry.mark_sent(key or context["registry_key"], context["clip_uid"], account.email)
             _acknowledge_campaign_upload(sid)
         if same and (matched is None or not complete):
             matched = {"email": account.email, "ok": complete, "finalized": complete,
+                       "org_key": account.org_key,
                        "session_id": sid, "recovered": complete,
                        "error": None if complete else "Envio anterior ainda pendente; nova sessão não criada."}
+            if context.get('content_provenance') is not None:
+                from .content_provenance import canonical_digest
+                lineage=context['content_provenance']
+                if (not isinstance(lineage,dict) or lineage.get('session_id')!=sid
+                        or lineage.get('task_id')!=first.get('task_id') or lineage.get('org_key')!=account.org_key
+                        or lineage.get('delivery_binding_sha256') != canonical_digest({
+                            k:v for k,v in lineage.items() if k!='delivery_binding_sha256'})):
+                    raise ValueError('Vínculo de conteúdo da retomada inválido; preserve os registros.')
+                # Keep the immutable planning descriptor and expose receipt
+                # confirmation separately. Updating its flag would invalidate
+                # its original digest or turn a plan into evidence of delivery.
+                matched['content_provenance']=json.loads(json.dumps(lineage,allow_nan=False))
+                matched['content_receipt_confirmed']=complete
     return matched
 
 
@@ -1722,6 +1956,25 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                       error="Ego4D sem sensores reais confirmados no preparo; envio bloqueado.")
         return result
     try:
+        if item.get("source") == "ego4d":
+            from . import content_provenance
+            try:
+                if not item.get("imu_csv") or not item.get("frames_csv"):
+                    raise ValueError("Ego4D sem CSV medido completo; envio bloqueado sem substituição sintética.")
+                result["source_provenance"] = content_provenance.revalidate_content_provenance(item)
+                if not isinstance(item.get("_content_candidate"), dict):
+                    raise ValueError(content_provenance.INTEGRITY_ERROR)
+                candidate = dict(item["_content_candidate"])
+                candidate["selection_evidence"] = item["content_provenance"]["selection_evidence"]
+                result["selection_evidence"] = ego4d.revalidate_selection_evidence(
+                    candidate, task_name=item.get("task_name_authoritative"),
+                    task_id=task_id, registry_key=item.get("registry_key"))
+                # Required native event observations are not derivable from
+                # offline bucket-resampled source CSV. Block before any Auth,
+                # pending-journal pump or newly assigned device/session clock.
+                content_provenance.require_dataset_native_delivery_support(item["derived_diagnostics"])
+            except ValueError as exc:
+                raise UploadError(str(exc), transient=False, phase="prepare") from exc
         if (org_policy.account_kind(account.email) == "crowtado"
                 and account.org_key != config.ORG_KEY):
             raise AuthError(
@@ -1748,14 +2001,19 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         if recover_pending and not getattr(sess, "_moneymin_pending_pumped", False):
             recovered = pump_pending(
                 sess, account_email=account.email, required_org_key=account.org_key,
+                on_progress=on_progress,
             )
             sess._moneymin_pending_pumped = True
             if recovered:
                 result["recovered_uploads"] = len(recovered)
         else:
             recovered = []
-        journals = [row for row in list_sidecars() if not row.get("campaign_reconciled")] if recover_pending else []
-        reconciliation = _reconcile_uploads([*recovered, *journals], account, item, task_id) if recover_pending else None
+        journals = list_sidecars() if recover_pending else []
+        # pump_pending returns journals that the next disk read usually also
+        # contains. Remove only identical overlap between those two sources;
+        # conflicting duplicates within persisted data must remain detectable.
+        reconciliation_rows = [*journals, *(row for row in recovered if row not in journals)]
+        reconciliation = _reconcile_uploads(reconciliation_rows, account, item, task_id) if recover_pending else None
         if reconciliation is not None:
             return reconciliation
         policy_limits = (
@@ -1799,13 +2057,23 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         # frames.csv SEMPRE derivado do MP4 REAL (PTS/keyframes) + offset do
         # uptime Android do 1º frame. Nunca reusar o CSV preparado com relógio
         # em zero (desync: o metadata usa firstFrameSensorTimestampNs = uptime).
-        frames_csv = build_frames_csv_from_video(
-            video_path, duration_ms=int(item["duration_ms"]),
-            fps=fps, gop=profile.frames_gop, offset_ns=frames_offset)
+        try:
+            frames_csv = build_frames_csv_from_video(
+                video_path, duration_ms=int(item["duration_ms"]),
+                fps=fps, gop=profile.frames_gop, offset_ns=frames_offset,
+                **({"require_measured_pts": True}
+                   if item.get("source") == "ego4d" else {}))
+        except ValueError as exc:
+            if item.get("source") != "ego4d":
+                raise
+            raise UploadError(
+                'Vídeo sem PTS medidos; preparo interrompido.',
+                transient=False, phase='prepare') from exc
         plan = _chunk_plan(int(item["duration_ms"]), limits=policy_limits)
         chunk_paths: list[Path] = []
         chunk_zips: list[bytes] = []
         chunk_recorded: list[str] = []
+        lineage_chunks: list[dict[str, Any]] = []
         for index, (start_ms, dur_ms) in enumerate(plan):
             log_id = f"{session_id}_{index}"
             rec_at = recorded_at
@@ -1821,12 +2089,21 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 _cut_video_chunk(
                     video_path, part, start_ms / 1000.0, dur_ms / 1000.0)
                 part_imu, n_imu = _slice_imu_csv(imu_csv, start_ms, dur_ms)
-                part_frames = build_frames_csv_from_video(
-                    part, duration_ms=dur_ms, fps=fps,
-                    gop=profile.frames_gop,
-                    offset_ns=profile.uptime_ns_at(
-                        device_profile.recorded_at_to_wall_ms(rec_at)
-                        or start_wall or int(time.time() * 1000)))
+                try:
+                    part_frames = build_frames_csv_from_video(
+                        part, duration_ms=dur_ms, fps=fps,
+                        gop=profile.frames_gop,
+                        offset_ns=profile.uptime_ns_at(
+                            device_profile.recorded_at_to_wall_ms(rec_at)
+                            or start_wall or int(time.time() * 1000)),
+                        **({"require_measured_pts": True}
+                           if item.get("source") == "ego4d" else {}))
+                except ValueError as exc:
+                    if item.get("source") != "ego4d":
+                        raise
+                    raise UploadError(
+                        'Vídeo sem PTS medidos; preparo interrompido.',
+                        transient=False, phase='prepare') from exc
             part_probe = probe_video(part) if len(plan) > 1 else video_probe
             chunk_item = dict(item)
             if len(plan) > 1:
@@ -1838,7 +2115,17 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 duration_ms=dur_ms))
             chunk_paths.append(part)
             chunk_recorded.append(rec_at)
+            if item.get("source") == "ego4d":
+                lineage_chunks.append({"index": index, "start_ms": start_ms, "duration_ms": dur_ms,
+                    "video_path": str(part), "imu_csv": part_imu, "frames_csv": part_frames,
+                    "sidecar_bytes": chunk_zips[-1], "recorded_at": rec_at})
         result["session_id"] = session_id
+        if item.get("source") == "ego4d":
+            try:
+                result["source_provenance"] = content_provenance.bind_content_delivery(
+                    item, session_id, task_id, account.org_key, lineage_chunks)
+            except ValueError as exc:
+                raise UploadError(str(exc), transient=False, phase="prepare") from exc
         res = upload_session(
             sess, chunk_paths if len(chunk_paths) > 1 else chunk_paths[0],
             account.org_key,
@@ -1851,10 +2138,16 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             evaluate=evaluate, finalize=finalize,
             timeout_blob=timeout_blob,
             profile=profile,
-            suppress_per_chunk_catbear=len(chunk_paths) > 1,
+            suppress_per_chunk_catbear=True,
             on_progress=on_progress,
             campaign_context={"registry_key": item["registry_key"], "clip_uid": item["clip_uid"],
-                              "task_id": task_id} if item.get("registry_key") and item.get("clip_uid") else None,
+                              "task_id": task_id,
+                              **({"content_provenance": result["source_provenance"]}
+                                 if item.get("source") == "ego4d" else {})}
+                              if item.get("registry_key") and item.get("clip_uid") else None,
+            **({"expected_video_sha256": [row["video"]["sha256"]
+                                           for row in result["source_provenance"]["chunks"]]}
+               if item.get("source") == "ego4d" else {}),
         )
         result["session_id"] = res.session_id
         result["finalized"] = res.finalized
@@ -1923,6 +2216,9 @@ def run_campaign(
     should_stop: Callable[[], bool] | None = None,
 ) -> CampaignLog:
     """Executa e persiste o ciclo completo, inclusive em falhas inesperadas."""
+    if config.original_capture_plan is not None:
+        from .original_capture import run_original_capture_campaign
+        return run_original_capture_campaign(config, log, progress=progress, should_stop=should_stop)
     emails = [account.email.strip().casefold() for account in config.accounts]
     if not emails or any(not email for email in emails) or len(set(emails)) != len(emails):
         raise ValueError("Selecione contas válidas, sem duplicatas.")
@@ -1930,12 +2226,22 @@ def run_campaign(
         raise ValueError("Selecione ao menos uma categoria.")
     log = log or CampaignLog(started_at=_recorded_at_now(),
                              accounts=[a.email for a in config.accounts])
+    log.start_request_id = config.start_request_id
     log.save()
     prefetch = _ClipPrefetch(Path(config.work_dir))
     try:
         return _run_campaign(config, log, progress=progress,
                              should_stop=should_stop, prefetch=prefetch)
     except Exception as exc:
+        # The runner can restore confirmed progress after an observer fails.
+        # Keep the original exception/type and immutable attempt; this private
+        # reference is never inferred from server JSON or exposed in the API.
+        try:
+            exc._moneymin_campaign_log = log
+        except Exception:
+            # A custom exception may forbid private attributes. Recording
+            # progress is best effort and must preserve the original failure.
+            pass
         log.status = "error"
         log.issues.append({"kind": "campaign_error", "error": f"{type(exc).__name__}: {exc}"})
         try:
@@ -2406,6 +2712,7 @@ def _run_campaign(
             item["clip_uid"] = clip_info["clip_uid"]
             item["task_id"] = tsk.task_id
             item["task_name"] = display_name
+            item["task_name_authoritative"] = tsk.task_name
             item["task_scenario"] = tsk.scenario
             item["registry_key"] = registry_key
             item["dedup_clip_uids"] = list(clip_info.get("dedup_clip_uids") or [])
@@ -2988,11 +3295,10 @@ def _rank_seed_path() -> Path:
 
 
 @lru_cache(maxsize=1)
-def _load_rank_seed() -> dict[str, tuple[dict[str, Any], ...]] | None:
+def _rank_seed_bytes_cached(raw: bytes | None) -> dict[str, tuple[dict[str, Any], ...]] | None:
     """Carrega IDs e janelas; o arquivo não contém mídia, segredo ou narração."""
-    path = _rank_seed_path()
     try:
-        payload = json.loads(gzip.decompress(path.read_bytes()))
+        payload = json.loads(gzip.decompress(raw)) if raw is not None else {}
     except (OSError, ValueError, TypeError, gzip.BadGzipFile):
         return None
     if payload.get("schema") != 1 or not isinstance(payload.get("tasks"), dict):
@@ -3021,9 +3327,17 @@ def _load_rank_seed() -> dict[str, tuple[dict[str, Any], ...]] | None:
     return result
 
 
-@lru_cache(maxsize=1)
+def _load_rank_seed() -> dict[str, tuple[dict[str, Any], ...]] | None:
+    return _rank_seed_bytes_cached(ego4d._selection_source(_rank_seed_path())[0])
+
+
+_load_rank_seed.cache_clear = _rank_seed_bytes_cached.cache_clear
+
+
+@ego4d.selection_boundary
 def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
-    """Assinatura portátil dos arquivos que alimentam o ranking."""
+    """Content of the exact bound parser inputs; once per operation boundary."""
+    ego4d._selection_rank_seed(_rank_seed_path())
     files = (
         config.MEDIA_DATA_DIR / "ego4d" / "ego4d.json",
         config.MEDIA_DATA_DIR / "ego4d" / "clips.csv",
@@ -3042,17 +3356,25 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
             # Testes, instalações portáteis e DATA_DIR externo podem ficar fora
             # do checkout; o nome lógico ainda produz uma assinatura estável.
             relative = path.name
-        if not path.exists():
-            stamp.append((relative, 0, "missing"))
-            continue
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        stamp.append((relative, path.stat().st_size, digest.hexdigest()))
-    # Versão da união narração + clipe oficial. Invalida caches do recorte antigo.
-    stamp.append(("ranked-union", 6, "prepared-index-duration-filter"))
+        source = ego4d._selection_source(path)
+        stamp.append((relative, source[1], source[2]))
+    # v7 migrates stat-only approvals: old disk caches are recomputed suggestions.
+    stamp.append(("ranked-union", 7, "parsed-content-selection-evidence"))
     return tuple(stamp)
+
+
+def _rank_stamp_clear() -> None:
+    # The stamp itself is no longer memoized without its content-bound key.
+    pass
+
+
+_rank_cache_stamp.cache_clear = _rank_stamp_clear
+
+
+@ego4d.selection_boundary
+def _rank_evidenced(buckets):
+    return {name: tuple(ego4d.attach_selection_evidence(clip, name) for clip in clips)
+            for name, clips in buckets.items()}
 
 
 def _clip_window(clip: dict[str, Any]) -> tuple[float, float] | None:
@@ -3260,6 +3582,7 @@ def _merge_rank_seed(
     return result
 
 
+@ego4d.selection_boundary
 def _load_rank_cache(
     path: Path | None = None,
 ) -> dict[str, tuple[dict[str, Any], ...]] | None:
@@ -3267,46 +3590,56 @@ def _load_rank_cache(
     if not path.exists():
         return None
     try:
-        import pickle
-        stamp, buckets = pickle.loads(path.read_bytes())
+        # Legacy pickle caches are discarded, never executed during migration.
+        payload = json.loads(path.read_bytes())
+        if payload.get("schema") != 2:
+            return None
+        stamp, buckets = payload["stamp"], payload["buckets"]
+        stamp = tuple(tuple(item) for item in stamp)
     except Exception:  # noqa: BLE001 — cache corrompido = recompute
         return None
     if stamp != _rank_cache_stamp() or not isinstance(buckets, dict):
         return None
+    if any(not isinstance(name, str) or not isinstance(items, list)
+           or any(not isinstance(item, dict) for item in items)
+           for name, items in buckets.items()):
+        return None
     return {name: tuple(items) for name, items in buckets.items()}
 
 
+@ego4d.selection_boundary
 def _save_rank_cache(
     buckets: dict[str, tuple[dict[str, Any], ...]],
     path: Path | None = None,
 ) -> None:
     try:
-        import pickle
-        payload = pickle.dumps(
-            (_rank_cache_stamp(),
-             {name: list(items) for name, items in buckets.items()}),
-            protocol=4,
-        )
+        payload = json.dumps({"schema": 2, "stamp": _rank_cache_stamp(),
+                              "buckets": _rank_evidenced(buckets)},
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
         path = path or _rank_cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(payload)
-        tmp.replace(path)
+        tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            with tmp.open("xb") as handle:
+                handle.write(payload)
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
     except OSError:
         pass
 
 
 @lru_cache(maxsize=1)
-def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
+def _ranked_pools_snapshot(stamp) -> dict[str, tuple[dict[str, Any], ...]]:
     cached = _load_rank_cache()
     if cached is not None:
-        return _merge_rank_seed(cached)
+        return _rank_evidenced(_merge_rank_seed(cached))
     seed = _load_rank_seed()
     if seed and any(seed.values()):
         # The release already includes the verified full-range index. Rebuilding
         # millions of annotations on a cold customer installation blocks every
         # category query for minutes. Offline rebuilds belong to the seed tool.
-        result = _merge_rank_seed({})
+        result = _rank_evidenced(_merge_rank_seed({}))
         _save_rank_cache(result)
         return result
     spans = ego4d.rank_all_task_spans(min_dur_s=60, max_dur_s=1800) if ego4d.has_timed_narrations() else {}
@@ -3315,9 +3648,17 @@ def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
         ego4d.narration_evidence_clips(min_dur_s=60, max_dur_s=1800) if ego4d.has_timed_narrations() else {})
     buckets = _union_ranked_clips(
         _union_ranked_clips(spans, official), evidenced)
-    result = _merge_rank_seed(buckets)
+    result = _rank_evidenced(_merge_rank_seed(buckets))
     _save_rank_cache(result)
     return result
+
+
+@ego4d.selection_boundary
+def _ranked_pools_cached() -> dict[str, tuple[dict[str, Any], ...]]:
+    return _ranked_pools_snapshot(_rank_cache_stamp())
+
+
+_ranked_pools_cached.cache_clear = _ranked_pools_snapshot.cache_clear
 
 
 _RANK_INPUT_SIGNATURE = None
@@ -3334,11 +3675,8 @@ def _refresh_rank_inputs() -> None:
     )
     signature = []
     for path in paths:
-        try:
-            stat = path.stat()
-            signature.append((str(path), stat.st_mtime_ns, stat.st_size))
-        except OSError:
-            signature.append((str(path), None, None))
+        source = ego4d._selection_source(path)
+        signature.append((str(path), source[1], source[2]))
     signature = tuple(signature)
     if signature == _RANK_INPUT_SIGNATURE:
         return
@@ -3350,6 +3688,7 @@ def _refresh_rank_inputs() -> None:
     _RANK_INPUT_SIGNATURE = signature
 
 
+@ego4d.selection_boundary
 def _ranked_pools() -> dict[str, tuple[dict[str, Any], ...]]:
     """Todas as tasks de uma vez. Cache em disco para o GET /api/tasks não congelar a UI."""
     with _RANK_LOCK:
@@ -3358,7 +3697,7 @@ def _ranked_pools() -> dict[str, tuple[dict[str, Any], ...]]:
 
 
 @lru_cache(maxsize=8)
-def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
+def _duration_ranked_snapshot(stamp, min_dur_s: float, max_dur_s: float):
     """Filter the prepared index; a duration change must not rebuild Ego4D."""
     cache_key = hashlib.sha256(
         f"{float(min_dur_s):.6f}|{float(max_dur_s):.6f}".encode("ascii")
@@ -3366,15 +3705,24 @@ def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
     path = config.DATA_DIR / f"task_rank_cache_{cache_key}.pkl"
     cached = _load_rank_cache(path)
     if cached is not None:
-        return _merge_rank_seed(
-            cached, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+        return _rank_evidenced(_merge_rank_seed(
+            cached, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
     result = {
         name: tuple(clip for clip in rows
                     if min_dur_s <= float(clip.get("dur_s") or 0) <= max_dur_s)
         for name, rows in _ranked_pools_cached().items()
     }
+    result = _rank_evidenced(result)
     _save_rank_cache(result, path)
     return result
+
+
+@ego4d.selection_boundary
+def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
+    return _duration_ranked_snapshot(_rank_cache_stamp(), min_dur_s, max_dur_s)
+
+
+_duration_ranked_pools.cache_clear = _duration_ranked_snapshot.cache_clear
 
 
 def _compatible_task_clips(
@@ -3449,6 +3797,7 @@ def warm_task_catalog() -> None:
     _ranked_pools()
 
 
+@ego4d.selection_boundary
 def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                     max_dur_s: float = 1800,
                     include_unavailable: bool = False,
@@ -3474,6 +3823,7 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
         tasks = sess.all_tasks(org_key)
     else:
         tasks = remote_tasks
+    tasks = validate_task_catalog(tasks)
     mode = normalize_content_mode(content_mode)
     ready_by_uid: dict[str, bool] = {}
 

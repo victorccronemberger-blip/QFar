@@ -1,44 +1,28 @@
 """
-device_profile.py — Identidade de APARELHO por conta (anti-colusão).
+device_profile.py — Modelo histórico de perfil persistente por conta.
 
-A réplica replica o app ANDROID 1.22.0 (com.bakerdata.minute) em um Samsung
-Galaxy S21–S24. Antes, todas as contas reportavam o MESMO aparelho único:
-uptime congelado, calibração idêntica, `device={"model":"SM-S918B"}` em todo
-upload e nenhum `X-Device-Id`. N contas com o mesmo relógio congelado é a
-assinatura de colusão mais barata de detectar.
+O módulo deriva identidade, modelo, relógio e parâmetros de câmera a partir
+de configuração, catálogo e e-mail. Esses valores não são uma aquisição de
+Android ID, Build.MODEL, SystemClock ou calibração de um aparelho físico.
+Os nomes de campos seguem referências anteriores do cliente Android; isso
+não comprova equivalência com o APK 1.28.0 nem aceitação pelo provedor.
 
-Aqui cada conta ganha um perfil de aparelho PRÓPRIO e persistente (Samsung):
-
-  - device_id       — `android.ssaid:{ANDROID_ID}` → header `X-Device-Id`
-                      exato do app (getAndroidId, 16 hex; fallback é
-                      `android_no_ssaid`).
-  - device_model    — Build.MODEL real do aparelho sorteado (im.',
-                      `SM-S918B` = Galaxy S23 Ultra).
-  - os_version      — release do Android (ex.: "14") e sdk_int (ex.: 34)
-                      usados no metadata.json, UA e /app/opened.
-  - boot_wall_ms    — último boot do aparelho; `uptime_ns_at()` devolve o
-                      `SystemClock.elapsedRealtimeNanos` DERIVADO do momento
-                      real (recorded_at), nunca uma constante. "Reboota"
-                      sozinho após 21 dias.
-  - calib           — intrinsics ultra-wide SAMSUNG preservados (fx/fy/cx/cy
-                      no sensor nativo 4032x3024 + Brown-Conrady k1 k2 k3
-                      p1 p2 + rolling shutter) com jitter determinístico POR
-                      CONTA (celulares diferentes, mesmo chip).
-  - frames_gop      — GOP do frames.csv (28-32; ~1 keyframe/s a 30 fps).
-  - video_bitrate_mbps — bitrate real lido do MP4 da conta (7.4-8.8 Mbps).
-
-Estado persistido em `data/device_state/<email>.json` (gitignored). O perfil é
-PURE FUNCTION do e-mail (sem relógio na criação): mesmo perdendo o arquivo de
-estado, a conta recria o MESMO aparelho — fixado, sem rotacionar. Somente o
-"reboot" de 21d é dinâmico (e é persistido). Perfis legados são migrados
-automaticamente para um Samsung novo na 1ª leitura.
-Somente stdlib.
+Estado em `data/device_state/device_<SHA256 do proprietário>.json` (gitignored),
+com migração que preserva os bytes e o arquivo legado. Estado ilegível ou de
+outro proprietário exige revisão; não autoriza recriar a identidade.
+O relógio de boot e o jitter de calibração são calculados pelo próprio
+programa. Sua substituição por aquisição real exige um adaptador com
+proveniência de dispositivo e captura, conforme o roadmap de engenharia.
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import os
 import random
+import re
+import tempfile
 import threading
 import time
 import uuid
@@ -47,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from . import config, device_catalog
+from .atomic_io import save_json
+from .token_store import email_key as _account_email_key
 
 # Uptime plausível de um Android usado no dia a dia: mínimo 6h (logo após boot)
 # e máximo 21 dias (todo celular reinicia de quando em quando).
@@ -78,21 +64,170 @@ DEVICE_POOL: list[tuple[str, str, int, tuple[tuple[str, int], ...]]] = (
     _device_pool_from_catalog())
 
 _cache: dict[str, DeviceProfile] = {}
-_cache_lock = threading.Lock()
+_cache_lock = threading.RLock()
+_CANONICAL_PROFILE = re.compile(r"device_[0-9a-f]{64}\.json")
+_PROFILE_ERROR = (
+    "O perfil local de dispositivo está inválido ou possui proprietário "
+    "conflitante. Preserve os arquivos e revise o estado salvo."
+)
+
+
+class DeviceProfileError(ValueError):
+    """Unreadable or conflicting saved state never becomes another account."""
+
+
+def _email_key(email: object) -> str:
+    try:
+        return _account_email_key(email)
+    except ValueError:
+        raise DeviceProfileError(_PROFILE_ERROR) from None
 
 
 def _state_dir() -> Path:
     d = config.DATA_DIR / "device_state"
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise DeviceProfileError(_PROFILE_ERROR) from None
     return d
 
 
 def _profile_path(email: str) -> Path:
-    if (not email or email != email.strip()
-            or any(ord(ch) < 32 or ch in '<>:"/\\|?*' for ch in email)):
-        raise ValueError("email inválido para perfil de dispositivo")
-    safe = email.replace("@", "_at_").replace(".", "_")
-    return _state_dir() / f"device_{safe}.json"
+    key = _email_key(email)
+    return _state_dir() / ("device_" + hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
+
+
+def _legacy_profile_path(email: str) -> Path:
+    key = _email_key(email)
+    return _state_dir() / ("device_" + key.replace("@", "_at_").replace(".", "_") + ".json")
+
+
+def _present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _validated_profile(document: Any, email: object | None = None) -> DeviceProfile:
+    if not isinstance(document, dict):
+        raise DeviceProfileError(_PROFILE_ERROR) from None
+    key = _email_key(document.get("email"))
+    if email is not None and key != _email_key(email):
+        raise DeviceProfileError(_PROFILE_ERROR) from None
+    profile = DeviceProfile.from_dict(document)
+    # Preserve the established compatible format, without deriving replacement
+    # identity, calibration, timestamps or capture provenance from bad state.
+    if (not isinstance(profile.device_id, str)
+            or not profile.device_id.startswith("android.ssaid:")
+            or not profile.device_id[len("android.ssaid:"):]
+            or not isinstance(profile.calib, dict)
+            or not isinstance(profile.calib.get("distortion_model"), str)
+            or not profile.calib["distortion_model"]):
+        raise DeviceProfileError(_PROFILE_ERROR) from None
+    profile._bound_owner = key
+    return profile
+
+
+def _equivalent_profiles(left: DeviceProfile, right: DeviceProfile) -> bool:
+    first, second = left.to_dict(), right.to_dict()
+    first["email"], second["email"] = _email_key(left.email), _email_key(right.email)
+    return first == second
+
+
+def _decode_profile(payload: bytes) -> Any:
+    """Reject ambiguous/nonfinite saved JSON without rewriting its raw bytes."""
+    def unique_keys(pairs):
+        document = {}
+        for name, value in pairs:
+            if name in document:
+                raise DeviceProfileError(_PROFILE_ERROR)
+            document[name] = value
+        return document
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise DeviceProfileError(_PROFILE_ERROR)
+        return number
+
+    def invalid_constant(_value):
+        raise DeviceProfileError(_PROFILE_ERROR)
+
+    return json.loads(payload.decode("utf-8-sig"), object_pairs_hook=unique_keys,
+                      parse_float=finite_float, parse_constant=invalid_constant)
+
+
+def _read_profile(path: Path, email: object | None = None) -> tuple[DeviceProfile, bytes]:
+    try:
+        if path.is_symlink():
+            raise DeviceProfileError(_PROFILE_ERROR)
+        payload = path.read_bytes()
+        document = _decode_profile(payload)
+        profile = _validated_profile(document, email)
+        if (_CANONICAL_PROFILE.fullmatch(path.name)
+                and path.name != _profile_path(profile.email).name):
+            raise DeviceProfileError(_PROFILE_ERROR)
+        return profile, payload
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        raise DeviceProfileError(_PROFILE_ERROR) from None
+
+
+def _publish_exclusive(path: Path, payload: bytes, expected: DeviceProfile) -> None:
+    """Publish only an absent primary; preserve exact migration source bytes."""
+    temporary = None
+    try:
+        copied = _validated_profile(_decode_profile(payload), expected.email)
+        if not _equivalent_profiles(copied, expected):
+            raise DeviceProfileError(_PROFILE_ERROR)
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.",
+                                         suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            # Another creator/migration owns the destination. Never replace it.
+            current, _ = _read_profile(path, expected.email)
+            if not _equivalent_profiles(current, expected):
+                raise DeviceProfileError(_PROFILE_ERROR)
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        raise DeviceProfileError(_PROFILE_ERROR) from None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                raise DeviceProfileError(_PROFILE_ERROR) from None
+
+
+def _load_profile(email: object, *, migrate: bool) -> DeviceProfile | None:
+    """A primary is authoritative; legacy candidates must prove one owner."""
+    key = _email_key(email)
+    primary = _profile_path(key)
+    if _present(primary):
+        return _read_profile(primary, key)[0]
+    legacy = _legacy_profile_path(key)
+    candidates: list[tuple[DeviceProfile, bytes]] = []
+    if _present(legacy):
+        candidates.append(_read_profile(legacy, key))
+    for path in sorted(primary.parent.glob("device_*.json")):
+        if path == legacy or _CANONICAL_PROFILE.fullmatch(path.name):
+            continue
+        try:
+            profile, payload = _read_profile(path)
+        except DeviceProfileError:
+            continue
+        if _email_key(profile.email) == key:
+            candidates.append((profile, payload))
+    if not candidates:
+        return None
+    profile, payload = candidates[0]
+    if any(not _equivalent_profiles(other, profile) for other, _ in candidates[1:]):
+        raise DeviceProfileError(_PROFILE_ERROR) from None
+    if migrate:
+        _publish_exclusive(primary, payload, profile)
+        return _read_profile(primary, key)[0]
+    return profile
 
 
 def _load_calibration_base() -> dict[str, Any]:
@@ -259,12 +394,26 @@ class DeviceProfile:
         return cls(**known)
 
     def _persist(self) -> None:
-        try:
-            _profile_path(self.email).write_text(
-                json.dumps(self.to_dict(), indent=2, ensure_ascii=False),
-                encoding="utf-8")
-        except OSError:
-            pass  # melhor esforço — o perfil segue vivo em memória
+        with _cache_lock:
+            try:
+                key = _email_key(self.email)
+                if getattr(self, "_bound_owner", key) != key:
+                    raise DeviceProfileError(_PROFILE_ERROR)
+                candidate = _validated_profile(self.to_dict(), self.email)
+                payload = json.dumps(candidate.to_dict(), indent=2, ensure_ascii=False,
+                                     allow_nan=False).encode("utf-8")
+                roundtrip = _validated_profile(_decode_profile(payload), self.email)
+                if not _equivalent_profiles(roundtrip, candidate):
+                    raise DeviceProfileError(_PROFILE_ERROR)
+                path = _profile_path(self.email)
+                if _present(path):
+                    _read_profile(path, self.email)
+                    save_json(path, candidate.to_dict())
+                else:
+                    _publish_exclusive(path, payload, candidate)
+                self._bound_owner = key
+            except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+                raise DeviceProfileError(_PROFILE_ERROR) from None
 
     # --- tempo --------------------------------------------------------------
     def uptime_ns_at(self, wall_ms: int) -> int:
@@ -297,8 +446,11 @@ class DeviceProfile:
         return config.USER_AGENT
 
     def location_header_value(self) -> str | None:
-        """Valor EXATO do `formatDeviceLocationHeader` do bundle:
-        `<lat 6 casas>,<lon 6 casas>,<accuracy arredondada>,<isMock>`."""
+        """Serialização legada de coordenadas configuradas.
+
+        Não comprova origem GPS, precisão medida ou o sinal de mock. O quarto
+        campo fixo deste modelo ainda requer substituição por amostra real.
+        """
         lat = getattr(self, "latitude", None)
         lng = getattr(self, "longitude", None)
         if lat is None:
@@ -326,11 +478,11 @@ class DeviceProfile:
         return f"{lat:.6f},{lng:.6f},{round(accuracy)},false"
 
     def headers(self, *, include_location: bool = True) -> dict[str, str]:
-        """Headers de identidade que o app Android 1.22.0 envia.
+        """Headers derivados do perfil local histórico.
 
-        `include_location=False` é usado para rotas sem gate geográfico — o app
-        só envia `X-Device-Location` nas rotas de quota/elegibilidade geo
-        (DETALHAMENTO §2.1), nunca em TODA chamada.
+        `include_location` controla apenas a emissão local. O APK 1.28.0
+        chama deviceLocationHeaders também em createUpload e SAS; o filtro
+        do cliente e a origem da amostra são pendências separadas.
         """
         out = {
             "X-App-Version": config.APP_VERSION,
@@ -391,40 +543,24 @@ def get_profile(email: str, first_use_ms: int | None = None) -> DeviceProfile:
     ex.: o instante de registro da conta (mtime do token). Sem ele, cai na
     referência do 1º lote (18/08).
 
-    Perfis legados são substituídos por um Samsung novo na 1ª leitura — a
-    identidade de aparelho rotaciona UMA vez na migração.
+    Perfis compatíveis legados conservam identidade e bytes na migração.
+    Estado existente incompatível, ilegível ou de outro proprietário bloqueia
+    a leitura. O gerador histórico só é usado quando não há estado da conta.
     """
+    key = _email_key(email)
     with _cache_lock:
-        cached = _cache.get(email)
-    if cached is not None:
-        return cached
-
-    path = _profile_path(email)
-    profile: DeviceProfile | None = None
-    if path.exists():
-        try:
-            candidate = DeviceProfile.from_dict(
-                json.loads(path.read_text(encoding="utf-8")))
-            if (not candidate.device_id
-                    or not candidate.device_id.startswith("android.ssaid:")
-                    or not isinstance(candidate.calib, dict)
-                    or not candidate.calib.get("distortion_model")):
-                profile = None  # perfil legado/inválido — recria como Android
-            else:
-                # O nome do arquivo é a fonte de verdade. Um estado copiado de
-                # outra conta não pode continuar escrevendo no caminho alheio.
-                candidate.email = email
-                profile = candidate
-        except (json.JSONDecodeError, ValueError, TypeError):
-            profile = None
-
-    if profile is None:
-        profile = _create_profile(email, first_use_ms=first_use_ms)
-        profile._persist()
-
-    with _cache_lock:
-        _cache[email] = profile
-    return profile
+        profile = _load_profile(key, migrate=True)
+        if profile is None:
+            profile = _create_profile(key, first_use_ms=first_use_ms)
+            profile._persist()
+        cached = _cache.get(key)
+        # Revalidate persisted ownership before returning a cache hit. Runtime
+        # attributes remain on the cached object when the saved state agrees.
+        if (cached is not None and _email_key(cached.email) == key
+                and _equivalent_profiles(cached, profile)):
+            return cached
+        _cache[key] = profile
+        return profile
 
 
 # Referência do 1º lote de contas (batch de 18/08). O "primeiro uso" virtual
@@ -515,13 +651,13 @@ def repair_future_timestamps(
 
 
 def profile_age_days(email: str) -> float:
-    """Idade do perfil da conta em dias (0 se não existe)."""
-    path = _profile_path(email)
-    if not path.exists():
-        return 0.0
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        created = int(data.get("created_wall_ms") or 0)
-        return max(0.0, (_wall_ms_now() - created) / 86_400_000)
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return 0.0
+    """Idade de estado do proprietário; leitura não cria nem migra arquivo."""
+    with _cache_lock:
+        profile = _load_profile(email, migrate=False)
+        if profile is None:
+            return 0.0
+        try:
+            created = int(profile.created_wall_ms or 0)
+            return max(0.0, (_wall_ms_now() - created) / 86_400_000)
+        except (TypeError, ValueError):
+            raise DeviceProfileError(_PROFILE_ERROR) from None

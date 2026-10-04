@@ -33,9 +33,9 @@ class CampaignOrgGuardTests(unittest.TestCase):
              mock.patch.object(server, "_list_accounts", return_value=[
                  {"email": "good@example.com"}, {"email": "bad@example.com"}]), \
              mock.patch.object(server, "_resolve_org", side_effect=resolve), \
-             mock.patch.object(server.readiness, "campaign_readiness", return_value={"checks": []}), \
+             mock.patch.object(server.readiness, "campaign_readiness", return_value={"ready": True, "checks": []}), \
              mock.patch.object(server.campaign, "available_tasks") as tasks:
-            response = server.create_app().test_client().post("/api/campaigns", json={
+            response = server.create_app(for_testing=True).test_client().post("/api/campaigns", json={
                 "accounts": ["good@example.com", "bad@example.com"],
                 "tasks": [{"task_id": "task"}], "dataset": "ego4d",
             })
@@ -71,7 +71,8 @@ class CampaignOrgGuardTests(unittest.TestCase):
                         task_id="task", timeout_blob=30, evaluate=False, finalize=True,
                         session=sess,
                     )
-                pending.assert_called_once_with(sess, account_email=email, required_org_key=key)
+                pending.assert_called_once_with(sess, account_email=email, required_org_key=key,
+                                                on_progress=None)
                 sess.join_org.assert_not_called()
                 self.assertEqual(result["error"], "test stop")
 

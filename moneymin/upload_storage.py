@@ -3,12 +3,54 @@ from __future__ import annotations
 
 import threading
 import re
+import os
+import json
+import tempfile
 from pathlib import Path
 
-from . import config
-from .atomic_io import load_json, save_bytes, save_json
+from . import config, token_store
+from .atomic_io import load_json_state, save_json
 
 _LOCK = threading.RLock()
+
+
+def _copy_archive_without_overwrite(source: Path, destination: Path) -> None:
+    payload = source.read_bytes()
+    try:
+        # Exclusive creation also handles another writer creating the archive
+        # after our journal-existence check. Never replace an existing payload.
+        with destination.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        if destination.read_bytes() != payload:
+            raise ValueError("Arquivo de retomada já existente difere da origem; preserve ambos antes de migrar.")
+    # An interrupted new copy leaves the source and partial destination intact;
+    # its journal and migration acknowledgment are written only after success.
+
+
+def _journal_matches(path: Path, expected: dict) -> bool:
+    actual = load_json_state(path, None)
+    # Canonical JSON preserves value types; dict equality considers True == 1.
+    return (isinstance(actual, dict)
+            and json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True))
+
+
+def _save_migrated_journal_without_overwrite(target: Path, row: dict) -> None:
+    # Publish a complete JSON atomically without replacing a concurrent writer.
+    with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.",
+                                     suffix=".tmp", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        save_json(temporary, row)
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            if not _journal_matches(target, row):
+                raise ValueError("Registro de retomada já existente difere da origem; preserve ambos antes de migrar.")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def journal_directory() -> Path:
@@ -20,15 +62,11 @@ def journal_directory() -> Path:
     with _LOCK:
         # Account ownership comes only from this installation's tokens. Never
         # import another customer's journal just because a library is shared.
-        owners = set()
-        for path in config.tokens_dir().glob("token_*.json"):
-            token = load_json(path, {})
-            if isinstance(token, dict) and isinstance(token.get("email"), str):
-                owners.add(token["email"].strip().casefold())
+        owners = set(token_store.records(config.tokens_dir()))
         if not owners:
             return destination
         marker_path = config.DATA_DIR / "sidecar_migration.json"
-        marker = load_json(marker_path, None) if marker_path.exists() else {}
+        marker = load_json_state(marker_path, {})
         if not isinstance(marker, dict):
             raise ValueError("Registro de migração de envios inválido; restaure o arquivo antes de continuar.")
         source_key = str(legacy.resolve())
@@ -36,10 +74,14 @@ def journal_directory() -> Path:
         if not isinstance(migrated, list) or any(not isinstance(name, str) for name in migrated):
             raise ValueError("Registro de migração de envios inválido.")
         imported = set(migrated)
+        # Validate all consulted sources and existing destinations before
+        # copying one archive or publishing one journal/acknowledgment. A later
+        # ambiguous record must not leave an earlier partial migration behind.
+        pending = []
         for path in legacy.glob("*.json"):
             if path.name in imported:
                 continue
-            row = load_json(path, {})
+            row = load_json_state(path, {})
             if not isinstance(row, dict) or str(row.get("account_email", "")).strip().casefold() not in owners:
                 continue
             sid = row.get("session_id")
@@ -49,16 +91,22 @@ def journal_directory() -> Path:
                     or path.name != f"{sid}{'__' + str(chunk) if chunk else ''}.json"):
                 raise ValueError("Registro legado de envio inconsistente; restaure-o antes de continuar.")
             target = destination / path.name
-            if not target.exists():
-                archive = path.with_suffix(".data.zip")
-                if archive.exists():
-                    # Use the sibling archive, not an arbitrary persisted path.
-                    if archive.resolve().parent != legacy.resolve():
-                        raise ValueError("Arquivo de retomada fora da biblioteca de origem.")
-                    copied_archive = destination / archive.name
-                    save_bytes(copied_archive, archive.read_bytes())
-                    row["sidecar_data_path"] = str(copied_archive.resolve())
-                save_json(target, row)
+            archive = path.with_suffix(".data.zip")
+            copied_archive = destination / archive.name
+            if archive.exists():
+                # Use the sibling archive, not an arbitrary persisted path.
+                if archive.resolve().parent != legacy.resolve():
+                    raise ValueError("Arquivo de retomada fora da biblioteca de origem.")
+                row["sidecar_data_path"] = str(copied_archive.resolve())
+            if target.exists() and not _journal_matches(target, row):
+                raise ValueError("Registro de retomada já existente difere da origem; preserve ambos antes de migrar.")
+            if archive.exists() and copied_archive.exists() and archive.read_bytes() != copied_archive.read_bytes():
+                raise ValueError("Arquivo de retomada já existente difere da origem; preserve ambos antes de migrar.")
+            pending.append((path, row, target, archive, copied_archive))
+        for path, row, target, archive, copied_archive in pending:
+            if archive.exists():
+                _copy_archive_without_overwrite(archive, copied_archive)
+            _save_migrated_journal_without_overwrite(target, row)
             imported.add(path.name)
         if imported != set(migrated):
             marker[source_key] = sorted(imported)

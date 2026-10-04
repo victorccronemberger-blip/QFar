@@ -15,6 +15,8 @@ public:
   explicit UpdateManager(QObject* parent = nullptr);
   static bool verifyHashSignature(const QByteArray& hash,
                                   const QByteArray& signature);
+  static bool versionAllowed(const QString& candidate, const QString& current,
+                             bool allowEqual);
   void check(bool interactive = false);
   void repair();
   void downloadAndInstall();
@@ -27,7 +29,7 @@ signals:
   void updateAvailable(const QString& version, const QString& notes);
   void progress(qint64 received, qint64 total);
   void errorOccurred(const QString& message, bool interactive);
-  void installReady(const QString& packagePath);
+  void installReady(const QString& packagePath, const QString& verifiedSha256);
 
 private:
   friend class UpdateManagerTests;
@@ -37,6 +39,7 @@ private:
   void fetchPackage();
 
   QNetworkAccessManager _network;
+  QUrl _releaseEndpoint;
   QUrl _packageUrl;
   QUrl _checksumUrl;
   QUrl _signatureUrl;

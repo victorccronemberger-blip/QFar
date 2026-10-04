@@ -257,9 +257,9 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         successful = int(payload.get("ok_sends") or 0)
         if payload.get("status") == "error":
             return {
-                "level": "error", "stage": "Sem envios",
-                "title": "Campanha encerrada sem envios",
-                "detail": "Nenhum vídeo foi enviado. Confira os motivos no Histórico.",
+                "level": "error", "stage": "Sem finalizações confirmadas",
+                "title": "Campanha encerrada sem finalizações confirmadas",
+                "detail": "Nenhum novo envio teve finalização confirmada nesta tentativa. Confira os recibos no Histórico e em Recuperação antes de reenviar.",
             }
         if payload.get("status") == "partial":
             details = [f"{successful} envio(s) concluído(s)"]
@@ -311,6 +311,7 @@ class CampaignRunner:
         self.target_seconds_per_account = 0.0
         self.account_seconds: dict[str, float] = {}
         self.credited_deliveries: set[tuple[str, str, str]] = set()
+        self._reported_outcomes: set[tuple[tuple[str, str, str], str]] = set()
         self.total_sends = 0
         self.done_sends = 0
         self.ok_sends = 0
@@ -356,6 +357,7 @@ class CampaignRunner:
             self.target_seconds_per_account = hours * 3600
             self.account_seconds = {a.email: 0.0 for a in cfg.accounts}
             self.credited_deliveries.clear()
+            self._reported_outcomes.clear()
             self.done_sends = 0
             self.ok_sends = 0
             self.failed_sends = 0
@@ -440,6 +442,12 @@ class CampaignRunner:
             result = run_campaign(cfg, progress=on_progress,
                                   should_stop=self._checkpoint)
         except Exception as exc:  # noqa: BLE001 — reporta qualquer falha na UI
+            try:
+                self._restore_published_progress(getattr(exc, '_moneymin_campaign_log', None), cfg)
+            except Exception:
+                # Unreadable evidence or a malformed local record cannot
+                # suppress the original error or leave the runner active.
+                pass
             with self._lock:
                 self.pause_requested = False
                 self._resume.set()
@@ -474,6 +482,54 @@ class CampaignRunner:
                     self.current = ""
                     self.stage = "Encerrada"
 
+    def _restore_published_progress(self, log, cfg: CampaignConfig) -> None:
+        """Restore counters from this attempt and current receipts, no events."""
+        if not isinstance(log, campaign.CampaignLog):
+            return
+        from ..campaign_evidence import current_groups, current_result
+        groups = current_groups()
+        name = log._path.name if log._path is not None else None
+        configured = {account.email for account in cfg.accounts}
+        with self._lock:
+            if name is not None:
+                self.log_path = name
+            for item in log.items:
+                if not isinstance(item, dict) or not isinstance(item.get('accounts'), list):
+                    continue
+                for attempt in item['accounts']:
+                    if (not isinstance(attempt, dict) or attempt.get('email') not in configured
+                            or type(attempt.get('ok')) is not bool
+                            or any(type(attempt[key]) is not bool for key in ('skipped', 'finalized')
+                                   if key in attempt and attempt[key] is not None)):
+                        continue
+                    identity = (attempt['email'], str(item.get('registry_key') or item.get('task_scenario') or ''),
+                                str(item.get('clip_uid') or attempt.get('session_id') or ''))
+                    if not all(identity):
+                        continue
+                    outcome = 'skipped' if attempt.get('skipped') is True else 'ok' if attempt['ok'] else 'failed'
+                    if outcome == 'ok' and current_result(item, attempt, name, groups)['status'] != 'confirmed':
+                        continue
+                    if (identity, outcome) in self._reported_outcomes:
+                        continue
+                    self._reported_outcomes.add((identity, outcome))
+                    self.done_sends += 1
+                    if outcome == 'skipped':
+                        self.skipped_sends += 1
+                    elif outcome == 'failed':
+                        self.failed_sends += 1
+                    elif identity not in self.credited_deliveries:
+                        self.credited_deliveries.add(identity)
+                        self.ok_sends += 1
+                        duration = item.get('duration_ms')
+                        try:
+                            seconds = float(duration) / 1000.0 if type(duration) in (int, float) else 0.0
+                        except (ValueError, OverflowError):
+                            seconds = 0.0
+                        if math.isfinite(seconds) and seconds > 0:
+                            total = self.account_seconds.get(attempt['email'], 0.0) + seconds
+                            if math.isfinite(total):
+                                self.account_seconds[attempt['email']] = total
+
     def _on_event(self, kind: str, payload: dict[str, Any]) -> None:
         if kind == "account_excluded" and self.on_restriction:
             try:
@@ -485,6 +541,11 @@ class CampaignRunner:
         with self._lock:
             self.operation.event(kind, payload)
             if kind == "account_done":
+                identity = (str(payload.get('email') or ''), str(payload.get('registry_key') or payload.get('task') or ''),
+                            str(payload.get('clip_uid') or payload.get('session_id') or ''))
+                outcome = 'skipped' if payload.get('skipped') else (
+                    'ok' if payload.get('ok') and payload.get('finalized') is True else 'failed')
+                self._reported_outcomes.add((identity, outcome))
                 self.done_sends += 1
                 if payload.get("skipped"):
                     self.skipped_sends += 1
@@ -561,10 +622,16 @@ class CampaignRunner:
                     "encode": "preparando vídeo da conta",
                     "create/sas": "abrindo envio",
                     "create": "registrando envio",
+                    "sas": "preparando transferência",
                     "transport": "subindo vídeo",
                     "complete": "confirmando envio",
+                    "evaluate": "avaliando vídeo",
+                    "finalize": "finalizando sessão",
+                    "fail": "registrando falha do envio",
                     "sidecar": "preparando sensores",
                 }.get(phase, "processando envio")
+                if phase == "transport" and payload.get("artifact") == "sidecar":
+                    phase_pt = "subindo sensores"
                 suffix = ""
                 if phase == "transport" and payload.get("total_bytes"):
                     percent = float(payload.get("percent") or 0.0)

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config
-from .atomic_io import load_json, save_json
+from .atomic_io import JsonStateError, load_json_state, save_json
 
 FILE_NAME = "sent_videos.json"
 _LOCK = threading.RLock()
@@ -46,9 +46,8 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
     for p in data_dir.iterdir():
         if not (p.name.startswith("campaign_") and p.name.endswith(".json")):
             continue
-        log = load_json(p, {})
-        if not isinstance(log, dict):
-            continue
+        # A damaged historical receipt cannot prove that no clip was sent.
+        log = load_json_state(p, {})
         items = log.get("items", [])
         if not isinstance(items, list):
             continue
@@ -90,7 +89,10 @@ def _load_locked() -> dict[str, dict[str, list[str]]]:
         if data:
             _save(data)
         return data
-    raw = load_json(path, None)
+    try:
+        raw = load_json_state(path, None)
+    except JsonStateError:
+        raise ValueError("Registro de envios inválido ou ilegível; restaure o arquivo antes de continuar.") from None
     if not isinstance(raw, dict) or any(
         not isinstance(clips, dict) or any(
             not isinstance(emails, list) or any(not isinstance(email, str) for email in emails)
@@ -118,11 +120,18 @@ def _reset_history() -> dict[str, Any]:
     path = config.DATA_DIR / "sent_reset_history.json"
     if not path.exists():
         return {}
-    result = load_json(path, None)
+    try:
+        result = load_json_state(path, None)
+    except JsonStateError:
+        raise ValueError("Histórico de reset inválido; restaure o arquivo antes de continuar.") from None
     if (not isinstance(result, dict) or not isinstance(result.get("all", []), list)
             or not isinstance(result.get("completed_sessions", []), list)
             or not isinstance(result.get("scenarios", {}), dict)
-            or any(not isinstance(value, list) for value in result.get("scenarios", {}).values())):
+            or any(not isinstance(value, list) for value in result.get("scenarios", {}).values())
+            or any(not isinstance(value, str)
+                   for values in [result.get("all", []), result.get("completed_sessions", []),
+                                  *result.get("scenarios", {}).values()]
+                   for value in values)):
         raise ValueError("Histórico de reset inválido; restaure o arquivo antes de continuar.")
     return result
 
@@ -177,9 +186,22 @@ def mark_sent(scenario: str, clip_uid: str, email: str) -> None:
             _save(data)
 
 
+def recorded_emails(registry: dict[str, dict[str, list[str]]],
+                    scenario: str, clip_uid: str) -> set[str]:
+    """Read old category labels by stable task ID, preserving stored evidence."""
+    parts = scenario.split("|", 2)
+    if len(parts) >= 2 and parts[0] == "minute" and parts[1]:
+        task_prefix = f"minute|{parts[1]}"
+        keys = [key for key in registry
+                if key == task_prefix or key.startswith(task_prefix + "|")]
+    else:
+        keys = [scenario]
+    return set().union(*(set(registry.get(key, {}).get(clip_uid, [])) for key in keys))
+
+
 def sent_emails(scenario: str, clip_uid: str) -> set[str]:
     """Contas que já receberam `clip_uid` neste cenário."""
-    return set(load().get(scenario, {}).get(clip_uid, []))
+    return recorded_emails(load(), scenario, clip_uid)
 
 
 def is_sent_to_all(scenario: str, clip_uid: str, emails: list[str]) -> bool:

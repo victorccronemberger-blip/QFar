@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import account_transfer, config, minute_api, org_policy
-from .atomic_io import load_json, save_json
+from . import account_transfer, config, minute_api, org_policy, token_store
+from .atomic_io import JsonStateError, load_json_state, save_json
 from .web.account_issues import account_issue
 
 PREFS_PATH = config.DATA_DIR / "webui_prefs.json"
@@ -39,8 +39,9 @@ def _summarize_orgs(orgs: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 def _token_payload(data: dict[str, Any], email: str) -> dict[str, Any]:
+    data = token_store.validated(data, email)
     payload = {"email": email}
-    for key in ("idToken", "refreshToken", "localId", "expiresIn"):
+    for key in ("idToken", "refreshToken", "localId", "user_id", "uid", "expiresIn"):
         value = data.get(key)
         if value is not None:
             payload[key] = value
@@ -48,10 +49,15 @@ def _token_payload(data: dict[str, Any], email: str) -> dict[str, Any]:
     return payload
 
 
+def _load_org_prefs() -> dict[str, Any]:
+    prefs = load_json_state(PREFS_PATH, {})
+    if not isinstance(prefs.get("org_keys", {}), dict):
+        raise JsonStateError("Preferências de organização inválidas. O arquivo foi preservado para revisão.")
+    return prefs
+
+
 def _set_pref_org(email: str, org_key: str) -> None:
-    prefs = load_json(PREFS_PATH, {}) if PREFS_PATH.exists() else {}
-    if not isinstance(prefs, dict):
-        prefs = {}
+    prefs = _load_org_prefs()
     prefs.setdefault("org_keys", {})[email] = org_key
     save_json(PREFS_PATH, prefs)
 
@@ -69,6 +75,8 @@ def session_from_record(record: dict[str, Any]) -> minute_api.Session:
             sess.ensure_auth()
             return sess
         except (minute_api.AuthError, RuntimeError) as exc:
+            if isinstance(exc, minute_api.AuthError) and exc.account_issue_code == "identity":
+                raise
             last = exc
     if isinstance(password, str) and password:
         minute_api.login(email, password)
@@ -120,6 +128,8 @@ def _migrate_one(
     if dry_run:
         row["status"] = "dry_run"
         return row
+    if persist_prefs:
+        _load_org_prefs()
     try:
         sess = session_from_record(record)
         profile = sess.ensure_auth()

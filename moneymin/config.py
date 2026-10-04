@@ -288,6 +288,6 @@ def tokens_dir() -> Path:
 
 
 def token_path(email: str) -> Path:
-    """Caminho do arquivo de token para um e-mail."""
-    safe = email.replace("@", "_at_").replace(".", "_")
-    return tokens_dir() / f"token_{safe}.json"
+    """Caminho canônico por identidade; leitura legada exige owner conferido."""
+    from .token_store import record_path
+    return record_path(tokens_dir(), email)

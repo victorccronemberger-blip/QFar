@@ -11,7 +11,7 @@ from moneymin.web import server
 
 class PreviewStatusTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     @staticmethod
     def _log(path: Path, accounts: list[dict]) -> Path:
@@ -128,7 +128,7 @@ class PreviewStatusTests(unittest.TestCase):
 
 class CampaignReadinessGateTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
         self.not_ready = {
             "ready": False,
             "checks": [{

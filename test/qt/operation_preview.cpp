@@ -7,6 +7,7 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QEventLoop>
@@ -15,8 +16,10 @@
 #include <QDir>
 #include <QLabel>
 #include <QPushButton>
+#include <QPointer>
 #include <QProgressBar>
 #include <QSettings>
+#include <QFile>
 #include <QTemporaryDir>
 #include <QStackedWidget>
 #include <QListWidget>
@@ -31,6 +34,109 @@
 
 class OperationPreview {
 public:
+  static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
+    auto requests = std::make_shared<int>(0);
+    auto invalidSession = std::make_shared<bool>(false);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, requests, invalidSession] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, requests, invalidSession] {
+        const auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        QJsonObject result{{"ok", true}};
+        if (input.startsWith("POST /api/campaigns/drain ")) {
+          ++*requests;
+          bool authorized = false;
+          for (const auto& line : input.split('\n')) {
+            const auto colon = line.indexOf(':');
+            if (colon > 0 && line.left(colon).toLower() == "x-qmoney-session"
+                && line.mid(colon + 1).trimmed() == "inert-close-fixture") authorized = true;
+          }
+          if (!authorized) *invalidSession = true;
+          result.insert("draining", true);
+          result.insert("ready", *requests == 1 ? QJsonValue("true") : QJsonValue(*requests >= 3));
+        }
+        const auto body = QJsonDocument(result).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                      + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+        socket->disconnectFromHost();
+      });
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._api.setSessionToken("inert-close-fixture");
+    window._backendReady = true;
+    if (requestQuit) qApp->quit();
+    else window.close();
+    if (!window.isVisible() || !window._campaignClosePending) { qApp->exit(191); return; }
+    auto premature = std::make_shared<bool>(false);
+    auto* monitor = new QTimer(&window);
+    QObject::connect(monitor, &QTimer::timeout, &window, [&window, requests, invalidSession, premature] {
+      if (*requests < 3 && !window.isVisible()) *premature = true;
+      if (!window.isVisible() && window._campaignCloseReady)
+        qApp->exit(*premature || *invalidSession || *requests != 3 ? 192 : 0);
+    });
+    monitor->start(20);
+    QTimer::singleShot(5000, &window, [] { qApp->exit(193); });
+  }
+  static bool campaignCloseFinished(const MainWindow& window) {
+    return window._campaignCloseReady && !window.isVisible();
+  }
+  static void campaignHistoryEvidenceSmoke(MainWindow& window) {
+    auto* server=new QTcpServer(&window);
+    if(!server->listen(QHostAddress::LocalHost)) {qApp->exit(180);return;}
+    auto queries=std::make_shared<int>(0);
+    QObject::connect(server,&QTcpServer::newConnection,server,[server,queries] {
+      auto* socket=server->nextPendingConnection();
+      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,queries] {
+        const auto input=socket->property("input").toByteArray()+socket->readAll();
+        socket->setProperty("input",input);
+        if(!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered",true);
+        if(!input.startsWith("GET /api/logs/campaign_fixture.json ")) {qApp->exit(181);return;}
+        const bool valid=++*queries==1;
+        const QJsonObject current{{"status","confirmed"},{"evidence_source",valid?"journal":"preview"},
+          {"reconciled",true},{"chunks_found",1},{"chunks_expected",1},{"detail","Confirmacao posterior do recibo"}};
+        const QJsonObject result{{"email","fixture@example.com"},{"status","failed"},{"confirmation","not_confirmed"},
+          {"session_id","session-fixture"},{"detail","Falha original 503"},{"current_result",current}};
+        const QJsonObject item{{"task","Fixture"},{"clip_uid","clip-fixture"},{"duration_s",60},
+          {"success",0},{"failed",1},{"pending",0},{"skipped",0},{"accounts",QJsonArray{result}}};
+        const QJsonObject payload{{"schema",2},{"status","error"},
+          {"summary",QJsonObject{{"videos",1},{"success",0},{"failed",1},{"pending",0},{"skipped",0}}},
+          {"current_summary",QJsonObject{{"confirmed",1},{"pending",0},{"review",0},{"unknown",0}}},
+          {"items",QJsonArray{item}}};
+        const auto bytes=QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+          +QByteArray::number(bytes.size())+"\r\n\r\n"+bytes);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    window._historyTable->setRowCount(1);
+    auto* entry=new QTableWidgetItem("Fixture"); entry->setData(Qt::UserRole,"campaign_fixture.json");
+    window._historyTable->setItem(0,0,entry); window._historyTable->setCurrentCell(0,0);
+    auto* poll=new QTimer(&window); auto phase=std::make_shared<int>(0);
+    QObject::connect(poll,&QTimer::timeout,&window,[&window,queries,phase] {
+      if(window._historyEvidence->rowCount()!=1) return;
+      const auto proof=window._historyEvidence->item(0,3);
+      const auto text=window._historyDetail->toPlainText();
+      if(*phase==0 && *queries==1 && proof && proof->text()=="Recibo atual confirmado") {
+        if(!text.contains("RESULTADO DA TENTATIVA ORIGINAL") || !text.contains("SITUAÇÃO ATUAL DOS RECIBOS")
+            || !text.contains("1 confirmado(s)") || !text.contains("0 envio(s) concluído(s)")
+            || !proof->toolTip().contains("Falha original 503") || !proof->toolTip().contains("Confirmacao posterior")) {
+          qApp->exit(182);return;
+        }
+        *phase=1; window._historyEvidence->setRowCount(0);
+        window._historyTable->setCurrentCell(-1,-1); window._historyTable->setCurrentCell(0,0);
+      } else if(*phase==1 && *queries==2 && proof && proof->text()=="Falhou") {
+        qApp->exit(text.contains("0 confirmado(s)") && text.contains("1 sem recibo atual")?0:183);
+      }
+    });
+    poll->start(20); QTimer::singleShot(5000,qApp,[]{qApp->exit(184);});
+  }
   static void originalLibrarySmoke(MainWindow& window) {
     const QString previousClipboard = QApplication::clipboard()->text();
     QObject::connect(qApp, &QCoreApplication::aboutToQuit, qApp, [previousClipboard] { QApplication::clipboard()->setText(previousClipboard); });
@@ -128,6 +234,236 @@ public:
     poll->start(25);
     QTimer::singleShot(9000, &window, [] { qApp->exit(138); });
   }
+  static void originalLiveLab(MainWindow& window) {
+    const auto endpoint = qEnvironmentVariable("QMONEY_TEST_API");
+    if (!endpoint.startsWith(QStringLiteral("http://127.0.0.1:"))) { qApp->exit(160); return; }
+    QFile input(qEnvironmentVariable("QMONEY_TEST_CAPTURE_BODY"));
+    if (!input.open(QIODevice::ReadOnly)) { qApp->exit(161); return; }
+    const auto body = QJsonDocument::fromJson(input.readAll()).object();
+    if (body.isEmpty()) { qApp->exit(162); return; }
+    window._api.setBaseUrl(endpoint);
+    window._api.setSessionToken(qgetenv("QMONEY_TEST_SESSION"));
+    window._backendReady = true;
+    window.setWindowTitle(QStringLiteral("QMoney — campanha com mídia real em laboratório local"));
+    window._api.post(QStringLiteral("/api/campaigns/original/preflight"), body,
+      [&window, body](bool ok, const QJsonDocument& doc, const QString& error) {
+        if (!ok || doc.object().value("ok") != QJsonValue(true)) {
+          qWarning() << "LAB_PREFLIGHT" << error; qApp->exit(163); return;
+        }
+        auto approved = body;
+        approved.insert(QStringLiteral("preflight_id"), doc.object().value("preflight_id"));
+        window.submitOriginalCapture(approved, doc.object().value("original_summary").toObject());
+      });
+    auto phase = std::make_shared<int>(0);
+    auto* timer = new QTimer(&window);
+    QObject::connect(timer, &QTimer::timeout, &window, [&window, phase, timer] {
+      if (*phase == 0 && window._campaignActive && !window._campaignStartPending) {
+        *phase = 1; window.loadHome();
+      } else if (*phase == 1 && window._operationPause->isEnabled()) {
+        *phase = 10;
+        window._api.get(QStringLiteral("/fixture/progress"), [&window, phase](bool ok, const QJsonDocument& doc, const QString&) {
+          if (!ok) { qApp->exit(166); return; }
+          if (doc.object().value("staged_blocks").toInt() < 1) { *phase = 1; return; }
+          *phase = 2;
+          if (qApp->arguments().contains("--lab-stop")) window._campaignStop->click();
+          else window._operationPause->click();
+        });
+      } else if (*phase == 2 && window._operationPauseRequested && window._operationPause->isEnabled()) {
+        *phase = 3; window._operationPause->click();
+      } else if ((*phase == 3 || (*phase == 2 && qApp->arguments().contains("--lab-stop")))
+                 && !window._campaignActive && !window._campaignStartPending && !window._campaignStartUncertain) {
+        *phase = 4;
+        window._api.get(QStringLiteral("/api/campaigns/current"), [&window](bool ok, const QJsonDocument& doc, const QString&) {
+          const auto expected = qApp->arguments().contains("--lab-stop") ? QStringLiteral("stopped") : QStringLiteral("done");
+          if (!ok || doc.object().value("state").toString() != expected) { qApp->exit(165); return; }
+          window._pages->setCurrentIndex(7); window.loadHistory();
+        });
+      } else if (*phase == 4 && window._historyTable->rowCount() == 1) {
+        timer->stop();
+        qInfo() << "LAB_UI_FULL_FLOW_OK" << (qApp->arguments().contains("--lab-stop") ? "stop" : "pause-resume");
+        if (!qApp->arguments().contains("--lab-ui-hold")) qApp->exit(0);
+      }
+    });
+    timer->start(25);
+    QTimer::singleShot(qApp->arguments().contains("--lab-ui-hold") ? 180000 : 45000,
+      &window, [phase] { qApp->exit(*phase == 4 ? 0 : 164); });
+  }
+  static void campaignStartPersistenceSmoke(MainWindow& window) {
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(150); return; }
+    auto posts = std::make_shared<int>(0);
+    auto lookups = std::make_shared<int>(0);
+    const QString identity = QStringLiteral("ec7c75cc-9a46-4b70-bd62-f531a3b0309e");
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, posts, lookups, identity] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, posts, lookups, identity] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        const int end = input.indexOf("\r\n\r\n");
+        if (end < 0 || socket->property("answered").toBool()) return;
+        const auto match = QRegularExpression(QStringLiteral("Content-Length: (\\d+)"), QRegularExpression::CaseInsensitiveOption)
+          .match(QString::fromLatin1(input.left(end)));
+        if (match.hasMatch() && input.size() < end + 4 + match.captured(1).toInt()) return;
+        socket->setProperty("answered", true);
+        QJsonObject reply; int status = 200;
+        if (input.startsWith("POST /api/campaigns ")) {
+          ++*posts;
+          const auto saved = QJsonDocument::fromJson(QSettings().value("campaign/pendingStart").toByteArray()).object();
+          if (saved.value("start_request_id").toString() != identity || *posts != 1) { qApp->exit(151); return; }
+          status = 503; reply = {{"error_code", "request_outcome_unknown"}, {"error", "Resposta perdida"}};
+        } else if (input.startsWith("GET /api/campaigns/starts/")) {
+          ++*lookups;
+          if (!input.startsWith(("GET /api/campaigns/starts/" + identity + " ").toUtf8())) { qApp->exit(152); return; }
+          reply = {{"ok", true}, {"found", true}, {"start_request_id", identity},
+            {"status", "review"}, {"may_start", false}, {"kind", "dataset"}, {"outcome_unknown", true}};
+          if (qApp->arguments().contains("--start-terminal-persistence")) {
+            reply.insert("terminal", true); reply.insert("execution_state", "error");
+            reply.insert("log_name", "campaign_fixture.json"); reply.insert("delivery_confirmed", false);
+          }
+        } else if (input.startsWith("GET /api/campaigns/current?")) {
+          reply = {{"state", "idle"}, {"start_request_id", "foreign-operation"}, {"totals", QJsonObject{}}};
+        } else { qApp->exit(153); return; }
+        const auto bytes = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 " + QByteArray::number(status) + " OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+          + QByteArray::number(bytes.size()) + "\r\n\r\n" + bytes);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+    const auto base = QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort());
+    window._api.setBaseUrl(base);
+    if (qApp->arguments().contains("--start-persistence-read")) {
+      if (!window._campaignStartUncertain || window._campaignRequestedPreflight != identity) { qApp->exit(157); return; }
+      window.pollCampaign();
+    } else window.submitCampaign({{"preflight_id", identity}});
+    auto* probe = new QTimer(&window);
+    QObject::connect(probe, &QTimer::timeout, &window, [&window, posts, lookups, identity, base, probe] {
+      if (*lookups == 0) return;
+      if (qApp->arguments().contains("--start-terminal-persistence")) {
+        probe->stop();
+        qApp->exit(!window._campaignStartUncertain && window._campaignRequestedPreflight.isEmpty()
+          && QSettings().value("campaign/pendingStart").toByteArray().isEmpty() && *posts == 1 ? 0 : 158);
+        return;
+      }
+      if (!window._campaignStartUncertain) return;
+      if (qApp->arguments().contains("--start-persistence-write")) { probe->stop(); qApp->exit(*posts == 1 ? 0 : 159); return; }
+      probe->stop(); window._campaignPoll.stop();
+      auto* restored = new MainWindow(qobject_cast<oclero::qlementine::QlementineStyle*>(qApp->style()), nullptr, false);
+      restored->_api.setBaseUrl(base);
+      if (!restored->_campaignStartUncertain || restored->_campaignRequestedPreflight != identity
+          || restored->_campaignStart->isEnabled()) { qApp->exit(154); return; }
+      restored->pollCampaign();
+      QTimer::singleShot(300, restored, [restored, posts, lookups, identity] {
+        const auto saved = QJsonDocument::fromJson(QSettings().value("campaign/pendingStart").toByteArray()).object();
+        const int expectedPosts = qApp->arguments().contains("--start-persistence-read") ? 0 : 1;
+        qApp->exit(*posts == expectedPosts && *lookups >= 2 && restored->_campaignStartUncertain
+          && !restored->_campaignStart->isEnabled() && saved.value("start_request_id").toString() == identity ? 0 : 155);
+      });
+    });
+    probe->start(25); QTimer::singleShot(8000, &window, [] { qApp->exit(156); });
+  }
+  static void campaignConfirmedRestartSmoke(MainWindow& window) {
+    // Inert HTTP service: exercise real UI/ApiClient methods in one window,
+    // replacing only the restarted Runner's snapshot. No backend is launched.
+    const QString identity = QStringLiteral("d1affac3-94b5-4c7c-8732-267b151f7b34");
+    auto phase = std::make_shared<int>(0);
+    auto posts = std::make_shared<int>(0);
+    auto lookups = std::make_shared<int>(0);
+    auto foreignReplies = std::make_shared<int>(0);
+    auto terminal = std::make_shared<bool>(false);
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(170); return; }
+    QObject::connect(server, &QTcpServer::newConnection, server,
+        [server, identity, phase, posts, lookups, foreignReplies, terminal] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket,
+          [socket, identity, phase, posts, lookups, foreignReplies, terminal] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        const int end = input.indexOf("\r\n\r\n");
+        if (end < 0 || socket->property("answered").toBool()) return;
+        const auto length = QRegularExpression(QStringLiteral("Content-Length: (\\d+)"),
+            QRegularExpression::CaseInsensitiveOption).match(QString::fromLatin1(input.left(end)));
+        if (length.hasMatch() && input.size() < end + 4 + length.captured(1).toInt()) return;
+        socket->setProperty("answered", true);
+        QJsonObject reply;
+        if (input.startsWith("POST /api/campaigns ")) {
+          ++*posts;
+          const auto body = QJsonDocument::fromJson(input.mid(end + 4)).object();
+          const auto saved = QJsonDocument::fromJson(QSettings().value("campaign/pendingStart").toByteArray()).object();
+          if (*posts != 1 || body.value("preflight_id") != identity || saved.value("start_request_id") != identity) {
+            qApp->exit(171); return;
+          }
+          reply = {{"ok", true}, {"already_running", false}, {"start_request_id", identity},
+            {"preflight_id", identity}, {"total_sends", 1}, {"accounts", QJsonArray{"fixture@example.com"}}};
+        } else if (input.startsWith("GET /api/campaigns/current?")) {
+          if (*phase != 0) ++*foreignReplies;
+          reply = {{"state", *phase == 0 ? "running" : "idle"},
+            {"start_request_id", *phase == 0 ? identity : QStringLiteral("foreign-operation")},
+            {"totals", QJsonObject{}}};
+        } else if (input.startsWith(("GET /api/campaigns/starts/" + identity + " ").toUtf8())) {
+          ++*lookups;
+          reply = {{"ok", true}, {"found", true}, {"start_request_id", identity}, {"may_start", false},
+            {"status", "admitted"}, {"terminal", *terminal}, {"execution_state", *terminal ? "error" : "review"},
+            {"delivery_confirmed", false}, {"log_name", *terminal ? QJsonValue("campaign_fixture.json") : QJsonValue()}};
+        } else if (input.startsWith("GET /api/integrations ") || input.startsWith("GET /api/accounts/domains ")) {
+          reply = {{"ok", true}};
+        } else { qApp->exit(172); return; }
+        const auto bytes = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+          + QByteArray::number(bytes.size()) + "\r\n\r\n" + bytes);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    {
+      const QSignalBlocker a(window._campaignAccounts), t(window._campaignTasks);
+      auto* account = new QListWidgetItem("fixture@example.com", window._campaignAccounts);
+      account->setData(Qt::UserRole, "fixture@example.com"); account->setCheckState(Qt::Checked);
+      auto* task = new QListWidgetItem("Fixture", window._campaignTasks);
+      task->setData(Qt::UserRole, "fixture-task"); task->setCheckState(Qt::Checked);
+    }
+    window._taskReload.stop(); window._backendReady = true;
+    window.submitCampaign({{"preflight_id", identity}});
+    auto* probe = new QTimer(&window);
+    QObject::connect(probe, &QTimer::timeout, &window,
+        [&window, probe, identity, phase, posts, lookups, foreignReplies, terminal] {
+      if (window._campaignStartPending || window._campaignPollInFlight || window._campaignStartLookupInFlight) return;
+      const auto saved = QJsonDocument::fromJson(QSettings().value("campaign/pendingStart").toByteArray()).object();
+      if (*phase == 0 && *posts == 1 && window._campaignActive) {
+        if (window._campaignStartUncertain || window._campaignRequestedPreflight != identity
+            || saved.value("start_request_id") != identity) { qApp->exit(173); return; }
+        *phase = 1; window._campaignPoll.stop();
+        window.setBackendReady(false, QStringLiteral("Reiniciando motor de demonstração"));
+        window.setBackendReady(true); window.pollCampaign();
+      } else if (*phase == 1 && *foreignReplies > 0) {
+        if (!window._campaignStartUncertain || window._campaignRequestedPreflight != identity
+            || saved.value("start_request_id") != identity || window._campaignStart->isEnabled()
+            || window._campaignOriginal->isEnabled() || *posts != 1) {
+          qInfo() << "CONFIRMED_RESTART_LOST_BINDING" << window._campaignStartUncertain
+                  << window._campaignStart->isEnabled() << window._campaignRequestedPreflight;
+          qApp->exit(174); return;
+        }
+        if (*lookups == 0) return;
+        window._campaignStart->click(); window._campaignOriginal->click();
+        if (window.rememberCampaignStart(QStringLiteral("different-operation"))
+            || window._campaignRequestedPreflight != identity
+            || QJsonDocument::fromJson(QSettings().value("campaign/pendingStart").toByteArray()).object()
+                 .value("start_request_id") != identity) { qApp->exit(175); return; }
+        *phase = 2; *terminal = true; window.pollCampaign();
+      } else if (*phase == 2 && !window._campaignStartUncertain) {
+        probe->stop();
+        const bool resolved = window._campaignRequestedPreflight.isEmpty()
+          && QSettings().value("campaign/pendingStart").toByteArray().isEmpty()
+          && window._campaignStart->isEnabled() && window._campaignOriginal->isEnabled()
+          && *posts == 1 && *lookups >= 2;
+        qInfo() << "CONFIRMED_RESTART_RESOLVED" << resolved << "posts" << *posts << "lookups" << *lookups;
+        qApp->exit(resolved ? 0 : 176);
+      }
+    });
+    probe->start(25); QTimer::singleShot(8000, &window, [] { qApp->exit(177); });
+  }
   static void campaignParametersSmoke() {
     QSettings().setValue(QStringLiteral("campaign/draft"),QJsonDocument(QJsonObject{
       {"delay_mode","fixed"},{"delay_seconds",75},{"active_hours",false},{"hour_start",7},{"hour_end",18}
@@ -176,7 +512,7 @@ public:
           result={{"accounts",QJsonArray{QJsonObject{{"email","fixture@example.com"}}}}};
         } else if(input.startsWith("GET /api/balances ")) { result={{"balances",QJsonObject{}}};
         } else if(input.startsWith("GET /api/campaigns/current")) {
-          result={{"state",flow->running?"running":flow->stops?"stopped":"idle"},{"pause_requested",flow->paused},
+          result={{"start_request_id",flow->starts>0?"fixture":""},{"state",flow->running?"running":flow->stops?"stopped":"idle"},{"pause_requested",flow->paused},
                   {"totals",QJsonObject{{"total_sends",1},{"ok_sends",0}}}};
         } else if(input.startsWith("GET /api/logs ")) { result={{"logs",QJsonArray{}}};
         } else if(input.startsWith("GET /api/tasks?")) {
@@ -312,21 +648,129 @@ public:
     window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
     auto* panel = window.credentialCopyActions("fixture@example.com", true);
     panel->setParent(&window);
-    const auto buttons = panel->findChildren<QPushButton*>();
-    if (buttons.size() != 2) { qApp->exit(82); return; }
-    buttons[0]->click();
+    auto* copyEmail = panel->findChild<QPushButton*>(QStringLiteral("copyEmailButton"));
+    auto* copyPassword = panel->findChild<QPushButton*>(QStringLiteral("copyPasswordButton"));
+    if (!copyEmail || !copyPassword) { qApp->exit(82); return; }
+    copyEmail->click();
     if (QApplication::clipboard()->text() != "fixture@example.com") { qApp->exit(83); return; }
-    buttons[1]->click();
-    if (buttons[1]->isEnabled()) { qApp->exit(84); return; }
+    copyPassword->click();
+    if (copyPassword->isEnabled()) { qApp->exit(84); return; }
     auto* poll = new QTimer(&window);
-    QObject::connect(poll, &QTimer::timeout, &window, [buttons] {
-      if (!buttons[1]->isEnabled()) return;
+    QObject::connect(poll, &QTimer::timeout, &window, [copyPassword] {
+      if (!copyPassword->isEnabled()) return;
       qApp->exit(QApplication::clipboard()->text() == "fixture-only-password"
-          && buttons[1]->text() == QStringLiteral("Copiado!")
+          && copyPassword->text() == QStringLiteral("Copiado!")
           && !QApplication::activeModalWidget() ? 0 : 85);
     });
     poll->start(25);
     QTimer::singleShot(5000, &window, [] { qApp->exit(86); });
+  }
+  static void credentialViewSmoke(MainWindow& window) {
+    // Only literal fixture data and an isolated loopback server. No clipboard calls.
+    const QString fixtureEmail = QStringLiteral("fixture@example.invalid");
+    const QString activePassword = QStringLiteral("  fixture active password  ");
+    const QString bannedPassword = QStringLiteral(" banned fixture password ");
+    struct Flow { int requests=0, phase=1, cleared=0; QPointer<QDialog> dialog; };
+    auto flow = std::make_shared<Flow>();
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(140); return; }
+    QObject::connect(server, &QTcpServer::newConnection, server,
+                     [server, flow, fixtureEmail, activePassword, bannedPassword] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket,
+                       [socket, flow, fixtureEmail, activePassword, bannedPassword] {
+        auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        const int headerEnd = input.indexOf("\r\n\r\n");
+        if (headerEnd < 0 || socket->property("answered").toBool()) return;
+        const auto length = QRegularExpression(QStringLiteral("Content-Length: (\\d+)"),
+            QRegularExpression::CaseInsensitiveOption).match(QString::fromLatin1(input.left(headerEnd)));
+        if (!length.hasMatch()) { qApp->exit(141); return; }
+        if (input.size() < headerEnd + 4 + length.captured(1).toInt()) return;
+        socket->setProperty("answered", true);
+        const auto request = QJsonDocument::fromJson(input.mid(headerEnd + 4)).object();
+        const int number = ++flow->requests;
+        const auto route = number == 2 ? QByteArray("POST /api/accounts/banned/password ")
+                                      : QByteArray("POST /api/accounts/password ");
+        if (!input.startsWith(route) || request.size()!=1 || request.value("email").toString()!=fixtureEmail
+            || number > 5) { qApp->exit(142); return; }
+        int status=200;
+        QJsonObject response{{"email",fixtureEmail},{"password",number==2 ? bannedPassword : activePassword}};
+        if (number == 3) { status=409; response["error"]=activePassword; }
+        if (number == 4) response["email"]=QStringLiteral("other@example.invalid");
+        if (number == 5) response["password"]=QString();
+        const auto bytes=QJsonDocument(response).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 " + QByteArray::number(status) + " Fixture\r\nContent-Type: application/json\r\n"
+                      "Connection: close\r\nContent-Length: " + QByteArray::number(bytes.size()) + "\r\n\r\n" + bytes);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    auto* activePanel=window.credentialCopyActions(fixtureEmail,true,false);
+    auto* bannedPanel=window.credentialCopyActions(fixtureEmail,true,true);
+    auto* missingPanel=window.credentialCopyActions(fixtureEmail,false,false);
+    for (auto* panel : {activePanel,bannedPanel,missingPanel}) panel->setParent(&window);
+    auto* active=activePanel->findChild<QPushButton*>(QStringLiteral("viewCredentialsButton"));
+    auto* banned=bannedPanel->findChild<QPushButton*>(QStringLiteral("viewCredentialsButton"));
+    auto* missing=missingPanel->findChild<QPushButton*>(QStringLiteral("viewCredentialsButton"));
+    auto* missingCopy=missingPanel->findChild<QPushButton*>(QStringLiteral("copyPasswordButton"));
+    if (!active || !banned || !missing || !missingCopy || !active->isEnabled() || !banned->isEnabled()
+        || missing->isEnabled() || missingCopy->isEnabled()
+        || active->text()!=QStringLiteral("Ver acesso")) { qApp->exit(143); return; }
+    missing->click();
+    auto* poll=new QTimer(&window);
+    QObject::connect(poll,&QTimer::timeout,&window,
+                     [&window,flow,active,banned,poll,fixtureEmail,activePassword,bannedPassword] {
+      const auto privateStatus=window._status->text()+window._status->toolTip();
+      if (privateStatus.contains(fixtureEmail,Qt::CaseInsensitive)
+          || privateStatus.contains(activePassword.trimmed()) || privateStatus.contains(bannedPassword.trimmed())) {
+        qApp->exit(144); return;
+      }
+      auto* dialog=window.findChild<QDialog*>(QStringLiteral("savedAccountCredentialsDialog"));
+      if (flow->phase==1 || flow->phase==3) {
+        if (!dialog || !dialog->isVisible()) return;
+        const int expectedRequest=flow->phase==1 ? 1 : 2;
+        const QString expectedPassword=flow->phase==1 ? activePassword : bannedPassword;
+        auto* email=dialog->findChild<QLineEdit*>(QStringLiteral("savedAccountEmail"));
+        auto* password=dialog->findChild<QLineEdit*>(QStringLiteral("savedAccountPassword"));
+        auto* hide=dialog->findChild<QCheckBox*>(QStringLiteral("hideSavedAccountPassword"));
+        auto* buttons=dialog->findChild<QDialogButtonBox*>();
+        if (flow->requests!=expectedRequest || !dialog->isModal() || !dialog->testAttribute(Qt::WA_DeleteOnClose)
+            || !email || !password || !hide || !buttons || !buttons->button(QDialogButtonBox::Close)
+            || !email->isReadOnly() || !password->isReadOnly() || email->text()!=fixtureEmail
+            || password->text()!=expectedPassword || password->echoMode()!=QLineEdit::Normal || hide->isChecked()) {
+          qApp->exit(145); return;
+        }
+        hide->setChecked(true);
+        if (password->echoMode()!=QLineEdit::Password || password->text()!=expectedPassword) { qApp->exit(146); return; }
+        hide->setChecked(false);
+        if (password->echoMode()!=QLineEdit::Normal || password->text()!=expectedPassword) { qApp->exit(147); return; }
+        flow->dialog=dialog;
+        QObject::connect(dialog,&QDialog::finished,dialog,[flow,email,password] {
+          if (!email->text().isEmpty() || !password->text().isEmpty()) { qApp->exit(148); return; }
+          ++flow->cleared;
+        });
+        ++flow->phase;
+        buttons->button(QDialogButtonBox::Close)->click();
+      } else if (flow->phase==2 || flow->phase==4) {
+        if (flow->dialog || dialog) return;
+        if (!active->isEnabled() || !banned->isEnabled()) { qApp->exit(149); return; }
+        if (flow->phase==2) { ++flow->phase; banned->click(); }
+        else { ++flow->phase; active->click(); }
+      } else {
+        const int expectedRequest=flow->phase-2;
+        if (flow->requests!=expectedRequest || !active->isEnabled()) return;
+        if (dialog || QApplication::activeModalWidget() || active->text()!=QStringLiteral("Ver acesso")
+            || window._status->text().isEmpty()) { qApp->exit(150); return; }
+        if (flow->phase<7) { ++flow->phase; active->click(); }
+        else { poll->stop(); qApp->exit(flow->cleared==2 && flow->requests==5 ? 0 : 151); }
+      }
+    });
+    poll->start(25);
+    active->click();
+    if (active->isEnabled()) { qApp->exit(152); return; }
+    QTimer::singleShot(8000,&window,[] { qApp->exit(153); });
   }
   static void settingsSmoke(MainWindow& window) {
     const auto click = [](QWidget* widget, QPoint point) {
@@ -905,7 +1349,10 @@ int main(int argc, char** argv) {
   app.setApplicationName("OperationPreview");
   QTemporaryDir testSettings;
   QSettings::setDefaultFormat(QSettings::IniFormat);
-  QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, testSettings.path());
+  const auto persistentTestSettings = qEnvironmentVariable("QMONEY_TEST_SETTINGS_DIR");
+  QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
+    (app.arguments().contains("--start-persistence-write") || app.arguments().contains("--start-persistence-read"))
+      && !persistentTestSettings.isEmpty() ? persistentTestSettings : testSettings.path());
   const bool dark = app.arguments().contains("--dark");
   auto* style = new oclero::qlementine::QlementineStyle(&app);
   style->setAnimationsEnabled(false);
@@ -919,8 +1366,32 @@ int main(int argc, char** argv) {
     return app.exec();
   }
   window.show();
+  if (app.arguments().contains("--campaign-close-smoke") || app.arguments().contains("--campaign-quit-smoke")) {
+    app.setQuitOnLastWindowClosed(false);
+    const bool requestQuit = app.arguments().contains("--campaign-quit-smoke");
+    QTimer::singleShot(100, &window, [&window, requestQuit]{OperationPreview::campaignCloseSmoke(window, requestQuit);});
+    const int result = app.exec();
+    return result ? result : (OperationPreview::campaignCloseFinished(window) ? 0 : 194);
+  }
+  if (app.arguments().contains("--campaign-history-evidence-smoke")) {
+    QTimer::singleShot(100,&window,[&window]{OperationPreview::campaignHistoryEvidenceSmoke(window);});
+    return app.exec();
+  }
   if (app.arguments().contains("--campaign-parameters-smoke")) {
     QTimer::singleShot(100,&window,[] { OperationPreview::campaignParametersSmoke(); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--original-live-lab")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::originalLiveLab(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--confirmed-start-restart-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignConfirmedRestartSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--start-persistence-smoke") || app.arguments().contains("--start-persistence-write")
+      || app.arguments().contains("--start-persistence-read")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignStartPersistenceSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--campaign-controls-smoke") || app.arguments().contains("--campaign-controls-manual")) {
@@ -937,6 +1408,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--credential-copy-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::credentialCopySmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--credential-view-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::credentialViewSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--settings-smoke")) {

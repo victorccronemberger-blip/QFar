@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import config
-from .atomic_io import load_json, save_json
+from .atomic_io import JsonStateError, load_json_state, save_json
 from .device_profile import format_recorded_at
 
 _LOCK = threading.Lock()
@@ -33,7 +34,23 @@ def reserve(email: str, duration_s: float, *, now: float | None = None) -> Recor
     duration = max(1.0, float(duration_s))
     current = float(time.time() if now is None else now)
     with _LOCK:
-        state = load_json(timeline_path(), {"version": 1, "accounts": {}})
+        state = load_json_state(timeline_path(), {"version": 1, "accounts": {}})
+        # Every account is checked before allocating or replacing the document.
+        # Historical finite numeric strings keep their previous conversion;
+        # an invalid prior reservation cannot become a fresh empty timeline.
+        try:
+            existing_accounts = state.get("accounts", {})
+            if not isinstance(existing_accounts, dict):
+                raise ValueError
+            for previous in existing_accounts.values():
+                if not isinstance(previous, dict):
+                    raise ValueError
+                for key in ("last_start_epoch", "last_end_epoch", "duration_s", "updated_at"):
+                    if key in previous and (isinstance(previous[key], bool)
+                            or not math.isfinite(float(previous[key]))):
+                        raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise JsonStateError("Linha do tempo local inválida; o arquivo foi preservado. Restaure um backup válido antes de reservar outro intervalo.") from None
         accounts = state.setdefault("accounts", {})
         previous = accounts.get(email) or {}
         previous_end = float(previous.get("last_end_epoch") or 0.0)

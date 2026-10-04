@@ -24,7 +24,7 @@ class SentResetTests(unittest.TestCase):
             sent_registry.mark_sent("minute|task|Jardinagem", "clip-1", "user@example.com")
             runner = mock.Mock(running=False)
             with mock.patch.object(server, "RUNNER", runner):
-                response = server.create_app().test_client().post("/api/sent/reset", json={})
+                response = server.create_app(for_testing=True).test_client().post("/api/sent/reset", json={})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.get_json()["sent"], [])
             self.assertTrue(history.exists())
@@ -35,7 +35,7 @@ class SentResetTests(unittest.TestCase):
             sent_registry.mark_sent("scenario", "clip-1", "user@example.com")
             runner = mock.Mock(running=True)
             with mock.patch.object(server, "RUNNER", runner):
-                response = server.create_app().test_client().post("/api/sent/reset", json={})
+                response = server.create_app(for_testing=True).test_client().post("/api/sent/reset", json={})
             self.assertEqual(response.status_code, 409)
             self.assertIn("aguarde a campanha terminar", response.get_json()["error"])
             self.assertEqual(len(sent_registry.summary()), 1)

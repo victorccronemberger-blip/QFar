@@ -22,6 +22,58 @@ TRANSIENT_STATES = {
 }
 
 
+def journal_flags_valid(row: dict[str, Any]) -> bool:
+    """Persisted flags and state labels must keep their declared types."""
+    flags = ("finalized", "finalize_requested", "evaluation_required",
+             "evaluation_verified", "campaign_reconciled", "register_first",
+             "suppress_per_chunk_catbear", "create_attempted", "native_response_schema",
+             "remote_fail_attempted", "remote_fail_confirmed", "upload_delete_attempted",
+             "upload_delete_confirmed", "session_delete_attempted", "session_delete_confirmed")
+    return isinstance(row, dict) and all(
+        type(row[key]) is bool for key in flags if key in row) and all(
+        isinstance(row[key], str) for key in ("state", "phase") if key in row)
+
+
+def journal_evaluation_confirmed(row: dict[str, Any]) -> bool:
+    """Whether the stored quality gate permits confirmation of a receipt.
+
+    Legacy receipts had neither evaluation flag. Their recorded finalization
+    remains usable, without claiming that an evaluation was required or passed.
+    An explicit requirement needs an explicit successful verification. A lone
+    negative verification has an unknown requirement and cannot prove delivery.
+    """
+    if not journal_flags_valid(row) or row.get("phase") in {"evaluation_review", "quality_rejected"}:
+        return False
+    if "evaluation_required" in row:
+        return row["evaluation_required"] is False or row.get("evaluation_verified") is True
+    if "evaluation_verified" in row:
+        return row["evaluation_verified"] is True
+    return True
+
+
+def is_pending_finalization(row: dict[str, Any]) -> bool:
+    """A complete chunk can resume evaluation/finalize without resending bytes."""
+    upload_id = row.get("upload_id") if isinstance(row, dict) else None
+    return (journal_flags_valid(row) and row.get("state") == STATE_DONE
+            and row.get("phase") == "done" and row.get("finalize_requested") is True
+            and row.get("finalized") is not True
+            and isinstance(upload_id, str) and bool(upload_id.strip()))
+
+
+def journal_delivery_confirmed(row: dict[str, Any]) -> bool:
+    """A finalization flag alone cannot identify a confirmed upload receipt.
+
+    Every chunk needs its persisted provider upload ID. Unidentified legacy
+    records remain available for review instead of crediting delivery or hiding
+    recovery entries. Group ownership, context and completeness are checked by
+    the caller.
+    """
+    upload_id = row.get("upload_id") if isinstance(row, dict) else None
+    return (journal_evaluation_confirmed(row)
+            and row.get("state") == STATE_DONE and row.get("finalized") is True
+            and isinstance(upload_id, str) and bool(upload_id.strip()))
+
+
 class UploadError(RuntimeError):
     """Falha em uma etapa do upload ou da finalização da sessão."""
 
@@ -35,17 +87,21 @@ class UploadError(RuntimeError):
         transient: bool | None = None,
         blocked_reason: str | None = None,
         phase: str | None = None,
+        review_required: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.transient = transient
         self.blocked_reason = blocked_reason
         self.phase = phase
+        self.review_required = review_required
         self.attempts = None
 
     @property
     def retryable(self) -> bool:
         """Somente rede, timeout, 408/429 e 5xx merecem nova tentativa."""
+        if self.review_required:
+            return False
         if self.transient is not None:
             return self.transient
         if self.status_code is None:
@@ -152,4 +208,7 @@ __all__ = [
     "TRANSIENT_STATES",
     "UploadError",
     "UploadResult",
+    "is_pending_finalization",
+    "journal_evaluation_confirmed",
+    "journal_flags_valid",
 ]

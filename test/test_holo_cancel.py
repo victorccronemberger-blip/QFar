@@ -27,8 +27,8 @@ class HoloCancelTests(unittest.TestCase):
             with patch.object(holo_accelerator.holoassist, "data_dir", return_value=root):
                 self.assertFalse(holo_accelerator.clip_ready(clip, root))
                 marker = native.with_name(native.name + ".source.json")
-                marker.write_text(json.dumps(campaign._native_cache_key(
-                    source, None, None)), encoding="utf-8")
+                marker.write_text(json.dumps(campaign._native_cache_marker(
+                    source, native, None, None)), encoding="utf-8")
                 self.assertTrue(holo_accelerator.clip_ready(clip, root))
                 pitchshift = recording / "Video_pitchshift.mp4"
                 pitchshift.write_bytes(b"p" * (1024 * 1024 + 2))

@@ -1,5 +1,7 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -48,6 +50,9 @@ class SessionPolicyTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="qmoney-service-policy-")))
+        self.stack.enter_context(patch.object(config, "DATA_DIR", root))
+        self.stack.enter_context(patch.object(minute_api, "_VERSION_GATE_MEMORY", {}))
         self.stack.enter_context(patch.object(vpn, "ENFORCE", False))
         self.stack.enter_context(patch.object(config, "REQUIRE_CURL", False))
         self.clock = self.stack.enter_context(patch.object(minute_api.time, "monotonic", return_value=100.0))
@@ -134,12 +139,15 @@ class SessionPolicyTests(unittest.TestCase):
         self.assertEqual(other.recording_policy.max_duration_ms, 3000)
         self.assertEqual(config.recording_limits(), original)
 
-    def test_identity_change_invalidates_previous_policy(self):
+    def test_identity_change_is_rejected_and_preserves_previous_policy(self):
         self.session.warmup()
-        self.session.with_email("other@example.invalid")
-        self.assertIsNone(self.session.recording_policy)
-        self.assertIsNone(self.session._recording_checked_at)
-        self.assertIsNone(self.session.device_camera_allowed)
+        policy = self.session.recording_policy
+        checked = self.session._recording_checked_at
+        with self.assertRaises(AuthError):
+            self.session.with_email("other@example.invalid")
+        self.assertIs(self.session.recording_policy, policy)
+        self.assertEqual(self.session._recording_checked_at, checked)
+        self.assertEqual(self.session.email, "test@example.invalid")
 
     def test_policy_issue_is_not_a_ban_or_password_failure(self):
         issue = account_issue("fixture@example.invalid", AuthError("private diagnostic", code="policy"))
@@ -282,7 +290,8 @@ class SessionPolicyTests(unittest.TestCase):
             self.assertEqual(data["minVersion"], "9.9.9")
             self.assertTrue(minute_api._version_gate_blocks())
         finally:
-            minute_api._maybe_latch_version_gate("", clear=True)
+            with patch.object(config, "APP_VERSION", "9.9.9"):
+                minute_api._maybe_latch_version_gate("", clear=True)
 
     def test_latched_version_blocks_all_mutations_not_reads(self):
         try:
@@ -292,10 +301,16 @@ class SessionPolicyTests(unittest.TestCase):
                 self.session._check_write_policy(
                     "POST", "/api/v1/organizations/join", {"code": "X"})
             self.assertEqual(caught.exception.account_issue_code, "version")
+            previous = minute_api._version_gate_file().read_bytes()
+            with self.assertRaises(AuthError):
+                self.session.clear_version_gate()
+            self.assertEqual(minute_api._version_gate_file().read_bytes(), previous)
+            self.assertTrue(minute_api._version_gate_blocks())
             # Leituras seguem liberadas para diagnóstico.
             self.session._check_write_policy("GET", "/api/v1/users/me", None)
         finally:
-            minute_api._maybe_latch_version_gate("", clear=True)
+            with patch.object(config, "APP_VERSION", "9.9.9"):
+                minute_api._maybe_latch_version_gate("", clear=True)
 
     def test_minute_403_errors_are_typed(self):
         self.assertEqual(
@@ -371,8 +386,9 @@ class SessionPolicyTests(unittest.TestCase):
             self.opened.return_value = (204, "")
             self.session.warmup()
             self.assertTrue(self.session._app_opened_published)
-            self.session.with_email("other@example.invalid")
-            self.assertFalse(self.session._app_opened_published)
+            with self.assertRaises(AuthError):
+                self.session.with_email("other@example.invalid")
+            self.assertTrue(self.session._app_opened_published)
 
     def test_unknown_vpn_state_blocks_before_transport(self):
         with patch.object(vpn, "ENFORCE", True), patch.object(vpn, "vpn_active", return_value=None), \

@@ -118,7 +118,7 @@ class BulkWithdrawalTests(unittest.TestCase):
 
     def test_pending_cleanup_survives_restart_and_recovery_never_withdraws(self):
         server.save_json(server._wise_cleanup_path(), {"pending": True, "email": "one@example.com"})
-        restarted_client = server.create_app().test_client()
+        restarted_client = server.create_app(for_testing=True).test_client()
         with patch.object(server.crowtado, "solicitar_link_saque") as withdraw, \
              patch.object(server.crowtado, "configurar_metodo_saque") as configure, \
              patch.object(server, "_configured_crowtado_creds", return_value={"one@example.com": "pw"}):
@@ -328,7 +328,7 @@ class BulkWithdrawalTests(unittest.TestCase):
         self._cooldown_path_patch.start()
         self.addCleanup(self._cooldown_path_patch.stop)
         self.addCleanup(self._bulk_path_patch.stop)
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
         self._previous_balance_state = server.BALANCES_RUNNER.state
         self._previous_bulk_loaded = server._WITHDRAW_BULK_LOADED
         self._previous_cooldown_loaded = server._WITHDRAW_COOLDOWN_LOADED

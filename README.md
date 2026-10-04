@@ -156,7 +156,7 @@ Para montar uma versão local, com Qt e FFmpeg já disponíveis na árvore:
 .\scripts\build_release.ps1 -Version 1.0.0
 ```
 
-O resultado fica em `release\QMoney-windows-x64.zip`.
+O resultado fica em `dist\QMoney-windows-x64.zip` (ou `dist\staging\` com `-Staging`).
 
 ## Segurança e dados
 

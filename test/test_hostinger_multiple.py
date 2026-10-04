@@ -120,7 +120,7 @@ class HostingerDomainRecoveryTests(unittest.TestCase):
             {"resource_id": "box-a", "address": "codes@alpha.example", "domain": "alpha.example"},
             {"resource_id": "box-b", "address": "codes@beta.example", "domain": "beta.example"},
         ]))
-        self.client = server.create_app().test_client()
+        self.client = server.create_app(for_testing=True).test_client()
 
     def test_saved_token_without_routes_recovers_selected_mailbox_and_persists(self):
         response = self.client.get("/api/accounts/domains")
@@ -192,7 +192,7 @@ class HostingerProfilesApiTests(unittest.TestCase):
             "token": "same-token-0000000", "mailbox_id": "box-one",
             "routes": ["example.com"],
         }]}}
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         with mock.patch.object(server, "_migrate_legacy_integrations", return_value=secure), \
              mock.patch.object(server.hostinger_mail, "discover_mailboxes") as discover:
             response = client.put("/api/integrations/hostinger", json={
@@ -217,7 +217,7 @@ class HostingerProfilesApiTests(unittest.TestCase):
             {"resource_id": "box-b", "address": "codes@beta.example",
              "domain": "beta.example"},
         ]
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         with mock.patch.object(server, "_migrate_legacy_integrations", return_value=secure), \
              mock.patch.object(server, "save_secure_settings"), \
              mock.patch.object(server, "_integration_snapshot", return_value={}), \
@@ -243,7 +243,7 @@ class HostingerProfilesApiTests(unittest.TestCase):
             "token": "existing-token-0000", "mailbox_id": "box-one",
             "routes": ["one.example"],
         }]}}
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         with mock.patch.object(server, "_migrate_legacy_integrations", return_value=secure), \
              mock.patch.object(server, "save_secure_settings"), \
              mock.patch.object(server, "_integration_snapshot", return_value={}), \

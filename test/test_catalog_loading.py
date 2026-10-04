@@ -104,7 +104,7 @@ class CatalogLoadingTests(unittest.TestCase):
         self.assertEqual(work.call_count, 1)
 
     def test_async_endpoint_does_not_hold_http_or_account_lock_while_indexing(self):
-        app = server.create_app()
+        app = server.create_app(for_testing=True)
         entered, release = threading.Event(), threading.Event()
         def build(*args, **kwargs):
             self.assertEqual(kwargs["remote_tasks"], [{"name": "Gardening"}])
@@ -153,7 +153,7 @@ class CatalogLoadingTests(unittest.TestCase):
                     release.wait(3)
                     return payload
                 with patch.object(target, attribute, side_effect=slow) as work:
-                    client = server.create_app().test_client()
+                    client = server.create_app(for_testing=True).test_client()
                     try:
                         self.assertEqual(client.get(path).status_code, 202)
                         self.assertTrue(entered.wait(1))

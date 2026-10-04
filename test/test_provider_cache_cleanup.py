@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import hashlib
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,15 +24,21 @@ class ProviderCacheCleanupTests(unittest.TestCase):
             recording = recordings / "video.mp4"
             for path in (ego_video, holo_video, holo_source, catalog, recording):
                 path.write_bytes(b"123")
+            digest=hashlib.sha256(b'123').hexdigest()
+            marker={'version':campaign._NATIVE_CACHE_VERSION,'source_sha256':digest,
+                    'prepared_size':3,'prepared_sha256':digest}
+            for media in (ego_video,holo_video):
+                media.with_name(media.name+'.source.json').write_text(json.dumps(marker),encoding='utf8')
             with patch.object(holoassist, "data_dir", return_value=root / "holoassist"):
                 result = campaign.cleanup_media_cache(ego, provider="holoassist")
-                self.assertEqual(result["files"], 3)
+                self.assertEqual(result["files"], 2)
                 self.assertTrue(ego_video.exists())
                 self.assertTrue(catalog.exists())
                 self.assertFalse(holo_video.exists())
-                self.assertFalse(recording.exists())
+                # No ownership marker/journal binds this manually placed file.
+                self.assertTrue(recording.exists())
                 result = campaign.cleanup_media_cache(ego, provider="ego4d")
-                self.assertEqual(result["files"], 1)
+                self.assertEqual(result["files"], 2)
                 self.assertFalse(ego_video.exists())
                 self.assertTrue(catalog.exists())
 
@@ -39,12 +47,12 @@ class ProviderCacheCleanupTests(unittest.TestCase):
             self.assertEqual(server._local_dataset_provider("all"), "ego4d")
             with self.assertRaises(ValueError):
                 server._local_dataset_provider("holoassist")
-            response = server.create_app().test_client().post(
+            response = server.create_app(for_testing=True).test_client().post(
                 "/api/holo-cache/start", json={"provider": "holoassist"})
             self.assertEqual(response.status_code, 400)
 
     def test_cleanup_api_requires_known_provider_and_passes_selection(self):
-        client = server.create_app().test_client()
+        client = server.create_app(for_testing=True).test_client()
         self.assertEqual(client.post("/api/storage/cleanup", json={"provider": "other"}).status_code, 400)
         with patch.object(server.campaign, "cleanup_media_cache", return_value={
             "files": 2, "bytes": 10, "errors": [], "skipped": 0,
