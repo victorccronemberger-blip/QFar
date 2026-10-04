@@ -577,41 +577,61 @@ class JournalOwnerBindingTests(unittest.TestCase):
 
 
 class CompletionCliTests(unittest.TestCase):
-    @staticmethod
-    def _module():
+    """Retired uploader refuses before IO and never echoes private arguments."""
+
+    @classmethod
+    def setUpClass(cls):
         source = Path(__file__).resolve().parents[1] / "scripts" / "upload_video.py"
-        specification = importlib.util.spec_from_file_location("completion_policy_cli", source)
-        module = importlib.util.module_from_spec(specification)
-        specification.loader.exec_module(module)
-        return module
+        cls.code = compile(source.read_bytes(), str(source), "exec")
 
-    def test_cli_default_and_compatible_alias_and_explicit_false(self):
-        for options, expected in (([], True), (["--suppress-catbear"], True),
-                                  (["--no-suppress-catbear"], False)):
-            with self.subTest(options=options), _fixture() as (_, paths, _):
-                module = self._module()
-                result = UploadResult(session_id="fixture-session", org_key="fixture-org",
-                                      task_id=None, chunks=[], total_size_bytes=1,
-                                      total_duration_ms=60_000, recorded_at="fixture")
-                arguments = ["upload_video.py", "fixture@example.invalid", str(paths[0]),
-                             "fixture-org", "--no-normalize", *options]
-                with (mock.patch.object(module.sys, "argv", arguments),
-                      mock.patch.object(module, "_session", return_value=_Session()),
-                      mock.patch.object(module.device_profile, "get_profile", return_value=None),
-                      mock.patch.object(module.upload, "upload_session", return_value=result) as send,
-                      redirect_stdout(io.StringIO())):
-                    self.assertEqual(module.main(), 0)
-                self.assertIs(send.call_args.kwargs["suppress_per_chunk_catbear"], expected)
+    def _execute(self, mode, arguments=None):
+        import sys
+        original_import = __import__
+        imported = []
 
-    def test_cli_flag_options_are_mutually_exclusive(self):
-        module = self._module()
-        arguments = ["upload_video.py", "fixture@example.invalid", "fixture.mp4", "fixture-org",
-                     "--suppress-catbear", "--no-suppress-catbear"]
-        with (mock.patch.object(module.sys, "argv", arguments),
-              mock.patch.object(module, "_session") as create_session,
-              mock.patch.object(module.upload, "upload_session") as send):
-            with self.assertRaises(SystemExit) as caught:
-                module.main()
-        self.assertEqual(caught.exception.code, 2)
-        create_session.assert_not_called()
-        send.assert_not_called()
+        def inert_import(name, *args, **kwargs):
+            imported.append(name)
+            if name not in {"sys", "__future__"}:
+                raise AssertionError("Retired uploader attempted a dependency import")
+            return original_import(name, *args, **kwargs)
+
+        def forbidden_effect(*args, **kwargs):
+            raise AssertionError("Retired uploader attempted file/auth/transport IO")
+
+        output = io.StringIO()
+        namespace = {"__name__": "__main__" if mode == "cli" else "retired_upload_fixture"}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch("builtins.__import__", side_effect=inert_import))
+            stack.enter_context(mock.patch("builtins.open", side_effect=forbidden_effect))
+            for name in ("open", "read_bytes", "read_text", "write_bytes", "write_text", "exists"):
+                stack.enter_context(mock.patch.object(Path, name, side_effect=forbidden_effect))
+            stack.enter_context(mock.patch.object(upload, "upload_session", side_effect=forbidden_effect))
+            stack.enter_context(mock.patch.object(upload, "pump_pending", side_effect=forbidden_effect))
+            stack.enter_context(mock.patch.object(device_profile, "get_profile", side_effect=forbidden_effect))
+            stack.enter_context(mock.patch.object(sys, "stderr", output))
+            stack.enter_context(mock.patch.object(sys, "stdout", output))
+            stack.enter_context(mock.patch.object(sys, "argv", ["upload_video.py", *(arguments or [])]))
+            if mode == "cli":
+                with self.assertRaises(SystemExit) as refused:
+                    exec(self.code, namespace)
+                self.assertEqual(refused.exception.code, 2)
+            else:
+                exec(self.code, namespace)
+                if mode == "main":
+                    self.assertEqual(namespace["main"](arguments), 2)
+        self.assertEqual(set(imported), {"sys", "__future__"})
+        return output.getvalue()
+
+    def test_import_is_inert_without_application_dependencies(self):
+        self.assertEqual(self._execute("import"), "")
+
+    def test_cli_and_direct_main_refuse_before_effects_and_hide_arguments(self):
+        private = ["private-token-canary", "private-media-path-canary", "--pump",
+                   "--suppress-catbear", "--no-suppress-catbear"]
+        for mode, args in (("main", None), ("main", private), ("cli", private)):
+            with self.subTest(mode=mode, private_arguments=args is not None):
+                output = self._execute(mode, args)
+                self.assertIn("aposentada", output)
+                self.assertIn("Campanha", output)
+                self.assertIn("captura original", output)
+                self.assertNotIn("private-", output)

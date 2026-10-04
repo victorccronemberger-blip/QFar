@@ -64,6 +64,12 @@ scripts/*
 !scripts/index_ego4d_library.py
 !scripts/ego4d_variety.py
 !scripts/build_ego4d_task_seed.py
+!scripts/inspect_original_capture.py
+!scripts/upload_video.py
+!scripts/forensic_prepare.py
+!scripts/reid_native_upload.py
+!scripts/forensic_resend.py
+!scripts/registrar_conta.py
 *.bat
 HowUseMe.md
 PARA_RODAR_NO_DESTINO.md
