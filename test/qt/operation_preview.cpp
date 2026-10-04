@@ -639,7 +639,7 @@ public:
         if (!input.contains("fixture@example.com") || socket->property("answered").toBool()) return;
         socket->setProperty("answered", true);
         if (!input.startsWith("POST /api/accounts/password ")) { qApp->exit(81); return; }
-        const QByteArray body = R"({"password":"fixture-only-password"})";
+        const QByteArray body = R"({"email":"fixture@example.com","password":"fixture-only-password"})";
         socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
           + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
         socket->disconnectFromHost();
@@ -1272,7 +1272,7 @@ public:
         ++*step; window._historyTable->setCurrentCell(0,0);
       } else if (*step==6 && window._historyEvidence->rowCount()==2) {
         if(window._historyEvidence->item(0,2)->text()!="session-confirmed"
-            || window._historyEvidence->item(0,3)->text()!=QStringLiteral("Finalização confirmada")
+            || window._historyEvidence->item(0,3)->text()!=QStringLiteral("Confirmado na tentativa original")
             || window._historyEvidence->item(1,3)->text()!=QStringLiteral("Sem confirmação")) {
           qApp->exit(23); return;
         }
