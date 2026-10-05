@@ -95,9 +95,10 @@ def metadata():
 def bundle(metadata, *, frames=FRAMES, imu=IMU, extra=()):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(LOG_ID + ".metadata.json", json.dumps(metadata))
+        # APK writer order: imu → frames → metadata
         archive.writestr(LOG_ID + ".imu.csv", imu)
         archive.writestr(LOG_ID + ".frames.csv", frames)
+        archive.writestr(LOG_ID + ".metadata.json", json.dumps(metadata))
         for name, value in extra:
             archive.writestr(name, value)
     return output.getvalue()

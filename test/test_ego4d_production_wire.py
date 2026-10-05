@@ -37,6 +37,76 @@ def _source_imu_csv(duration_ms: int = 100) -> str:
     return "\n".join(lines) + "\n"
 
 
+class Ego4dPrepareNormalization(unittest.TestCase):
+    def test_normalize_fills_prepare_required_fields_from_window(self):
+        clip = {
+            "clip_uid": "abc",
+            "parent_video_uid": "parent",
+            "window_s": (10.0, 70.0),
+            "s3_path": "s3://ego4d-speac/public/v2/clips/abc.mp4",
+        }
+        out = campaign._normalize_ego_clip_for_prepare(clip)
+        self.assertEqual(out["exported_clip_uid"], "abc")
+        self.assertEqual(out["parent_start_sec"], "10.0")
+        self.assertEqual(out["parent_end_sec"], "70.0")
+        plan = campaign._ego_prepare_plan(out)
+        self.assertEqual(plan["clip_uid"], "abc")
+        self.assertAlmostEqual(plan["dur_s"], 60.0)
+
+
+class Ego4dMirrorCandidates(unittest.TestCase):
+    def test_clip_s3_candidates_include_speac_and_bristol(self):
+        from moneymin import ego4d
+        clip = {
+            "clip_uid": "uid-1",
+            "exported_clip_uid": "uid-1",
+            "s3_path": "s3://ego4d-bristol/public/v1/clips/uid-1.mp4",
+        }
+        cands = ego4d._clip_s3_candidates(clip)
+        buckets = {b for b, _ in cands}
+        self.assertIn("ego4d-bristol", buckets)
+        self.assertIn("ego4d-speac", buckets)
+        self.assertTrue(any(k.endswith("uid-1.mp4") for _, k in cands))
+
+
+class Ego4dPreferParentCuts(unittest.TestCase):
+    def test_prefer_parent_cuts_orders_long_needs_cut_first(self):
+        from moneymin import ego4d
+        clips = [
+            {"clip_uid": "short-export", "dur_s": 120.0, "needs_cut": False,
+             "parent_video_uid": "p1", "media_uid": "export-media-1"},
+            {"clip_uid": "long-parent", "dur_s": 900.0, "needs_cut": True,
+             "parent_video_uid": "p2", "media_uid": "p2"},
+        ]
+        ordered = ego4d.prefer_long_clips(clips, prefer_parent_cuts=True)
+        self.assertEqual(ordered[0]["clip_uid"], "long-parent")
+
+
+class Ego4dImuCarve(unittest.TestCase):
+    def test_carve_continuous_window_returns_subwindow(self):
+        from moneymin import imu_coverage
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            # Continuous 0-2s and 5-10s; requested window 0-10 → carve longest 5-10.
+            lines = ["canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z"]
+            for t in list(range(0, 2001, 10)) + list(range(5000, 10001, 10)):
+                lines.append(f"{t},0.01,0.02,0.03,0.1,0.2,9.81")
+            parent = "parent-carve"
+            (root / f"{parent}_imu.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            clip = {
+                "clip_uid": "orig", "source": "ego4d",
+                "parent_video_uid": parent, "window_s": (0.0, 10.0),
+                "dur_s": 10.0, "needs_cut": True,
+            }
+            carved = imu_coverage.carve_continuous_window(
+                clip, root, min_s=3.0, max_s=30.0)
+            self.assertIsNotNone(carved)
+            start, end = carved["window_s"]
+            self.assertGreaterEqual(end - start, 3.0)
+            self.assertGreaterEqual(start, 4.9)
+            self.assertEqual(carved["imu_carved_from"], "orig")
+
+
 class Ego4dCachedExpansionBestOf(unittest.TestCase):
     """v1.0.73/v2.0.2 accelerator merge restored into campaign selection."""
 
@@ -180,6 +250,11 @@ class Ego4dForgeEnvelope(unittest.TestCase):
             self.assertEqual(diag["sampleCount"], stats["sampleCount"])
             self.assertEqual(diag["interpolatedCount"], stats["interpolatedCount"])
             self.assertGreater(diag["interpolatedCount"], 0)
+            # APK EgoImu always emits config ceiling, never measured span.
+            self.assertEqual(diag["maxInterpolationSpanNs"], "25000000")
+            self.assertNotEqual(
+                diag["maxInterpolationSpanNs"],
+                stats.get("measuredMaxInterpolationSpanNs"))
             self.assertNotIn("clockOffsetNs", diag)
             self.assertEqual(meta["device"]["model"], "SM-S901E")
             self.assertEqual(meta["platform"], {"os": "android", "version": 34})
@@ -188,6 +263,14 @@ class Ego4dForgeEnvelope(unittest.TestCase):
             self.assertEqual(int(imu_out.splitlines()[1].split(",")[0]), UPTIME_NS)
             self.assertEqual(
                 int(meta["timebase"]["firstFrameSensorTimestampNs"]), UPTIME_NS)
+            # Writer order: imu → frames → metadata
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf2:
+                names = [i.filename for i in zf2.infolist()]
+            self.assertEqual(
+                names,
+                ["forge-session_0.imu.csv",
+                 "forge-session_0.frames.csv",
+                 "forge-session_0.metadata.json"])
 
     def test_forge_map_document_exists(self):
         root = Path(__file__).resolve().parents[1]

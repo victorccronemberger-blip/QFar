@@ -815,6 +815,10 @@ def _clip_record(c: dict[str, Any], pv: dict[str, Any]) -> dict[str, Any]:
     return {
         "dur_s": round(dur, 1),
         "clip_uid": uid,
+        # prepare_clip / _ego_prepare_plan need these identities preserved.
+        "exported_clip_uid": uid,
+        "parent_start_sec": str(c.get("parent_start_sec") if c.get("parent_start_sec") is not None else s),
+        "parent_end_sec": str(c.get("parent_end_sec") if c.get("parent_end_sec") is not None else e),
         "device": dev,
         "scenario": " | ".join(scenarios),
         "scenarios": scenarios,
@@ -823,6 +827,8 @@ def _clip_record(c: dict[str, Any], pv: dict[str, Any]) -> dict[str, Any]:
         "action_text": action_text,
         "action_units": _action_units(action_text),
         "parent_video_uid": str(c.get("parent_video_uid") or ""),
+        "media_uid": c.get("media_uid"),
+        "media_time_offset_s": float(c.get("media_time_offset_s") or 0.0),
         "needs_cut": bool(c.get("needs_cut")),
     }
 
@@ -1793,11 +1799,14 @@ def list_windows(
 
 
 def prefer_long_clips(clips: list[dict[str, Any]], *,
-                     shuffle: bool = False) -> list[dict[str, Any]]:
-    """Export oficial primeiro; dentro disso, longos (≥10 min, depois ≥5 min).
+                     shuffle: bool = False,
+                     prefer_parent_cuts: bool = False) -> list[dict[str, Any]]:
+    """Ordena candidatos por duração (≥10 min, depois ≥5 min).
 
-    O clipe CRF 18 já era a mídia preferida. Enfileirar o full-scale só porque
-    a janela é mais longa invertia essa preferência e baixava o pai inteiro.
+    Default histórico: export oficial CRF-18 primeiro (menos IO).
+    ``prefer_parent_cuts=True`` (campanha): janelas longas do pai (`needs_cut`)
+    antes dos exports curtos, quando a evidência já passou — melhor aproveita
+    o dataset IMU-coberto.
     """
     buckets = {
         True: ([], [], []),
@@ -1813,7 +1822,9 @@ def prefer_long_clips(clips: list[dict[str, Any]], *,
         else:
             group[2].append(clip)
     ordered: list[dict[str, Any]] = []
-    for exported in (True, False):
+    # exported=True first historically; parent cuts first when asked.
+    export_order = (False, True) if prefer_parent_cuts else (True, False)
+    for exported in export_order:
         for bucket in buckets[exported]:
             if shuffle:
                 random.shuffle(bucket)
@@ -2022,10 +2033,53 @@ def _valid_imu_cache(path: Path) -> bool:
         return False
 
 
+def _clip_s3_candidates(clip: dict[str, Any]) -> list[tuple[str, str]]:
+    """Primary s3 path plus known Ego4D mirrors for the same clip UID."""
+    primary = str(clip.get("s3_path") or "").replace("s3://", "").strip()
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(bucket: str, key: str) -> None:
+        pair = (bucket, key)
+        if bucket and key and pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+
+    if primary:
+        bucket, _, key = primary.partition("/")
+        _add(bucket, key)
+    uid = str(clip.get("exported_clip_uid") or clip.get("clip_uid") or "").strip()
+    if uid:
+        for bucket, prefix in (
+            ("ego4d-speac", "public/v2/clips"),
+            ("ego4d-bristol", "public/v1/clips"),
+            ("ego4d-consortium-sharing", "public/v1/clips"),
+            ("ego4d-consortium-sharing", "public/v2/clips"),
+        ):
+            _add(bucket, f"{prefix}/{uid}.mp4")
+    return out
+
+
+def _download_clip_with_mirrors(clip: dict[str, Any], dest: Path) -> Path:
+    """Try primary then mirrors until a probe-valid MP4 lands."""
+    errors: list[str] = []
+    for bucket, key in _clip_s3_candidates(clip):
+        try:
+            return _download_to(bucket, key, dest, validator=_valid_mp4_cache)
+        except Exception as exc:  # noqa: BLE001 — try next mirror
+            errors.append(f"s3://{bucket}/{key}: {exc}")
+            continue
+    detail = "; ".join(errors[:4]) or "sem candidatos S3"
+    raise RuntimeError(
+        f"falha ao baixar clipe Ego4D {clip.get('clip_uid')}: {detail}")
+
+
 def download_clip(clip: dict[str, Any], dest: Path) -> Path:
     """Baixa o MP4 do clipe para `dest` (no-op se já existir).
 
     Janelas longas (`needs_cut`): baixa o vídeo-pai uma vez e corta localmente.
+    Se o mirror primário falhar na validação (ex.: bristol incompleto), tenta
+    speac/consortium com o mesmo ``clip_uid``.
     """
     dest = Path(dest)
     needs_cut = bool(clip.get("needs_cut"))
@@ -2037,18 +2091,18 @@ def download_clip(clip: dict[str, Any], dest: Path) -> Path:
         raise ValueError("janela Ego4D inválida; o vídeo inteiro não pode substituir o trecho solicitado")
     if _valid_mp4_cache(dest):
         return dest
-    s3_path = str(clip["s3_path"]).replace("s3://", "")
-    bucket, _, key = s3_path.partition("/")
     if needs_cut and end > start:
         media_uid = str(clip.get("media_uid") or clip.get("parent_video_uid")
                         or "parent")
         parent_path = dest.parent / f"{media_uid}.mp4"
         if not _valid_mp4_cache(parent_path):
+            # Parent full-scale usually lives on the video s3_path, not clip mirrors.
+            s3_path = str(clip["s3_path"]).replace("s3://", "")
+            bucket, _, key = s3_path.partition("/")
             _download_to(bucket, key, parent_path, validator=_valid_mp4_cache)
         return _extract_window(
             parent_path, start - media_offset, end - start, dest)
-    _download_to(bucket, key, dest, validator=_valid_mp4_cache)
-    return dest
+    return _download_clip_with_mirrors(clip, dest)
 
 
 def download_imu(video: dict[str, Any], dest: Path) -> Path | None:
@@ -2183,14 +2237,19 @@ def build_imu_csv(
     continuity = [_continuity(component) for component in counts]
     max_gap_samples = max(
         1, int(math.ceil(IMU_MAX_INTERPOLATION_GAP_MS / step_ms)))
+    # Continuity is judged on the source window grid, not on a longer probe
+    # duration_ms (encode rounding must not invent a trailing IMU hole).
+    window_bins = max(
+        1, int(round((declared_end_ms - start_ms) / step_ms)) + 1)
     labels = ("giroscópio", "acelerômetro")
     for label, (first, last, valid_count, internal_gap) in zip(
             labels, continuity, strict=True):
         leading_gap = first
-        trailing_gap = (n - 1) - last
+        trailing_gap = max(0, (window_bins - 1) - last)
         largest_gap = max(leading_gap, trailing_gap, internal_gap)
         if largest_gap > max_gap_samples:
-            source_rate = valid_count / max(0.001, duration_ms / 1000.0)
+            source_rate = valid_count / max(
+                0.001, (declared_end_ms - start_ms) / 1000.0)
             raise RuntimeError(
                 f"cobertura IMU insuficiente no {label} "
                 f"(taxa efetiva={source_rate:.1f}Hz, lacuna máxima="
@@ -2276,7 +2335,10 @@ def build_imu_csv(
             "droppedRowCount": 0,
             "interpolatedCount": int(interpolated_count),
             "maxAlignmentDeltaNs": half_step,
-            "maxInterpolationSpanNs": str(span_ns if span_ns > 0 else step_ns_i),
+            # Wire field is always APK ceiling; measured span is provenance-only.
+            "maxInterpolationSpanNs": "25000000",
+            "measuredMaxInterpolationSpanNs": str(
+                span_ns if span_ns > 0 else step_ns_i),
             "nearestFallbackCount": int(nearest_fallback_count),
             "nearestFallbackToleranceNs": "1000000",
             "p95AlignmentDeltaNs": half_step,

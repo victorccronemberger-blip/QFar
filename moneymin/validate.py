@@ -233,6 +233,15 @@ def validate_sidecar_zip(
             if missing:
                 return [Check("zip", "fail",
                               "membros ausentes: " + ", ".join(missing))]
+            # Writer APK order: imu → frames → metadata (C2500n0).
+            ordered = [info.filename for info in archive.infolist()
+                       if info.filename in required]
+            expected_order = [
+                f"{log_id}.imu.csv",
+                f"{log_id}.frames.csv",
+                f"{log_id}.metadata.json",
+            ]
+            order_ok = ordered == expected_order
             metadata = decode_json_state(
                 archive.read(f"{log_id}.metadata.json").decode("utf-8"))
             imu_text = archive.read(f"{log_id}.imu.csv").decode("utf-8")
@@ -243,6 +252,11 @@ def validate_sidecar_zip(
                       "metadata.json inválido ou ambíguo; arquivo preservado")]
     except Exception as exc:  # noqa: BLE001
         return [Check("zip", "fail", f"zip inválido: {exc}")]
+
+    checks.append(Check(
+        "zip.member_order",
+        "pass" if order_ok else "fail",
+        "imu→frames→metadata" if order_ok else f"ordem {ordered}"))
 
     # --- metadata_json.valid -------------------------------------------------
     if not isinstance(metadata, dict):
@@ -377,6 +391,20 @@ def validate_sidecar_zip(
             "warn",
             f"strategy={diag.get('strategy')!r}; 1.29 usa gyro_anchored_v1",
         ))
+    if isinstance(diag, dict):
+        span = diag.get("maxInterpolationSpanNs")
+        # EgoImu constructor always serializes config ceiling 25000000.
+        if span is None:
+            checks.append(Check(
+                "imuDiagnostics.maxInterpolationSpanNs",
+                "warn",
+                "ausente (writer 1.29 emite 25000000)"))
+        else:
+            span_ok = span == "25000000" or span == 25000000
+            checks.append(Check(
+                "imuDiagnostics.maxInterpolationSpanNs",
+                "pass" if span_ok else "fail",
+                repr(span)))
     if isinstance(diag, dict) and _positive_int(diag.get("sampleCount")):
         imu_rows = len([ln for ln in imu_text.splitlines() if ln.strip()]) - 1
         reported = int(diag.get("sampleCount"))

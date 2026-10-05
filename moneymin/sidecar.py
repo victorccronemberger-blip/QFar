@@ -85,20 +85,26 @@ _FFPROBE_CACHE: str | None = None
 def _local_tools_bin(name: str) -> str | None:
     """Binário distribuído no runtime privado do QMoney.
 
-    Aceita ``tools/<nome>/bin/<nome>.exe`` e a estrutura do zip do gyan.dev
-    (``tools/ffmpeg/ffmpeg-<vers>-essentials_build/bin/ffmpeg.exe``).
+    Aceita ``tools/<nome>/bin/<nome>.exe``, a estrutura do zip do gyan.dev
+    (``tools/ffmpeg/ffmpeg-<vers>-essentials_build/bin/ffmpeg.exe``) e o
+    pacote empacotado em ``dist/QMoney/runtime/tools/...``.
     """
     exe = name + (".exe" if os.name == "nt" else "")
-    base = config.RUNTIME_ROOT / "tools" / name
-    flat = base / "bin" / exe
-    if flat.exists():
-        return str(flat)
-    try:
-        for cand in sorted(base.glob(f"*/bin/{exe}")):
-            if cand.exists():
-                return str(cand)
-    except OSError:
-        pass
+    roots = [
+        config.RUNTIME_ROOT / "tools" / name,
+        config.CODE_ROOT / "tools" / name,
+        config.CODE_ROOT / "dist" / "QMoney" / "runtime" / "tools" / name,
+    ]
+    for base in roots:
+        flat = base / "bin" / exe
+        if flat.exists():
+            return str(flat)
+        try:
+            for cand in sorted(base.glob(f"*/bin/{exe}")):
+                if cand.exists():
+                    return str(cand)
+        except OSError:
+            continue
     return None
 
 
@@ -388,8 +394,10 @@ def _forge_imu_diagnostics(
     """Minute 1.29 ``imuDiagnostics`` (n0.1 / Y / q0.1) for the forged envelope.
 
     Prefer measured resample counters from ``ego4d.build_imu_csv(..., stats=)``.
-    Ceiling ``maxInterpolationSpanNs`` stays the APK constant ``25000000`` when
-    the measured span is missing; never invent ``interpolatedCount == sampleCount``.
+    ``maxInterpolationSpanNs`` is always the APK config ceiling ``25000000``
+    (EgoImu aligner constructor) — never the observed gap. Measured span may
+    live in provenance under another key; never invent
+    ``interpolatedCount == sampleCount``.
     """
     base = {
         "droppedRowCount": 0,
@@ -412,7 +420,7 @@ def _forge_imu_diagnostics(
         if type(value) is int and value >= 0:
             base[key] = value
     for key in (
-        "maxAlignmentDeltaNs", "maxInterpolationSpanNs",
+        "maxAlignmentDeltaNs",
         "nearestFallbackToleranceNs", "p95AlignmentDeltaNs",
     ):
         value = measured.get(key)
@@ -424,6 +432,8 @@ def _forge_imu_diagnostics(
         base["strategy"] = "gyro_anchored_v1"
     # sampleCount must match the CSV that ships in the zip.
     base["sampleCount"] = int(sample_count)
+    # APK writer always emits the config ceiling, not measured max span.
+    base["maxInterpolationSpanNs"] = "25000000"
     return base
 
 
@@ -480,11 +490,27 @@ def build_metadata_json(
     codec = probe.get("codec") or "h264"
     # O app Android encoda H.264 em MP4; o MediaFormat reporta video/avc.
     mime = "video/avc" if codec in ("h264", "avc1", "avc") else f"video/{codec}"
-    # Valores reportados pelo MediaFormat de um MP4 H.264 High@4.2 real (Android).
-    # profile 8 = AVCProfileHigh, level 8192 = AVCLevel42.
+    # Espelha o que MediaExtractor costuma expor (V.smali): profile/level do
+    # High@4.2 que pedimos ao encoder; bitRate/colorStandard só se o probe
+    # trouxer valor finito — senão null como o app quando a chave falta.
+    probe_bitrate = probe.get("bitrate")
+    try:
+        bit_rate = int(probe_bitrate) if probe_bitrate not in (None, "", 0) else None
+    except (TypeError, ValueError):
+        bit_rate = None
+    if bit_rate is not None and bit_rate <= 0:
+        bit_rate = None
+    color_standard = probe.get("color_standard", probe.get("colorStandard"))
+    if color_standard is None:
+        color_standard = None
+    else:
+        try:
+            color_standard = int(color_standard)
+        except (TypeError, ValueError):
+            color_standard = None
     codec_actuals = {
-        "bitRate": probe.get("bitrate") or 8_000_000,
-        "colorStandard": 1,
+        "bitRate": bit_rate,
+        "colorStandard": color_standard,
         "gopMaxFrames": None,
         "hasBFrames": None,
         "height": height,
@@ -1082,6 +1108,8 @@ def build_sidecar_zip_custom(
     imu_csv = imu_csv if imu_csv is not None else build_imu_csv(duration_ms)
     first_t = _imu_csv_first_timestamp_ns(imu_csv)
     # Relative prepare grids start at 0. Skip if already on the uptime domain.
+    if uptime_ns < 0:
+        raise ValueError("uptime_ns da IMU deve ser não-negativo")
     if first_t is not None and first_t < uptime_ns:
         imu_csv = offset_imu_csv_timestamps(imu_csv, uptime_ns)
     if imu_sample_count is None or int(imu_sample_count or 0) <= 0:
@@ -1109,9 +1137,10 @@ def build_sidecar_zip_custom(
                                         offset_ns=uptime_ns))
 
     buf = io.BytesIO()
+    # Ordem do writer APK (EgoSidecar / n0.1): imu → frames → metadata.
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{log_id}.metadata.json",
-                    json.dumps(metadata, ensure_ascii=False))
         zf.writestr(f"{log_id}.imu.csv", imu_csv)
         zf.writestr(f"{log_id}.frames.csv", frames_csv)
+        zf.writestr(f"{log_id}.metadata.json",
+                    json.dumps(metadata, ensure_ascii=False))
     return buf.getvalue()

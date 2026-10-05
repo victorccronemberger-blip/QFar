@@ -26,15 +26,30 @@ Membros na raiz: `{logId}.metadata.json`, `{logId}.imu.csv`, `{logId}.frames.csv
 - create POST sobrescreve com curto: `device:{model}`, `platform:{os}`, `appVersion`
 - `imuDiagnostics.strategy`: `gyro_anchored_v1`
 - **sem** `clockOffsetNs` no zip
-- `maxInterpolationSpanNs`: teto APK `"25000000"`; contadores vêm do resample (`stats=`)
+- `maxInterpolationSpanNs`: **sempre** teto APK `"25000000"` (nunca o gap medido)
+- Contadores (`interpolatedCount`, nearest-fallback) vêm do resample (`stats=`)
 - `sampleCount` == linhas do CSV
 - IMU `t0` == `timebase.firstFrameSensorTimestampNs`
+- Ordem zip (writer APK): **`imu.csv` → `frames.csv` → `metadata.json`**
+- `codecActuals.bitRate` / `colorStandard`: valor do probe ou **null** (não inventar)
 
 ## Qualidade que não se forja com mentira
 
 - Ego4D **sem** `imu_real` → envio bloqueado (sem IMU sintética)
 - Frames Ego4D exigem PTS medidos (`require_measured_pts=True`)
 - Proveniência local marca `recording_origin=third_party_dataset`
+
+## Falhas fechadas no prepare E2E (ao vivo)
+
+| Falha | Correção |
+|---|---|
+| `list_clips` sem `exported_clip_uid` / `parent_start_sec` | campos no `_clip_record` + `_normalize_ego_clip_for_prepare` |
+| Mirror bristol MP4 inválido no probe | `_download_clip_with_mirrors` (speac/consortium) |
+| Lacuna IMU fantasma (probe > janela) | continuidade na grade da **janela**, não no padding do probe |
+| `ffmpeg` não no PATH | resolve também `dist/QMoney/runtime/tools/ffmpeg` |
+| uptime negativo (wall << boot) | `uptime_ns_at` recalcula boot no intervalo plausível |
+| `maxInterpolationSpanNs` medido | pin APK `"25000000"` |
+| Ordem zip errada | imu → frames → metadata |
 
 ## Limites honestos
 

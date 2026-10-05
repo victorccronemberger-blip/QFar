@@ -187,9 +187,9 @@ class Minute129SidecarBuilderTests(unittest.TestCase):
         meta["imuDiagnostics"]["clockOffsetNs"] = "123"
         poisoned = io.BytesIO()
         with zipfile.ZipFile(poisoned, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("native-session_0.metadata.json", json.dumps(meta))
             archive.writestr("native-session_0.imu.csv", imu)
             archive.writestr("native-session_0.frames.csv", frames)
+            archive.writestr("native-session_0.metadata.json", json.dumps(meta))
         checks = {c.name: c for c in validate_sidecar_zip(
             poisoned.getvalue(), log_id="native-session_0", duration_ms=1000)}
         self.assertEqual(checks["imuDiagnostics.no_clockOffsetNs"].status, "fail")

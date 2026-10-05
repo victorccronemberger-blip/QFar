@@ -135,6 +135,88 @@ def _intervals(path: str, size: int, mtime_ns: int, gap_ms: float,
     return canonical
 
 
+def continuous_intervals_for_imu(
+    imu_path: Path, *, gap_ms: float | None = None,
+) -> tuple[tuple[float, float], ...]:
+    """Gyro∩accel continuity intervals (seconds) for a local Ego4D IMU CSV."""
+    path = Path(imu_path)
+    if not path.is_file():
+        return ()
+    gap = float(ego4d.IMU_MAX_INTERPOLATION_GAP_MS if gap_ms is None else gap_ms)
+    try:
+        stat = path.stat()
+        source_path = str(path.resolve())
+        fingerprint = _source_fingerprint(source_path, stat.st_size, stat.st_mtime_ns)
+        return _intervals(source_path, stat.st_size, stat.st_mtime_ns, gap, fingerprint)
+    except (OSError, ValueError, csv.Error):
+        return ()
+
+
+def carve_continuous_window(
+    clip: dict, work_dir: Path, *, min_s: float, max_s: float,
+) -> dict | None:
+    """Return a refined Ego4D clip inside the longest continuous IMU overlap.
+
+    Does not invent sensor data. Returns None when no ≥min_s continuous piece
+    remains inside the original window.
+    """
+    if clip.get("source") == "holoassist":
+        return None
+    parent = clip.get("parent_video_uid")
+    window = clip.get("window_s")
+    if not parent or not window:
+        return None
+    path = Path(work_dir) / f"{parent}_imu.csv"
+    intervals = continuous_intervals_for_imu(path)
+    if not intervals:
+        return None
+    original_start, original_end = map(float, window)
+    # Prefer the longest overlap with the requested window.
+    candidates = []
+    for start, end in intervals:
+        start = math.ceil(max(start + 0.002, original_start) * 1000) / 1000
+        end = math.floor(min(end - 0.002, original_end) * 1000) / 1000
+        end = min(end, start + max_s)
+        if end - start >= min_s:
+            candidates.append((end - start, start, end))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    _, start, end = candidates[0]
+    uid = f"{parent}_{start:.3f}_{end:.3f}"
+    aliases = {clip.get("clip_uid"), *(clip.get("dedup_clip_uids") or [])}
+    aliases.discard(None)
+    # Prefer catalog resolution when the local index is already warm; never
+    # block carve on S3/network — synthesize a parent cut instead.
+    row = video = None
+    try:
+        row, video = ego4d.find_clip(uid)
+    except Exception:  # noqa: BLE001 — offline / missing AWS profile
+        row = video = None
+    if row is not None and video is not None:
+        return {
+            **clip, **ego4d._clip_record(row, video), "source": "ego4d",
+            "exported_clip_uid": uid, "parent_start_sec": str(start),
+            "parent_end_sec": str(end),
+            "media_uid": row.get("media_uid", parent),
+            "media_time_offset_s": row.get("media_time_offset_s", 0.0),
+            "imu_carved_from": clip.get("clip_uid"),
+            "dedup_clip_uids": sorted(str(a) for a in aliases),
+        }
+    return {
+        **clip,
+        "clip_uid": uid,
+        "exported_clip_uid": uid,
+        "window_s": (start, end),
+        "dur_s": end - start,
+        "needs_cut": True,
+        "parent_start_sec": str(start),
+        "parent_end_sec": str(end),
+        "imu_carved_from": clip.get("clip_uid"),
+        "dedup_clip_uids": sorted(str(a) for a in aliases),
+    }
+
+
 def refine_candidates(candidates: list[dict], work_dir: Path, min_s: float, max_s: float) -> list[dict]:
     result = []
     seen = {}

@@ -25,7 +25,13 @@ possível e entregar o envelope Minute o mais coerente possível.
 ## Uso do dataset “mais perfeito”
 
 1. Seleção: narrado + oficial + expansão do cache do acelerador  
-2. Diversidade: `prefer_long_clips` + `diverse_order`  
+2. Diversidade: `prefer_long_clips(prefer_parent_cuts=True)` + `diverse_order`  
 3. Sensores: IMU real, preflight, refine em CSV local, gap único 25 ms  
-4. Envelope: Android 1.29 coerente (relógio, CSV, metadata)  
-5. CatBear: humano — nós só maximizamos qualidade e cobertura local  
+4. Lacuna no prepare → **carve** da maior subjanela contínua (sem inventar sinal)  
+5. Envelope: Android 1.29 coerente (relógio, CSV, metadata, ordem zip APK)  
+6. CatBear: humano — nós só maximizamos qualidade e cobertura local  
+
+## Funil honesto
+
+`has_imu` (~24% do Ego4D) → task/narration/hygiene → gap 25 ms → prepare/carve → wire 1.29.  
+Não restaurar gap 75 ms; não inventar IMU.  

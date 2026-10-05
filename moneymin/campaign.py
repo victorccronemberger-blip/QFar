@@ -47,6 +47,7 @@ from . import (
     device_profile,
     ego4d,
     holoassist,
+    nymeria,
     org_policy,
     recording_timeline,
     sent_registry,
@@ -102,6 +103,7 @@ __all__ = [
     "normalize_dataset_provider",
     "prepare_clip",
     "prepare_holoassist_clip",
+    "prepare_nymeria_clip",
     "run_campaign",
     "session_result",
     "upload_to_account",
@@ -154,7 +156,7 @@ MIN_DUR_MS, MAX_DUR_MS = 60000, 1800000
 # fazia uma gravação humana de 15 min aparecer no parceiro como dois envios.
 # O sufixo `{session}_{i}` continua existindo apenas para gravações que
 # realmente excedam o teto remoto.
-DATASET_PROVIDERS = frozenset({"all", "ego4d", "holoassist"})
+DATASET_PROVIDERS = frozenset({"all", "ego4d", "holoassist", "nymeria"})
 CONTENT_MODES = frozenset({"both", "cache", "dataset"})
 
 
@@ -163,7 +165,7 @@ CONTENT_MODES = frozenset({"both", "cache", "dataset"})
 def normalize_dataset_provider(value: str | None) -> str:
     provider = str(value or "all").strip().lower()
     if provider not in DATASET_PROVIDERS:
-        raise ValueError("dataset inválido (all|ego4d|holoassist)")
+        raise ValueError("dataset inválido (all|ego4d|holoassist|nymeria)")
     return provider
 
 
@@ -706,6 +708,63 @@ def ego_clip_cache_state(
     return "pending"
 
 
+def _try_prepare_imu_carve(
+    clip_info: dict[str, Any],
+    work_dir: Path,
+    *,
+    min_dur_s: float,
+    max_dur_s: float,
+    allow_download: bool,
+    progress: Callable[[str, dict[str, Any]], None] | None,
+    log: Callable[[str], None],
+    emit: Callable[..., None],
+    display_name: str,
+) -> dict[str, Any] | None:
+    """On IMU-gap prepare failure, retry the longest continuous subwindow."""
+    from .imu_coverage import carve_continuous_window
+
+    carved = carve_continuous_window(
+        clip_info, work_dir, min_s=min_dur_s, max_s=max_dur_s)
+    if carved is None:
+        return None
+    log(f"    [i] IMU com lacuna — tentando subjanela contínua "
+        f"{carved.get('clip_uid')}")
+    emit("clip_imu_carve", clip_uid=clip_info.get("clip_uid"),
+         carved_uid=carved.get("clip_uid"), task_name=display_name)
+    parent = carved.get("parent_video_uid")
+    video = ego4d._cat().videos.get(parent) if parent else None
+    if video is None:
+        return None
+    try:
+        item = prepare_clip(
+            carved, video, work_dir, progress=progress,
+            allow_download=allow_download)
+    except Exception:  # noqa: BLE001
+        return None
+    return {"item": item, "clip": carved}
+
+
+def _normalize_ego_clip_for_prepare(clip: dict[str, Any]) -> dict[str, Any]:
+    """Ensure list_clips / carved / ranked records all satisfy ``_ego_prepare_plan``."""
+    out = dict(clip)
+    uid = str(out.get("exported_clip_uid") or out.get("clip_uid") or "").strip()
+    if not uid:
+        raise RuntimeError("Clipe Ego4D sem clip_uid/exported_clip_uid")
+    out["clip_uid"] = str(out.get("clip_uid") or uid)
+    out["exported_clip_uid"] = uid
+    window = out.get("window_s")
+    if (out.get("parent_start_sec") is None or out.get("parent_end_sec") is None) and window:
+        start, end = float(window[0]), float(window[1])
+        out["parent_start_sec"] = str(start)
+        out["parent_end_sec"] = str(end)
+        out["window_s"] = (start, end)
+        out.setdefault("dur_s", end - start)
+    out.setdefault("source", "ego4d")
+    out.setdefault("needs_cut", bool(out.get("needs_cut")))
+    out.setdefault("media_time_offset_s", float(out.get("media_time_offset_s") or 0.0))
+    return out
+
+
 def prepare_clip(
     clip: dict[str, Any],
     video: dict[str, Any],
@@ -716,6 +775,7 @@ def prepare_clip(
 ) -> dict[str, Any]:
     """Baixa clipe + IMU real, normaliza o vídeo e monta o sidecar. (sem upload)"""
     from . import content_provenance
+    clip = _normalize_ego_clip_for_prepare(clip)
     selection_evidence = clip.get("selection_evidence")
     if selection_evidence is not None:
         selection_evidence = ego4d.revalidate_selection_evidence(clip)
@@ -855,6 +915,106 @@ def prepare_clip(
         "_cleanup_paths": [
             str(source_video_path), str(native), str(imu_path),
         ],
+    }
+
+
+def prepare_nymeria_clip(
+    clip: dict[str, Any],
+    work_dir: Path,
+    *,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
+    allow_download: bool = True,
+) -> dict[str, Any]:
+    """Extrai RGB+IMU reais do Aria VRS e monta item Minute-ready."""
+    from . import nymeria_vrs
+
+    _ = allow_download  # dados já locais na library Nymeria
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    def _progress(phase: str, **payload: Any) -> None:
+        if progress:
+            progress(phase, payload)
+
+    clip_uid = str(clip.get("clip_uid") or "")
+    seq_dir = Path(str(clip.get("path") or ""))
+    window = clip.get("window_s")
+    if not clip_uid.startswith("nymeria:") or not seq_dir.is_dir():
+        raise RuntimeError("identidade Nymeria inválida")
+    if not window or len(window) != 2:
+        raise RuntimeError("janela Nymeria inválida")
+    start_s, end_s = float(window[0]), float(window[1])
+    if not (math.isfinite(start_s) and math.isfinite(end_s) and end_s > start_s):
+        raise RuntimeError("janela Nymeria inválida")
+    dur_s = end_s - start_s
+    dur_ms = int(round(dur_s * 1000))
+    if not (MIN_DUR_MS <= dur_ms <= MAX_DUR_MS):
+        raise RuntimeError(f"clipe {clip_uid} fora da janela de duração ({dur_ms}ms)")
+
+    motion_vrs = seq_dir / "recording_head" / "data" / "motion.vrs"
+    data_vrs = seq_dir / "recording_head" / "data" / "data.vrs"
+    if not motion_vrs.is_file() or not data_vrs.is_file():
+        raise RuntimeError(f"VRS Nymeria ausente em {seq_dir}")
+
+    _progress("imu_lookup")
+    t0_ns, t1_ns = nymeria.device_window_for_sequence(
+        seq_dir, start_s=start_s, end_s=end_s)
+    _progress("imu_preflight")
+    samples = nymeria_vrs.read_imu_samples(
+        motion_vrs, t0_ns=t0_ns, t1_ns=t1_ns, label="imu-right")
+    imu_diag: dict[str, Any] = {}
+    # Validate continuity before expensive RGB extract
+    _ = nymeria_vrs.build_imu_csv_from_samples(
+        samples, stats=None)
+    _progress("imu_ready", samples=len(samples))
+
+    stem = "nymeria_" + clip_uid.replace(":", "_").replace(".", "_")
+    raw_mp4 = work_dir / f"{stem}_raw.mp4"
+    _progress("video_lookup")
+    nymeria_vrs.extract_rgb_mp4(
+        data_vrs, raw_mp4, t0_ns=t0_ns, t1_ns=t1_ns)
+    _progress("video_ready", bytes=raw_mp4.stat().st_size)
+    _progress("encode")
+    native = _normalize_video(raw_mp4, work_dir, stem=stem)
+    _progress(
+        "encode_ready",
+        encoder="NVENC" if _use_nvenc(_ffmpeg_bin()) else "CPU",
+    )
+    probe = probe_video(native)
+    dur_ms = int(probe.get("duration_ms") or dur_ms)
+    if not (MIN_DUR_MS <= dur_ms <= MAX_DUR_MS):
+        raise RuntimeError(
+            f"clipe {clip_uid} fora da janela de duração ({dur_ms}ms)")
+    _progress("sidecar")
+    imu_csv = nymeria_vrs.build_imu_csv_from_samples(
+        samples, stats=imu_diag)
+    n_samples = max(
+        1, int(dur_ms / 1000 * config.ANDROID_IMU_SAMPLE_RATE_HZ) + 1)
+    if imu_diag.get("sampleCount"):
+        n_samples = int(imu_diag["sampleCount"])
+    frames_csv = _frames_csv(dur_ms, fps=(probe.get("fps") or 30.0))
+    return {
+        "clip_uid": clip_uid,
+        "video_path": str(native),
+        "duration_ms": dur_ms,
+        "device": "Project Aria",
+        "scenario": str(clip.get("scenario") or clip.get("script") or ""),
+        "imu_real": True,
+        "imu_csv": imu_csv,
+        "frames_csv": frames_csv,
+        "n_samples": n_samples,
+        "imu_diagnostics": dict(imu_diag),
+        "probe": probe,
+        "source": "nymeria",
+        "window_s": [start_s, end_s],
+        "seq_id": clip.get("seq_id"),
+        "source_provenance": {
+            "dataset": "nymeria",
+            "recording_origin": "third_party_dataset",
+            "seq_id": clip.get("seq_id"),
+            "window_s": [start_s, end_s],
+        },
+        "_cleanup_paths": [str(raw_mp4), str(native)],
     }
 
 
@@ -1368,6 +1528,11 @@ class _ClipPrefetch:
                 prepare_holoassist_clip, clip_info, self.work_dir
             )
             return
+        if clip_info.get("source") == "nymeria":
+            self._fut = self._pool.submit(
+                prepare_nymeria_clip, clip_info, self.work_dir
+            )
+            return
         try:
             clip, video = _ego_clip_inputs(clip_info)
         except Exception:  # noqa: BLE001
@@ -1715,8 +1880,8 @@ def _cleanup_uploaded_item(
 @cleanup_operation
 def cleanup_media_cache(work_dir: Path | None = None, *, provider: str = "all") -> dict[str, Any]:
     """Limpa downloads/derivados, preservando catálogos e estado da campanha."""
-    if provider not in {"all", "ego4d", "holoassist"}:
-        raise ValueError("provedor inválido (ego4d|holoassist|all)")
+    if provider not in {"all", "ego4d", "holoassist", "nymeria"}:
+        raise ValueError("provedor inválido (ego4d|holoassist|nymeria|all)")
     work = Path(work_dir or config.MEDIA_DATA_DIR / "ego4d")
     from .recovery import media_cleanup_protection
     protection = media_cleanup_protection()  # Validate before deleting one file.
@@ -1956,11 +2121,16 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
     é o `_native.mp4` compartilhado, salvo `unique_video=True`.
     """
     result: dict[str, Any] = {"email": account.email, "ok": False}
-    if item.get("source") == "ego4d" and item.get("imu_real") is not True:
+    if item.get("source") in {"ego4d", "nymeria"} and item.get("imu_real") is not True:
         result.update(finalized=False, retryable=False,
-                      error="Ego4D sem sensores reais confirmados no preparo; envio bloqueado.")
+                      error="Dataset sem sensores reais confirmados no preparo; envio bloqueado.")
         return result
     try:
+        if item.get("source") == "nymeria":
+            if not item.get("imu_csv") or not item.get("frames_csv"):
+                raise UploadError(
+                    "Nymeria sem CSV medido completo; envio bloqueado sem substituição sintética.",
+                    transient=False, phase="prepare")
         if item.get("source") == "ego4d":
             from . import content_provenance
             try:
@@ -2047,9 +2217,10 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             item = dict(item)
             item["imu_diagnostics"] = imu_diag_live
         if not imu_csv:
-            if item.get("source") == "ego4d":
-                raise UploadError("IMU real Ego4D ausente; envio bloqueado sem substituição sintética.",
-                                  transient=False, phase="prepare")
+            if item.get("source") in {"ego4d", "nymeria"}:
+                raise UploadError(
+                    "IMU real do dataset ausente; envio bloqueado sem substituição sintética.",
+                    transient=False, phase="prepare")
             # Sem IMU real: gera a do APARELHO (sinal próprio por conta — nunca
             # a mesma IMU sintética para N contas).
             imu_csv = build_imu_csv(
@@ -2059,6 +2230,7 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         start_wall = device_profile.recorded_at_to_wall_ms(recorded_at)
         frames_offset = profile.uptime_ns_at(
             start_wall or int(time.time() * 1000))
+        require_pts = item.get("source") in {"ego4d", "nymeria"}
         # frames.csv SEMPRE derivado do MP4 REAL (PTS/keyframes) + offset do
         # uptime Android do 1º frame. Nunca reusar o CSV preparado com relógio
         # em zero (desync: o metadata usa firstFrameSensorTimestampNs = uptime).
@@ -2066,10 +2238,9 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             frames_csv = build_frames_csv_from_video(
                 video_path, duration_ms=int(item["duration_ms"]),
                 fps=fps, gop=profile.frames_gop, offset_ns=frames_offset,
-                **({"require_measured_pts": True}
-                   if item.get("source") == "ego4d" else {}))
+                **({"require_measured_pts": True} if require_pts else {}))
         except ValueError as exc:
-            if item.get("source") != "ego4d":
+            if not require_pts:
                 raise
             raise UploadError(
                 'Vídeo sem PTS medidos; preparo interrompido.',
@@ -2102,9 +2273,9 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                             device_profile.recorded_at_to_wall_ms(rec_at)
                             or start_wall or int(time.time() * 1000)),
                         **({"require_measured_pts": True}
-                           if item.get("source") == "ego4d" else {}))
+                           if require_pts else {}))
                 except ValueError as exc:
-                    if item.get("source") != "ego4d":
+                    if not require_pts:
                         raise
                     raise UploadError(
                         'Vídeo sem PTS medidos; preparo interrompido.',
@@ -2299,11 +2470,33 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
         # Fonte complementar primeiro: são sessões inteiras de uma
         # tarefa rotulada, não inferências por texto de narração.
         shorts = [*strict_holoassist, *shorts]
+    if dataset_provider in ("all", "nymeria"):
+        try:
+            nymeria_clips = nymeria.automatic_candidates(
+                min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s)
+        except Exception:
+            nymeria_clips = []
+        # Nymeria is IMU-complete by construction — do not bury it behind Ego4D.
+        # Only Minute duration bounds + real VRS coverage limit the pool.
+        if dataset_provider == "nymeria":
+            shorts = list(nymeria_clips)
+        else:
+            shorts = [*nymeria_clips, *shorts]
     if content_mode == "cache":
         shorts = [clip for clip in shorts if _clip_is_cached(clip, work_dir)]
     else:
         from .imu_coverage import refine_candidates
-        shorts = refine_candidates(shorts, work_dir, tsk.min_dur_s, tsk.max_dur_s)
+        # refine_candidates is Ego4D-IMU-CSV specific; keep Nymeria intact.
+        ego: list[dict[str, Any]] = []
+        other: list[dict[str, Any]] = []
+        for clip in shorts:
+            uid = str(clip.get("clip_uid") or "")
+            if clip.get("source") == "nymeria" or uid.startswith("nymeria:"):
+                other.append(clip)
+            else:
+                ego.append(clip)
+        ego = refine_candidates(ego, work_dir, tsk.min_dur_s, tsk.max_dur_s)
+        shorts = [*ego, *other]
     return shorts
 
 
@@ -2534,7 +2727,8 @@ def _run_campaign(
                 _log(f"  pool: {len(shorts)} trechos puros → {len(fresh)} "
                      f"sessões ({merged_n} cortes do vídeo-pai, {hours:.1f}h)")
                 clips = _prefer_cached_clips(diverse_order(ego4d.prefer_long_clips(
-                    fresh, shuffle=config.shuffle_schedule), used_parents=used_parents),
+                    fresh, shuffle=config.shuffle_schedule,
+                    prefer_parent_cuts=True), used_parents=used_parents),
                     work_dir, prioritize=content_mode != "dataset")
                 # Prefer content that serves more accounts, keeping cache/diversity
                 # ordering within each group. Partially sent clips remain fallback.
@@ -2655,6 +2849,11 @@ def _run_campaign(
                         clip_info, work_dir, progress=_prepare_progress,
                         allow_download=content_mode != "cache",
                     )
+                if item is None and clip_info.get("source") == "nymeria":
+                    item = prepare_nymeria_clip(
+                        clip_info, work_dir, progress=_prepare_progress,
+                        allow_download=content_mode != "cache",
+                    )
                 if item is None:
                     clip, video = _ego_clip_inputs(clip_info)
                     if clip is None or video is None:
@@ -2678,15 +2877,50 @@ def _run_campaign(
                         f"vídeo preparado excede a duração máxima de {tsk.max_dur_s:g}s"
                     )
             except Exception as exc:  # noqa: BLE001 — pula o clipe, segue a campanha
-                if any(reason in str(exc).lower() for reason in (
+                imu_fail = any(reason in str(exc).lower() for reason in (
                         "cobertura imu insuficiente", "sem amostras válidas de imu",
-                        "sem cobertura contínua de imu", "sem imu real")):
+                        "sem cobertura contínua de imu", "atravessa trecho sem cobertura",
+                        "sem imu real"))
+                carved_item = None
+                if imu_fail and not clip_info.get("imu_carved_from"):
+                    def _carve_progress(
+                        phase: str,
+                        payload: dict[str, Any],
+                        _clip_uid: str = str(clip_info["clip_uid"]),
+                    ) -> None:
+                        _emit("clip_prepare_progress", clip_uid=_clip_uid,
+                              phase=phase, **payload)
+
+                    carved_item = _try_prepare_imu_carve(
+                        clip_info, work_dir,
+                        min_dur_s=float(tsk.min_dur_s),
+                        max_dur_s=float(tsk.max_dur_s),
+                        allow_download=content_mode != "cache",
+                        progress=_carve_progress,
+                        log=_log,
+                        emit=_emit,
+                        display_name=display_name,
+                    )
+                if carved_item is None:
+                    if imu_fail:
+                        rejected_imu.add(clip_info["clip_uid"])
+                    error = f"{type(exc).__name__}: {exc}"
+                    _log(f"    [!] prepare falhou: {error}")
+                    _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
+                          task_name=display_name, ok=False, error=error)
+                    continue
+                item = carved_item["item"]
+                clip_info = carved_item["clip"]
+                prepared_duration = float(item["duration_ms"])
+                if (not math.isfinite(prepared_duration) or prepared_duration <= 0
+                        or prepared_duration + 1000 < tsk.min_dur_s * 1000
+                        or prepared_duration > tsk.max_dur_s * 1000):
                     rejected_imu.add(clip_info["clip_uid"])
-                error = f"{type(exc).__name__}: {exc}"
-                _log(f"    [!] prepare falhou: {error}")
-                _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
-                      task_name=display_name, ok=False, error=error)
-                continue
+                    _log("    [!] carve fora da janela de duração")
+                    _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
+                          task_name=display_name, ok=False,
+                          error="carve fora da duração")
+                    continue
             _emit("clip_ready", clip_uid=clip_info["clip_uid"],
                   duration_ms=item["duration_ms"], imu_real=item["imu_real"],
                   source_provenance=item.get("source_provenance"))
@@ -3810,6 +4044,11 @@ def _clip_is_cached(clip: dict[str, Any], work_dir: Path) -> bool:
     if str(clip.get("source") or "") == "holoassist":
         from .holo_accelerator import clip_ready
         return clip_ready(clip, work_dir)
+    if str(clip.get("source") or "") == "nymeria" or str(
+            clip.get("clip_uid") or "").startswith("nymeria:"):
+        stem = "nymeria_" + str(clip.get("clip_uid") or "").replace(
+            ":", "_").replace(".", "_")
+        return (Path(work_dir) / f"{stem}_native.mp4").is_file()
     return ego_clip_cache_state(clip, work_dir) == "ready"
 
 

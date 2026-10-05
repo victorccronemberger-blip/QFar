@@ -44,9 +44,9 @@ def native_fixture():
 def sidecar_checks(metadata):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(f"{LOG_ID}.metadata.json", json.dumps(metadata))
         archive.writestr(f"{LOG_ID}.imu.csv", IMU)
         archive.writestr(f"{LOG_ID}.frames.csv", FRAMES)
+        archive.writestr(f"{LOG_ID}.metadata.json", json.dumps(metadata))
     return {check.name: check for check in validate_sidecar_zip(
         output.getvalue(), log_id=LOG_ID, duration_ms=1000)}
 

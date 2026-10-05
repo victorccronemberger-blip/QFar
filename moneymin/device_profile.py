@@ -428,16 +428,16 @@ class DeviceProfile:
         # wall em NS (boot fica em ms no perfil) — as comparações são todas em ns
         wall_ns = int(wall_ms) * 1_000_000
         u = wall_ns - int(self.boot_wall_ms) * 1_000_000
-        if u < MIN_UPTIME_NS:
-            u += 86_400 * 1_000_000_000
-        if u > MAX_UPTIME_NS:
+        # Wall atrás do boot (skew / wall artificial): recalcula boot no
+        # intervalo plausível [MIN_UPTIME, 3d], como no ramo de reboot.
+        if u < MIN_UPTIME_NS or u > MAX_UPTIME_NS:
             day = int(wall_ms) // 86_400_000
             rng = random.Random(f"moneymin.reboot:{self.device_id}:{day}")
             self.boot_wall_ms = int(wall_ms) - rng.randint(
                 int(MIN_UPTIME_NS / 1e6), 3 * 86_400_000)
             u = wall_ns - int(self.boot_wall_ms) * 1_000_000
             self._persist()
-        return u
+        return max(int(u), int(MIN_UPTIME_NS))
 
     # --- saídas usadas pela réplica -----------------------------------------
     def user_agent(self) -> str:
