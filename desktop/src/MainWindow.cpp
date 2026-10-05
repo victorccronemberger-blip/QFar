@@ -4028,6 +4028,9 @@ void MainWindow::openRecovery() {
   title->setObjectName(QStringLiteral("reviewTitle"));
   layout->addWidget(title);
   auto* summary = quietLabel(QStringLiteral("Lendo os registros desta instalação…"));
+  summary->setObjectName(QStringLiteral("recoverySummary"));
+  summary->setTextFormat(Qt::PlainText);
+  summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
   layout->addWidget(summary);
   auto* table = new QTableWidget(0, 4);
   configureTable(table, QStringLiteral("Registros de recuperação"),
@@ -4036,18 +4039,35 @@ void MainWindow::openRecovery() {
   table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
   table->setEditTriggers(QAbstractItemView::NoEditTriggers);
   layout->addWidget(table, 1);
-  layout->addWidget(quietLabel(QStringLiteral("Reconciliar registra na lista local apenas finalizações já confirmadas. Essa ação não envia mídia e não solicita saques.")));
+  auto* failed = card(QStringLiteral("Leitura não concluída"), quietLabel(QStringLiteral(
+      "A lista não foi carregada. Ainda não foi possível confirmar quais envios precisam de atenção.\n\n"
+      "Clique em Tentar novamente. Se o erro persistir, copie o diagnóstico para identificar a causa.\n\n"
+      "Os registros de envios anteriores foram preservados.")));
+  failed->hide();
+  layout->addWidget(failed, 1);
+  auto* reconciliationHint = quietLabel(QStringLiteral("Reconciliar registra na lista local apenas finalizações já confirmadas. Essa ação não envia mídia e não solicita saques."));
+  layout->addWidget(reconciliationHint);
+  auto* resumePanel = new QWidget(dialog);
   auto* resumeRow = new QHBoxLayout;
+  resumeRow->setContentsMargins(0, 0, 0, 0);
+  resumePanel->setLayout(resumeRow);
   auto* resumeAccount = new ComboBox(dialog);
   resumeAccount->setAccessibleName(QStringLiteral("Conta para retomar envios"));
   resumeRow->addWidget(resumeAccount, 1);
   auto* resume = new QPushButton(QStringLiteral("Retomar envios desta conta"), dialog);
   resume->setEnabled(false);
   resumeRow->addWidget(resume);
-  layout->addLayout(resumeRow);
+  layout->addWidget(resumePanel);
   auto* poll = new QTimer(dialog);
   poll->setInterval(1500);
   auto* buttons = new QHBoxLayout;
+  auto* retry = new QPushButton(QStringLiteral("Tentar novamente"), dialog);
+  retry->setObjectName(QStringLiteral("recoveryRetry"));
+  buttons->addWidget(retry);
+  auto* copyDiagnostic = new QPushButton(QStringLiteral("Copiar diagnóstico"), dialog);
+  copyDiagnostic->setObjectName(QStringLiteral("recoveryCopyDiagnostic"));
+  copyDiagnostic->hide();
+  buttons->addWidget(copyDiagnostic);
   auto* wallet = new QPushButton(QStringLiteral("Restaurar Wise / Dots na carteira"));
   wallet->hide();
   connect(wallet, &QPushButton::clicked, dialog, [this, dialog] { dialog->close(); _navigation->setCurrentRow(6); });
@@ -4058,14 +4078,40 @@ void MainWindow::openRecovery() {
   buttons->addWidget(reconcile);
   layout->addLayout(buttons);
   const QPointer<QDialog> guard(dialog);
-  const auto render = [guard, table, summary, reconcile, resume, resumeAccount, poll](bool ok, const QJsonDocument& document, const QString& error) {
+  const auto render = [guard, table, summary, reconcile, resume, resumeAccount, poll, retry, copyDiagnostic, failed, resumePanel, reconciliationHint](bool ok, const QJsonDocument& document, const QString& error) {
     if (!guard) return;
-    if (!ok) { summary->setText(error); reconcile->setEnabled(false); resume->setEnabled(false); return; }
+    retry->setEnabled(true);
+    if (!ok) {
+      poll->stop();
+      table->hide();
+      failed->show();
+      resumePanel->hide();
+      reconciliationHint->hide();
+      reconcile->hide();
+      summary->setText(error);
+      reconcile->setEnabled(false);
+      resume->setEnabled(false);
+      resumeAccount->setEnabled(false);
+      const auto diagnostic = document.object().value(QStringLiteral("recovery_error")).toObject();
+      const auto report = QJsonObject{{"version", QCoreApplication::applicationVersion()},
+          {"recovery_error", diagnostic}};
+      guard->setProperty("recoveryDiagnostic", QJsonDocument(report).toJson(QJsonDocument::Indented));
+      copyDiagnostic->setVisible(!diagnostic.isEmpty());
+      return;
+    }
+    table->show();
+    failed->hide();
+    resumePanel->show();
+    reconciliationHint->show();
+    reconcile->show();
+    copyDiagnostic->hide();
+    guard->setProperty("recoveryDiagnostic", QByteArray());
     const auto data = document.object();
     if (data.value(QStringLiteral("loading")).toBool()) {
       summary->setText(data.value(QStringLiteral("message")).toString());
       reconcile->setEnabled(false);
       resume->setEnabled(false);
+      retry->setEnabled(false);
       poll->start();
       return;
     }
@@ -4124,17 +4170,22 @@ void MainWindow::openRecovery() {
     resume->setEnabled(!running && !accountNames.isEmpty());
     resumeAccount->setEnabled(!running);
   };
-  const auto refresh = [this, guard, wallet, render] {
+  const auto fetch = [this, guard, wallet, render](bool force) {
     if (!guard || guard->property("readingRecovery").toBool()) return;
     guard->setProperty("readingRecovery", true);
-    _api.get(QStringLiteral("/api/recovery?async=1"), [guard, wallet, render](bool ok, const QJsonDocument& document, const QString& error) {
+    _api.get(force ? QStringLiteral("/api/recovery?async=1&refresh=1") : QStringLiteral("/api/recovery?async=1"), [guard, wallet, render](bool ok, const QJsonDocument& document, const QString& error) {
       if (!guard) return;
       guard->setProperty("readingRecovery", false);
       wallet->setVisible(document.object().value("wise_cleanup").toObject().value("pending").toBool());
       render(ok, document, error);
     });
   };
+  const auto refresh = [fetch] { fetch(false); };
   connect(poll, &QTimer::timeout, dialog, refresh);
+  connect(retry, &QPushButton::clicked, dialog, [fetch] { fetch(true); });
+  connect(copyDiagnostic, &QPushButton::clicked, dialog, [guard] {
+    if (guard) QApplication::clipboard()->setText(QString::fromUtf8(guard->property("recoveryDiagnostic").toByteArray()));
+  });
   connect(resume, &QPushButton::clicked, dialog, [this, guard, resume, resumeAccount, summary, refresh] {
     const QString email = resumeAccount->currentText();
     if (email.isEmpty() || !guard) return;
@@ -5047,6 +5098,14 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
                            QStringLiteral("Revise as pendências da verificação."), QStringLiteral("error"));
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       updateCampaignActions();
+      if (result.value(QStringLiteral("recovery_error")).isObject()) {
+        QMessageBox message(QMessageBox::Warning, QStringLiteral("Campanha não iniciada"),
+                            blockerLines.join(QLatin1Char('\n')), QMessageBox::Close, this);
+        auto* open = message.addButton(QStringLiteral("Abrir recuperação"), QMessageBox::ActionRole);
+        message.exec();
+        if (message.clickedButton() == open) openRecovery();
+        return;
+      }
       const auto issues = result.value(QStringLiteral("account_issues")).toArray();
       const auto errors = result.value(QStringLiteral("account_errors")).toArray();
       if (!issues.isEmpty()) {

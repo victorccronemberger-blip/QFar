@@ -1,11 +1,15 @@
 import json
 import tempfile
 import unittest
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from moneymin import config, recovery, sent_registry, upload
+from moneymin.media_lifecycle import media_state_lease
+from moneymin.operation_lease import OperationLeaseError
+from moneymin.recovery_errors import RecoveryReadError, error_response
 
 
 class RecoveryViewTests(unittest.TestCase):
@@ -155,6 +159,78 @@ class RecoveryViewTests(unittest.TestCase):
             recovery.snapshot()
         with self.assertRaises(ValueError):
             recovery.reconcile_confirmed()
+
+    def test_corrupt_record_diagnostic_is_stable_private_and_preserves_bytes(self):
+        path = self.journals / "secret-account-token.json"
+        path.write_bytes(b"{private-payload")
+        with self.assertRaises(RecoveryReadError) as caught:
+            recovery.snapshot()
+        first = error_response(caught.exception)
+        self.assertEqual(first["recovery_error"]["code"], "journal_unreadable")
+        self.assertEqual(len(first["recovery_error"]["record_ref"]), 12)
+        with self.assertRaises(RecoveryReadError) as repeated:
+            recovery.snapshot()
+        self.assertEqual(first, error_response(repeated.exception))
+        self.assertNotIn("secret-account-token", json.dumps(first))
+        self.assertNotIn("private-payload", json.dumps(first))
+        self.assertNotIn(str(self.root), json.dumps(first))
+        self.assertEqual(path.read_bytes(), b"{private-payload")
+
+    def test_reset_history_has_specific_diagnostic_and_still_blocks(self):
+        self.save()
+        reset = self.root / "sent_reset_history.json"
+        reset.write_bytes(b"{invalid-private-value")
+        with self.assertRaises(RecoveryReadError) as caught:
+            recovery.snapshot()
+        self.assertEqual(caught.exception.code, "reset_history")
+        self.assertEqual(reset.read_bytes(), b"{invalid-private-value")
+        self.assertEqual(json.loads((self.journals / "session1.json").read_text()), self.row)
+
+    def test_snapshot_holds_cleanup_barrier_while_reading_journal(self):
+        self.save()
+        results = []
+        original = upload._read_sidecar_file
+        def read(path):
+            def competing_cleanup():
+                try:
+                    with media_state_lease():
+                        results.append("unsafe")
+                except OperationLeaseError:
+                    results.append("blocked")
+            thread = threading.Thread(target=competing_cleanup)
+            thread.start()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            return original(path)
+        with patch.object(upload, "_read_sidecar_file", side_effect=read):
+            self.assertEqual(recovery.snapshot()["confirmed"], 1)
+        self.assertEqual(results, ["blocked"])
+
+    def test_busy_snapshot_reports_retry_without_reading_or_empty_result(self):
+        with patch.object(recovery, "media_state_lease", side_effect=OperationLeaseError("private")), \
+             patch.object(recovery, "_groups") as groups:
+            with self.assertRaises(RecoveryReadError) as caught:
+                recovery.snapshot()
+        self.assertEqual(caught.exception.code, "busy")
+        groups.assert_not_called()
+        self.assertNotIn("private", json.dumps(error_response(caught.exception)))
+
+    def test_api_exposes_specific_diagnostic_for_sync_and_async(self):
+        from moneymin.web import server
+        client = server.create_app(for_testing=True).test_client()
+        failure = RecoveryReadError("journal_conflict", Path("secret-session.json"))
+        with patch.object(recovery, "snapshot", side_effect=failure):
+            expected = error_response(failure)
+            response = client.get("/api/recovery")
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.get_json()["recovery_error"], expected["recovery_error"])
+            # The loader callback runs in-process so this checks mapping, not timing.
+            from moneymin.web.catalog_loader import CatalogLoader
+            with patch.object(CatalogLoader, "get", side_effect=lambda key, work, **kwargs: work(lambda text: None)):
+                response = client.get("/api/recovery?async=1")
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.get_json()["recovery_error"], expected["recovery_error"])
+            self.assertNotIn("secret-session", response.get_data(as_text=True))
 
     def test_transport_completion_is_not_finalization(self):
         self.save({**self.row, "state": "transport_done", "finalized": False})

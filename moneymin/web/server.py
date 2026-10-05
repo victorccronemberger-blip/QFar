@@ -4414,6 +4414,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         removable = {i["email"] for i in account_issues if i.get("restriction_confirmed") is True}
         survivors = [a for a in accounts if a.email not in removable]
         recovery_exclusions = {}
+        recovery_error = None
         try:
             unresolved = recovery.snapshot()["items"]
             selected_recovery = [item for item in unresolved if item["email"] in emails]
@@ -4425,8 +4426,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
             if recovery_exclusions:
                 warnings.append(f"{len(recovery_exclusions)} clipe(s) reservado(s) por envios anteriores. "
                                 "Esses clipes não serão reenviados nem contarão como progresso novo; a campanha usará outros conteúdos.")
-        except (ValueError, OSError):
-            blockers.append("Não foi possível verificar as pendências. Abra Pendências e recuperação.")
+        except (ValueError, OSError) as exc:
+            from ..recovery_errors import error_response
+            failure = error_response(exc)
+            recovery_error = failure["recovery_error"]
+            blockers.append(failure["error"] + " Abra Recuperação de envios.")
         reusable = (bool(survivors) and bool(selected) and catalog_loaded and ready.get("ready") is True
                     and len(blockers) == len(account_errors)
                     and all(i.get("restriction_confirmed") is True for i in account_issues))
@@ -4497,6 +4501,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             "account_workers": campaign.clamp_account_workers(requested_workers, len(accounts)),
             "target_hours": target_hours,
             "blockers": blockers,
+            "recovery_error": recovery_error,
             "warnings": warnings,
             "account_errors": account_errors,
             "account_issues": account_issues,
@@ -4916,14 +4921,17 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 progress("Lendo os registros de recuperação desta instalação…")
                 try:
                     return recovery.snapshot(), 200
-                except (ValueError, OSError):
-                    return {"error": "Não foi possível ler todos os registros de recuperação. Preserve os dados e revise a instalação."}, 409
-            result, status = recovery_catalog.get((worker.get("state"), worker.get("email")), read)
+                except (ValueError, OSError) as exc:
+                    from ..recovery_errors import error_response
+                    return error_response(exc), 409
+            result, status = recovery_catalog.get((worker.get("state"), worker.get("email")), read,
+                                                  refresh=request.args.get("refresh") == "1")
             return jsonify({**result, "wise_cleanup": _wise_cleanup_snapshot(), "worker": worker}), status
         try:
             return jsonify({**recovery.snapshot(), "wise_cleanup": _wise_cleanup_snapshot(), "worker": RECOVERY.snapshot()})
-        except (ValueError, OSError):
-            return jsonify({"error": "Não foi possível ler todos os registros de recuperação. Preserve os dados e revise a instalação."}), 409
+        except (ValueError, OSError) as exc:
+            from ..recovery_errors import error_response
+            return jsonify(error_response(exc)), 409
 
     @app.post("/api/recovery/reconcile")
     def reconcile_recovery():

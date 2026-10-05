@@ -8,6 +8,7 @@
 #include <QClipboard>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QMessageBox>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QEventLoop>
@@ -38,6 +39,7 @@ class OperationPreview {
 public:
 #include "operation_qa.inc"
 #include "accounts_qa.inc"
+#include "recovery_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -1557,6 +1559,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--settings-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::settingsSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--recovery-diagnostics-smoke") || app.arguments().contains("--recovery-preview")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::recoveryDiagnosticsSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--live-catalog-smoke")) {

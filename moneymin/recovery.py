@@ -6,6 +6,9 @@ from pathlib import Path
 
 from . import campaign, sent_registry, upload
 from .atomic_io import save_json
+from .recovery_errors import RecoveryReadError
+from .media_lifecycle import media_state_lease
+from .operation_lease import OperationLeaseError
 from .upload_types import (is_pending_finalization, journal_delivery_confirmed,
                            journal_evaluation_confirmed, journal_flags_valid)
 
@@ -84,29 +87,31 @@ def _groups(directory=None, *, include_reconciled=False,
     try:
         paths = sorted(path for path in (directory or upload.sidecars_dir()).iterdir()
                        if path.name.lower().endswith(".json"))
-    except OSError:
-        raise ValueError("Não foi possível ler todos os registros de envio; preserve os dados e revise a recuperação.") from None
+    except RecoveryReadError:
+        raise
+    except (OSError, ValueError):
+        raise RecoveryReadError("store_unreadable") from None
     for path in paths:
         try:
             row = upload._read_sidecar_file(path)
         except (OSError, UnicodeError, ValueError, upload.UploadError):
-            raise ValueError("Um registro de envio está ilegível. Preserve os dados e revise a recuperação.") from None
+            raise RecoveryReadError("journal_unreadable", path) from None
         if not isinstance(row, dict):
-            raise ValueError("Um registro de envio tem formato inválido.")
+            raise RecoveryReadError("journal_unreadable", path)
         # Legacy zero-chunk journals are normalized only in memory. Listing
         # must not rewrite the original bytes merely to inspect recovery.
         row = {**row, "chunk_index": row.get("chunk_index", 0)}
         key = tuple(row.get(field) for field in ("account_email", "org_key", "session_id"))
         if any(not isinstance(value, str) or not value for value in key):
-            raise ValueError("Um registro de envio não identifica a conta, organização ou sessão.")
+            raise RecoveryReadError("journal_identity", path)
         try:
             expected_name = upload._sidecar_filename(key[2], row.get("chunk_index"))
-        except upload.UploadError as exc:
-            raise ValueError("Um registro de envio tem identidade inválida.") from exc
+        except upload.UploadError:
+            raise RecoveryReadError("journal_identity", path) from None
         if path.name != expected_name:
-            raise ValueError("Um registro de envio não corresponde à sua sessão e parte.")
+            raise RecoveryReadError("journal_identity", path)
         if key[2] in owners and owners[key[2]] != key[:2]:
-            raise ValueError("Uma sessão de envio tem identidades conflitantes.")
+            raise RecoveryReadError("session_conflict", path)
         owners[key[2]] = key[:2]
         groups.setdefault(key, []).append(row)
     if include_reconciled:
@@ -202,13 +207,26 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
 
 
 def snapshot() -> dict:
+    # Enumeration and reads share the writers/cleanup barrier. A disappearing
+    # journal must not be mistaken for a corrupt store during local cleanup.
+    try:
+        with media_state_lease(wait=True):
+            return _snapshot_locked()
+    except OperationLeaseError:
+        raise RecoveryReadError("busy") from None
+
+
+def _snapshot_locked() -> dict:
     groups = _groups(include_reconciled=True)
     publications = _read_required_publications(groups)
     groups = _visible_groups(groups, publications)
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
                if not rows[0].get("campaign_context")}
     contexts = campaign._legacy_upload_contexts(missing, [row for rows in groups for row in rows]) if missing else {}
-    reset_checker = sent_registry.recovery_reset_checker()
+    try:
+        reset_checker = sent_registry.recovery_reset_checker()
+    except (ValueError, OSError):
+        raise RecoveryReadError("reset_history") from None
     items = [item for rows in groups if (item := _describe(rows, contexts, reset_checker, publications)) is not None]
     return {"items": items, "pending": sum(item["status"] in {"pending", "needs_review"} for item in items),
             "confirmed": sum(item["status"] == "confirmed" for item in items),

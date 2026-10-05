@@ -22,7 +22,7 @@ class CatalogLoadingTests(unittest.TestCase):
             self.assertTrue(entered.wait(1))
             started = time.monotonic()
             for _ in range(20):
-                body, status = loader.get(("a",), work)
+                body, status = loader.get(("a",), work, refresh=True)
                 self.assertEqual(status, 202)
                 self.assertEqual(body["message"], "Indexing")
             self.assertLess(time.monotonic() - started, .5)
@@ -36,6 +36,23 @@ class CatalogLoadingTests(unittest.TestCase):
             time.sleep(.01)
         self.assertEqual(result, ({"tasks": [{"id": "real-result"}]}, 200))
         self.assertEqual(work.call_count, 1)
+
+    def test_manual_retry_replaces_cached_error_with_fresh_read(self):
+        loader = CatalogLoader(ttl_s=600)
+        work = Mock(side_effect=[({"error": "preserved"}, 409), ({"items": []}, 200)])
+        def finished():
+            for _ in range(100):
+                result = loader.get(("recovery",), work)
+                if result[1] != 202:
+                    return result
+                time.sleep(.01)
+            self.fail("read did not finish")
+        self.assertEqual(finished()[1], 409)
+        self.assertEqual(loader.get(("recovery",), work)[1], 409)
+        self.assertEqual(work.call_count, 1)
+        self.assertEqual(loader.get(("recovery",), work, refresh=True)[1], 202)
+        self.assertEqual(finished(), ({"items": []}, 200))
+        self.assertEqual(work.call_count, 2)
 
     def test_selection_changes_do_not_create_unbounded_workers(self):
         loader = CatalogLoader(max_pending=1)

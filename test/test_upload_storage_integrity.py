@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from moneymin import config, upload_storage
+from moneymin.recovery_errors import RecoveryReadError, error_response
 
 
 class UploadArchiveMigrationIntegrityTests(unittest.TestCase):
@@ -87,6 +88,37 @@ class UploadArchiveMigrationIntegrityTests(unittest.TestCase):
 
     def migrated_row(self):
         return {**self.row, "sidecar_data_path": str(self.target.resolve())}
+
+    def test_migration_errors_identify_stage_without_exporting_paths_or_payloads(self):
+        marker = self.user / "sidecar_migration.json"
+        marker.write_text("private-invalid-json")
+        with self.assertRaises(RecoveryReadError) as caught:
+            upload_storage.journal_directory()
+        self.assertEqual(caught.exception.code, "migration_marker")
+        self.assertEqual(marker.read_text(), "private-invalid-json")
+        marker.unlink()  # Only the isolated test fixture changes.
+        source_journal = self.legacy / "session1.json"
+        source_journal.write_text("private-invalid-json")
+        with self.assertRaises(RecoveryReadError) as caught:
+            upload_storage.journal_directory()
+        self.assertEqual(caught.exception.code, "migration_source")
+        self.assertNotIn("private-invalid-json", json.dumps(error_response(caught.exception)))
+        self.assertNotIn(str(self.root), json.dumps(error_response(caught.exception)))
+        self.assertEqual(source_journal.read_text(), "private-invalid-json")
+
+    def test_conflicting_copies_have_distinct_stable_diagnostics(self):
+        self.target.write_bytes(b"other-archive")
+        with self.assertRaises(RecoveryReadError) as caught:
+            upload_storage.journal_directory()
+        self.assertEqual(caught.exception.code, "archive_conflict")
+        self.target.unlink()  # Only the isolated test fixture changes.
+        journal = self.destination / "session1.json"
+        journal.write_text(json.dumps({**self.migrated_row(), "state": "done"}))
+        with self.assertRaises(RecoveryReadError) as caught:
+            upload_storage.journal_directory()
+        self.assertEqual(caught.exception.code, "journal_conflict")
+        self.assertEqual(json.loads(journal.read_text())["state"], "done")
+        self.assertFalse((self.user / "sidecar_migration.json").exists())
 
     def test_conflicting_existing_journal_is_preserved_without_acknowledgment(self):
         journal = self.destination / "session1.json"

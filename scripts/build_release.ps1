@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.0.36",
+    [string]$Version = "2.0.37",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [switch]$Staging
 )

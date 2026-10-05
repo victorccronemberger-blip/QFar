@@ -88,6 +88,20 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertFalse(result['can_remove_and_continue'])
         self.assertIsNone(result['preflight_id'])
 
+    def test_recovery_read_failure_keeps_preflight_blocked_and_returns_diagnostic(self):
+        from moneymin import recovery
+        from moneymin.recovery_errors import RecoveryReadError
+        self.body['accounts'] = ['good@example.com']
+        with patch.object(recovery, 'snapshot', side_effect=RecoveryReadError('reset_history')):
+            result = self.preflight()
+        self.assertFalse(result['ok'])
+        self.assertIsNone(result['preflight_id'])
+        self.assertFalse(result['can_remove_and_continue'])
+        self.assertEqual(result['recovery_error']['code'], 'reset_history')
+        self.assertIn('sent_reset_history.json', ' '.join(result['blockers']))
+        self.runner.start.assert_not_called()
+        self.assertTrue(server.config.token_path('good@example.com').exists())
+
     def test_modified_request_or_changed_token_rejects_without_removal(self):
         for mutation in ['body', 'token', 'expired']:
             with self.subTest(mutation=mutation):

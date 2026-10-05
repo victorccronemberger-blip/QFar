@@ -15,12 +15,16 @@ class CatalogLoader:
         self._max_pending = max_pending
         self._timeout_s = timeout_s
 
-    def get(self, key: tuple, work: Callable, *, scope: str | None = None) -> tuple[dict, int]:
+    def get(self, key: tuple, work: Callable, *, scope: str | None = None, refresh: bool = False) -> tuple[dict, int]:
         with self._lock:
             now = time.monotonic()
             for old_key, row in list(self._jobs.items()):
                 if row.get("finished") is not None and now - row["finished"] >= self._ttl_s:
                     del self._jobs[old_key]
+            # Explicit retries replace terminal cached results, never a read
+            # still queued/running. Repeated clicks cannot duplicate workers.
+            if refresh and key in self._jobs and "finished" in self._jobs[key]:
+                del self._jobs[key]
             if scope is not None:
                 # Replace queued selections, never launch concurrent catalog builds.
                 for old_key, old_row in list(self._jobs.items()):
