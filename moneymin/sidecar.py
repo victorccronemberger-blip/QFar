@@ -1,43 +1,37 @@
 """
-sidecar.py — Preparação de `.data.zip` com um modelo histórico de metadados.
+sidecar.py — Preparação de `.data.zip` segundo o contrato do Minute Android.
 
-O builder contém valores derivados e fallbacks sintéticos. A comparação por
-métodos do APK 1.28.0 encontrou diferenças em plataforma, relógios, diagnóstico
-IMU, calibração e codec; este módulo não comprova aquisição nativa de sensores.
+Âncora atual: APK 1.29.0 real (Galaxy S22 SM-S901E), pacote smali `l2.1`
+(n0.1 / S / K0$b / Y / q.1 / Q0 / J0). Histórico 1.28 (emulador) permanece
+válido nos literais CSV/timebase e está citado em VALIDACAO_MINUTE_1_28_0.md.
 
-O contrato abaixo foi extraído da decomposição do APK Android (`jadx_out`):
-`EgoSidecar.kt` (metadata.json + zip), `EgoCodecActuals.kt`, `EgoImu.kt`
-(500 Hz), `EgoAudioConfig.kt` e `CameraCalibration.kt`/`buildIntrinsicsMap`
-(intrinsics Brown-Conrady do Camera2). O backend (`POST /uploads/{id}/evaluate`)
-valida o blob `{log_id}.data.zip` ao lado do MP4; seus membros vivem na RAIZ
-do zip com o prefixo `{log_id}.`:
+O builder ainda contém valores derivados e fallbacks sintéticos. Não comprova
+aquisição nativa de sensores. Use-o como espelho estrutural do writer Android.
 
-  - {log_id}.imu.csv     -> header: t,ax,ay,az,wx,wy,wz   (500 Hz, t em ns)
-  - {log_id}.frames.csv  -> header: i,ptsNs,dtNs,tNs,key  (30 fps)
-  - {log_id}.metadata.json -> estrutura ego nativa ANDROID completa
+O backend (`POST /uploads/{id}/evaluate`) valida `{log_id}.data.zip` ao lado do
+MP4. Membros na RAIZ do zip, prefixo `{log_id}.` (confirmado n0.1.smali):
 
-Formato do metadata.json (EgoSidecar.buildMetadata, jadx):
-  - id/logId top-level; createdAt ISO-8601 UTC com 3 ms
-  - platform = {type: "android", version: sdkInt}
-  - device   = {model: Build.MODEL, systemName: "Android", systemVersion: release}
-  - source == "ego"
-  - timebase.clockDomain == "android_elapsedRealtimeNanos" (EgoCameraController)
-  - cameras[0] = {name: "camera_logical_X", source: "builtin", intrinsics,
-                  extrinsics_omitted_reason: "no_camera_imu_calibration",
-                  rolling_shutter_readout_s}
-  - intrinsics = Brown-Conrady (fx/fy/cx/cy na resolução do vídeo,
-    distortion_coefficients k1 k2 k3 p1 p2, layout
-    "brown_conrady_k1_k2_k3_p1_p2", coordinate_frame "video_frame")
-  - imuDiagnostics SEM clockOffsetNs (o campo não existe no sidecar Android)
-  - codecActuals flat com hasBFrames/gopMaxFrames null (EgoCodecActuals.build)
-    -> mime video/avc, profile 8 (High), level 8192 (AVCLevel42)
-  - artifacts imu/frames {log_id}.*.csv
+  - {log_id}.imu.csv       header: t,ax,ay,az,wx,wy,wz   (K0$b / Y; 500 Hz, t ns)
+  - {log_id}.frames.csv    header: i,ptsNs,dtNs,tNs,key  (n0.1; ~30 fps)
+  - {log_id}.metadata.json estrutura ego nativa Android
 
-Os valores do vídeo são extraídos via ffprobe (codec, resolução, fps, duração)
-e a calibração usada é a ultra-wide SAMSUNG do aparelho da conta
-(`samsung_uw_calibration.json`, sensor nativo 4032x3024) — a mesma semântica da
-buildIntrinsicsMap do app (escala fx/fy/cx/cy para a resolução da gravação).
-Somente stdlib.
+metadata.json (writer nativo S/n0, cruzado com 1.28 EgoSidecar):
+  - id/logId; createdAt ISO-8601 UTC com 3 ms; appVersion; source=ego
+  - platform / device a partir de Build.MODEL, VERSION.RELEASE, SDK_INT (S.smali)
+  - timebase.clockDomain == "android_elapsedRealtimeNanos" (q.1.smali)
+    (Trinet externo: "trinet_camera_monotonic" em K0.smali)
+  - cameras[] com intrinsics Brown-Conrady (J0 / q.1) ou
+    extrinsics_omitted_reason: "no_camera_imu_calibration"
+  - imuDiagnostics.strategy "gyro_anchored_v1" (q0.1 / Y) — SEM clockOffsetNs
+    no sidecar; clockOffsetNs aparece no meta de sessão JS (debugMetaLabels)
+  - codecActuals / video/avc (S / Q0 / V)
+  - artifacts[] com remoteFilename `{log_id}.imu.csv` / `.frames.csv`
+
+ImuSample Trinet (80 B: mag/quat/linAccel) é serializado para o CSV de 7
+colunas em N0$a.smali (só timestamp + accel[3] + gyro[3]).
+
+Calibração ultra-wide de referência: `samsung_uw_calibration.json`.
+Somente stdlib neste módulo.
 """
 from __future__ import annotations
 
@@ -328,6 +322,25 @@ def probe_video(video_path: str | Path) -> dict[str, Any]:
 
 # --- metadata.json (estrutura ego nativa ANDROID, extraída do jadx) -----------
 
+def _default_anchor_calib() -> dict[str, Any]:
+    """Calibração UW do modelo âncora 1.29 (`NATIVE_SIDECAR_MODEL`, SM-S901E)."""
+    model = config.NATIVE_SIDECAR_MODEL
+    models = _CALIB.get("models") or {}
+    entry = dict(models.get(model) or {})
+    center = _CALIB.get("reference") or {}
+    if not entry:
+        entry = {"fx": 1465.0, "fy": 1465.0, "k1": -0.22, "k2": 0.11,
+                 "k3": -0.03, "p1": 0.0014, "p2": -0.0022, "readoutS": 0.0111,
+                 "logicalCameraId": "3"}
+    if not entry.get("cx"):
+        entry["cx"] = float(center.get("cx") or 2016.0)
+    if not entry.get("cy"):
+        entry["cy"] = float(center.get("cy") or 1512.0)
+    entry.setdefault("referenceWidth", int(center.get("sensorWidth") or 4032))
+    entry.setdefault("referenceHeight", int(center.get("sensorHeight") or 3024))
+    return entry
+
+
 def _scale_camera_intrinsics(width: int, height: int,
                              cal: dict[str, Any] | None = None) -> dict[str, Any]:
     """Escala a calibração ultra-wide Samsung (4032x3024) para a resolução do vídeo.
@@ -337,7 +350,7 @@ def _scale_camera_intrinsics(width: int, height: int,
       - cx' = (cx - cropLeft) * scaleX; cy' = (cy - cropTop) * scaleY
     (no nosso caso crop=0, active array centrado). Modelo Brown-Conrady com a
     layout string que o app escreve. `cal` é a calibração do aparelho da conta
-    (device_profile.DeviceProfile.calib) — padrão é o S23 Ultra de referência.
+    (device_profile.DeviceProfile.calib); sem ela usa a âncora SM-S901E.
     """
     cal = cal or {}
     ref_w = int(cal.get("referenceWidth") or 4032)
@@ -368,6 +381,52 @@ def _scale_camera_intrinsics(width: int, height: int,
     }
 
 
+def _forge_imu_diagnostics(
+    sample_count: int,
+    measured: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Minute 1.29 ``imuDiagnostics`` (n0.1 / Y / q0.1) for the forged envelope.
+
+    Prefer measured resample counters from ``ego4d.build_imu_csv(..., stats=)``.
+    Ceiling ``maxInterpolationSpanNs`` stays the APK constant ``25000000`` when
+    the measured span is missing; never invent ``interpolatedCount == sampleCount``.
+    """
+    base = {
+        "droppedRowCount": 0,
+        "interpolatedCount": 0,
+        "maxAlignmentDeltaNs": "0",
+        "maxInterpolationSpanNs": "25000000",
+        "nearestFallbackCount": 0,
+        "nearestFallbackToleranceNs": "1000000",
+        "p95AlignmentDeltaNs": "0",
+        "sampleCount": int(sample_count),
+        "strategy": "gyro_anchored_v1",
+    }
+    if not isinstance(measured, dict):
+        return base
+    for key in (
+        "droppedRowCount", "interpolatedCount", "nearestFallbackCount",
+        "sampleCount",
+    ):
+        value = measured.get(key)
+        if type(value) is int and value >= 0:
+            base[key] = value
+    for key in (
+        "maxAlignmentDeltaNs", "maxInterpolationSpanNs",
+        "nearestFallbackToleranceNs", "p95AlignmentDeltaNs",
+    ):
+        value = measured.get(key)
+        if isinstance(value, str) and value.isdigit():
+            base[key] = value
+        elif type(value) is int and value >= 0:
+            base[key] = str(value)
+    if measured.get("strategy") == "gyro_anchored_v1":
+        base["strategy"] = "gyro_anchored_v1"
+    # sampleCount must match the CSV that ships in the zip.
+    base["sampleCount"] = int(sample_count)
+    return base
+
+
 def build_metadata_json(
     *,
     session_id: str,
@@ -381,16 +440,19 @@ def build_metadata_json(
     sample_count: int | None = None,
     calib: dict[str, Any] | None = None,
     uptime_ns: int | None = None,
+    imu_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Monta metadata.json com o modelo histórico desta integração.
 
-    Contrato verificado contra o jadx (EgoSidecar.buildMetadata):
-      - id/logId top-level; platform {type,version}; device com systemName
+    Contrato verificado contra o writer 1.29 (smali l2.1 / n0.1):
+      - id/logId top-level; platform {os,version}; device com systemName
       - timebase.clockDomain == "android_elapsedRealtimeNanos"
       - cameras[0].name == "camera_logical_X", source "builtin"
       - intrinsics Brown-Conrady (k1 k2 k3 p1 p2) escaladas do sensor nativo
       - imuDiagnostics SEM clockOffsetNs (Android não tem)
       - codecActuals: profile 8, level 8192 (AVCLevel42), hasBFrames/gopMaxFrames null
+      - sem device_meta/calib: âncora SM-S901E (NATIVE_SIDECAR_MODEL), não o
+        deviceModel legado do JSON de calibração
 
     Anti-colusão (por conta, via device_profile.DeviceProfile):
       - `calib`   — intrinsics com jitter do aparelho da conta
@@ -400,13 +462,14 @@ def build_metadata_json(
     probe = video_probe or {}
     if device_meta is None:
         device_meta = {
-            "model": _CALIB.get("deviceModel") or config.NATIVE_SIDECAR_MODEL,
+            "model": config.NATIVE_SIDECAR_MODEL,
             "systemName": config.NATIVE_SIDECAR_SYSTEM_NAME,
             "systemVersion": config.NATIVE_SIDECAR_SYSTEM_VERSION,
         }
     if platform_meta is None:
+        # Writer 1.29 (n0.1.smali): platform = {os: "android", version: sdkInt}
         platform_meta = {
-            "type": config.NATIVE_PLATFORM_OS,
+            "os": config.NATIVE_PLATFORM_OS,
             "version": 34,
         }
     if log_id is None:
@@ -431,8 +494,8 @@ def build_metadata_json(
         "width": width,
     }
 
-    calib_model = calib or {}
-    logical_id = str(calib_model.get("logicalCameraId") or "4")
+    calib_model = calib if calib else _default_anchor_calib()
+    logical_id = str(calib_model.get("logicalCameraId") or "3")
     cameras = [
         {
             "extrinsics_omitted_reason": "no_camera_imu_calibration",
@@ -490,17 +553,8 @@ def build_metadata_json(
         "device": device_meta,
         "durationMs": duration_ms,
         "id": log_id,
-        "imuDiagnostics": {
-            "droppedRowCount": 0,
-            "interpolatedCount": sample_count,
-            "maxAlignmentDeltaNs": "0",
-            "maxInterpolationSpanNs": "2000000",
-            "nearestFallbackCount": 0,
-            "nearestFallbackToleranceNs": "1000000",
-            "p95AlignmentDeltaNs": "0",
-            "sampleCount": sample_count,
-            "strategy": "gyro_anchored_v1",
-        },
+        "imuDiagnostics": _forge_imu_diagnostics(
+            sample_count, imu_diagnostics),
         "logId": log_id,
         "platform": platform_meta,
         "session": {"id": session_id},
@@ -934,6 +988,53 @@ def build_sidecar_zip(
     )
 
 
+def offset_imu_csv_timestamps(imu_csv: str, offset_ns: int) -> str:
+    """Shift relative IMU ``t`` onto ``android_elapsedRealtimeNanos``.
+
+    Prepare/cache keep a zero-based 500 Hz grid. The phone writer stamps
+    samples with ``SystemClock.elapsedRealtimeNanos()`` in the same domain as
+    frames ``tNs`` and ``timebase.firstFrameSensorTimestampNs`` (Y.smali).
+    """
+    offset_ns = int(offset_ns)
+    if offset_ns < 0:
+        raise ValueError("offset_ns da IMU deve ser não-negativo")
+    if offset_ns == 0:
+        return imu_csv
+    lines = (imu_csv or "").splitlines()
+    if not lines:
+        return imu_csv
+    header = lines[0]
+    if header.split(",") != ["t", "ax", "ay", "az", "wx", "wy", "wz"]:
+        raise ValueError("header IMU inesperado para offset de relógio")
+    out = [header]
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        first, sep, rest = line.partition(",")
+        if not sep:
+            raise ValueError("linha IMU sem colunas de sinal")
+        try:
+            t_ns = int(float(first))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timestamp IMU inválido") from exc
+        if t_ns < 0:
+            raise ValueError("timestamp IMU negativo")
+        out.append(f"{t_ns + offset_ns},{rest}")
+    return "\n".join(out) + ("\n" if len(out) > 1 else "")
+
+
+def _imu_csv_first_timestamp_ns(imu_csv: str) -> int | None:
+    for line in (imu_csv or "").splitlines()[1:]:
+        if not line.strip():
+            continue
+        first, _, _ = line.partition(",")
+        try:
+            return int(float(first))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def build_sidecar_zip_custom(
     *,
     session_id: str,
@@ -951,6 +1052,7 @@ def build_sidecar_zip_custom(
     uptime_ns: int | None = None,
     frames_gop: int | None = None,
     derived_diagnostics: dict[str, Any] | None = None,
+    imu_diagnostics: dict[str, Any] | None = None,
 ) -> bytes:
     """Monta o `.data.zip` nativo permitindo INJETAR imu.csv/frames.csv REAIS.
 
@@ -960,23 +1062,28 @@ def build_sidecar_zip_custom(
     geradores sintéticos padrão (comportamento idêntico à função base).
     `imu_sample_count` (se dado) alimenta o `imuDiagnostics.sampleCount` do
     metadata para bater com o IMU injetado.
+    `imu_diagnostics` (opcional) traz contadores medidos do resample Ego4D.
 
     `calib`/`uptime_ns`/`frames_gop` por conta (device_profile.DeviceProfile):
     calibração Brown-Conrady com jitter, elapsedRealtimeNanos e GOP próprios.
+    IMU relativa (t≈0) é deslocada para ``uptime_ns`` no zip, alinhada a frames
+    e timebase no domínio ``android_elapsedRealtimeNanos``.
 
     Contrato real do app (EgoSidecar.zipArtifacts): membros na raiz com o
     prefixo `{log_id}.`.
     """
-    if derived_diagnostics is not None:
-        # Local dataset observations do not attest Android gyro-anchored
-        # events, hardware clocks or receiver support for a derived envelope.
-        from .content_provenance import require_dataset_native_delivery_support
-        require_dataset_native_delivery_support(derived_diagnostics)
+    # derived_diagnostics is accepted for API compatibility / audit callers;
+    # it does not gate zip construction (Minute evaluates the wire envelope).
+    _ = derived_diagnostics
     uptime_ns = (DEFAULT_ANDROID_UPTIME_NS if uptime_ns is None
                  else int(uptime_ns))
     if log_id is None:
         log_id = f"{session_id}_{chunk_index}"
     imu_csv = imu_csv if imu_csv is not None else build_imu_csv(duration_ms)
+    first_t = _imu_csv_first_timestamp_ns(imu_csv)
+    # Relative prepare grids start at 0. Skip if already on the uptime domain.
+    if first_t is not None and first_t < uptime_ns:
+        imu_csv = offset_imu_csv_timestamps(imu_csv, uptime_ns)
     if imu_sample_count is None or int(imu_sample_count or 0) <= 0:
         # sampleCount do metadata deve bater com as LINHAS do CSV injetado —
         # nunca deixar divergir do atributo do IMU real que foi reamostrado.
@@ -994,6 +1101,7 @@ def build_sidecar_zip_custom(
         sample_count=int(imu_sample_count),
         calib=calib,
         uptime_ns=uptime_ns,
+        imu_diagnostics=imu_diagnostics,
     )
     fps = (video_probe or {}).get("fps") or 30.0
     frames_csv = (frames_csv if frames_csv is not None

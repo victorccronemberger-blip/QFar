@@ -12,15 +12,15 @@ Pipeline de 6 etapas (espelha o fluxo nativo do app Android):
 Comportamento nativo adicional (observado no bundle do app e na spec):
   - PATCH /api/v1/uploads/{id}/fail          -> marca o upload como falho (error_message)
   - GET   /api/v1/uploads/{upload_id}        -> consulta status (upload_status)
-  - suppress_per_chunk_catbear=True no PATCH complete em novos envios (APK 1.28.0)
+  - suppress_per_chunk_catbear=True + network_type no PATCH complete (APK 1.29.0)
   - retries limitados nas etapas compatíveis; CREATE sem recibo não é repetido
   - retry-late: após exaurir retries o chunk fica pendente p/ tentativa futura
   - loss record: arquivo local sumiu -> registra perda em vez de abortar
   - sidecar persistente (data/sidecars/<session_id>.json) + fila de retomada
 
-A API nunca toca nos bytes do MP4 — eles vão direto pro Azure Blob Storage
-(figcbapp.blob.core.windows.net). O registro é criado antes da emissão das URLs
-SAS nos novos envios, conforme driveCreate no bytecode do APK 1.28.0.
+A API nunca toca nos bytes do MP4 — eles vão direto pro Azure Blob Storage.
+O registro é criado antes da emissão das URLs SAS nos novos envios, conforme
+driveCreate do APK 1.29.0 (S22).
 Jornais legados conservam a política de ordem para retomar a etapa pendente.
 Cada arquivo _N.mp4 é um chunk de uma mesma sessionId.
 
@@ -815,26 +815,26 @@ def complete_upload(
     *,
     suppress_per_chunk_catbear: bool = True,
     session_complete: bool = False,
+    network_type: str = "wifi",
     _native_response_schema: bool = False,
 ) -> dict[str, Any]:
     """Confirma um blob já enviado; operação reutilizável após reinício.
 
-    No APK 1.28.0, ``session_complete`` é condicional e ``finalize`` ainda está
-    implementado. O QMoney usa a estratégia explícita ``complete -> finalize``;
-    o orquestrador não combina as duas formas de conclusão. Novos envios usam
-    supressão True, como a atribuição incondicional observada no helper do APK.
-    False explícito mantém a omissão legada, exceto quando session_complete=True
-    exige True pelo contrato histórico deste helper. Sem prova de aceitação remota.
+    No APK 1.29.0, ``_completeUpload`` envia sempre ``suppress_per_chunk_catbear``
+    e ``network_type`` (wifi|cellular); ``session_complete`` só no último chunk.
+    O QMoney usa ``complete -> finalize`` em etapas separadas. Sem prova de
+    aceitação remota pelo Catbear.
     """
     _require_completion_flags(suppress_per_chunk_catbear, session_complete)
     if type(_native_response_schema) is not bool:
         raise UploadError("Contrato de resposta inválido; use um valor booleano.",
                           transient=False, phase="preflight")
     body: dict[str, Any] = {"size_bytes": int(size_bytes)}
-    # O helper Android 1.28.0 envia supressão sempre e session_complete apenas
-    # no ramo condicional. A aceitação do backend não é provada pelo bytecode.
+    # Helper Android 1.29.0 (decompiled L357749–357760).
     if suppress_per_chunk_catbear or session_complete:
         body["suppress_per_chunk_catbear"] = True
+    if network_type:
+        body["network_type"] = str(network_type)
     if session_complete:
         body["session_complete"] = True
     status, text, response_headers = _session_request(
@@ -1331,7 +1331,7 @@ def _upload_single_chunk(
 ) -> ChunkResult:
     """Executa registro -> SAS -> PUT Blob -> PATCH /complete.
 
-    Novos envios usam a ordem observada em driveCreate do APK 1.28.0:
+    Novos envios usam a ordem observada em driveCreate do APK 1.29.0:
     POST /uploads -> SAS -> transporte -> complete. False é preservado para
     retomadas explicitamente identificadas com a ordem legada.
 
@@ -1443,7 +1443,7 @@ def _upload_single_chunk(
                 probe = probe_video(video_path)
                 # Sem device_meta/platform_meta: o metadata.json do sidecar usa
                 # o device COMPLETO Android (Build.MODEL + systemName +
-                # systemVersion; platform {type,version}) — o que o catbear espera.
+                # systemVersion; platform {os,version} no 1.29) — o que o catbear espera.
                 # Com `profile` (anti-colusão): intrinsics Brown-Conrady e
                 # elapsedRealtimeNanos DO APARELHO DA CONTA — cada upload tem
                 # identidade de sensor própria.
@@ -1711,13 +1711,12 @@ def _upload_single_chunk(
         # O app nativo espalha o metadata.json do sidecar e DEPOIS sobrescreve
         # device/platform/appVersion com getDeviceUploadMeta() — formato curto
         # Android (DETALHAMENTO §2.2):
-        #   device   = {"model": "SM-S918B"}   (só Build.MODEL)
+        #   device   = {"model": "SM-S901E"}   (só Build.MODEL)
         #   platform = {"os": "android"}       (só os)
         #   appVersion = binaryAppVersion
         # O metadata.json DENTRO do sidecar permanece COMPLETO (model +
-        # systemName/systemVersion; platform {type,version}) — é o sidecar que
-        # alimenta os checks de integridade (artifact.metadata_json.*); o POST
-        # usa o formato curto.
+        # systemName/systemVersion; platform {os,version} no 1.29) — é o
+        # sidecar que alimenta os checks; o POST usa o formato curto.
         # Com perfil: o MODELO SAMSUNG DO APARELHO DA CONTA (S21–S24).
         if _original_capture is not None:
             # Short POST fields come from the reviewed capture. The ZIP bytes
@@ -1844,7 +1843,7 @@ def _upload_single_chunk(
                 "Registro conflitante em estado failed; envio preservado para revisão.",
                 status_code=409, transient=False, phase="create_conflict_dead_end")
 
-    # Ordem observada em driveCreate do APK 1.28.0: registro -> SAS -> transporte.
+    # Ordem observada em driveCreate do APK 1.29.0: registro -> SAS -> transporte.
     if register_first:
         try:
             if resume_row is None:
@@ -2253,7 +2252,7 @@ def upload_session(
                       registro para revisão, sem presumir idempotência remota.
         retry_backoff — multiplicador do backoff entre retries (default 1.5).
         suppress_per_chunk_catbear — True em envios novos, como no helper do APK
-                      1.28.0, independentemente da contagem de chunks. False
+                      1.29.0, independentemente da contagem de chunks. False
                       explícito mantém a omissão legada. Journal existente governa
                       a política efetiva: valor booleano salvo ou False se ausente.
         fail_on_error — se True, marca PATCH /fail quando o registro já existe

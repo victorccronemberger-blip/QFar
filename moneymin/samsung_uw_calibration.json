@@ -1,6 +1,6 @@
 {
-  "deviceModel": "SM-G991B",
-  "note": "Calibração ultra-wide Samsung (lens intrinsics) em coordenadas do sensor nativo 4032x3024. O sidecar re-escala fx/fy/cx/cy para 1440x1080 (proporcional), igual o app Android (buildIntrinsicsMap: fx*scaleX, (cx-cropLeft)*scaleX). Modelo de distorção Brown-Conrady k1 k2 k3 p1 p2. Valores plausíveis para a família S21-S24 (ultra-wide ~1/2.55\", 12MP). Não são medições por unidade: datasets públicos (SCGC, 100-Phones, Zenodo smartphone) não cobrem UW SEI deste pipeline; use USB/calibração própria para âncora real.",
+  "deviceModel": "SM-S901E",
+  "note": "Âncora top-level = Galaxy S22 SM-S901E (Minute 1.29.0 real). Calibração ultra-wide Samsung em coordenadas do sensor nativo 4032x3024. O sidecar re-escala fx/fy/cx/cy para a resolução do vídeo (buildIntrinsicsMap). Brown-Conrady k1 k2 k3 p1 p2. Entradas em models{} cobrem a família S21–S24; top-level deviceModel deve coincidir com NATIVE_SIDECAR_MODEL para o caminho sem perfil.",
   "reference": {
     "sensorWidth": 4032,
     "sensorHeight": 3024,

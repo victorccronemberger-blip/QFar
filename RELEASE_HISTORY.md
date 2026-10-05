@@ -2,12 +2,14 @@
 
 Índice das **101 releases públicas**, consultado em **05/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
-Versão atual: [v2.0.30](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.30). Destaques solicitados: [v1.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v1.0.73) e [v2.0.2](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.2).
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
+Versão atual: [v2.0.31](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.31). Destaques solicitados: [v1.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v1.0.73) e [v2.0.2](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.2).
+
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.31](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.31) | 05/10/2026 | Campanha Ego4D: envelope Minute 1.29 (IMU no elapsedRealtime, gap 25 ms, imuDiagnostics do resample, SM-S901E), sem gate artificial de delivery; restaura expansao do cache do Acelerador (best-of v1.0.73/v2.0.2). | [Desde v2.0.30](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.30...v2.0.31) |
 | [v2.0.30](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.30) | 04/10/2026 13:28 | Consolida as correções da Campanha, dos envios e da recuperação de estado, com rastreabilidade do conteúdo e proteção contra duplicação após falhas ou reinícios. | [Desde v2.0.27](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.27...v2.0.30) |
 | [v2.0.27](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.27) | 02/10/2026 15:52 | Corrige a limpeza de e-mail que preservava newsletters e avisos de acesso por interpretar cabeçalhos técnicos, assinaturas e palavras genéricas como pagamentos. | [Desde v2.0.26](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.26...v2.0.27) |
 | [v2.0.26](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.26) | 02/10/2026 07:21 | Corrige contagens de campanha sem finalização confirmada, preserva a duração e os sensores medidos do Ego4D e acrescenta uma biblioteca pesquisável com a origem dos vídeos. | [Desde v2.0.25](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.25...v2.0.26) |

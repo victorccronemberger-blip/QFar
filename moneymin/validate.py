@@ -1,9 +1,10 @@
 """
 validate.py — Validação local de estrutura e coerência dos artefatos Minute.
 
-Interpreta os formatos observados no APK Android 1.28.0, incluindo timestamps
-reais por quadro e relógios de câmera externa. Não comprova origem física dos
-dados nem substitui a avaliação remota (`POST /uploads/{id}/evaluate`).
+Contrato alinhado ao APK Android 1.29.0 (Galaxy S22, smali `l2.1`) e ao
+histórico 1.28.0. Cobre timestamps por quadro, IMU CSV, timebase
+android_elapsedRealtimeNanos / trinet_camera_monotonic. Não comprova origem
+física dos dados nem substitui `POST /uploads/{id}/evaluate`.
 
 Severidade:
   - fail: estrutura inválida ou incoerência demonstrável entre os artefatos.
@@ -95,7 +96,7 @@ def _check_metadata_fields(metadata: dict[str, Any]) -> list[Check]:
         Check("metadata_json.chunk", "pass" if chunk_ok else "fail",
               "chunk deve ter index Int não negativo e startTimeMs/endTimeMs Long"),
         Check("metadata_json.source", "pass" if source_ok else "fail",
-              "source=ego no writer Ll2/o0.c do APK 1.28.0"),
+              "source=ego no writer l2.1/n0 do APK 1.29.0"),
         Check("metadata_json.appVersion", "pass" if version_ok else "fail",
               "appVersion deve ser string não vazia; versão remota não é validada localmente"),
     ]
@@ -127,7 +128,7 @@ def _axis(row: list[str]) -> list[int | float] | None:
 
 
 def _check_platform(platform: Any, name: str, *, require_version: bool = False) -> Check:
-    """APK 1.28 escreve os; type é compatibilidade explícita do formato legado."""
+    """APK 1.29 (n0.1.smali) escreve platform.os; type é legado pré-1.29."""
     if not isinstance(platform, dict):
         return Check(name, "fail", "platform não é objeto")
     values = {key: platform[key] for key in ("os", "type") if key in platform}
@@ -137,7 +138,7 @@ def _check_platform(platform: Any, name: str, *, require_version: bool = False) 
     if require_version and not _positive_int(platform.get("version")):
         return Check(name, "fail", "version deve ser SDK inteiro positivo")
     if "os" not in values:
-        return Check(name, "warn", "platform.type legado; APK 1.28 usa platform.os")
+        return Check(name, "warn", "platform.type legado; APK 1.29 usa platform.os")
     return Check(name, "pass", "platform.os=android")
 
 
@@ -297,10 +298,10 @@ def validate_sidecar_zip(
     raw_domain = timebase.get("clockDomain")
     clock_domain = raw_domain if isinstance(raw_domain, str) else ""
     accepted = {_NATIVE_CLOCK, _EXTERNAL_CLOCK}
+    # 1.29 writer only emits native or Trinet domains (q.1 / K0.smali).
     checks.append(Check(
         "timebase.clockDomain",
-        "fail" if not clock_domain else
-        "pass" if clock_domain in accepted else "warn",
+        "pass" if clock_domain in accepted else "fail",
         clock_domain or "(ausente)"))
     for key in ("startNs", "endNs", "startSensorTimestampNs",
                 "endSensorTimestampNs", "firstFrameSensorTimestampNs"):
@@ -354,14 +355,28 @@ def validate_sidecar_zip(
     # --- IMU csv -------------------------------------------------------------
     imu_checks = _check_imu_csv(imu_text, duration_ms)
     checks.extend(imu_checks)
+    checks.append(_check_imu_timebase(imu_text, timebase))
 
     # --- frames csv ----------------------------------------------------------
     frame_checks = _check_frames_csv(frames_text, duration_ms)
     checks.extend(frame_checks)
     checks.append(_check_frames_timebase(frames_text, timebase))
 
-    # --- imuDiagnostics.sampleCount ↔ IMU ------------------------------------
+    # --- imuDiagnostics (1.29: strategy + sampleCount; sem clockOffsetNs) ----
     diag = metadata.get("imuDiagnostics") or {}
+    if isinstance(diag, dict) and "clockOffsetNs" in diag:
+        checks.append(Check(
+            "imuDiagnostics.no_clockOffsetNs",
+            "fail",
+            "clockOffsetNs não pertence ao metadata.json do sidecar 1.29 "
+            "(só ao meta de sessão JS / debug overlay)",
+        ))
+    elif isinstance(diag, dict) and diag.get("strategy") not in (None, "gyro_anchored_v1"):
+        checks.append(Check(
+            "imuDiagnostics.strategy",
+            "warn",
+            f"strategy={diag.get('strategy')!r}; 1.29 usa gyro_anchored_v1",
+        ))
     if isinstance(diag, dict) and _positive_int(diag.get("sampleCount")):
         imu_rows = len([ln for ln in imu_text.splitlines() if ln.strip()]) - 1
         reported = int(diag.get("sampleCount"))
@@ -425,6 +440,53 @@ def _check_imu_csv(text: str, duration_ms: int) -> list[Check]:
         "pass" if ok_span else "fail",
         f"span {span / 1e9:.3f}s vs duração {duration_ms / 1000:.3f}s"))
     return checks
+
+
+def _check_imu_timebase(text: str, timebase: dict[str, Any]) -> Check:
+    """IMU ``t`` and timebase must share ``android_elapsedRealtimeNanos``.
+
+    Phone EgoImu stamps samples with the same elapsedRealtime domain as
+    ``firstFrameSensorTimestampNs`` (Y.smali / q.1). A relative zero grid
+    against a non-zero uptime anchor fails the wire envelope.
+    """
+    name = "xcheck.imu_timebase"
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return Check(name, "fail", "imu.csv sem amostras suficientes")
+    if not isinstance(timebase, dict):
+        return Check(name, "fail", "timebase não é objeto")
+    domain = timebase.get("clockDomain")
+    if domain and domain != _NATIVE_CLOCK:
+        return Check(name, "warn",
+                     f"domínio {domain!r}; cruzamento IMU/elapsedRealtime não exigido")
+    try:
+        if lines[0].split(",") != ["t", "ax", "ay", "az", "wx", "wy", "wz"]:
+            raise ValueError("header IMU inesperado")
+        first_imu = _ns(lines[1].split(",")[0])
+        if first_imu is None:
+            raise ValueError("primeiro t inválido")
+        anchor = _ns(timebase.get("firstFrameSensorTimestampNs"))
+        start = _ns(timebase.get("startNs"))
+        end = _ns(timebase.get("endNs"))
+        if anchor is None or start is None or end is None or end <= start:
+            raise ValueError("âncora/intervalo inválidos")
+    except (TypeError, ValueError, IndexError) as exc:
+        return Check(name, "fail", f"não foi possível cruzar IMU e timebase: {exc}")
+    # One sample period (2 ms at 500 Hz) around the first-frame sensor anchor.
+    step_ns = int(1_000_000_000 // config.ANDROID_IMU_SAMPLE_RATE_HZ)
+    if anchor > step_ns and first_imu < step_ns:
+        return Check(
+            name, "fail",
+            f"IMU relativa t0={first_imu} com âncora elapsedRealtime={anchor}")
+    if abs(first_imu - anchor) > step_ns:
+        return Check(
+            name, "fail",
+            f"IMU t0={first_imu} desalinhada da âncora do 1º frame ({anchor})")
+    if first_imu < start - step_ns or first_imu > end + step_ns:
+        return Check(
+            name, "fail",
+            f"IMU t0={first_imu} fora do intervalo timebase [{start}, {end}]")
+    return Check(name, "pass", "IMU e timebase no mesmo domínio elapsedRealtime")
 
 
 def _check_frames_csv(text: str, duration_ms: int) -> list[Check]:

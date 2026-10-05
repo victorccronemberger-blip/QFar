@@ -77,13 +77,7 @@ class Ego4dCampaignMeasuredFrameTests(unittest.TestCase):
         self.sidecars = []
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        # This focal witness isolates the frame contract. Dataset delivery is
-        # prohibited by the REAL policy in test_content_provenance_contract;
-        # here the receiving-policy/selection boundaries are explicitly inert.
-        from moneymin import content_provenance
-        self.content_provenance = content_provenance
-        self.stack.enter_context(patch.object(content_provenance,
-            'require_dataset_native_delivery_support', return_value=None))
+        # Frame contract only; selection/provenance boundaries are inert here.
         self.stack.enter_context(patch.object(campaign.ego4d,
             'revalidate_selection_evidence', return_value={'schema': 1, 'physical_provenance_verified': False}, create=True))
         self.stack.enter_context(patch.object(campaign.org_policy, 'account_kind', return_value='other'))
@@ -116,10 +110,11 @@ class Ego4dCampaignMeasuredFrameTests(unittest.TestCase):
                 'imu_csv': 't,ax,ay,az,wx,wy,wz\n0,1,2,3,4,5,6\n',
                 'n_samples': 1, 'require_measured_pts': False}
         if source == 'ego4d':
+            from moneymin import content_provenance
             sensor = self.root / 'declared-canonical-imu.csv'
             sensor.write_text('canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z\n'
                 f'0,4,5,6,1,2,3\n{duration_ms},4,5,6,1,2,3\n', encoding='utf-8')
-            item.update(self.content_provenance.prepare_content_provenance(
+            item.update(content_provenance.prepare_content_provenance(
                 self.media, sensor, self.media, item['imu_csv'], 'i,ptsNs,dtNs,tNs,key\n',
                 clip_uid='declared-clip', parent_video_uid='declared-parent', media_uid='declared-media',
                 window_s=(0, duration_ms / 1000), media_offset_s=0,

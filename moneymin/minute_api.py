@@ -13,7 +13,7 @@ Exemplo:
     login("user@example.com", "senha")          # grava secrets/token_user_at_example_com.json
     s = Session.from_email("user@example.com")   # carrega + SEMPRE troca o idToken no Firebase
     me = s.get("/api/v1/users/me")
-    cats = s.get("/api/v1/categories")
+    tasks = s.all_tasks(org_key)  # categorias vêm embutidas em cada task (1.29)
 """
 from __future__ import annotations
 
@@ -31,6 +31,54 @@ from urllib.parse import urlencode, urlsplit, parse_qs
 from . import config, credential_store, device_profile, transport, token_store
 from .atomic_io import JsonStateError, load_json_state, save_json
 from .service_policy import RecordingPolicy
+
+
+def minute_lang_code() -> str:
+    """Código i18n do app Minute (`en`|`es`|`pt`) para `?langCode=`.
+
+    O Hermes `withLangCode` omite o parâmetro quando o idioma é `en`.
+    `ACCEPT_LANGUAGE` HTTP (ex. pt-BR) é mapeado para o código curto do app.
+    """
+    raw = (config.ACCEPT_LANGUAGE or "").split(",", 1)[0].strip().lower()
+    if not raw or raw.startswith("en"):
+        return ""
+    if raw.startswith("pt"):
+        return "pt"
+    if raw.startswith("es"):
+        return "es"
+    primary = raw.split("-", 1)[0]
+    return primary if primary in ("pt", "es", "en") else ""
+
+
+def _tasks_lang_query() -> str:
+    code = minute_lang_code()
+    if not code or code == "en":
+        return ""
+    return f"?langCode={code}"
+
+
+def categories_from_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Agrega `categories[{slug,label}]` embutidas nas tasks (prática 1.29).
+
+    Substitui o endpoint global `/api/v1/categories` como fonte primária.
+    """
+    by_slug: dict[str, dict[str, Any]] = {}
+    for task in tasks:
+        for cat in task.get("categories") or []:
+            if not isinstance(cat, dict):
+                continue
+            slug = cat.get("slug")
+            if not isinstance(slug, str) or not slug.strip():
+                continue
+            key = slug.strip()
+            if key not in by_slug:
+                by_slug[key] = {
+                    "slug": key,
+                    "label": cat.get("label") or key,
+                    "id": cat.get("id") or key,
+                    "name": cat.get("label") or cat.get("name") or key,
+                }
+    return list(by_slug.values())
 
 # Folga antes do exp do JWT: PUT de blob pode passar de 2 min; 10 min evita
 # mandar um Bearer que morre no meio do upload.
@@ -932,13 +980,28 @@ class Session:
             raise AuthError("Catálogo retornou estrutura inválida.", code="invalid_response")
         return data
 
-    def categories(self) -> Any:
-        """Categorias globais do Minute (base para o enquadramento)."""
-        return self._catalog_json("/api/v1/categories")
+    def categories(self, org_key: str | None = None) -> Any:
+        """Categorias para enquadramento a partir das tasks da org (Minute 1.29).
+
+        O app 1.29 não usa `/api/v1/categories` como fonte da home; as
+        categorias vêm embutidas em cada task. Se `org_key` for omitido e o
+        usuário tiver exatamente uma org, usa essa; caso contrário exige a chave.
+        """
+        key = org_key
+        if not key:
+            orgs = self.my_orgs()
+            if len(orgs) == 1:
+                key = orgs[0].get("resourceKey") or orgs[0].get("key") or orgs[0].get("id")
+            else:
+                raise AuthError(
+                    "categories() no 1.29 exige org_key (categorias vêm das tasks).",
+                    code="invalid_request",
+                )
+        tasks = self.all_tasks(str(key))
+        return categories_from_tasks(tasks)
 
     def org_tasks(self, org_key: str) -> Any:
-        lang = config.ACCEPT_LANGUAGE.split(",", 1)[0].strip()
-        query = f"?lang={lang}" if lang else ""
+        query = _tasks_lang_query()
         return self._catalog_json(f"/api/v1/orgs/{org_key}/tasks{query}")
 
     def org_quota(self, org_key: str) -> Any:
@@ -1217,8 +1280,7 @@ class Session:
 
     def all_tasks(self, org_key: str) -> list[dict[str, Any]]:
         """Tasks de uma org, sempre como lista (normaliza list/dict)."""
-        lang = config.ACCEPT_LANGUAGE.split(",", 1)[0].strip()
-        query = f"?lang={lang}" if lang else ""
+        query = _tasks_lang_query()
         body = self._catalog_json(f"/api/v1/orgs/{org_key}/tasks{query}")
         return validate_task_catalog(_as_list(body))
 

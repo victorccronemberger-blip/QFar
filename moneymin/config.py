@@ -150,9 +150,11 @@ CROWTADO_REF = "4NGM98UV"
 CROWTADO_SIGNUP_URL = f"https://www.crowtado.com/sign-up?ref={CROWTADO_REF}"
 
 # Valores de compatibilidade configurados para esta integração.
-# Aceitação do header não comprova equivalência de uploads com o APK 1.28.0.
-APP_VERSION = os.environ.get("MINUTE_APP_VERSION", "1.28.0")
-ANDROID_VERSION_CODE = os.environ.get("MINUTE_ANDROID_VERSION_CODE", "1004033")
+# Defaults alinhados ao APK real Galaxy S22 (SM-S901E) Minute 1.29.0
+# versionCode 1004038, pull ADB 2026-10-04. Aceitação do header não comprova
+# equivalência integral de uploads. Override por ambiente permanece.
+APP_VERSION = os.environ.get("MINUTE_APP_VERSION", "1.29.0")
+ANDROID_VERSION_CODE = os.environ.get("MINUTE_ANDROID_VERSION_CODE", "1004038")
 # UA Android: TODO o HTTP passa pelo OkHttp (RN fetch + AzureBlockUploader) com
 # o header default `okhttp/<versão>` — o bundle não contém nenhum literal de UA
 # custom, e o APK declara okhttp/4.12.0. O OkHttp manda o MESMO header para
@@ -193,25 +195,28 @@ EGO4D_AWS_REGION = os.environ.get("EGO4D_AWS_REGION", "").strip()
 
 
 # --- Perfil nativo do app ANDROID (réplica do upload) ------------------------
-# Valores extraídos anteriormente do APK Android v1.22.0 (jadx_out/sources/app/useminute):
-# o meta do POST /uploads usa o formato CURTO getDeviceUploadMeta
-# (platform={os}, device={model}), enquanto o metadata.json DENTRO do sidecar
-# usa o formato COMPLETO (platform={type,version:sdk} + device com
-# systemName/systemVersion). O aparelho de cada conta vem do device_profile
-# (pool Samsung Galaxy S21–S24); estes são apenas os fallbacks de uploads
-# avulsos sem perfil.
+# Fonte atual: APK Minute 1.29.0 instalado no Galaxy S22 SM-S901E (serial
+# RQCT804KN2N), pacote ofuscado smali `l2.1` + JS `bundle/decompiled.js`.
+# Histórico: análises 1.22/1.28 em emulador documentadas em VALIDACAO_MINUTE_*.
+#
+# POST /uploads meta curto (getDeviceUploadMeta L357240): platform={os},
+# device={model}. metadata.json no .data.zip: device Build.MODEL + RELEASE,
+# platform com SDK (S.smali ~1697–1737). Perfis por conta vêm de device_profile;
+# estes defaults são fallbacks avulsos.
 
-# Formato curto do POST /uploads: só "model" (Build.MODEL de um Samsung comum).
-NATIVE_DEVICE_MODEL = os.environ.get("MINUTE_NATIVE_DEVICE_MODEL", "SM-S918B")
+# Formato curto do POST /uploads: só "model" (Build.MODEL do S22 âncora).
+NATIVE_DEVICE_MODEL = os.environ.get("MINUTE_NATIVE_DEVICE_MODEL", "SM-S901E")
 # Formato curto do POST /uploads: só "os".
 NATIVE_PLATFORM_OS = os.environ.get("MINUTE_NATIVE_PLATFORM_OS", "android")
 # Formato COMPLETO do device dentro do sidecar (Build.MODEL + Android release).
-NATIVE_SIDECAR_MODEL = os.environ.get("MINUTE_NATIVE_SIDECAR_MODEL", "SM-S918B")
+NATIVE_SIDECAR_MODEL = os.environ.get("MINUTE_NATIVE_SIDECAR_MODEL", "SM-S901E")
 NATIVE_SIDECAR_SYSTEM_NAME = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_NAME", "Android")
 NATIVE_SIDECAR_SYSTEM_VERSION = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_VERSION", "14")
 
-# IMU do pipeline "ego" do app (EgoImu.SAMPLING_PERIOD_US = 2000 -> 500 Hz).
-# A câmera Trinet externa roda a 562 Hz (TrinetImuCsv.IMU_SAMPLE_RATE_HZ).
+# IMU pipeline ego: CSV `t,ax,ay,az,wx,wy,wz` (K0$b.smali / Y.smali header).
+# Taxa 500 Hz confirmada no contrato 1.28 e mantida no 1.29 (smali l2.1).
+# Trinet USB: ImuSample 80 B (mag/quat/linAccel) é reduzido a accel+gyro no CSV
+# (N0$a.smali). Taxa Trinet histórica ~562 Hz permanece nota de calibração.
 ANDROID_IMU_SAMPLE_RATE_HZ = 500
 
 # O fingerprint OkHttp/Android exige curl_cffi; o fallback urllib é Python puro

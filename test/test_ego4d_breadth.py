@@ -150,11 +150,13 @@ class LocalSensorCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "imu.csv"
             lines = ["canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z"]
-            for t in (0, 50, 100, 150, 200, 500, 550, 600, 650, 700):
-                gyro = ",," if t in (500, 550, 600) else "1,2,3"
+            # Spacing 20 ms stays inside the Minute 1.29 25 ms max span;
+            # the 500–600 ms gyro hole still splits coverage.
+            for t in (0, 20, 40, 60, 80, 100, 200, 220, 240, 260, 280, 300):
+                gyro = ",," if t in (200, 220, 240) else "1,2,3"
                 lines.append(f"{t},{gyro},4,5,6")
             path.write_text("\n".join(lines))
-            self.assertEqual(local_sensor_intervals(path), [(0, 0.2), (0.65, 0.7)])
+            self.assertEqual(local_sensor_intervals(path), [(0, 0.1), (0.26, 0.3)])
 
 
 class CatalogRefreshTests(unittest.TestCase):

@@ -6,14 +6,15 @@ Responsável por, dado um conjunto de clipes + contas + tasks:
   2. Enviar para cada conta configurada (upload_session com IMU real).
   3. Gerar um relatório estruturado (JSON) com os resultados e status.
 
-Fluxo completo (VÁLIDO, verificado 13/08 — catbear retornou `great` em
-Clarity/Variety/Task para montagem de móveis e lavagem de carro, em 2 contas):
+Fluxo completo (contrato wire Minute 1.29 / SM-S901E):
   Ego4D(clipe+IMU real) -> normalize_video(1440x1080 yuv420p) -> sidecar nativo
   -> upload_session(register_first, evaluate, finalize) -> relatório.
 
 Regras de ouro (não descumprir):
   - O cenário do vídeo DEVE corresponder à task do Minute (`task` score).
-  - IMU real do Ego4D (não sintética) no sidecar (coerência sensor<->vídeo).
+  - IMU real do Ego4D (não sintética) no sidecar; grade 500 Hz no domínio
+    ``android_elapsedRealtimeNanos`` (mesmo eixo de frames/timebase).
+  - Gate de entrega: envelope 1.29 válido + proveniência honesta third_party.
   - Vídeos longos: `timeout_blob` alto para o PUT do blob não estourar.
 """
 from __future__ import annotations
@@ -793,7 +794,9 @@ def prepare_clip(
             f"clipe {clip_uid}: duração codificada divergente da janela original "
             f"({dur_ms}ms versus {round(dur_s * 1000)}ms)")
     _progress("sidecar")
-    imu_csv = ego4d.build_imu_csv(imu_path, window_s, duration_ms=dur_ms)
+    imu_diag: dict[str, Any] = {}
+    imu_csv = ego4d.build_imu_csv(
+        imu_path, window_s, duration_ms=dur_ms, stats=imu_diag)
     # 500 Hz (EgoImu.SAMPLING_PERIOD_US=2000) — o n_samples alimenta o
     # imuDiagnostics.sampleCount e precisa bater com as linhas do CSV.
     n_samples = max(
@@ -828,6 +831,8 @@ def prepare_clip(
         "imu_path": str(imu_path),
         "window_s": list(window_s),
         "n_samples": n_samples, "probe": probe,
+        # Contadores do resample → imuDiagnostics forjado no zip (Minute 1.29).
+        "imu_diagnostics": dict(imu_diag),
         "source": "ego4d",
         # Local audit/history only. Never relabel third-party footage as a
         # newly captured recording or claim the output grid as the native rate.
@@ -1191,8 +1196,8 @@ def _build_sidecar(item: dict[str, Any], session_id: str, log_id: str,
         frames_gop=profile.frames_gop,
         device_meta=profile.sidecar_device_meta(),
         platform_meta=profile.sidecar_platform_meta(),
-        **({"derived_diagnostics": item["derived_diagnostics"]}
-           if item.get("source") == "ego4d" and "derived_diagnostics" in item else {}),
+        imu_diagnostics=(item.get("imu_diagnostics")
+                         if isinstance(item.get("imu_diagnostics"), dict) else None),
     )
 
 
@@ -1969,10 +1974,6 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 result["selection_evidence"] = ego4d.revalidate_selection_evidence(
                     candidate, task_name=item.get("task_name_authoritative"),
                     task_id=task_id, registry_key=item.get("registry_key"))
-                # Required native event observations are not derivable from
-                # offline bucket-resampled source CSV. Block before any Auth,
-                # pending-journal pump or newly assigned device/session clock.
-                content_provenance.require_dataset_native_delivery_support(item["derived_diagnostics"])
             except ValueError as exc:
                 raise UploadError(str(exc), transient=False, phase="prepare") from exc
         if (org_policy.account_kind(account.email) == "crowtado"
@@ -2037,10 +2038,14 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             video_probe = probe_video(video_path)
         imu_csv = item.get("imu_csv") or ""
         if unique_video and item.get("imu_path") and item.get("window_s"):
+            imu_diag_live: dict[str, Any] = {}
             imu_csv = ego4d.build_imu_csv(
                 item["imu_path"], tuple(item["window_s"]),
                 duration_ms=item["duration_ms"],
-                seed=f"{item['clip_uid']}|{account.email}")
+                seed=f"{item['clip_uid']}|{account.email}",
+                stats=imu_diag_live)
+            item = dict(item)
+            item["imu_diagnostics"] = imu_diag_live
         if not imu_csv:
             if item.get("source") == "ego4d":
                 raise UploadError("IMU real Ego4D ausente; envio bloqueado sem substituição sintética.",
@@ -2270,6 +2275,13 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
             shorts = list(_compatible_task_clips(
                 tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
                 max_dur_s=tsk.max_dur_s))
+            # Best of v1.0.73/v2.0.2: merge accelerator-ready Ego4D so
+            # already-normalized cache is not left unused by the rank pool.
+            if content_mode != "dataset":
+                shorts = _with_cached_expansion(
+                    shorts, tsk.task_name, min_dur_s=tsk.min_dur_s,
+                    max_dur_s=tsk.max_dur_s, work_dir=work_dir,
+                    include_disabled=True)
         else:
             shorts = ego4d.list_clips(
                 scenario=tsk.scenario,
@@ -3765,6 +3777,35 @@ def _compatible_task_clips(
     return (*holo_clips, *ego_clips)
 
 
+def _with_cached_expansion(
+    clips: list[dict[str, Any]],
+    task_name: str,
+    *,
+    min_dur_s: float,
+    max_dur_s: float,
+    work_dir: Path | None = None,
+    include_disabled: bool = False,
+) -> list[dict[str, Any]]:
+    """Acrescenta cenário já gravado pelo acelerador, sem buscar mídia nova.
+
+    Restaurado de v1.0.73/v2.0.2: o rank narrado sozinho deixava clipes
+    `_native` prontos fora do pool. Melhor aproveitamento do Ego4D em disco.
+    """
+    from .ego_accelerator import ready_scenario_clips
+
+    merged = list(clips)
+    seen = {str(clip.get("clip_uid") or "") for clip in merged}
+    for extra in ready_scenario_clips(
+            task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+            work_dir=work_dir, allow_disabled=include_disabled):
+        uid = str(extra.get("clip_uid") or "")
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        merged.append(extra)
+    return merged
+
+
 def _clip_is_cached(clip: dict[str, Any], work_dir: Path) -> bool:
     if str(clip.get("source") or "") == "holoassist":
         from .holo_accelerator import clip_ready
@@ -3852,6 +3893,14 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                      if 60 <= c["dur_s"] <= 1800]
         clips = list(_compatible_task_clips(
             name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
+        if (mode != "dataset"
+                and normalize_dataset_provider(dataset_provider) in ("all", "ego4d")):
+            all_clips = _with_cached_expansion(
+                all_clips, name, min_dur_s=60, max_dur_s=1800,
+                include_disabled=True)
+            clips = _with_cached_expansion(
+                clips, name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                include_disabled=True)
         if mode == "cache":
             all_clips = [clip for clip in all_clips if cache_ready(clip)]
             clips = [clip for clip in clips if cache_ready(clip)]

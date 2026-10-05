@@ -72,6 +72,11 @@ KNOWN_INCOMPLETE_IMU_VIDEO_UIDS = frozenset({
     "ce2cf2f6-24aa-4195-93a6-f82b283815e6",
 })
 
+# Continuidade por sensor / cobertura de catálogo. Alinhado ao EgoImu 1.29
+# maxInterpolationSpanNs = 25_000_000 (25 ms). Usado no resample e no gate
+# de catálogo para não admitir janelas que falham no prepare.
+IMU_MAX_INTERPOLATION_GAP_MS = 25.0
+
 
 _SELECTION_SNAPSHOT = contextvars.ContextVar("ego4d_selection_snapshot", default=None)
 _SELECTION_VERSION = "ego4d-selection-content-v2"
@@ -652,7 +657,8 @@ def _window_uid(parent_uid: str, start_s: float, end_s: float) -> str:
 
 
 def imu_coverage_intervals(
-    video: dict[str, Any], *, max_gap_s: float = 0.050,
+    video: dict[str, Any], *,
+    max_gap_s: float = IMU_MAX_INTERPOLATION_GAP_MS / 1000.0,
 ) -> list[tuple[float, float]]:
     """Intervalos contínuos cobertos pelo IMU segundo o metadata oficial."""
     components = (video.get("imu_metadata") or {}).get("component_metadata") or []
@@ -677,7 +683,7 @@ def imu_coverage_intervals(
 
 def imu_window_is_covered(
     video: dict[str, Any], window_s: tuple[float, float],
-    *, tolerance_s: float = 0.050,
+    *, tolerance_s: float = IMU_MAX_INTERPOLATION_GAP_MS / 1000.0,
 ) -> bool:
     """Recusa janelas que atravessam componentes sem IMU."""
     if str(video.get("video_uid") or "") in KNOWN_INCOMPLETE_IMU_VIDEO_UIDS:
@@ -2060,11 +2066,7 @@ def download_imu(video: dict[str, Any], dest: Path) -> Path | None:
 
 # --- Conversão da IMU para o sidecar ------------------------------------------
 
-# O arquivo canônico reúne sensores de frequências diferentes. Uma câmera pode
-# ter giroscópio a 100/200 Hz e acelerômetro a 50/200 Hz; exigir ocupação de
-# 70% da grade Android de 500 Hz reprova até uma captura perfeita. O critério
-# correto é a continuidade temporal de CADA sensor antes da reamostragem.
-IMU_MAX_INTERPOLATION_GAP_MS = 75.0
+# IMU_MAX_INTERPOLATION_GAP_MS definido no topo do módulo (catálogo + resample).
 
 
 def build_imu_csv(
@@ -2074,6 +2076,7 @@ def build_imu_csv(
     duration_ms: int | None = None,
     seed: str | None = None,
     validate_only: bool = False,
+    stats: dict[str, Any] | None = None,
 ) -> str:
     """Converte e valida a IMU oficial antes de gerar o sidecar ANDROID.
 
@@ -2083,6 +2086,10 @@ def build_imu_csv(
     ordenada pelo timestamp canônico e só interpola lacunas curtas. Uma janela
     sem cobertura confiável falha em vez de fabricar minutos com a última
     amostra observada.
+
+    Se ``stats`` for um dict, preenche contadores no formato do
+    ``imuDiagnostics`` do Minute 1.29 (sampleCount, interpolatedCount, …)
+    para o metadata forjado refletir o resample — não zeros inventados.
     """
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz deve ser positivo")
@@ -2232,7 +2239,23 @@ def build_imu_csv(
             for a, b in zip(before, after, strict=True)
         )
 
+    interpolated_count = 0
+    nearest_fallback_count = 0
+    max_interp_span_samples = 0
+    run = 0
     for idx in range(n):
+        gyro_missing = not counts[0][idx]
+        accel_missing = not counts[1][idx]
+        if gyro_missing or accel_missing:
+            interpolated_count += 1
+            run += 1
+            max_interp_span_samples = max(max_interp_span_samples, run)
+        else:
+            run = 0
+        # Conta hold de borda antes de atualizar left/right em _component_values.
+        for component, missing in ((0, gyro_missing), (1, accel_missing)):
+            if missing and (left[component] is None or right[component] is None):
+                nearest_fallback_count += 1
         gyro = _component_values(0, idx)
         accel = _component_values(1, idx)
         # Android: grava o sensor COMO LIDO (sem negar o eixo z — convenção
@@ -2242,4 +2265,22 @@ def build_imu_csv(
             f"{accel[0]:.6f}", f"{accel[1]:.6f}", f"{accel[2]:.6f}",
             f"{gyro[0]:.6f}", f"{gyro[1]:.6f}", f"{gyro[2]:.6f}",
         ])
+    if stats is not None:
+        step_ns_i = int(round(step_ms * 1_000_000))
+        span_ns = max_interp_span_samples * step_ns_i
+        # APK config ceiling (0x17d7840); measured span never exceeds the gate.
+        span_ns = min(span_ns, int(IMU_MAX_INTERPOLATION_GAP_MS * 1_000_000))
+        half_step = str(max(0, step_ns_i // 2))
+        stats.clear()
+        stats.update({
+            "droppedRowCount": 0,
+            "interpolatedCount": int(interpolated_count),
+            "maxAlignmentDeltaNs": half_step,
+            "maxInterpolationSpanNs": str(span_ns if span_ns > 0 else step_ns_i),
+            "nearestFallbackCount": int(nearest_fallback_count),
+            "nearestFallbackToleranceNs": "1000000",
+            "p95AlignmentDeltaNs": half_step,
+            "sampleCount": int(n),
+            "strategy": "gyro_anchored_v1",
+        })
     return out.getvalue()

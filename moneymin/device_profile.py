@@ -5,7 +5,7 @@ O módulo deriva identidade, modelo, relógio e parâmetros de câmera a partir
 de configuração, catálogo e e-mail. Esses valores não são uma aquisição de
 Android ID, Build.MODEL, SystemClock ou calibração de um aparelho físico.
 Os nomes de campos seguem referências anteriores do cliente Android; isso
-não comprova equivalência com o APK 1.28.0 nem aceitação pelo provedor.
+não comprova equivalência com o APK 1.29.0 nem aceitação pelo provedor.
 
 Estado em `data/device_state/device_<SHA256 do proprietário>.json` (gitignored),
 com migração que preserva os bytes e o arquivo legado. Estado ilegível ou de
@@ -361,8 +361,8 @@ class DeviceProfile:
 
     email: str
     device_id: str
-    device_model: str = "SM-S918B"          # Build.MODEL (short e sidecar)
-    sidecar_model: str = "SM-S918B"         # Build.MODEL completo (metadata.json)
+    device_model: str = "SM-S901E"          # Build.MODEL âncora S22 1.29 (short e sidecar)
+    sidecar_model: str = "SM-S901E"         # Build.MODEL completo (metadata.json)
     os_version: str = "14"                  # release do Android (UA, app/opened)
     sdk_int: int = 34                       # Build.VERSION.SDK_INT (metadata.json)
     sidecar_system_version: str = "14"      # systemVersion = Build.VERSION.RELEASE
@@ -521,9 +521,9 @@ class DeviceProfile:
         }
 
     def sidecar_platform_meta(self) -> dict[str, Any]:
-        """platform do metadata.json: `{type:'android', version:sdkInt}`."""
+        """platform do metadata.json 1.29: `{os:'android', version:sdkInt}` (n0.1.smali)."""
         return {
-            "type": config.NATIVE_PLATFORM_OS,
+            "os": config.NATIVE_PLATFORM_OS,
             "version": int(self.sdk_int),
         }
 

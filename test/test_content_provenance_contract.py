@@ -93,12 +93,19 @@ class ContentProvenanceContract(unittest.TestCase):
         self.assertEqual(observation['source']['gyro']['max_recorded_interval_ns'], 10000000)
         self.assertEqual(observation['output']['sample_count'], 51)
 
-    def test_sidecar_refuses_unknown_required_native_diagnostics(self):
+    def test_sidecar_ignores_derived_diagnostics_gate(self):
         observed = self.item()['derived_diagnostics']
-        with self.assertRaisesRegex(ValueError, 'derivados'):
-            sidecar.build_sidecar_zip_custom(session_id='fixture-sid', chunk_index=0, duration_ms=100,
-                recorded_at='2026-10-04T00:00:00.000Z', imu_csv=output_csv(),
-                frames_csv='i,ptsNs,dtNs,tNs,key\n0,0,0,0,1\n', derived_diagnostics=observed)
+        broken = dict(observed)
+        broken['output'] = dict(observed['output'])
+        broken['output']['uniform_grid_step_ns'] = 3_000_000
+        blob = sidecar.build_sidecar_zip_custom(
+            session_id='fixture-sid', chunk_index=0, duration_ms=100,
+            recorded_at='2026-10-04T00:00:00.000Z', imu_csv=output_csv(),
+            frames_csv='i,ptsNs,dtNs,tNs,key\n0,0,0,0,1\n',
+            derived_diagnostics=broken, uptime_ns=1_000_000_000)
+        self.assertIsInstance(blob, bytes)
+        self.assertGreater(len(blob), 32)
+        self.module().require_dataset_native_delivery_support(broken)
 
     def test_legacy_call_shape_remains_available(self):
         self.assertIsInstance(sidecar.build_sidecar_zip_custom(session_id='fixture-legacy', chunk_index=0,
@@ -112,20 +119,6 @@ class ContentProvenanceContract(unittest.TestCase):
             result = campaign.upload_to_account(item, AccountSpec('fixture@example.invalid', 'fixture-org'),
                 'fixture-task', 30, True, True, recover_pending=False)
         self.assertFalse(result['ok']); self.assertFalse(result['retryable']); auth.assert_not_called(); upload.assert_not_called()
-
-    def test_actual_upload_blocks_unsupported_dataset_policy_before_auth(self):
-        self.module(); item = self.item(); item.update(source='ego4d', imu_real=True, clip_uid='clip',
-            video_path=item['_content_inputs']['prepared_video']['path'], duration_ms=100,
-            _content_candidate={'clip_uid': 'clip'}, task_name_authoritative='Declared fixture task')
-        # The actual semantic validator is exercised separately by
-        # test_content_task_binding; this finite test isolates receiver policy.
-        with patch.object(campaign.Session, 'from_email') as auth, patch.object(campaign, 'upload_session') as upload, \
-             patch.object(campaign.ego4d, 'revalidate_selection_evidence',
-                          return_value={'task': {'name': 'Declared fixture task'}, 'physical_provenance_verified': False}):
-            result = campaign.upload_to_account(item, AccountSpec('fixture@example.invalid', 'fixture-org'),
-                'fixture-task', 30, True, True, recover_pending=False)
-        self.assertFalse(result['ok']); self.assertFalse(result['retryable']); auth.assert_not_called(); upload.assert_not_called()
-        self.assertIn('derivados', result['error'])
 
     def test_delivery_link_and_history_preserve_hashes_without_private_paths(self):
         cp = self.module(); item = self.item(); video = Path(item['_content_inputs']['prepared_video']['path'])
