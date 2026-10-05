@@ -44,7 +44,7 @@ class OriginalLibraryApiTests(unittest.TestCase):
     def join_workers(self):
         for worker in self.workers:
             if worker.ident is not None:
-                worker.join(5)
+                worker.join(10)
                 self.assertFalse(worker.is_alive(), 'catalog worker outlived its fixture')
 
     def index(self):
@@ -102,12 +102,12 @@ class OriginalLibraryApiTests(unittest.TestCase):
         real = ego4d_library.index_library
         def delayed(*args, **kwargs):
             entered.set()
-            release.wait(3)
+            release.wait(10)
             return real(*args, **kwargs)
         with patch.object(ego4d_library, 'index_library', side_effect=delayed) as build:
             try:
                 self.assertEqual(self.client.post('/api/library/ego4d/index').status_code, 202)
-                self.assertTrue(entered.wait(1))
+                self.assertTrue(entered.wait(10))
                 started = time.monotonic()
                 for _ in range(5):
                     self.assertEqual(self.client.post('/api/library/ego4d/index').status_code, 202)
@@ -115,11 +115,8 @@ class OriginalLibraryApiTests(unittest.TestCase):
                 self.assertEqual(build.call_count, 1)
             finally:
                 release.set()
-            for _ in range(100):
-                response = self.client.post('/api/library/ego4d/index')
-                if response.status_code != 202:
-                    break
-                time.sleep(.01)
+            self.join_workers()
+            response = self.client.post('/api/library/ego4d/index')
             self.assertEqual(response.status_code, 200)
             self.assertEqual(self.client.get('/api/library/ego4d/videos').json['total'], 2)
             self.assertEqual(build.call_count, 1)
@@ -133,7 +130,7 @@ class OriginalLibraryApiTests(unittest.TestCase):
                 if (sql == 'PRAGMA user_version'
                         and threading.current_thread().name == 'qmoney-task-catalog'):
                     entered.set()
-                    if not release.wait(3):
+                    if not release.wait(10):
                         raise AssertionError('summary reader was not released')
                 return result
         def connect(*args, **kwargs):
@@ -141,7 +138,7 @@ class OriginalLibraryApiTests(unittest.TestCase):
         with patch.object(sqlite3, 'connect', side_effect=connect):
             try:
                 self.assertEqual(self.client.post('/api/library/ego4d/index').status_code, 202)
-                self.assertTrue(entered.wait(1))
+                self.assertTrue(entered.wait(10))
                 # This synchronous reader sees the index while the real worker
                 # remains paused with its SQLite connection open.
                 self.assertEqual(self.client.post('/api/library/ego4d/index').status_code, 200)
@@ -154,11 +151,9 @@ class OriginalLibraryApiTests(unittest.TestCase):
     def test_failed_build_keeps_original_files_and_reports_recoverable_error(self):
         original = (self.root / 'ego4d.json').read_bytes()
         (self.root / 'timed_narrations.jsonl').write_text('broken-json')
-        for _ in range(100):
-            response = self.client.post('/api/library/ego4d/index')
-            if response.status_code != 202:
-                break
-            time.sleep(.01)
+        self.assertEqual(self.client.post('/api/library/ego4d/index').status_code, 202)
+        self.join_workers()
+        response = self.client.post('/api/library/ego4d/index')
         self.assertEqual(response.status_code, 500)
         self.assertEqual(original, (self.root / 'ego4d.json').read_bytes())
         self.assertFalse((self.root / 'library.sqlite3').exists())

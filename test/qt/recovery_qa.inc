@@ -1,5 +1,5 @@
   static void recoveryDiagnosticsSmoke(MainWindow& window) {
-    QCoreApplication::setApplicationVersion(QStringLiteral("fixture-2.0.38"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("fixture-2.0.39"));
     window.applyStructuralStyle(qApp->arguments().contains("--dark"));
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(220); return; }
