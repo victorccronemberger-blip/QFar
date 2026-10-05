@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 import time
 from typing import Any
+from . import account_health
 
 MAX_AGE_S = 24 * 3600
 MONEY_FIELDS = ("availableCents", "pendingCents", "inTransitCents", "lifetimeCents")
@@ -33,11 +34,18 @@ def restriction(record: dict[str, Any], state: dict[str, Any], account: dict[str
                 "reason": "A última leitura informou retenção: " + hold + ". A consulta atual é inconclusiva; não presume liberação."}
     issue = record.get("issue") if isinstance(record.get("issue"), dict) else {}
     health = account.get("last_check") if isinstance(account.get("last_check"), dict) else {}
-    health_issue = health.get("issue") if isinstance(health.get("issue"), dict) else {}
-    if issue.get("restriction_confirmed") is True or health_issue.get("restriction_confirmed") is True:
-        evidence = issue if issue.get("restriction_confirmed") is True else health_issue
+    service_issues = [(name, account_health.provider(health, name)) for name in account_health.SERVICES]
+    confirmed = [(name, check["issue"]) for name, check in service_issues
+                 if check.get("issue", {}).get("restriction_confirmed") is True]
+    if issue.get("restriction_confirmed") is True or confirmed:
+        evidence = issue if issue.get("restriction_confirmed") is True else confirmed[0][1]
+        services = [name.title() for name, _ in confirmed]
         return {"code": "restricted", "label": "Restrição registrada", "confirmed": True,
-                "reason": str(evidence.get("reason") or "Restrição confirmada na última verificação da plataforma.")}
+                "reason": (" / ".join(services) + ": " if services else "") + str(evidence.get("reason") or "Restrição confirmada na última verificação da plataforma.")}
+    historical = [name.title() for name, check in service_issues if check.get("last_restriction")]
+    if historical:
+        return {"code": "historical_restriction", "label": "Restrição anterior · confirmar", "confirmed": False,
+                "reason": "A consulta atual ficou inconclusiva. Há restrição anterior em " + " e ".join(historical) + "; verifique os serviços novamente antes de sacar."}
     if state["confirmed"] and isinstance(eligibility, dict) and eligibility.get("checked") is True and (
             eligibility.get("withdrawalOverride") is True or eligibility.get("available") is True and eligibility.get("blocked") is False):
         return {"code": "clear", "label": "Sem retenção informada", "confirmed": True,
@@ -138,7 +146,7 @@ def snapshot(accounts: list[dict[str, Any]], balances: dict[str, Any], connected
         account_restriction = restriction(record, state, account)
         is_connected = email in connected and kind == "crowtado"
         withdraw = payout(record, state, is_connected, kind)
-        if account_restriction["code"] in {"disabled", "restricted"}:
+        if account_restriction["code"] in {"disabled", "restricted", "historical_restriction"}:
             withdraw = {"code": "restricted", "label": account_restriction["label"],
                         "reason": account_restriction["reason"], "eligible": False}
         counts["accounts"] += 1

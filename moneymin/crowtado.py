@@ -425,6 +425,40 @@ def consultar_saldo_api(email: str, senha: str) -> dict[str, Any]:
     return summary
 
 
+def verificar_restricoes(email: str, senha: str) -> dict[str, Any]:
+    """Fresh authentication and read-only payout checks; never request a withdrawal."""
+    session = login(email, senha)
+    try:
+        summary = _read_balance_summary(session)
+        if summary.get("onHoldReason") or summary.get("holdReason"):
+            return _restricoes_from_summary(summary, {})
+        eligibility = _site_trpc(session, "externalMobileCapture.eligibilityStatus", None, method="GET")
+        return _restricoes_from_summary(summary, eligibility)
+    except Exception as exc:
+        exc.crowtado_login_verified = True
+        raise
+
+
+def _restricoes_from_summary(summary: dict[str, Any], payload: Any) -> dict[str, Any]:
+    """Keep explicit payout evidence even when another read is unavailable."""
+    if summary.get("onHoldReason") or summary.get("holdReason"):
+        return {"restricted": True, "restriction_kind": "payout",
+                "reason": "A Crowtado informa retenção de saque. Confira o motivo no painel Crowtado."}
+    eligibility = _normalize_eligibility(payload)
+    if eligibility.get("checked") is not True:
+        raise CrowtadoError("Elegibilidade Crowtado não confirmada", code="invalid_response")
+    if eligibility.get("withdrawalOverride") is not True and eligibility.get("blocked") is True:
+        reasons = eligibility.get("reasons", [])
+        reason = ("A Crowtado informa conta desativada e retém os saques. Solicite regularização ao suporte."
+                  if "account" in reasons else
+                  "A Crowtado bloqueou a elegibilidade por VPN." if "vpn" in reasons else
+                  "A Crowtado bloqueou a elegibilidade do dispositivo." if "device" in reasons else
+                  "A Crowtado informou bloqueio de elegibilidade de saque.")
+        return {"restricted": True, "restriction_kind": "payout", "reason": reason}
+    return {"restricted": False, "restriction_kind": "none", "payout_available":
+            eligibility.get("withdrawalOverride") is True or eligibility.get("available") is True}
+
+
 _WITHDRAW_RESULT_FIELDS = {
     "status",
     "amountCents",

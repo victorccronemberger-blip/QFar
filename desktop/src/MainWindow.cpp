@@ -649,7 +649,7 @@ void MainWindow::resizeEvent(QResizeEvent* event) {
     }
     _accountsTable->setColumnWidth(1, compact?135:155);
     _accountsTable->setColumnWidth(2, compact?165:205);
-    _accountsTable->setColumnWidth(3, compact?180:210);
+    _accountsTable->setColumnWidth(3, compact?210:250);
   }
   if (_operationColumns) _operationColumns->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
   if (_campaignSelectionColumns) _campaignSelectionColumns->setDirection(compact ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
@@ -2582,14 +2582,14 @@ QWidget* MainWindow::buildAccountsPage() {
                  QStringLiteral("Adicione uma conta ou importe suas credenciais para começar."));
   _accountsTable->setMinimumHeight(230);
   _accountsTable->setHorizontalHeaderLabels(
-      {QStringLiteral("Conta"), QStringLiteral("Cadastro"), QStringLiteral("Acesso Minute"), QStringLiteral("Saques Crowtado"), QStringLiteral("Ações")});
+      {QStringLiteral("Conta"), QStringLiteral("Cadastro"), QStringLiteral("Minute"), QStringLiteral("Crowtado · acesso / saques"), QStringLiteral("Ações")});
   _accountsTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   _accountsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
   _accountsTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
   _accountsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
   _accountsTable->setColumnWidth(1, 155);
   _accountsTable->setColumnWidth(2, 205);
-  _accountsTable->setColumnWidth(3, 210);
+  _accountsTable->setColumnWidth(3, 250);
   _accountsTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Fixed);
   _accountsTable->setColumnWidth(4, 108);
   _accountsTable->verticalHeader()->setDefaultSectionSize(56);
@@ -2689,7 +2689,7 @@ QWidget* MainWindow::buildAccountsPage() {
   tabs->insertTab(0, accountsScroll, QStringLiteral("Contas cadastradas"));
   tabs->setCurrentIndex(0);
   return pageShell(QStringLiteral("Contas"),
-                   QStringLiteral("Gerencie as identidades usadas no Minute e valide cada acesso."), body);
+                   QStringLiteral("Verifique o acesso e os banimentos de Minute e Crowtado separadamente."), body);
 }
 
 QWidget* MainWindow::buildBalancesPage() {
@@ -3100,7 +3100,7 @@ QWidget* MainWindow::buildBannedPage() {
   actions->addWidget(_bannedRefresh);
   layout->addLayout(actions);
   auto* help = quietLabel(QStringLiteral(
-      "O status é consultado no Minute e o saldo no Crowtado. O saque depende do saldo Crowtado confirmado, "
+      "Minute e Crowtado são verificados separadamente, incluindo acesso e retenção de saque. O saque depende do saldo Crowtado confirmado, "
       "mesmo quando o Minute está desativado. Valores com * são da última consulta de saldo concluída."));
   help->setWordWrap(true);
   layout->addWidget(help);
@@ -3165,9 +3165,15 @@ void MainWindow::loadBanned() {
             balance.contains(QStringLiteral("pendingCents")) ? usdMoney(balance.value(QStringLiteral("pendingCents")).toInteger()) + suffix : absent,
             friendlyDate(account.value(QStringLiteral("banned_at")).toString()),
             friendlyDate(monitor.value(QStringLiteral("checked_at")).toString())};
-        const QString detail = monitor.value(QStringLiteral("detail")).toString() + QStringLiteral("\n")
+        QString detail = monitor.value(QStringLiteral("detail")).toString() + QStringLiteral("\n")
             + monitor.value(QStringLiteral("balance_detail")).toString() + QStringLiteral("\nSaldo atualizado: ")
             + friendlyDate(monitor.value(QStringLiteral("balance_updated_at")).toString());
+        const auto providers = monitor.value("providers").toObject();
+        for (const auto& name : QStringList{"minute", "crowtado"}) {
+          const auto check = providers.value(name).toObject();
+          if (!check.isEmpty()) detail += QStringLiteral("\n%1: %2\n%3").arg(name == "minute" ? QStringLiteral("Minute") : QStringLiteral("Crowtado"),
+              check.value("status_label").toString(), check.value("error").toString());
+        }
         for (int col = 0; col < values.size(); ++col) {
           auto* item = new QTableWidgetItem(values[col]);
           item->setToolTip(detail.trimmed());
@@ -6376,33 +6382,48 @@ void MainWindow::renderAccounts(const QJsonArray& accounts) {
       const qint64 expiry = static_cast<qint64>(account.value(QStringLiteral("expires_at")).toDouble());
       const auto lastCheck = _accountChecks.contains(email)
           ? _accountChecks.value(email) : account.value(QStringLiteral("last_check")).toObject();
+      const auto providers = lastCheck.value("providers").toObject();
+      const auto minuteCheck = providers.isEmpty() ? lastCheck : providers.value("minute").toObject();
+      const auto crowtadoCheck = providers.value("crowtado").toObject();
       QString state = expiry > QDateTime::currentSecsSinceEpoch()
           ? QStringLiteral("Token no prazo · não verificada")
           : QStringLiteral("Acesso precisa ser verificado");
-      if (!lastCheck.isEmpty()) {
-        state = lastCheck.value(QStringLiteral("status_label")).toString(
-                    lastCheck.value(QStringLiteral("status")).toString() == QStringLiteral("active")
+      if (!minuteCheck.isEmpty()) {
+        state = minuteCheck.value(QStringLiteral("status_label")).toString(
+                    minuteCheck.value(QStringLiteral("status")).toString() == QStringLiteral("active")
                         ? QStringLiteral("Acesso verificado") : QStringLiteral("Verificação inconclusiva"))
-                + QStringLiteral(" · ") + friendlyDate(lastCheck.value(QStringLiteral("checked_at")).toString());
+                + QStringLiteral(" · ") + friendlyDate(minuteCheck.value(QStringLiteral("checked_at")).toString());
       }
       if (!account.value("has_minute_access").toBool(true)) state = QStringLiteral("Minute ainda não conectado");
       auto* statusCell = cell(state.section(QStringLiteral(" · "),0,0));
-      QString checkDetails = state + QStringLiteral("\n") + lastCheck.value(QStringLiteral("error")).toString();
-      if (!lastCheck.value("last_success_at").toString().isEmpty())
-        checkDetails += QStringLiteral("\nÚltimo acesso confirmado: ") + friendlyDate(lastCheck.value("last_success_at").toString());
+      QString checkDetails = state + QStringLiteral("\n") + minuteCheck.value(QStringLiteral("error")).toString();
+      if (!minuteCheck.value("last_success_at").toString().isEmpty())
+        checkDetails += QStringLiteral("\nÚltimo acesso confirmado: ") + friendlyDate(minuteCheck.value("last_success_at").toString());
+      if (!minuteCheck.value("last_restriction").toObject().isEmpty())
+        checkDetails += QStringLiteral("\nÚltima restrição registrada: ") + friendlyDate(minuteCheck.value("last_restriction").toObject().value("checked_at").toString());
       statusCell->setToolTip(checkDetails);
       _accountsTable->setItem(row, 2, statusCell);
       const auto restriction = account.value("restriction").toObject();
       auto* restrictionCell = cell(isClaru ? QStringLiteral("Não se aplica")
-          : restriction.value("label").toString(QStringLiteral("Restrição não verificada")));
-      restrictionCell->setToolTip(restriction.value("reason").toString());
+          : crowtadoCheck.value("status_label").toString(QStringLiteral("Crowtado não verificada")));
+      QString crowtadoDetails = crowtadoCheck.value("status_label").toString()
+          + QStringLiteral("\n") + friendlyDate(crowtadoCheck.value("checked_at").toString())
+          + QStringLiteral("\n") + crowtadoCheck.value("error").toString()
+          + QStringLiteral("\nCarteira (última consulta): ") + restriction.value("label").toString()
+          + QStringLiteral("\n") + restriction.value("reason").toString();
+      if (crowtadoCheck.value("access_status").toString() == "active")
+        crowtadoDetails += QStringLiteral("\nLogin Crowtado aceito nesta consulta.");
+      if (!crowtadoCheck.value("last_success_at").toString().isEmpty())
+        crowtadoDetails += QStringLiteral("\nÚltima verificação confirmada: ") + friendlyDate(crowtadoCheck.value("last_success_at").toString());
+      if (!crowtadoCheck.value("last_restriction").toObject().isEmpty())
+        crowtadoDetails += QStringLiteral("\nÚltima restrição registrada: ") + friendlyDate(crowtadoCheck.value("last_restriction").toObject().value("checked_at").toString());
+      restrictionCell->setToolTip(crowtadoDetails);
       _accountsTable->setItem(row, 3, restrictionCell);
       auto* actions = new QWidget;
       auto* actionsLayout = new QHBoxLayout(actions);
       actionsLayout->setContentsMargins(5, 5, 5, 5);
       actionsLayout->setSpacing(7);
       auto* check = new QPushButton(QStringLiteral("Verificar"));
-      check->setEnabled(account.value("has_minute_access").toBool(true));
       check->setMinimumSize(86, 32);
       connect(check, &QPushButton::clicked, this, [this, email] {
         setAccountTransferBusy(true);
@@ -6421,7 +6442,7 @@ void MainWindow::renderAccounts(const QJsonArray& accounts) {
               const auto issue = check.value(QStringLiteral("issue")).toObject();
               showAccountIssues(QStringLiteral("Conta não verificada"),
                   issue.isEmpty() ? QStringList{email + QStringLiteral(": ") + error} : QStringList{},
-                  issue.isEmpty() ? QJsonArray{} : QJsonArray{issue});
+                  check.value("issues").isArray() ? check.value("issues").toArray() : issue.isEmpty() ? QJsonArray{} : QJsonArray{issue});
             } else setStatus(QStringLiteral("Acesso de %1 verificado agora.").arg(email));
             loadAccounts();
           });
@@ -6435,7 +6456,7 @@ void MainWindow::renderAccounts(const QJsonArray& accounts) {
       auto* menuButton = new QPushButton(QStringLiteral("Ações"));
       auto* menu = new QMenu(menuButton);
       menu->addAction(QStringLiteral("Ver detalhes"), this, [this, account] { showAccountDetails(account); });
-      auto* verify = menu->addAction(QStringLiteral("Verificar acesso Minute"), check, &QPushButton::click);
+      auto* verify = menu->addAction(QStringLiteral("Verificar Minute e Crowtado"), check, &QPushButton::click);
       verify->setEnabled(check->isEnabled());
       check->setParent(menuButton); check->hide();
       if (!registrationState.isEmpty() && registrationState != "complete") {
@@ -6493,6 +6514,17 @@ void MainWindow::showAccountDetails(const QJsonObject& account) {
     account.value("last_check").toObject().value("status_label").toString(),
     account.value("last_check").toObject().value("error").toString(),
     account.value("restriction").toObject().value("reason").toString(), QStringLiteral("\nEtapas do cadastro:")};
+  const auto health = _accountChecks.value(account.value("email").toString(), account.value("last_check").toObject());
+  const auto providers = health.value("providers").toObject();
+  for (const auto& name : QStringList{"minute", "crowtado"}) {
+    const auto check = name == "minute" && providers.isEmpty() ? health : providers.value(name).toObject();
+    const auto prior = check.value("last_restriction").toObject();
+    lines.insert(lines.size()-1, QStringLiteral("\n%1: %2\nVerificada em: %3\n%4\nÚltima restrição: %5\n%6").arg(
+        name == "minute" ? QStringLiteral("Minute") : QStringLiteral("Crowtado"),
+        check.value("status_label").toString(QStringLiteral("Não verificada")),
+        friendlyDate(check.value("checked_at").toString()), check.value("error").toString(),
+        friendlyDate(prior.value("checked_at").toString()), prior.value("issue").toObject().value("reason").toString()));
+  }
   const auto registration = account.value("registration").toObject();
   const auto steps = registration.value("steps").toObject();
   const QStringList keys{"proxy","ban_check","save_partial","crowtado_signup","demographics","minute_register","link_minute","validate"};
@@ -6691,7 +6723,9 @@ void MainWindow::checkAllAccounts() {
       _accountChecks.insert(email, check);
       if (check.value(QStringLiteral("status")).toString() != QStringLiteral("active")) {
         const auto issue = check.value(QStringLiteral("issue")).toObject();
-        if (!issue.isEmpty()) issues.append(issue);
+        if (check.value("issues").isArray()) {
+          for (const auto& item : check.value("issues").toArray()) issues.append(item);
+        } else if (!issue.isEmpty()) issues.append(issue);
         else legacyErrors << email + QStringLiteral(": ") + check.value(QStringLiteral("error")).toString();
       }
     }
@@ -7408,7 +7442,7 @@ void MainWindow::showBalanceDetails(const QString& email) {
       : eligibility.value(QStringLiteral("withdrawalOverride")).toBool()
       ? QStringLiteral("Exceção de saque informada pela Crowtado")
       : eligibility.value(QStringLiteral("available")).toBool() && !eligibility.value(QStringLiteral("blocked")).toBool()
-      ? QStringLiteral("Regular na última consulta") : QStringLiteral("Pendente ou bloqueada no Minute"));
+      ? QStringLiteral("Regular na última consulta Crowtado") : QStringLiteral("Pendente ou bloqueada pela Crowtado · confira o motivo"));
   addPlain(QStringLiteral("Método informado"), balance.value(QStringLiteral("payoutPreference")).toString());
   addPlain(QStringLiteral("Motivo da retenção"), balance.value(QStringLiteral("onHoldReason")).toString(
       balance.value(QStringLiteral("holdReason")).toString()));

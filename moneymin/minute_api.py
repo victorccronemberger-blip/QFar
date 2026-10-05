@@ -1078,6 +1078,19 @@ class Session:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def checked_quality_state(self, org_key: str) -> dict[str, Any]:
+        """A verification must distinguish a failed quality read from active access."""
+        status, text = self.get(f"/api/v1/organizations/{org_key}/quality-screen")
+        if status != 200:
+            raise _auth_failure(status, text, "Consulta de restrições Minute")
+        try:
+            state = json.loads(text)
+        except (ValueError, TypeError):
+            raise AuthError("Estado de qualidade Minute inválido", code="invalid_response") from None
+        if not isinstance(state, dict) or state.get("userState") not in ("active", "on_hold", "inactive"):
+            raise AuthError("Estado de qualidade Minute incompleto", code="invalid_response")
+        return state
+
     def org_state(self, org_key: str) -> dict[str, Any]:
         """Estado operacional do usuário numa org (disabled + userState).
 

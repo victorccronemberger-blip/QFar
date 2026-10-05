@@ -35,6 +35,48 @@ static void accountsQaPreview(MainWindow& window) {
   QTimer::singleShot(200,&window,[&window] {qApp->exit(window.grab().save(qApp->arguments().at(1))?0:1);});
 }
 
+static void accountServicesSmoke(MainWindow& window) {
+  window.applyStructuralStyle(qApp->arguments().contains("--dark"));
+  QJsonArray accounts;
+  const QStringList states{"active", "disabled", "inconclusive"};
+  for (int i=0; i<3; ++i) for (int j=0; j<3; ++j) {
+    const auto minute=QJsonObject{{"status",states.at(i)},
+      {"status_label",i==0?"Acesso verificado":i==1?"Banida · Minute":"Verificação inconclusiva"},
+      {"checked_at","2026-10-05T12:00:00Z"},{"error",i==1?"A organização Minute confirmou restrição.":i==2?"Minute não respondeu.":""}};
+    const auto site=QJsonObject{{"status",states.at(j)},
+      {"status_label",j==0?"Sem restrição informada":j==1?"Banida · saque suspenso":"Login aceito · saque não verificado"},
+      {"checked_at","2026-10-05T12:00:00Z"},{"access_status","active"},
+      {"error",j==1?"A Crowtado reteve os saques.":j==2?"Elegibilidade Crowtado não respondeu.":""}};
+    accounts.append(QJsonObject{{"email",QStringLiteral("caso-%1-%2@example.invalid").arg(i).arg(j)},
+      {"has_minute_access",i!=2},{"has_password",true},{"account_kind","crowtado"},{"org_name","Datoric"},
+      {"last_check",QJsonObject{{"status",i==0&&j==0?"active":i==1||j==1?"disabled":"inconclusive"},
+        {"status_label","Resultado agregado"},{"providers",QJsonObject{{"minute",minute},{"crowtado",site}}}}},
+      {"restriction",QJsonObject{{"code",i==0&&j==0?"clear":"restricted"},{"label","Diagnóstico da carteira"},{"reason","Motivo do saque"}}}});
+  }
+  window._backendReady=true; window._accountsAvailable=true;
+  window._pages->setCurrentIndex(5); window._navigation->setCurrentRow(5);
+  window.renderAccounts(accounts);
+  for (int row=0; row<9; ++row) {
+    const auto minute=accounts.at(row).toObject().value("last_check").toObject().value("providers").toObject().value("minute").toObject();
+    const auto site=accounts.at(row).toObject().value("last_check").toObject().value("providers").toObject().value("crowtado").toObject();
+    const QString expectedMinute=row/3==2?QStringLiteral("Minute ainda não conectado"):minute.value("status_label").toString().section(QStringLiteral(" · "),0,0);
+    if(window._accountsTable->item(row,2)->text()!=expectedMinute
+        || window._accountsTable->item(row,3)->text()!=site.value("status_label").toString()
+        || !window._accountsTable->item(row,3)->toolTip().contains(QStringLiteral("Login Crowtado aceito"))) {qApp->exit(254); return;}
+    bool enabled=false;
+    for(const auto* menu:window._accountsTable->cellWidget(row,4)->findChildren<QMenu*>())
+      for(const auto* action:menu->actions()) if(action->text()==QStringLiteral("Verificar Minute e Crowtado")) enabled=action->isEnabled();
+    if(!enabled) {qApp->exit(255);return;}
+  }
+  window._accountsAttention->setChecked(true);
+  int visible=0; for(int row=0;row<9;++row) visible+=!window._accountsTable->isRowHidden(row);
+  if(visible!=8) {qApp->exit(256); return;}
+  window._accountsAttention->setChecked(false);
+  if(qApp->arguments().contains("--account-services-preview")) {
+    QTimer::singleShot(150,&window,[&window] {qApp->exit(window.grab().save(qApp->arguments().at(1))?0:1);});
+  } else qApp->exit(0);
+}
+
 static void accountsQaSmoke(MainWindow& window) {
   struct Flow { bool malformed=false, dropped=false, imported=false; std::shared_ptr<QTemporaryDir> folder=std::make_shared<QTemporaryDir>(); int posts=0, requests=0, statusReads=0; QString state="idle", requestId; };
   auto flow=std::make_shared<Flow>();

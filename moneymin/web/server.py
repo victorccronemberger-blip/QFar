@@ -93,7 +93,7 @@ from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import SecureStoreError, load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
-from . import wallet, registration_state
+from . import wallet, registration_state, account_health
 from .catalog_loader import CatalogLoader
 from .org_migration import OrgMigrationRunner
 from .banned_monitor import BannedMonitor
@@ -609,6 +609,9 @@ def _banned_withdraw_eligibility(row: dict[str, Any]) -> tuple[bool, str]:
     if not row.get("password"):
         return False, "A senha Crowtado não está salva no registro de banidas."
     monitor = row.get("monitor") if isinstance(row.get("monitor"), dict) else {}
+    site_check = account_health.provider(monitor, "crowtado")
+    if site_check and site_check.get("status") != "active":
+        return False, "Crowtado: " + str(site_check.get("status_label") or "verificação inconclusiva") + ". Verifique novamente antes de sacar."
     if monitor.get("withdraw_result_status"):
         return False, str(monitor.get("withdraw_result_detail") or
                           "O saque já foi solicitado ou recusado; atualize o saldo antes de tentar novamente.")
@@ -1692,6 +1695,10 @@ def _load_account_health_history() -> dict[str, dict[str, Any]]:
         if "email" in record and (not isinstance(record["email"], str)
                                    or record["email"].strip().casefold() != key):
             _invalid_local_state()
+        try:
+            account_health.validate(record, key)
+        except (ValueError, TypeError, RecursionError):
+            _invalid_local_state()
         for field in ("status", "status_label", "checked_at"):
             if field in record and not isinstance(record[field], str):
                 _invalid_local_state()
@@ -1767,35 +1774,46 @@ def _resolve_org(email: str, session: Session | None = None) -> str:
     return org_key
 
 
-def _check_account_health(email: str) -> dict[str, Any]:
-    """Verifica a conta e garante sua organização obrigatória antes de ativá-la."""
+def _check_minute_health(email: str) -> dict[str, Any]:
+    """Check the target organization and quality state, not just authentication."""
     session = None
     for attempt in range(1, 3):
         try:
             session = session or Session.from_email(email)
             profile = session.ensure_auth()
+            if type(profile.get("disabled")) is not bool:
+                raise AuthError("Estado da conta Minute incompleto", code="invalid_response")
             organizations = [
                 org for org in (profile.get("organizations") or [])
                 if isinstance(org, dict)
             ]
+            target = next((org for org in organizations if org.get("resourceKey") == org_policy.target_org_key(email)), {})
+            if "disabled" in target and type(target["disabled"]) is not bool:
+                raise AuthError("Estado da organização Minute incompleto", code="invalid_response")
             try:
                 org_key = org_policy.ensure_membership(session, email, organizations)
             except RuntimeError as exc:
                 if "suspensa" in str(exc).casefold():
                     raise AuthError(str(exc), code="restricted") from exc
                 raise AuthError(str(exc), code="organization") from exc
+            quality = session.checked_quality_state(org_key)
+            if not isinstance(quality, dict) or quality.get("userState") not in ("active", "on_hold", "inactive"):
+                raise AuthError("Estado de qualidade Minute incompleto", code="invalid_response")
+            if quality["userState"] in ("on_hold", "inactive"):
+                raise AuthError("A organização alvo restringiu o acesso Minute", code="restricted")
             result = {
                 "email": email, "status": "active", "status_label": "Acesso verificado",
                 "org_key": org_key, "expires_at": session.data.get("expires_at", 0),
             }
             break
         except Exception as exc:  # noqa: BLE001 — qualquer falha ambígua é inconclusiva
-            issue = account_issue(email, exc)
+            issue = account_issue(email, exc, stage="Verificação Minute")
+            issue["provider"] = "minute"
             if issue["retryable"] and attempt < 2:
                 time.sleep(2.0 if issue["code"] == "rate_limit" else 0.5)
                 continue
             status, label = {
-                "restricted": ("disabled", "Restrição confirmada"),
+                "restricted": ("disabled", "Banida · Minute"),
                 "authentication": ("needs_reauth", "Reconectar acesso"),
                 "missing_access": ("needs_reauth", "Reconectar acesso"),
                 "organization": ("needs_org", "Organização pendente"),
@@ -1805,6 +1823,72 @@ def _check_account_health(email: str) -> dict[str, Any]:
             break
     result["attempts"] = attempt
     result["checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return result
+
+
+def _check_crowtado_health(email: str) -> dict[str, Any]:
+    if org_policy.account_kind(email) == "claru":
+        return {"email": email, "status": "not_applicable", "status_label": "Não se aplica",
+                "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "attempts": 0}
+    for attempt in range(1, 3):
+        try:
+            password = _saved_account_password(email)
+            if not password:
+                raise crowtado.CrowtadoError("Sem senha Crowtado salva", code="missing_access")
+            state = crowtado.verificar_restricoes(email, password)
+            if state["restricted"]:
+                issue = account_issue(email, crowtado.CrowtadoError("Restrição", code="restricted"),
+                                      stage="Verificação Crowtado · saques")
+                issue.update(provider="crowtado", reason=state["reason"],
+                             action="Confira o painel e solicite regularização ao suporte da Crowtado. A conta permanece disponível para consulta.")
+                result = {"email": email, "status": "disabled", "status_label": "Banida · saque suspenso",
+                          "restriction_kind": state["restriction_kind"], "access_status": "active",
+                          "issue": issue, "error": issue_text(issue)}
+            else:
+                result = {"email": email, "status": "active", "status_label": "Sem restrição informada",
+                          "access_status": "active", "payout_available": state["payout_available"]}
+            break
+        except Exception as exc:  # noqa: BLE001 — missing evidence never confirms clearance
+            issue = account_issue(email, exc, stage="Verificação Crowtado")
+            issue["provider"] = "crowtado"
+            if issue["retryable"] and attempt < 2:
+                time.sleep(2.0 if issue["code"] == "rate_limit" else 0.5)
+                continue
+            status, label = {"restricted": ("disabled", "Banida · login recusado"),
+                             "authentication": ("needs_reauth", "Reconectar Crowtado"),
+                             "missing_access": ("needs_reauth", "Conectar Crowtado"),
+                             "crowtado_account_missing": ("needs_reauth", "Cadastro não encontrado")}.get(
+                                 issue["code"], ("inconclusive", "Verificação inconclusiva"))
+            result = {"email": email, "status": status, "status_label": label,
+                      "error": issue_text(issue), "issue": issue}
+            if status == "disabled":
+                result["restriction_kind"] = "account"
+                result["access_status"] = "disabled"
+            elif getattr(exc, "crowtado_login_verified", False) is True:
+                result["access_status"] = "active"
+                result["status_label"] = "Login aceito · saque não verificado"
+            break
+    result.update(attempts=attempt, checked_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    return result
+
+
+def _check_account_health(email: str) -> dict[str, Any]:
+    """Always consult both services independently using the identity's assigned proxy."""
+    from .. import registration_proxy
+    providers = {}
+    try:
+        with registration_proxy.route(registration_proxy.assign(email, "")):
+            providers["minute"] = _check_minute_health(email)
+            providers["crowtado"] = _check_crowtado_health(email)
+    except Exception as exc:  # local routing failure must not fall back to another IP
+        for name in account_health.SERVICES:
+            if name not in providers:
+                issue = account_issue(email, exc, stage=f"Verificação {name.title()} · conexão")
+                issue["provider"] = name
+                providers[name] = {"email": email, "status": "inconclusive", "status_label": "Verificação inconclusiva",
+                                   "error": issue_text(issue), "issue": issue, "attempts": 0,
+                                   "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    result = account_health.aggregate(email, providers)
     _save_account_check(email, result)
     return result
 
@@ -1812,19 +1896,22 @@ def _check_account_health(email: str) -> dict[str, Any]:
 def _save_account_check(email: str, result: dict[str, Any]) -> None:
     with _PERSISTENCE_LOCK:
         try:
-            health = load_json_state(ACCOUNT_HEALTH_PATH, {})
+            health = _load_account_health_history()
             previous = health.get(email.strip().casefold(), {})
             candidate = dict(result)
-            candidate["last_success_at"] = (result["checked_at"] if result["status"] == "active"
-                                           else previous.get("last_success_at") if isinstance(previous, dict) else None)
+            # Copy nested diagnoses before adding provider-specific history.
             candidate = decode_json_state(json.dumps(candidate))
+            account_health.preserve_history(candidate, previous if isinstance(previous, dict) else {})
+            candidate = decode_json_state(json.dumps(candidate))
+            account_health.validate(candidate, email.strip().casefold())
             health[email.strip().casefold()] = candidate
             save_json(ACCOUNT_HEALTH_PATH, health)
             result["last_success_at"] = candidate["last_success_at"]
-            if result["status"] == "disabled" and result.get("issue", {}).get("restriction_confirmed"):
-                _ban_accounts([result["issue"]])
-                result["permanently_removed"] = True
-            if result["status"] == "active" and result.get("org_key"):
+            if "providers" in candidate:
+                result["providers"] = candidate["providers"]
+            # Checking one service must not erase access to the other service.
+            minute = account_health.provider(result, "minute")
+            if minute.get("status") == "active" and result.get("org_key"):
                 prefs = _load_prefs()
                 prefs.setdefault("org_keys", {})[email] = result["org_key"]
                 _save_prefs(prefs)
@@ -2448,13 +2535,14 @@ def create_app(*, for_testing: bool = False) -> Flask:
         accounts = _list_accounts()
         registrations = registration_state.load()
         removed = _removed_accounts()
+        health = _load_account_health_history()
         known = {row["email"].strip().casefold() for row in accounts}
         for email, registration in registrations.items():
             if (email not in known and email not in removed
                     and credential_store.record_path(config.SECRETS_DIR, email).exists()):
                 accounts.append({"email": email, "expires_at": 0, "org_key": None,
                                  "org_name": "Não verificada", "account_kind": "crowtado",
-                                 "last_check": {}, "has_minute_access": config.token_path(email).exists()})
+                                 "last_check": health.get(email, {}), "has_minute_access": config.token_path(email).exists()})
         passwords = _crowtado_creds()
         balances = _load_balances()
         for account in accounts:
@@ -2465,9 +2553,24 @@ def create_app(*, for_testing: bool = False) -> Flask:
             account["has_password"] = bool(_saved_account_password(account["email"], passwords))
             record = balances.get(account["email"], {})
             account["restriction"] = wallet.restriction(record, wallet.reading(record), account)
-            if registration and any(step.get("code") == "restricted" for step in registration["steps"].values()):
+            registration_bans = []
+            if registration:
+                for name, step in registration["steps"].items():
+                    if step.get("code") != "restricted":
+                        continue
+                    service = "minute" if name == "minute_register" else "crowtado"
+                    check = account_health.provider(account["last_check"], service)
+                    try:
+                        newer = (check.get("status") == "active" and
+                            datetime.datetime.fromisoformat(check["checked_at"]) >= datetime.datetime.fromisoformat(registration["updated_at"]))
+                    except (KeyError, TypeError, ValueError):
+                        newer = False
+                    if not newer:
+                        registration_bans.append(service.title())
+            if registration_bans:
+                sources = " e ".join(dict.fromkeys(registration_bans))
                 account["restriction"] = {"code": "restricted", "confirmed": True,
-                    "label": "Conta restrita na Crowtado", "reason": "A autenticação Crowtado informou restrição explícita da conta. Solicite a regularização ao suporte da Crowtado."}
+                    "label": "Banida · " + sources, "reason": sources + " confirmou banimento durante o cadastro. Verifique os serviços novamente ou solicite regularização ao suporte."}
         return jsonify({"accounts": accounts})
 
     @app.post("/api/accounts/password")

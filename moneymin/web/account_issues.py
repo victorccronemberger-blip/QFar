@@ -22,6 +22,9 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     elif explicit == "restricted":
         code, reason = "restricted", "A plataforma informou uma restrição na conta ou organização."
         action = "Consulte o estado no Minute e contate o suporte da plataforma. Trocar a senha não remove a restrição."
+        if "crowtado" in stage.casefold():
+            reason = "A Crowtado confirmou uma restrição de acesso desta conta."
+            action = "Confira a conta no site e contate o suporte da Crowtado. Trocar a senha não remove essa restrição."
     elif explicit == "version":
         code, reason = "version", "A versão do aplicativo precisa ser atualizada."
         action = "Atualize o QMoney. Este diagnóstico não indica problema com a conta."
@@ -50,6 +53,9 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     elif explicit == "missing_access" or any(x in raw for x in ("nenhum acesso salvo", "sem token salvo", "token ilegível", "token vazio ou corrompido")):
         code, reason = "missing_access", "O acesso local está ausente ou não pode ser lido."
         action = "Em Contas, informe o mesmo e-mail e a senha do Minute e clique em Conectar. Não é necessário remover a conta."
+        if "crowtado" in stage.casefold():
+            reason = "A senha Crowtado não está disponível para verificar esta conta."
+            action = "Use Conectar Crowtado e salve a senha deste serviço. O resultado do Minute permanece independente."
     elif explicit == "organization" or "nenhuma organização" in raw:
         code, reason = "organization", "O login respondeu, mas a conta não está vinculada a uma organização."
         action = "Confira o vínculo da conta no Minute; se necessário, solicite a regularização ao suporte."

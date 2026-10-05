@@ -21,6 +21,9 @@ class HealthResilienceTests(unittest.TestCase):
             mock.patch.object(server, "BALANCES_PATH", Path(self.tmp.name) / "balances.json"),
             mock.patch.object(server, "PREFS_PATH", Path(self.tmp.name) / "prefs.json"),
             mock.patch.object(server.time, "sleep"),
+            mock.patch.object(server, "_check_crowtado_health", return_value={
+                "email": "a@example.com", "status": "active", "status_label": "Sem restrição informada",
+                "checked_at": "2026-09-17T10:00:00Z", "attempts": 0}),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -36,6 +39,7 @@ class HealthResilienceTests(unittest.TestCase):
 
     def test_temporary_failure_recovers_without_migration_or_removal(self):
         sess = mock.Mock(data={"expires_at": 123})
+        sess.checked_quality_state.return_value = {"userState": "active"}
         sess.ensure_auth.side_effect = [AuthError("HTTP 503", code="service"), self.profile]
         with mock.patch.object(server.Session, "from_email", return_value=sess), \
              mock.patch.object(server, "_set_account_removed") as remove:
@@ -58,7 +62,8 @@ class HealthResilienceTests(unittest.TestCase):
 
     def test_old_org_is_migrated_and_only_then_marked_active(self):
         sess = mock.Mock(data={})
-        sess.ensure_auth.return_value = {"organizations": [{"resourceKey": config.HUB_ORG_KEY}]}
+        sess.checked_quality_state.return_value = {"userState": "active"}
+        sess.ensure_auth.return_value = {"organizations": [{"resourceKey": config.HUB_ORG_KEY}], "disabled": False}
         sess.join_org.return_value = (200, "{}")
         sess.me.return_value = {"organizations": [{"resourceKey": config.ORG_KEY}]}
         with mock.patch.object(server.Session, "from_email", return_value=sess):
@@ -69,7 +74,7 @@ class HealthResilienceTests(unittest.TestCase):
 
     def test_unconfirmed_migration_is_not_marked_active(self):
         sess = mock.Mock(data={})
-        old_profile = {"organizations": [{"resourceKey": config.HUB_ORG_KEY}]}
+        old_profile = {"organizations": [{"resourceKey": config.HUB_ORG_KEY}], "disabled": False}
         sess.ensure_auth.return_value = old_profile
         sess.join_org.return_value = (200, "{}")
         sess.me.return_value = old_profile
@@ -87,10 +92,11 @@ class HealthResilienceTests(unittest.TestCase):
 
     def test_target_org_disabled_is_confirmed_but_unrelated_org_does_not_block(self):
         sess = mock.Mock(data={})
+        sess.checked_quality_state.return_value = {"userState": "active"}
         for target_disabled in (False, True):
             sess.ensure_auth.return_value = {"organizations": [
                 {"resourceKey": config.HUB_ORG_KEY, "disabled": True},
-                {"resourceKey": config.ORG_KEY, "disabled": target_disabled}]}
+                {"resourceKey": config.ORG_KEY, "disabled": target_disabled}], "disabled": False}
             with mock.patch.object(server.Session, "from_email", return_value=sess):
                 row = server._check_account_health("a@example.com")
             self.assertEqual(row["status"], "disabled" if target_disabled else "active")

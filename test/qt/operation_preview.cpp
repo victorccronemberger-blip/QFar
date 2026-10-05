@@ -1480,6 +1480,11 @@ int main(int argc, char** argv) {
   app.setFont(QFont(QStringLiteral("Inter"), 10));
   MainWindow window(style, nullptr, false);
   window.resize(app.arguments().contains("--compact") ? QSize(980, 680) : QSize(1586, 992));
+  if (app.arguments().contains("--account-services-smoke") || app.arguments().contains("--account-services-preview")) {
+    window.show();
+    QTimer::singleShot(100,&window,[&window] {OperationPreview::accountServicesSmoke(window);});
+    return app.exec();
+  }
   if (app.arguments().contains("--accounts-qa-smoke") || app.arguments().contains("--accounts-qa-preview") || app.arguments().contains("--accounts-live-create")) {
     window.show();
     QTimer::singleShot(100,&window,[&window] {
