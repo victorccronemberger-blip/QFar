@@ -28,7 +28,7 @@ def _provider_from_preferences() -> str:
     provider = str(raw.get("dataset_provider") or "holoassist").strip().lower()
     if raw.get("holoassist_enabled") is False:
         return "ego4d"
-    return provider if provider in {"holoassist", "ego4d", "all"} else "holoassist"
+    return provider if provider in {"holoassist", "ego4d", "nymeria", "ambos", "all"} else "holoassist"
 
 
 def _binary_works(command: str) -> bool:
@@ -137,8 +137,8 @@ def campaign_readiness(
 ) -> dict[str, Any]:
     """Retorna checks locais sem autenticar contas nem enviar dados."""
     selected = (provider or _provider_from_preferences()).strip().lower()
-    if selected not in {"holoassist", "ego4d", "all"}:
-        raise ValueError("provider deve ser holoassist, ego4d ou all")
+    if selected not in {"holoassist", "ego4d", "nymeria", "ambos", "all"}:
+        raise ValueError("provider deve ser holoassist, ego4d, nymeria, ambos ou all")
     from .campaign import normalize_content_mode
     mode = normalize_content_mode(content_mode)
 
@@ -215,7 +215,18 @@ def campaign_readiness(
                     f"{ready}/{total} clipe(s) prontos; os demais são preparados sob demanda",
                 ))
 
-    if selected in {"ego4d", "all"}:
+    if selected in {"nymeria", "ambos"}:
+        from . import nymeria
+        root = nymeria.data_root()
+        sequences = nymeria.sequence_dirs(root)
+        checks.append(_check(
+            "Biblioteca Nymeria",
+            "ok" if sequences else "error",
+            f"{len(sequences)} sequência(s) em {root}" if sequences
+            else f"nenhuma sequência com metadata.json em {root}",
+        ))
+
+    if selected in {"ego4d", "ambos", "all"}:
         ego_dir = config.MEDIA_DATA_DIR / "ego4d"
         catalog_ok = (
             (ego_dir / "ego4d.json").exists()

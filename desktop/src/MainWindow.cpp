@@ -1742,10 +1742,10 @@ QWidget* MainWindow::buildCampaignPage() {
   sourceColumn->addLayout(sourceLayout);
   _dataset = new ComboBox;
   configureCombo(_dataset, 180);
-  _dataset->addItem(QStringLiteral("Conteúdo combinado"), QStringLiteral("all"));
-  _dataset->addItem(QStringLiteral("Somente Ego4D"), QStringLiteral("ego4d"));
-  _dataset->addItem(QStringLiteral("Somente HoloAssist"), QStringLiteral("holoassist"));
-  _dataset->setCurrentIndex(1);
+  _dataset->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
+  _dataset->addItem(QStringLiteral("Nymeria"), QStringLiteral("nymeria"));
+  _dataset->addItem(QStringLiteral("Ambos"), QStringLiteral("ambos"));
+  _dataset->setCurrentIndex(0);
   connect(_dataset, &QComboBox::currentIndexChanged, this,
           [this] { _taskReload.start(); });
   sourceLayout->addWidget(new QLabel(QStringLiteral("Origem")));

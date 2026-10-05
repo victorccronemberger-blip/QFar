@@ -64,5 +64,44 @@ class NymeriaProviderTests(unittest.TestCase):
         self.assertTrue(any(str(c.get("clip_uid", "")).startswith("nymeria:") for c in cands))
 
 
+class NymeriaSelectionTests(unittest.TestCase):
+    def test_ambos_combines_ego4d_and_nymeria_without_holoassist(self):
+        from moneymin import campaign
+        campaign._nymeria_windows.cache_clear()
+        ego = {"clip_uid": "ego1", "dur_s": 90, "source": "ego4d"}
+        nymeria = {"clip_uid": "nymeria:s:0.000:60.000", "dur_s": 60, "source": "nymeria"}
+        with patch.object(campaign, "_ranked_pools", return_value={"Gardening": (ego,)}), \
+             patch.object(campaign.task_matching, "canonical_task_name", side_effect=lambda name: name), \
+             patch.object(campaign.holoassist, "list_clips") as holo, \
+             patch.object(campaign.nymeria, "automatic_candidates", return_value=[nymeria]):
+            ambos = campaign._compatible_task_clips("Gardening", "ambos")
+            only = campaign._compatible_task_clips("Gardening", "nymeria")
+        self.assertEqual([clip["source"] for clip in ambos], ["nymeria", "ego4d"])
+        self.assertEqual([clip["source"] for clip in only], ["nymeria"])
+        holo.assert_not_called()
+        self.assertEqual(campaign.normalize_dataset_provider("ambos"), "ambos")
+
+
+class NymeriaReadinessTests(unittest.TestCase):
+    def test_readiness_accepts_nymeria_and_reports_the_library(self):
+        from moneymin import readiness
+        with patch("moneymin.nymeria.sequence_dirs", return_value=[Path("seq")]):
+            result = readiness.campaign_readiness("nymeria")
+        self.assertEqual(result["provider"], "nymeria")
+        library = next(item for item in result["checks"]
+                       if item["name"] == "Biblioteca Nymeria")
+        self.assertEqual(library["status"], "ok")
+        self.assertIn("1 sequência", library["detail"])
+
+    def test_readiness_blocks_a_missing_nymeria_library(self):
+        from moneymin import readiness
+        with patch("moneymin.nymeria.sequence_dirs", return_value=[]):
+            result = readiness.campaign_readiness("nymeria")
+        library = next(item for item in result["checks"]
+                       if item["name"] == "Biblioteca Nymeria")
+        self.assertEqual(library["status"], "error")
+        self.assertFalse(result["ready"])
+
+
 if __name__ == "__main__":
     unittest.main()

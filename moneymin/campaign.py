@@ -156,7 +156,7 @@ MIN_DUR_MS, MAX_DUR_MS = 60000, 1800000
 # fazia uma gravação humana de 15 min aparecer no parceiro como dois envios.
 # O sufixo `{session}_{i}` continua existindo apenas para gravações que
 # realmente excedam o teto remoto.
-DATASET_PROVIDERS = frozenset({"all", "ego4d", "holoassist", "nymeria"})
+DATASET_PROVIDERS = frozenset({"all", "ambos", "ego4d", "holoassist", "nymeria"})
 CONTENT_MODES = frozenset({"both", "cache", "dataset"})
 
 
@@ -165,7 +165,7 @@ CONTENT_MODES = frozenset({"both", "cache", "dataset"})
 def normalize_dataset_provider(value: str | None) -> str:
     provider = str(value or "all").strip().lower()
     if provider not in DATASET_PROVIDERS:
-        raise ValueError("dataset inválido (all|ego4d|holoassist|nymeria)")
+        raise ValueError("dataset inválido (all|ambos|ego4d|holoassist|nymeria)")
     return provider
 
 
@@ -2439,7 +2439,7 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
     content_mode = normalize_content_mode(config.content_mode)
     work_dir = Path(config.work_dir)
     shorts: list[dict[str, Any]] = []
-    if dataset_provider in ("all", "ego4d"):
+    if dataset_provider in ("all", "ambos", "ego4d"):
         if tsk.task_name and task_matching.rule_for(tsk.task_name):
             # A mesma seleção usada pela tela inclui o índice
             # portátil mesmo quando há narrações locais parciais.
@@ -2470,7 +2470,7 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
         # Fonte complementar primeiro: são sessões inteiras de uma
         # tarefa rotulada, não inferências por texto de narração.
         shorts = [*strict_holoassist, *shorts]
-    if dataset_provider in ("all", "nymeria"):
+    if dataset_provider in ("all", "ambos", "nymeria"):
         try:
             nymeria_clips = nymeria.automatic_candidates(
                 min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s)
@@ -2636,7 +2636,7 @@ def _run_campaign(
                 # automática; config antiga/manual não pode furar o matching.
                 clips = []
                 ego_compatible: dict[str, dict[str, Any]] | None = None
-                if (dataset_provider in ("all", "ego4d") and tsk.task_name
+                if (dataset_provider in ("all", "ambos", "ego4d") and tsk.task_name
                         and task_matching.rule_for(tsk.task_name)):
                     compatible_ego = list(_compatible_task_clips(
                         tsk.task_name, "ego4d", min_dur_s=tsk.min_dur_s,
@@ -2648,8 +2648,28 @@ def _run_campaign(
                         <= tsk.max_dur_s
                     }
                 for uid in tsk.clip_uids:
+                    if uid.startswith("nymeria:"):
+                        if dataset_provider not in {"all", "ambos", "nymeria"}:
+                            _log(f"  [!] clipe {uid} pertence ao Nymeria — pulando")
+                            continue
+                        compatible = {
+                            candidate["clip_uid"]: candidate
+                            for candidate in nymeria.automatic_candidates(
+                                min_dur_s=tsk.min_dur_s,
+                                max_dur_s=tsk.max_dur_s,
+                            )
+                        }
+                        nymeria_clip = compatible.get(uid)
+                        if nymeria_clip is None:
+                            _log(
+                                f"  [!] clipe {uid} incompatível com "
+                                f"'{display_name}' — pulando"
+                            )
+                            continue
+                        clips.append(nymeria_clip)
+                        continue
                     if uid.startswith("holoassist:"):
-                        if dataset_provider == "ego4d":
+                        if dataset_provider in {"ego4d", "nymeria", "ambos"}:
                             _log(f"  [!] clipe {uid} pertence ao HoloAssist — pulando")
                             continue
                         # O UID explícito não pode furar categoria, duração ou
@@ -2674,6 +2694,9 @@ def _run_campaign(
                         continue
                     if dataset_provider == "holoassist":
                         _log(f"  [!] clipe {uid} não pertence ao HoloAssist — pulando")
+                        continue
+                    if dataset_provider == "nymeria":
+                        _log(f"  [!] clipe {uid} não pertence ao Nymeria — pulando")
                         continue
                     if ego_compatible is not None:
                         candidate = ego_compatible.get(uid)
@@ -3971,6 +3994,16 @@ def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
 _duration_ranked_pools.cache_clear = _duration_ranked_snapshot.cache_clear
 
 
+@lru_cache(maxsize=8)
+def _nymeria_windows(min_dur_s: float, max_dur_s: float) -> tuple[dict[str, Any], ...]:
+    """Janelas Nymeria já filtradas pela duração do Minute."""
+    try:
+        clips = nymeria.automatic_candidates(min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+    except Exception:
+        return ()
+    return tuple(dict(clip) for clip in clips)
+
+
 def _compatible_task_clips(
     task_name: str,
     dataset_provider: str = "all",
@@ -3986,7 +4019,7 @@ def _compatible_task_clips(
     provider = normalize_dataset_provider(dataset_provider)
     ego_clips: tuple[dict[str, Any], ...] = ()
     task_name = task_matching.canonical_task_name(task_name)
-    if provider in ("all", "ego4d"):
+    if provider in ("all", "ambos", "ego4d"):
         if ((min_dur_s, max_dur_s) != (60, 1800)
                 and ego4d.has_timed_narrations()):
             with _RANK_LOCK:
@@ -4002,13 +4035,19 @@ def _compatible_task_clips(
                           if min_dur_s <= float(c.get("dur_s") or 0) <= max_dur_s)
     if provider == "ego4d":
         return ego_clips
-    holo_clips: tuple[dict[str, Any], ...]
-    try:
-        holo_clips = tuple(holoassist.list_clips(
-            task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
-    except FileNotFoundError:
-        holo_clips = ()
-    return (*holo_clips, *ego_clips)
+    if provider == "nymeria":
+        return _nymeria_windows(min_dur_s, max_dur_s)
+    holo_clips: tuple[dict[str, Any], ...] = ()
+    if provider in ("all", "holoassist"):
+        try:
+            holo_clips = tuple(holoassist.list_clips(
+                task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
+        except FileNotFoundError:
+            holo_clips = ()
+    nymeria_clips = _nymeria_windows(min_dur_s, max_dur_s) if provider in ("all", "ambos") else ()
+    if provider == "ambos":
+        return (*nymeria_clips, *ego_clips)
+    return (*holo_clips, *nymeria_clips, *ego_clips)
 
 
 def _with_cached_expansion(
@@ -4133,7 +4172,7 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
         clips = list(_compatible_task_clips(
             name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
         if (mode != "dataset"
-                and normalize_dataset_provider(dataset_provider) in ("all", "ego4d")):
+                and normalize_dataset_provider(dataset_provider) in ("all", "ambos", "ego4d")):
             all_clips = _with_cached_expansion(
                 all_clips, name, min_dur_s=60, max_dur_s=1800,
                 include_disabled=True)
