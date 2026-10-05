@@ -22,12 +22,21 @@ static void accountsQaPreview(MainWindow& window) {
   window._backendReady=true; window._accountsAvailable=true;
   window._pages->setCurrentIndex(5); window._navigation->setCurrentRow(5);
   window.renderAccounts(accountsFixture());
+  if(qApp->arguments().contains("--creator")) {
+    window._pages->widget(5)->findChild<QTabWidget*>()->setCurrentIndex(2);
+    window._bulkRegisterDomain->clear();window._bulkRegisterDomain->addItem("example.invalid","example.invalid");
+    for(auto* combo:{window._accountProxy,window._bulkRegisterProxy}) {
+      combo->clear();combo->addItem("Sem proxy","");combo->addItem("Automático · alternar por conta","auto");
+      combo->addItem("203.0.113.10:8080","fixture-proxy-id");combo->setCurrentIndex(1);
+    }
+    window._bulkRegisterStatus->setText(QStringLiteral("Crowtado + Minute, com código de e-mail automático. Depois, conclua idade, equipamento e vínculo manualmente no site Crowtado."));
+  }
   window._backendState->setText(QStringLiteral("● Prévia isolada"));
   QTimer::singleShot(200,&window,[&window] {qApp->exit(window.grab().save(qApp->arguments().at(1))?0:1);});
 }
 
 static void accountsQaSmoke(MainWindow& window) {
-  struct Flow { bool malformed=false, dropped=false; int posts=0, requests=0, statusReads=0; QString state="idle", requestId; };
+  struct Flow { bool malformed=false, dropped=false, imported=false; std::shared_ptr<QTemporaryDir> folder=std::make_shared<QTemporaryDir>(); int posts=0, requests=0, statusReads=0; QString state="idle", requestId; };
   auto flow=std::make_shared<Flow>();
   auto* server=new QTcpServer(&window);
   if (!server->listen(QHostAddress::LocalHost)) {qApp->exit(231);return;}
@@ -44,14 +53,20 @@ static void accountsQaSmoke(MainWindow& window) {
       QJsonObject out{{"ok",true}};
       if (input.startsWith("GET /api/accounts ")) out=flow->malformed?QJsonObject{{"accounts","invalid"}}:QJsonObject{{"accounts",accountsFixture()}};
       else if (input.startsWith("GET /api/accounts/migration ")) out={{"state","idle"}};
+      else if (input.startsWith("GET /api/accounts/proxies ")) out={{"proxies",flow->imported?QJsonArray{QJsonObject{{"id","fixture-proxy-id"},{"label","203.0.113.10:8080"}}}:QJsonArray{}}};
       else if (input.startsWith("GET /api/accounts/domains ")) out={{"domains",QJsonArray{QJsonObject{{"domain","example.invalid"}}}}};
       else if (input.startsWith("GET /api/accounts/bulk-register/preflight")) out={{"ready",true},{"checks",QJsonObject{}}};
+      else if(input.startsWith("POST /api/accounts/proxies/import ")) {
+        const auto body=QJsonDocument::fromJson(input.mid(split+4)).object();
+        if(body.value("text").toString()!=QStringLiteral("203.0.113.10:8080:fixture-user:fixture-password\n")) {qApp->exit(249);return;}
+        flow->imported=true;out={{"ok",true},{"total",1}};
+      }
       else if (input.startsWith("POST /api/accounts/register?async=1 ")) {
         ++flow->requests;
         const auto body=QJsonDocument::fromJson(input.mid(split+4)).object();
         const auto requestId=body.value("request_id").toString();
         if(requestId.isEmpty()) {qApp->exit(248);return;}
-        if (body.value("birth_month").toInt()!=2 || body.value("birth_year").toInt()!=1990 || body.value("gender").toString()!="female") {qApp->exit(232);return;}
+        if (body.contains("birth_month") || body.contains("birth_year") || body.contains("gender") || body.value("proxy_id").toString()!=QStringLiteral("fixture-proxy-id")) {qApp->exit(232);return;}
         if(flow->requestId!=requestId) {
           ++flow->posts; flow->requestId=requestId;
           flow->state="running"; flow->statusReads=0;
@@ -63,7 +78,7 @@ static void accountsQaSmoke(MainWindow& window) {
         const bool done=flow->state=="done";
         out={{"state",flow->state},{"total",1},{"completed",done?1:0},{"created",done?1:0},{"failed",0},
           {"results",done?QJsonArray{QJsonObject{{"email","new@example.invalid"},{"nome","QA"},{"sobrenome","Fixture"},
-            {"gender","female"},{"created",true},{"removed",false},{"removable",true},{"steps",QJsonObject{}},{"error",QJsonValue()}}}:QJsonArray{}},
+            {"gender","female"},{"created",true},{"removed",false},{"removable",true},{"steps",QJsonObject{{"link_minute",QJsonObject{{"status","manual"},{"detail","Confirmar no site"}}}}},{"error",QJsonValue()}}}:QJsonArray{}},
           {"current_email",done?"":"new@example.invalid"},{"current_step",done?"":"Confirmando e-mail"}};
       }
       const auto bytes=QJsonDocument(out).toJson(QJsonDocument::Compact);
@@ -88,16 +103,23 @@ static void accountsQaSmoke(MainWindow& window) {
     } else if(*stage==1 && !window._accountsAvailable) {
       if(window._accountsTable->rowCount()!=24 || window._accountAdd->isEnabled()) {qApp->exit(237);return;}
       flow->malformed=false;window.loadAccounts();++*stage;
-    } else if(*stage==2 && window._accountsAvailable) {
+    } else if(*stage==2 && window._accountsAvailable && !window._accountTransferBusy) {
+      QFile file(flow->folder->filePath("proxies.txt"));
+      if(!file.open(QIODevice::WriteOnly)) {qApp->exit(250);return;}
+      file.write("203.0.113.10:8080:fixture-user:fixture-password\n");file.close();
+      window.importRegistrationProxiesFile(file.fileName());++*stage;
+    } else if(*stage==3 && flow->imported && window._registrationProxiesReady && window._accountProxy->currentData().toString()=="auto") {
+      if(window._bulkRegisterProxy->currentData().toString()!="auto" || window._accountProxy->count()!=3) {qApp->exit(251);return;}
+      window._accountProxy->setCurrentIndex(window._accountProxy->findData("fixture-proxy-id"));
       window._accountEmail->setText("new@example.invalid"); window._accountPassword->setText("fixture-only-password");
-      window._accountBirthMonth->setValue(2);window._accountBirthYear->setValue(1990);
-      window._accountGender->setCurrentIndex(window._accountGender->findData("female"));
+      if(!window._accountBirthMonth->isHidden() && window._accountBirthMonth->isVisible()) {qApp->exit(252);return;}
       window.addAccount(true);window.addAccount(true);++*stage;
-    } else if(*stage==3 && flow->state=="done" && !window._bulkRegisterPolling && window._accountsAvailable) {
+    } else if(*stage==4 && flow->state=="done" && !window._bulkRegisterPolling && window._accountsAvailable) {
       if(flow->posts!=1 || !flow->dropped || window._bulkRegisterTable->rowCount()!=1 || !window._accountPassword->text().isEmpty()) {
         qWarning("Accounts QA: posts=%d dropped=%d rows=%d passwordCleared=%d",flow->posts,flow->dropped,window._bulkRegisterTable->rowCount(),window._accountPassword->text().isEmpty());
         qApp->exit(flow->posts!=1?245:window._bulkRegisterTable->rowCount()!=1?246:247);return;
       }
+      if(!window._bulkRegisterTable->item(0,2)->text().contains("site manual")) {qApp->exit(253);return;}
       qApp->exit(0);
     }
   });

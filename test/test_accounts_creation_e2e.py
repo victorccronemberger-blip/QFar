@@ -88,6 +88,10 @@ def test_http_creation_saves_protected_access_and_confirms_all_steps(setup):
         assert set(snapshot["results"][0]["steps"]) == registration_state.STEPS
         remote["criar_conta"].assert_called_once_with(EMAIL, PASSWORD)
         minute_register.assert_called_once_with(EMAIL, PASSWORD, config.INVITE_CODE)
+        remote["preencher_demografia"].assert_not_called()
+        remote["vincular_minute"].assert_not_called()
+        assert rows[0]["registration"]["steps"]["demographics"]["status"] == "manual"
+        assert rows[0]["registration"]["steps"]["link_minute"]["status"] == "manual"
     finally:
         service.shutdown(); thread.join(timeout=5)
 
@@ -111,7 +115,7 @@ def test_initial_progress_write_failure_does_not_start_remote_work_or_lock_futur
 def test_incomplete_account_visible_password_recoverable_resume_skips_confirmed_creation(setup):
     app, body, remote, minute_register, root = setup
     client = app.test_client()
-    remote["vincular_minute"].side_effect = RuntimeError("HTTP 503")
+    minute_register.side_effect = RuntimeError("HTTP 503")
     assert client.post("/api/accounts/register?async=1", json=body).status_code == 200
     failed = await_terminal(client)
     assert failed["results"][0]["partial"] is True
@@ -119,10 +123,10 @@ def test_incomplete_account_visible_password_recoverable_resume_skips_confirmed_
     row = client.get("/api/accounts").get_json()["accounts"][0]
     assert row["registration"]["state"] == "incomplete"
     assert client.post("/api/accounts/password", json={"email": EMAIL}).get_json()["password"] == PASSWORD
-    remote["vincular_minute"].side_effect = None
+    minute_register.side_effect = lambda email, password, code: token_store.save(config.SECRETS_DIR,email,{"email":email,"idToken":"fixture-token","refreshToken":"fixture-refresh","expires_at":time.time()+3600})
     assert client.post(f"/api/accounts/{EMAIL}/resume", json={}).status_code == 200
     assert await_terminal(client)["created"] == 1
-    assert remote["criar_conta"].call_count == 1 and minute_register.call_count == 1
+    assert remote["criar_conta"].call_count == 1 and minute_register.call_count == 2
     assert client.post(f"/api/accounts/{EMAIL}/resume", json={}).status_code == 409
 
 
@@ -215,7 +219,7 @@ def test_explicit_clerk_restriction_is_visible_and_prevents_minute_creation_on_r
     error = server.crowtado._remote_error("Login Crowtado", 403, {"errors": [{"code": code, "long_message": "sensitive-remote-detail"}]})
     assert error.account_issue_code == "restricted"
     assert "sensitive" not in str(error)
-    remote["preencher_demografia"].side_effect = error
+    remote["login"].side_effect = error
     client = app.test_client()
     client.post("/api/accounts/register?async=1", json=body)
     assert await_terminal(client)["failed"] == 1
@@ -256,20 +260,20 @@ def test_wrong_password_attempt_does_not_hide_previously_complete_account(setup)
     remote["criar_conta"].assert_called_once()
 
 
-def test_resume_own_signup_retries_unfinished_demographics_before_minute_creation(setup):
+def test_resume_own_signup_retries_minute_without_repeating_crowtado_or_site_steps(setup):
     app, body, remote, minute_register, root = setup
     client = app.test_client()
-    remote["preencher_demografia"].side_effect = RuntimeError("temporary failure")
+    save_token = minute_register.side_effect
+    minute_register.side_effect = RuntimeError("temporary failure")
     client.post("/api/accounts/register?async=1", json=body)
     assert await_terminal(client)["failed"] == 1
-    minute_register.assert_not_called()
-    remote["preencher_demografia"].side_effect = None
+    minute_register.side_effect = save_token
     client.post(f"/api/accounts/{EMAIL}/resume", json={})
     assert await_terminal(client)["created"] == 1
-    assert remote["preencher_demografia"].call_count == 2
-    remote["preencher_demografia"].assert_called_with(EMAIL, PASSWORD, birth_month=2, birth_year=1990, gender="female")
+    for name in ("preencher_demografia", "vincular_minute"):
+        remote[name].assert_not_called()
     remote["criar_conta"].assert_called_once()
-    minute_register.assert_called_once()
+    assert minute_register.call_count == 2
 
 
 @pytest.mark.parametrize("message", ["DEMOGRAPHICS_REQUIRED", "Birth month, birth year, and gender are required"])
@@ -286,7 +290,7 @@ def test_generic_412_does_not_authorize_demographic_changes():
     assert error.account_issue_code != "demographics_required"
 
 
-def test_unavailable_minute_task_preserves_partial_account_and_explains_the_block(setup):
+def test_unavailable_site_task_does_not_block_creation_and_is_left_manual(setup):
     app, body, remote, minute_register, root = setup
     error = server.crowtado._trpc_error("externalMobileCapture.saveEmail", 412,
         [{"error": {"json": {"message": "minute_task_unavailable"}}}])
@@ -294,9 +298,174 @@ def test_unavailable_minute_task_preserves_partial_account_and_explains_the_bloc
     remote["vincular_minute"].side_effect = error
     client = app.test_client()
     client.post("/api/accounts/register?async=1", json=body)
-    assert await_terminal(client)["failed"] == 1
+    assert await_terminal(client)["created"] == 1
     row = client.get("/api/accounts").get_json()["accounts"][0]
-    assert row["registration"]["state"] == "incomplete" and row["has_password"]
-    assert "tarefa Minute está indisponível" in row["registration"]["error"]
-    assert row["registration"]["steps"]["link_minute"]["code"] == "minute_task_unavailable"
+    assert row["registration"]["state"] == "complete" and row["has_password"]
+    assert row["registration"]["error"] is None
+    assert row["registration"]["steps"]["link_minute"]["status"] == "manual"
+    remote["vincular_minute"].assert_not_called()
+    remote["preencher_demografia"].assert_not_called()
+    assert len(server._list_accounts()) == 1
+
+
+def test_new_account_requires_only_email_and_password(setup):
+    app, body, remote, *_ = setup
+    client = app.test_client()
+    assert client.post("/api/accounts/register?async=1",json={"email":EMAIL,"password":PASSWORD}).status_code == 200
+    assert await_terminal(client)["created"] == 1
+    remote["preencher_demografia"].assert_not_called()
+    remote["vincular_minute"].assert_not_called()
+
+
+def test_proxy_import_endpoint_is_private_transactional_and_locked_during_creation(setup):
+    app, body, remote, *_ = setup
+    client = app.test_client()
+    text = "127.0.0.1:8080:fixture-user:fixture-password"
+    response = client.post("/api/accounts/proxies/import",json={"text":text})
+    assert response.status_code == 200 and response.get_json()["total"] == 1
+    assert "fixture-user" not in response.get_data(as_text=True)
+    assert "fixture-password" not in response.get_data(as_text=True)
+    rows = client.get("/api/accounts/proxies").get_json()
+    assert rows["proxies"][0]["label"] == "127.0.0.1:8080"
+    assert client.post("/api/accounts/proxies/import",json={"text":text+"\ninvalid"}).status_code == 400
+    assert client.get("/api/accounts/proxies").get_json() == rows
+    server._BULK_REGISTER_STATE["state"] = "running"
+    assert client.post("/api/accounts/proxies/import",json={"text":text}).status_code == 409
+
+
+def test_crowtado_and_minute_use_same_proxy_and_resume_reuses_it(setup, monkeypatch):
+    from moneymin import registration_proxy as proxies
+    app, body, remote, register, *_ = setup
+    client = app.test_client()
+    client.post("/api/accounts/proxies/import",json={"text":"127.0.0.1:8080:fixture-user:fixture-password\n127.0.0.2:8081:other-user:other-password"})
+    observed = []
+    monkeypatch.setattr(proxies,"check_exit_ip",lambda: "203.0.113.1")
+    remote["criar_conta"].side_effect = lambda *a,**k: observed.append(proxies.endpoint())
+    save_token = register.side_effect
+    def fail_once(*args):
+        observed.append(proxies.endpoint())
+        raise RuntimeError("fixture-user fixture-password temporary failure")
+    register.side_effect = fail_once
+    client.post("/api/accounts/register?async=1",json={**body,"proxy_id":"auto"})
+    failed = await_terminal(client)
+    assert failed["failed"] == 1 and "fixture-password" not in json.dumps(failed)
+    assert "fixture-user" not in json.dumps(failed)
+    assert observed[0] == observed[1] and observed[0].startswith("http://127.0.0.1:")
+    first = registration_state.load()[EMAIL]["identity"]["proxy_id"]
+    register.side_effect = save_token
+    client.post(f"/api/accounts/{EMAIL}/resume",json={})
+    assert await_terminal(client)["created"] == 1
+    assert registration_state.load()[EMAIL]["identity"]["proxy_id"] == first
+    remote["criar_conta"].assert_called_once()
+    assert proxies.endpoint() is None
+
+
+def test_proxy_failure_prevents_both_remote_creations_without_direct_retry(setup, monkeypatch):
+    from moneymin import registration_proxy as proxies
+    app, body, remote, register, *_ = setup
+    client = app.test_client()
+    client.post("/api/accounts/proxies/import",json={"text":"127.0.0.1:8080:fixture-user:fixture-password"})
+    monkeypatch.setattr(proxies,"check_exit_ip",Mock(side_effect=RuntimeError("fixture-password upstream rejected")))
+    client.post("/api/accounts/register?async=1",json={**body,"proxy_id":"auto"})
+    row = await_terminal(client)
+    assert row["failed"] == 1 and row["results"][0]["steps"]["proxy"]["status"] == "fail"
+    assert "fixture-password" not in json.dumps(row)
+    remote["criar_conta"].assert_not_called(); register.assert_not_called()
+    assert proxies.endpoint() is None
+
+
+def test_invalid_proxy_selection_is_rejected_before_starting_worker(setup):
+    app, body, remote, register, *_ = setup
+    response = app.test_client().post("/api/accounts/register?async=1",json={**body,"proxy_id":"auto"})
+    assert response.status_code == 400
+    remote["criar_conta"].assert_not_called(); register.assert_not_called()
+
+
+def test_resume_legacy_link_failure_leaves_site_steps_manual_and_preserves_both_accounts(setup):
+    app, body, remote, register, *_ = setup
+    client = app.test_client()
+    client.post("/api/accounts/register?async=1",json=body)
+    assert await_terminal(client)["created"] == 1
+    row = registration_state.load()[EMAIL]
+    row["steps"]["link_minute"] = {"status":"fail","detail":"task unavailable","code":"minute_task_unavailable"}
+    registration_state.update(EMAIL,steps=row["steps"],state="incomplete",error="old site step failed")
+    client.post(f"/api/accounts/{EMAIL}/resume",json={})
+    assert await_terminal(client)["created"] == 1
+    assert registration_state.load()[EMAIL]["steps"]["link_minute"]["status"] == "manual"
+    remote["criar_conta"].assert_called_once(); register.assert_called_once()
+    remote["preencher_demografia"].assert_not_called(); remote["vincular_minute"].assert_not_called()
+
+
+@pytest.mark.parametrize("code", ["restricted", "network", "timeout", "forbidden", "invalid_response"])
+def test_post_creation_access_failure_is_never_counted_as_success(setup, code):
+    app, body, remote, register, *_ = setup
+    client = app.test_client()
+    remote["login"].side_effect = server.crowtado.CrowtadoError("fixture account blocked" if code=="restricted" else "fixture consultation inconclusive",code=code)
+    client.post("/api/accounts/register?async=1",json=body)
+    row = await_terminal(client)
+    assert row["created"] == 0 and row["failed"] == 1
+    result = row["results"][0]
+    assert result["created"] is False and result["partial"] is True
+    assert result["steps"]["ban_check"]["status"] == "fail" and result["steps"]["ban_check"]["code"] == code
+    account = client.get("/api/accounts").get_json()["accounts"][0]
+    assert account["registration"]["state"] == "incomplete"
+    assert account["restriction"]["confirmed"] is (code == "restricted")
     assert server._list_accounts() == []
+    register.assert_not_called()
+    remote["criar_conta"].assert_called_once()
+
+
+def test_uncertain_access_can_be_rechecked_without_recreating_the_account(setup):
+    app, body, remote, register, *_ = setup
+    client = app.test_client()
+    remote["login"].side_effect = server.crowtado.CrowtadoError("temporary timeout",code="timeout")
+    client.post("/api/accounts/register?async=1",json=body)
+    assert await_terminal(client)["created"] == 0
+    remote["login"].side_effect = None
+    client.post(f"/api/accounts/{EMAIL}/resume",json={})
+    assert await_terminal(client)["created"] == 1
+    remote["criar_conta"].assert_called_once()
+    register.assert_called_once()
+    assert remote["login"].call_count == 2
+
+
+def test_same_account_new_request_keeps_confirmed_remote_creation(setup):
+    app, body, remote, register, *_ = setup
+    client = app.test_client()
+    client.post("/api/accounts/register?async=1",json=body)
+    assert await_terminal(client)["created"] == 1
+    client.post("/api/accounts/register?async=1",json=body)
+    assert await_terminal(client)["created"] == 1
+    remote["criar_conta"].assert_called_once(); register.assert_called_once()
+
+
+def test_minute_suspended_org_is_not_counted_as_success(setup):
+    app, body, remote, register, *_ = setup
+    session = server.Session.from_email.return_value
+    session.ensure_auth.return_value["organizations"][0]["disabled"] = True
+    client = app.test_client()
+    client.post("/api/accounts/register?async=1",json=body)
+    result = await_terminal(client)
+    assert result["created"] == 0 and result["failed"] == 1
+    assert result["results"][0]["steps"]["minute_register"]["code"] == "restricted"
+    register.assert_called_once()
+    assert server._list_accounts() == []
+    row = client.get("/api/accounts").get_json()["accounts"][0]
+    assert row["restriction"]["confirmed"] and row["restriction"]["code"] == "restricted"
+
+
+def test_minute_target_org_auth_block_is_not_counted_as_success(setup):
+    app, body, remote, register, *_ = setup
+    session = server.Session.from_email.return_value
+    profile = session.ensure_auth.return_value
+    def auth(**kwargs):
+        if kwargs.get("org_key") == config.ORG_KEY:
+            raise minute_api.AuthError("Fixture account inactive",code="restricted")
+        return profile
+    session.ensure_auth.side_effect = auth
+    client = app.test_client()
+    client.post("/api/accounts/register?async=1",json=body)
+    result = await_terminal(client)
+    assert result["created"] == 0 and result["results"][0]["steps"]["minute_register"]["code"] == "restricted"
+    assert server._list_accounts() == []
+    session.ensure_auth.assert_called_with(org_key=config.ORG_KEY)

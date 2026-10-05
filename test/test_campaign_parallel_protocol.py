@@ -186,7 +186,8 @@ class CampaignParallelProtocolTests(unittest.TestCase):
         expected_accounts = fixture.emails if control == 'pause' else fixture.emails[:2]
         count = len(expected_accounts)
         self.assertEqual((snapshot['state'], history['status']),
-                         ('done', 'done') if control == 'pause' else ('stopped', 'stopped'))
+                         ('done', 'done') if control == 'pause' else ('stopped', 'stopped'),
+                         {'runner_error': snapshot.get('error'), 'issues': history.get('issues')})
         self.assertEqual(snapshot['totals']['ok_sends'], count)
         self.assertEqual({row['email'] for row in history['items'][0]['accounts']}, set(expected_accounts))
         self.assertEqual(sum(kind == 'create' for kind, _, _, _ in wire), count * 2)

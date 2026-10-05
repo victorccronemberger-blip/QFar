@@ -146,7 +146,7 @@ HOSTINGER_MAIL_PROFILES = (
 
 # --- Crowtado (registro de conta com referral) --------------------------------
 # Código de indicação IMUTÁVEL — fixo no código, não configurável.
-CROWTADO_REF = "4NGM98UV"
+CROWTADO_REF = "4G7PWD9E"
 CROWTADO_SIGNUP_URL = f"https://www.crowtado.com/sign-up?ref={CROWTADO_REF}"
 
 # Valores de compatibilidade configurados para esta integração.

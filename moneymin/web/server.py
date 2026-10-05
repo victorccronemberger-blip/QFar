@@ -653,7 +653,8 @@ def _remember_banned_withdraw_result(
             return
 
 _STEP_LABELS = {
-    "ban_check": "verificação de ban",
+    "proxy": "conexão do proxy",
+    "ban_check": "verificar bloqueio na Crowtado",
     "crowtado_signup": "criação Crowtado",
     "save_partial": "proteger credencial local",
     "demographics": "demografia Crowtado",
@@ -662,7 +663,7 @@ _STEP_LABELS = {
     "validate": "validação pós-criação",
 }
 _STEP_ORDER = [
-    "ban_check", "save_partial", "crowtado_signup",
+    "proxy", "ban_check", "save_partial", "crowtado_signup",
     "demographics", "minute_register", "link_minute", "validate",
 ]
 _CROWTADO_SIGNUP_RETRIES = 2
@@ -879,26 +880,69 @@ def _validate_minute_membership(email: str) -> str:
         org for org in (profile.get("organizations") or [])
         if isinstance(org, dict)
     ]
-    org_key = org_policy.ensure_membership(session, email, organizations)
+    try:
+        org_key = org_policy.ensure_membership(session, email, organizations)
+    except RuntimeError as exc:
+        if str(exc) == "Conta suspensa na organização de destino.":
+            from ..minute_api import AuthError
+            raise AuthError(str(exc), code="restricted") from None
+        raise
+    # Membership alone does not exclude account/org suspension or quality hold.
+    session.ensure_auth(org_key=org_key)
     _cache_org_key(email, org_key)
     return org_key
 
 
-def _full_register_account(
+def _full_register_account(email: str, password: str, identity_data: dict[str, Any],
+                           *, on_step: Any = None, resume: bool = False) -> dict[str, Any]:
+    from .. import registration_proxy
+    from contextlib import ExitStack
+    scope = ExitStack()
+    try:
+        saved = credential_store.lookup(config.SECRETS_DIR, email, strict=True)
+        if saved and saved != password:
+            raise ValueError("A conta já possui outra senha protegida. Reconecte o acesso antes de registrar.")
+    except ValueError as exc:
+        return {"steps": {"save_partial": _step_fail(str(exc))}, "error": str(exc), "partial": False}
+    identity_data = dict(identity_data)
+    previous = registration_state.load().get(email.strip().casefold(), {})
+    steps = dict(previous.get("steps", {})) if resume or saved else {}
+    try:
+        proxy = registration_proxy.assign(email, identity_data.get("proxy_id", ""))
+        if proxy:
+            identity_data["proxy_id"] = proxy["id"]
+        scope.enter_context(registration_proxy.route(proxy))
+        if proxy:
+            if callable(on_step):
+                on_step("proxy")
+            ip = registration_proxy.check_exit_ip()
+            steps["proxy"] = _step_ok(f"{proxy['host']}:{proxy['port']} · IP de saída {ip}")
+        else:
+            steps["proxy"] = _step_skip("Conexão direta selecionada pelo usuário")
+    except (OSError, ValueError, RuntimeError):
+        scope.close()
+        detail = "Não foi possível confirmar o proxy selecionado. Confira a conexão e tente novamente; nenhuma conta foi criada nesta tentativa e nenhuma conexão direta foi usada."
+        steps["proxy"] = _step_fail(detail)
+        if previous.get("state") != "complete":
+            registration_state.update(email, identity=identity_data, steps=steps, state="incomplete", error=detail)
+        return {"steps": steps, "error": detail,
+                "partial": steps.get("save_partial", {}).get("status") == "ok"}
+    try:
+        registration_state.update(email, identity=identity_data, steps=steps)
+        return _register_account_steps(email, password, identity_data, on_step=on_step, resume=True)
+    finally:
+        scope.close()
+
+
+def _register_account_steps(
     email: str, password: str, identity_data: dict[str, Any],
     *, on_step: Any = None, resume: bool = False,
 ) -> dict[str, Any]:
-    """Fluxo completo com retry, save parcial e validação pós-criação.
-
-    Diferente da versão anterior:
-    - Crowtado signup tem retry (Turnstile pode falhar transitoriamente)
-    - Credenciais são confirmadas localmente antes da primeira chamada remota
-    - Validação pós-criação confirma que tudo realmente funciona
-    """
+    """Cria Crowtado (com OTP) e Minute; etapas do site são manuais."""
     import logging
     import time
 
-    from .. import crowtado, account_bans as bans
+    from .. import crowtado, account_bans as bans, registration_proxy
     from ..minute_api import register as minute_register, login as minute_login
 
     logger = logging.getLogger("moneymin.register")
@@ -928,7 +972,7 @@ def _full_register_account(
         # Public diagnostics never contain the supplied secret.
         result = dict(result)
         if isinstance(result.get("error"), str):
-            result["error"] = result["error"].replace(password, "[senha protegida]")
+            result["error"] = registration_proxy.redact(result["error"], password)
         registration_state.update(email, identity=identity_data, steps=steps,
                                   state="incomplete" if result.get("error") else "complete",
                                   error=result.get("error"))
@@ -947,7 +991,7 @@ def _full_register_account(
 
     def _record_step(step_name: str, result: dict[str, str]) -> None:
         result = dict(result)
-        result["detail"] = result.get("detail", "").replace(password, "[senha protegida]")
+        result["detail"] = registration_proxy.redact(result.get("detail", ""), password)
         steps[step_name] = result
         registration_state.update(email, identity=identity_data, steps=steps)
         elapsed = time.monotonic() - step_start.get(step_name, time.monotonic())
@@ -977,16 +1021,7 @@ def _full_register_account(
     # Step 1: Crowtado signup (Chrome + Turnstile + email OTP) — com retry
     _notify("crowtado_signup")
     crowtado_signup_ok = confirmed("crowtado_signup")
-    crowtado_existed = crowtado_signup_ok
-    if crowtado_signup_ok:
-        # Resume only after authenticating the original Crowtado identity.
-        # A saved signup checkpoint cannot authorize Minute registration.
-        _notify("validate")
-        try:
-            crowtado.login(email, password)
-        except Exception as exc:
-            _record_step("validate", failure(exc))
-            return finish({"steps": steps, "error": f"acesso Crowtado: {exc}"})
+    crowtado_login_confirmed = False
     last_error: str = ""
     for attempt in range(1, _CROWTADO_SIGNUP_RETRIES + 1):
         if crowtado_signup_ok:
@@ -1002,6 +1037,9 @@ def _full_register_account(
             crowtado_signup_ok = True
             break
         except Exception as exc:
+            if getattr(exc, "account_issue_code", None) == "restricted":
+                _record_step("crowtado_signup", failure(exc))
+                return finish({"steps": steps, "error": f"crowtado: {exc}"})
             error_msg = str(exc)
             lower = error_msg.lower()
             # Somente duplicidade explícita permite retomar uma conta. Erros
@@ -1019,7 +1057,7 @@ def _full_register_account(
                     crowtado.login(email, password)
                     _record_step("crowtado_signup", _step_skip("conta já existia; login OK"))
                     crowtado_signup_ok = True
-                    crowtado_existed = True
+                    crowtado_login_confirmed = True
                     break
                 except Exception as login_exc:
                     _record_step("crowtado_signup", failure(login_exc))
@@ -1033,24 +1071,22 @@ def _full_register_account(
         _record_step("crowtado_signup", _step_fail(f"{last_error} (após {_CROWTADO_SIGNUP_RETRIES} tentativas)"))
         return finish({"steps": steps, "error": f"crowtado: {last_error}"})
 
-    # Step 3: Demographics (gate obrigatório desde 26/08)
-    _notify("demographics")
+    # Creating a Clerk user is not proof of usable access. Reject explicit
+    # bans/locks and keep network/auth uncertainty out of the success counter.
+    _notify("ban_check")
     try:
-        if confirmed("demographics") and steps["demographics"]["status"] == "ok":
-            _record_step("demographics", steps["demographics"])
-        elif crowtado_existed and previous.get("steps", {}).get("crowtado_signup", {}).get("status") != "ok":
-            _record_step("demographics", _step_skip("dados da conta existente preservados"))
-        else:
-            crowtado.preencher_demografia(
-                email, password,
-                birth_month=int(identity_data["birth_month"]),
-                birth_year=int(identity_data["birth_year"]),
-                gender=identity_data.get("gender"),
-            )
-            _record_step("demographics", _step_ok("preenchida"))
+        if not crowtado_login_confirmed:
+            crowtado.login(email, password)
+        _record_step("ban_check", _step_ok("Login Crowtado aceito; nenhum bloqueio de autenticação informado."))
     except Exception as exc:
-        _record_step("demographics", failure(exc))
-        return finish({"steps": steps, "error": f"demografia: {exc}"})
+        _record_step("ban_check", failure(exc))
+        return finish({"steps": steps, "error": f"verificação Crowtado: {exc}"})
+
+    # Existing completed site steps are preserved; unfinished ones belong to the user.
+    for name, detail in (("demographics", "Preencher idade, gênero e equipamento manualmente no site Crowtado."),
+                         ("link_minute", "Abrir Tarefas e vincular o Minute manualmente no site Crowtado.")):
+        if steps.get(name, {}).get("status") != "ok":
+            _record_step(name, {"status": "manual", "detail": detail})
 
     # Step 4: Minute register (com invite code da org)
     _notify("minute_register")
@@ -1081,56 +1117,7 @@ def _full_register_account(
         _record_step("minute_register", failure(exc))
         return finish({"steps": steps, "error": f"minute: {exc}"})
 
-    # Step 5: Vincular email Minute dentro da Crowtado
-    _notify("link_minute")
-    try:
-        try:
-            crowtado.vincular_minute(email, password)
-        except Exception as exc:
-            # O gate explícito permite completar cadastros interrompidos sem
-            # alterar demografia de contas que já estão completas.
-            if not crowtado_existed or not (getattr(exc, "account_issue_code", None) == "demographics_required"
-                                            or "DEMOGRAPHICS_REQUIRED" in str(exc)):
-                raise
-            _notify("demographics")
-            try:
-                crowtado.preencher_demografia(
-                    email, password, birth_month=int(identity_data["birth_month"]),
-                    birth_year=int(identity_data["birth_year"]), gender=identity_data.get("gender"))
-                _record_step("demographics", _step_ok("cadastro incompleto recuperado"))
-            except Exception as demographic_exc:
-                _record_step("demographics", failure(demographic_exc))
-                raise
-            _notify("link_minute")
-            crowtado.vincular_minute(email, password)
-        _record_step("link_minute", _step_ok("vinculado"))
-    except Exception as exc:
-        _record_step("link_minute", failure(exc))
-        return finish({"steps": steps, "error": f"vínculo: {exc}"})
-
-    # Step 6: Validação pós-criação — confirma que tudo funciona
     _notify("validate")
-    validation_issues: list[str] = []
-    validation_code = ""
-    try:
-        crowtado.login(email, password)
-    except Exception as exc:
-        validation_issues.append(f"login Crowtado: {exc}")
-        validation_code = getattr(exc, "account_issue_code", "") or ""
-    try:
-        minute_login(email, password)
-        _validate_minute_membership(email)
-    except Exception as exc:
-        validation_issues.append(f"login Minute: {exc}")
-    if validation_issues:
-        detail = "; ".join(validation_issues)
-        failed = _step_fail(detail)
-        if validation_code:
-            failed["code"] = validation_code
-        _record_step("validate", failed)
-        logger.warning("[register] %s — validação parcial: %s", email, detail)
-        # Não é fatal — a conta foi criada, mas algo não confere
-        return finish({"steps": steps, "error": f"validação: {detail}", "partial": True})
     try:
         # O tombstone só é removido quando todo o fluxo remoto foi confirmado.
         # Assim uma tentativa falha nunca ressuscita uma conta excluida.
@@ -1139,7 +1126,7 @@ def _full_register_account(
         detail = "conta criada e validada, mas a ativação local não pôde ser salva"
         _record_step("validate", _step_fail(detail))
         return finish({"steps": steps, "error": f"validação: {detail}", "partial": True})
-    _record_step("validate", _step_ok("tudo confirmado e acesso local ativado"))
+    _record_step("validate", _step_ok("Crowtado e Minute criados; etapas do site pendentes de confirmação manual"))
     _save_account_check(email, {"email": email, "status": "active", "status_label": "Acesso verificado",
                                "org_key": config.ORG_KEY, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
     logger.info("[register] %s — fluxo completo com sucesso", email)
@@ -2765,12 +2752,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
 
     @app.post("/api/accounts/register")
     def register_account():
-        """Fluxo completo de 6 etapas para uma conta.
-
-        Body: {email, password, gender?}. Se gender não vier, gera dados
-        demográficos aleatórios. Roda Crowtado signup → demografia → Minute
-        → vínculo → salva. Retorna o dict de steps.
-        """
+        """Cria Crowtado com e-mail verificado e Minute; site fica manual."""
         if request.args.get("async") == "1":
             return bulk_register_accounts()
         body = request.get_json(silent=True) or {}
@@ -2783,18 +2765,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
             return jsonify({"error": "informe email e senha"}), 400
         if not _hostinger_is_configured():
             return jsonify({"error": "Configure a integração Hostinger (domínio catch-all) antes de criar contas."}), 409
-        gender = str(body.get("gender", "")).strip() or None
-        if not gender:
-            gender = "male" if random.random() < 0.48 else "female"
         identity_data: dict[str, Any] = {
-            "nome": email.split("@")[0],
-            "sobrenome": "",
-            "email": email,
-            "senha": password,
-            "gender": gender,
-            "birth_month": random.randint(1, 12),
-            "birth_year": random.randint(1980, 2003),
+            "nome": email.split("@")[0], "sobrenome": "",
+            "email": email, "senha": password,
             "use_referral": body.get("use_referral", True),
+            "proxy_id": body.get("proxy_id", ""),
         }
         if type(identity_data["use_referral"]) is not bool:
             return jsonify({"error": "use_referral deve ser booleano."}), 400
@@ -2802,6 +2777,22 @@ def create_app(*, for_testing: bool = False) -> Flask:
         ok = result["error"] is None
         return jsonify({"ok": ok, "email": email, "partial": result.get("partial", False), "steps": result["steps"],
                          "error": result["error"]}), 200 if ok else 400
+
+    @app.get("/api/accounts/proxies")
+    def list_registration_proxies():
+        from .. import registration_proxy
+        return jsonify({"proxies": registration_proxy.public_rows()})
+
+    @app.post("/api/accounts/proxies/import")
+    def import_registration_proxies():
+        from .. import registration_proxy
+        if RUNNER.running or RECOVERY.running or BALANCES_RUNNER.running:
+            return jsonify({"error": "Pare a operação antes de importar proxies."}), 409
+        try:
+            result = registration_proxy.import_text((request.get_json(silent=True) or {}).get("text"))
+        except (OSError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
 
     @app.get("/api/accounts/domains")
     def list_account_domains():
@@ -2818,8 +2809,19 @@ def create_app(*, for_testing: bool = False) -> Flask:
     @app.get("/api/accounts/bulk-register/preflight")
     def bulk_register_preflight():
         """Valida todas as dependências antes de iniciar a criação em lote."""
-        result = _preflight_checks(request.args.get("domain", ""))
-        return jsonify(result)
+        from .. import registration_proxy
+        selection = request.args.get("proxy_id", "")
+        try:
+            registration_proxy.validate_selection(selection)
+            proxy = registration_proxy.selected(selection)
+            with registration_proxy.route(proxy):
+                ip = registration_proxy.check_exit_ip() if proxy else None
+                result = _preflight_checks(request.args.get("domain", ""))
+                if proxy:
+                    result["checks"]["proxy"] = {"ok": True, "detail": f"IP de saída {ip}"}
+                return jsonify(result)
+        except (OSError, ValueError, RuntimeError):
+            return jsonify({"ready": False, "checks": {"proxy": {"ok": False, "detail": "Proxy indisponível; confira a seleção e a conexão."}}})
 
     @app.get("/api/accounts/bulk-register/status")
     def bulk_register_status():
@@ -2854,16 +2856,18 @@ def create_app(*, for_testing: bool = False) -> Flask:
 
     @app.post("/api/accounts/bulk-register")
     def bulk_register_accounts(single=None):
-        """Cria N contas novas com o fluxo completo (Crowtado + Minute + vínculo).
-
-        Body: {count, domain}. Gera identidades via identity.gerar_identidade(),
-        executa as 6 etapas por conta e reporta progresso via /status.
-        """
+        """Cria contas Crowtado + Minute com proxy selecionado e progresso durável."""
         with _BULK_REGISTER_LOCK:
             if _BULK_REGISTER_STATE.get("state") in ("running", "stopping"):
                 return jsonify({"error": "Já existe uma criação em andamento."}), 409
 
         body = single or request.get_json(silent=True) or {}
+        from .. import registration_proxy
+        proxy_id = body.get("proxy_id", "")
+        try:
+            registration_proxy.validate_selection(proxy_id)
+        except (OSError, ValueError):
+            return jsonify({"error": "Selecione um proxy disponível ou importe o arquivo TXT."}), 400
         use_referral = body.get("use_referral", True)
         if type(use_referral) is not bool:
             return jsonify({"error": "use_referral deve ser booleano."}), 400
@@ -2880,14 +2884,14 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 if not isinstance(password, str) or not password or len(password) > 4096:
                     raise ValueError("Informe uma senha válida.")
                 month, year = body.get("birth_month"), body.get("birth_year")
-                if (type(month) is not int or not 1 <= month <= 12 or type(year) is not int
-                        or not 1900 <= year <= datetime.date.today().year
-                        or body.get("gender") not in crowtado.GENDERS):
+                if (("birth_month" in body and (type(month) is not int or not 1 <= month <= 12))
+                        or ("birth_year" in body and (type(year) is not int or not 1900 <= year <= datetime.date.today().year))
+                        or ("gender" in body and body.get("gender") not in crowtado.GENDERS)):
                     raise ValueError("Informe mês, ano de nascimento e gênero válidos para o cadastro.")
                 identity_data = {"email": email, "senha": password,
                                  "nome": body.get("nome", email.split("@")[0]),
                                  "sobrenome": body.get("sobrenome", ""),
-                                 "birth_month": month, "birth_year": year, "gender": body["gender"]}
+                                  **{key: body[key] for key in ("birth_month", "birth_year", "gender") if key in body}}
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
         try:
@@ -2962,7 +2966,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     return False
                 email = account_identity["email"]
                 password = account_identity["senha"]
+                if not manual:
+                    for key in ("gender", "birth_month", "birth_year"):
+                        account_identity.pop(key, None)
                 account_identity["use_referral"] = use_referral
+                account_identity["proxy_id"] = proxy_id
                 used_emails.add(email.lower())
 
                 def _on_step(step_name: str) -> None:
@@ -2986,9 +2994,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     "email": email,
                     "nome": account_identity["nome"],
                     "sobrenome": account_identity["sobrenome"],
-                    "gender": account_identity["gender"],
-                    "birth_month": account_identity["birth_month"],
-                    "birth_year": account_identity["birth_year"],
+                    "gender": account_identity.get("gender"),
+                    "birth_month": account_identity.get("birth_month"),
+                    "birth_year": account_identity.get("birth_year"),
                     "created": ok,
                     "partial": result.get("partial", False),
                     "removable": removable,

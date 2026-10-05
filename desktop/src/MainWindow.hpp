@@ -149,6 +149,14 @@ private:
   void importAccounts();
   void exportAccounts(bool selectedOnly);
   void loadBulkRegisterDomains();
+  void loadRegistrationProxies(bool selectAuto = false);
+  void importRegistrationProxiesFile(const QString& path);
+  QComboBox* _accountProxy{};
+  QComboBox* _bulkRegisterProxy{};
+  QPushButton* _accountProxyImport{};
+  QPushButton* _bulkProxyImport{};
+  bool _registrationProxiesReady{false};
+  int _registrationProxiesRevision{0};
   void checkBulkRegisterDomain();
   void startBulkRegister();
   void pollBulkRegister();

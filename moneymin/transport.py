@@ -168,9 +168,14 @@ def http_request_detailed(
     _resolve()
     headers = _headers_for(headers)
     if _kind == "curl" and _cffi is not None:
+        from .registration_proxy import endpoint
+        proxy = endpoint()
+        if proxy:
+            from curl_cffi.const import CurlOpt
         resp = _cffi.request(
             method.upper(), url, headers=headers, data=body,
             timeout=timeout, impersonate=_impersonate,
+            **({"proxies":{"http":proxy,"https":proxy}, "curl_options":{CurlOpt.NOPROXY: "", CurlOpt.PROXY: proxy}} if proxy else {}),
         )
         return resp.status_code, resp.content, {
             str(key): str(value) for key, value in dict(resp.headers).items()

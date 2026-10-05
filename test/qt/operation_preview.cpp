@@ -414,6 +414,8 @@ public:
           reply = {{"ok", true}};
         } else if(input.startsWith("GET /api/accounts ")) {
           reply={{"accounts",QJsonArray{}}};
+        } else if(input.startsWith("GET /api/accounts/proxies ")) {
+          reply={{"proxies",QJsonArray{}}};
         } else if(input.startsWith("GET /api/accounts/migration ") || input.startsWith("GET /api/accounts/bulk-register/status ")) {
           reply={{"state","idle"}};
         } else { qApp->exit(172); return; }

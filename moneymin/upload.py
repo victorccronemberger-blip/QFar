@@ -1016,19 +1016,23 @@ def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None
 
 def list_sidecars(state: str | None = None) -> list[dict[str, Any]]:
     """Valida todos os journals antes de retornar o filtro de estado."""
+    from .media_lifecycle import media_state_lease
     out: list[dict[str, Any]] = []
     try:
-        # iterdir reports directory I/O failures; glob can silently omit them.
-        paths = sorted(path for path in sidecars_dir().iterdir() if path.name.lower().endswith(".json"))
-        for path in paths:
-            data = _read_sidecar_file(path)
-            if not isinstance(data, dict):
-                raise ValueError("invalid journal format")
-            expected_name = _sidecar_filename(data.get("session_id"), data.get("chunk_index", 0))
-            if path.name != expected_name:
-                raise ValueError("invalid journal identity")
-            if state is None or data.get("state") == state:
-                out.append(data)
+        # Read one coherent generation while writers/cleanup hold the same
+        # short local barrier. No network work occurs under this lease.
+        with media_state_lease(wait=True):
+            # iterdir reports directory I/O failures; glob can silently omit them.
+            paths = sorted(path for path in sidecars_dir().iterdir() if path.name.lower().endswith(".json"))
+            for path in paths:
+                data = _read_sidecar_file(path)
+                if not isinstance(data, dict):
+                    raise ValueError("invalid journal format")
+                expected_name = _sidecar_filename(data.get("session_id"), data.get("chunk_index", 0))
+                if path.name != expected_name:
+                    raise ValueError("invalid journal identity")
+                if state is None or data.get("state") == state:
+                    out.append(data)
     except (OSError, UnicodeError, ValueError, UploadError):
         # Corrupt or unknown receipts must never become proof of no prior upload.
         # Keep diagnostics independent of filenames, payloads and parser errors.

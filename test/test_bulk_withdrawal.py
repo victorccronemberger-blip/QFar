@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -11,7 +11,7 @@ from moneymin.web import server
 
 def confirmed_balance(cents):
     return {"availableCents": cents, "pendingCents": 0, "inTransitCents": 0,
-            "lifetimeCents": cents, "contributorEligibility": {"checked": True, "available": True, "blocked": False}, "updated_at": datetime.now(timezone.utc).isoformat()}
+            "lifetimeCents": cents, "contributorEligibility": {"checked": True, "available": True, "blocked": False}, "updated_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()}
 
 
 class BulkWithdrawalTests(unittest.TestCase):
@@ -268,7 +268,7 @@ class BulkWithdrawalTests(unittest.TestCase):
              patch.object(server, "_withdraw_once", return_value=({"ok": True}, 200)) as withdraw:
             response = self.client.post("/api/balances/withdraw", json={
                 "email": email, "method": "wise", "wise_confirmed": True, **destination})
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.get_json())
         withdraw.assert_called_once_with(email, "pw", destination)
 
     def test_individual_wise_can_use_background_worker(self):

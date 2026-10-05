@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import ssl
 import urllib.request
+from urllib.parse import urlsplit
 from functools import lru_cache
 from typing import Any
 
@@ -37,14 +38,28 @@ def context() -> ssl.SSLContext:
     return value
 
 
+class _RequiredProxy(urllib.request.ProxyHandler):
+    def proxy_open(self, req, proxy, type):
+        # Selected registration proxies must also override NO_PROXY/Windows bypass.
+        req.set_proxy(urlsplit(proxy).netloc, "http")
+        return None
+
+
 def build_opener(*handlers: Any) -> urllib.request.OpenerDirector:
     """Cria opener urllib com o TLS portátil, cookies/proxy e demais handlers."""
+    from .registration_proxy import endpoint
+    proxy = endpoint()
+    if proxy:
+        handlers = (_RequiredProxy({"http":proxy,"https":proxy}), *handlers)
     return urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=context()), *handlers)
 
 
 def urlopen(url: Any, data: bytes | None = None, timeout: float | None = None):
     """Equivalente a urllib.request.urlopen usando o contexto do QMoney."""
+    from .registration_proxy import endpoint
+    if endpoint():
+        return build_opener().open(url, data=data, timeout=timeout)
     return urllib.request.urlopen(url, data=data, timeout=timeout, context=context())
 
 

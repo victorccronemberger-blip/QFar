@@ -1,6 +1,7 @@
 """Unreadable or mismatched disk journals block automatic transport safely."""
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,54 @@ class UploadJournalIntegrityTests(unittest.TestCase):
 
     def disk_bytes(self):
         return {path.name: path.read_bytes() for path in self.journals.iterdir()}
+
+    def test_listing_excludes_concurrent_checkpoint_replacement(self):
+        from moneymin.media_lifecycle import media_state_lease
+        from moneymin.operation_lease import OperationLeaseError
+        entered, release = threading.Event(), threading.Event()
+        result, errors = [], []
+        original = upload._read_sidecar_file
+
+        def read(path):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError('Listing fixture was not released')
+            return original(path)
+
+        def listing():
+            try:
+                result.extend(upload.list_sidecars())
+            except Exception as exc:
+                errors.append(exc)
+
+        def write():
+            try:
+                upload.save_sidecar({**self.row, 'state': 'done'})
+            except Exception as exc:
+                errors.append(exc)
+
+        writer = threading.Thread(target=write)
+        with patch.object(upload, '_read_sidecar_file', side_effect=read):
+            reader = threading.Thread(target=listing)
+            reader.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                # The same barrier used by save_sidecar is already owned by
+                # the listing thread, before a checkpoint can be replaced.
+                with self.assertRaises(OperationLeaseError):
+                    with media_state_lease():
+                        pass
+                writer.start()
+            finally:
+                release.set()
+                reader.join(3)
+                if writer.ident is not None:
+                    writer.join(3)
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [self.row])
+        self.assertEqual(upload.list_sidecars()[0]['state'], 'done')
 
     def assert_loader_and_pump_blocked(self):
         before = self.disk_bytes()

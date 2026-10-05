@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
@@ -10,6 +12,10 @@ class RegistrationValidationTests(unittest.TestCase):
     def setUp(self):
         self.context = ExitStack()
         self.addCleanup(self.context.close)
+        root = Path(self.context.enter_context(tempfile.TemporaryDirectory()))
+        self.context.enter_context(patch.object(server.config, "DATA_DIR", root / "data"))
+        self.context.enter_context(patch.object(server.config, "SECRETS_DIR", root / "secrets"))
+        self.context.enter_context(patch.object(server, "_save_account_check"))
         self.identity = {"birth_month": 1, "birth_year": 1990, "gender": "male"}
         self.context.enter_context(patch.object(server.account_bans, "require_not_banned"))
         self.activate = self.context.enter_context(patch.object(server, "_set_account_removed"))
@@ -33,12 +39,12 @@ class RegistrationValidationTests(unittest.TestCase):
         self.signup.side_effect = RuntimeError("account already exists")
         result = self.run_registration()
         self.assertIsNone(result["error"])
-        self.assertEqual(result["steps"]["demographics"]["status"], "skip")
+        self.assertEqual(result["steps"]["demographics"]["status"], "manual")
         self.demographics.assert_not_called()
 
-    def test_new_account_populates_demographics(self):
+    def test_new_account_leaves_site_details_manual(self):
         self.assertIsNone(self.run_registration()["error"])
-        self.demographics.assert_called_once()
+        self.demographics.assert_not_called()
         self.register.assert_called_once_with(
             "review@example.invalid", "test-only", server.config.INVITE_CODE,
         )
@@ -75,14 +81,15 @@ class RegistrationValidationTests(unittest.TestCase):
         self.link.side_effect = [RuntimeError("412 DEMOGRAPHICS_REQUIRED"), None]
         result = self.run_registration()
         self.assertIsNone(result["error"])
-        self.demographics.assert_called_once()
-        self.assertEqual(self.link.call_count, 2)
-        self.assertEqual(result["steps"]["demographics"]["status"], "ok")
+        self.demographics.assert_not_called()
+        self.link.assert_not_called()
+        self.assertEqual(result["steps"]["demographics"]["status"], "manual")
 
     def test_other_link_failure_does_not_modify_demographics(self):
         self.signup.side_effect = RuntimeError("account already exists")
         self.link.side_effect = RuntimeError("HTTP 503 unavailable")
-        self.assertIsNotNone(self.run_registration()["error"])
+        self.assertIsNone(self.run_registration()["error"])
+        self.link.assert_not_called()
         self.demographics.assert_not_called()
 
     def test_save_failure_returns_partial_steps_and_stops_external_work(self):
@@ -135,9 +142,9 @@ class RegistrationValidationTests(unittest.TestCase):
         self.session.me.return_value = new_profile
         result = self.run_registration()
         self.assertIsNone(result["error"])
-        self.assertEqual(self.login.call_count, 2)
+        self.assertEqual(self.login.call_count, 1)
         self.session.join_org.assert_called_once_with(server.config.INVITE_CODE)
-        self.link.assert_called_once()
+        self.link.assert_not_called()
 
     def test_explicit_duplicate_requires_new_membership_confirmation(self):
         self.register.side_effect = RuntimeError("EMAIL_EXISTS")

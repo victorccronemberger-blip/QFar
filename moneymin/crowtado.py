@@ -200,6 +200,28 @@ def login(email: str, password: str) -> CrowtadoSession:
         return _login_locked(email, password)
 
 
+def _check_login_user_flags(payload: Any, session_id: str) -> None:
+    """Use explicit flags for the authenticated user, never infer bans from 403."""
+    if not isinstance(payload, dict):
+        return
+    users = []
+    response = payload.get("response")
+    if isinstance(response, dict) and isinstance(response.get("user"), dict):
+        users.append(response["user"])
+    client = payload.get("client")
+    if isinstance(client, dict):
+        sessions = client.get("sessions") or []
+        if isinstance(sessions, list):
+            users.extend(row["user"] for row in sessions if isinstance(row, dict)
+                         and row.get("id") == session_id and isinstance(row.get("user"), dict))
+    for user in users:
+        for flag in ("banned", "locked"):
+            if flag in user and type(user[flag]) is not bool:
+                raise CrowtadoError("A Crowtado retornou um estado de conta inválido; verifique novamente.", code="invalid_response")
+            if user.get(flag) is True:
+                raise CrowtadoError("A Crowtado confirmou banimento ou bloqueio desta conta. Fale com o suporte.", code="restricted")
+
+
 def _login_locked(email: str, password: str) -> CrowtadoSession:
     """Autentica no Clerk por senha. Levanta CrowtadoError se falhar.
 
@@ -258,6 +280,7 @@ def _login_locked(email: str, password: str) -> CrowtadoSession:
     sid = sign_in.get("created_session_id")
     if status != 200 or si_status != "complete" or not sid:
         raise _remote_error("Login Crowtado não concluído", status, body)
+    _check_login_user_flags(body, sid)
     sess.session_id = sid
     return sess
 
@@ -987,6 +1010,7 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
     já sai verificada e logada).
     """
     import subprocess
+    from .registration_proxy import endpoint
 
     from playwright.sync_api import sync_playwright
 
@@ -998,10 +1022,12 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
 
+    proxy = endpoint()
+    proxy_args = [f"--proxy-server={proxy}", "--disable-quic"] if proxy else []
     proc = subprocess.Popen(
         [_chrome_exe(), f"--remote-debugging-port={port}",
          f"--user-data-dir={CHROME_PROFILE}", "--no-first-run",
-         "--no-default-browser-check", "about:blank"],
+         "--no-default-browser-check", *proxy_args, "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         _wait_port(port)
@@ -1010,7 +1036,7 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
             ctx = browser.contexts[0]
             ctx.clear_cookies()  # sessão da conta anterior (batch) não vaza
             page = ctx.new_page()
-            signup_url = f"{SITE_BASE}/pt-BR/sign-up"
+            signup_url = f"{SITE_BASE}/sign-up"
             if ref:
                 signup_url += "?" + urllib.parse.urlencode({"ref": ref})
             page.goto(signup_url,

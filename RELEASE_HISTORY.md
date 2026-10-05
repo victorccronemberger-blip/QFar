@@ -5,11 +5,11 @@
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.33](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.33). Destaques solicitados: [v1.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v1.0.73) e [v2.0.2](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.2).
+Versão atual: [v2.0.34](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.34). Destaques solicitados: [v1.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v1.0.73) e [v2.0.2](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.2).
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
-| [v2.0.33](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.33) | 05/10/2026 | Revisa Carteira, Operação e Contas: consultas e restrições de saque verificáveis, recuperação de estado e cadastro retomável com proteção contra duplicação. | [Desde v2.0.32](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.32...v2.0.33) |
+| [v2.0.34](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.34) | 05/10/2026 | Criador com importação de proxies protegidos e fluxo reduzido Crowtado + Minute; banimentos e consultas inconclusivas não contam como sucesso. Código de e-mail automático, etapas do site manuais e nova indicação. Inclui as revisões de Carteira, Operação e Contas. | [Desde v2.0.32](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.32...v2.0.34) |
 | [v2.0.32](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.32) | 05/10/2026 01:25 | Corrige bloqueios de teste e publicação, mantém o catálogo portátil offline e verifica o pacote Windows antes de publicar. | [Desde v2.0.31](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.31...v2.0.32) |
 | [v2.0.31](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.31) | 05/10/2026 | Campanha Ego4D: envelope Minute 1.29 (IMU no elapsedRealtime, gap 25 ms, imuDiagnostics do resample, SM-S901E), sem gate artificial de delivery; restaura expansao do cache do Acelerador (best-of v1.0.73/v2.0.2). | [Desde v2.0.30](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.30...v2.0.31) |
 | [v2.0.30](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.30) | 04/10/2026 13:28 | Consolida as correções da Campanha, dos envios e da recuperação de estado, com rastreabilidade do conteúdo e proteção contra duplicação após falhas ou reinícios. | [Desde v2.0.27](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.27...v2.0.30) |
@@ -120,8 +120,9 @@ Estas tags ficam registradas separadamente para preservar a situação real das 
 
 | Tag | Situação | Código e mudanças |
 |---|---|---|
+| v2.0.33 | CI interrompido nos testes de backend; sem release pública | [Código](https://github.com/victorccronemberger-blip/QFar/tree/v2.0.33) · [Desde v2.0.32](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.32...v2.0.33) |
 | v1.0.30 | Rascunho; sem publicação registrada | [Código](https://github.com/victorccronemberger-blip/QFar/tree/v1.0.30) · [Desde v1.0.28](https://github.com/victorccronemberger-blip/QFar/compare/v1.0.28...v1.0.30) |
 | v2.0.28 | Publicação retirada após falha no CI; rascunho sem binários | [Código](https://github.com/victorccronemberger-blip/QFar/tree/v2.0.28) · [Desde v2.0.27](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.27...v2.0.28) |
 | v2.0.29 | Publicação retirada após falha no CI; rascunho sem binários | [Código](https://github.com/victorccronemberger-blip/QFar/tree/v2.0.29) · [Desde v2.0.28](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.28...v2.0.29) |
 
-Os números de versão refletem as tags existentes; não foram criadas versões para preencher lacunas. A v2.0.33 é a release mais recente.
+Os números de versão refletem as tags existentes; não foram criadas versões para preencher lacunas. A v2.0.34 é a release mais recente.

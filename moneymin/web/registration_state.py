@@ -8,7 +8,7 @@ from .. import config, credential_store
 from ..atomic_io import JsonStateError, load_json_state, save_json
 
 _LOCK = threading.RLock()
-STEPS = {"ban_check", "save_partial", "crowtado_signup", "demographics",
+STEPS = {"proxy", "ban_check", "save_partial", "crowtado_signup", "demographics",
          "minute_register", "link_minute", "validate"}
 
 
@@ -25,13 +25,13 @@ def load() -> dict:
                          and isinstance(row.get("identity"), dict))
                 if valid:
                     identity = row["identity"]
-                    valid = (set(identity) <= {"nome", "sobrenome", "gender", "birth_month", "birth_year", "use_referral"}
+                    valid = (set(identity) <= {"nome", "sobrenome", "gender", "birth_month", "birth_year", "use_referral", "proxy_id"}
                              and ("use_referral" not in identity or type(identity["use_referral"]) is bool)
-                             and all(isinstance(identity[k], str) for k in ("nome", "sobrenome", "gender") if k in identity)
+                             and all(isinstance(identity[k], str) for k in ("nome", "sobrenome", "gender", "proxy_id") if k in identity)
                              and all(type(identity[k]) is int for k in ("birth_month", "birth_year") if k in identity)
                              and (row.get("error") is None or isinstance(row.get("error"), str))
                              and all(key in STEPS and isinstance(step, dict) and set(step) <= {"status", "detail", "code"}
-                                and step.get("status") in {"ok", "skip", "fail"}
+                                and step.get("status") in {"ok", "skip", "fail", "manual"}
                                 and ("code" not in step or isinstance(step["code"], str))
                                 and isinstance(step.get("detail", ""), str)
                                 for key, step in row["steps"].items()))
@@ -49,7 +49,7 @@ def update(email: str, *, identity=None, steps=None, state="running", error=None
         previous = rows.get(key, {})
         row = {"email": key, "state": state,
                "identity": {k: v for k, v in (identity or previous.get("identity", {})).items()
-                            if k in {"nome", "sobrenome", "gender", "birth_month", "birth_year", "use_referral"}},
+                            if k in {"nome", "sobrenome", "gender", "birth_month", "birth_year", "use_referral", "proxy_id"}},
                "steps": copy.deepcopy(steps if steps is not None else previous.get("steps", {})),
                "error": error, "updated_at": datetime.now(timezone.utc).isoformat()}
         rows[key] = row

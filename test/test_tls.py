@@ -9,6 +9,9 @@ from moneymin import tls
 
 
 class PortableTlsTests(unittest.TestCase):
+    def setUp(self):
+        tls.context.cache_clear()
+
     def tearDown(self):
         tls.context.cache_clear()
 

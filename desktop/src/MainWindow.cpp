@@ -2425,7 +2425,7 @@ QWidget* MainWindow::buildAccountsPage() {
   _accountPassword->setEchoMode(QLineEdit::Password);
   _accountPassword->setPlaceholderText(QStringLiteral("senha do Minute / Crowtado"));
   form->addRow(QStringLiteral("Senha"), _accountPassword);
-  auto* birth = new QWidget;
+  auto* birth = new QWidget(formBody);
   auto* birthLayout = new QHBoxLayout(birth);
   birthLayout->setContentsMargins(0, 0, 0, 0);
   _accountBirthMonth = new QSpinBox;
@@ -2439,18 +2439,30 @@ QWidget* MainWindow::buildAccountsPage() {
   birthLayout->addWidget(_accountBirthMonth);
   birthLayout->addWidget(_accountBirthYear);
   birthLayout->addStretch();
-  form->addRow(QStringLiteral("Nascimento (nova conta)"), birth);
-  _accountGender = new ComboBox;
+  birth->hide();
+  _accountGender = new ComboBox(formBody);
   _accountGender->addItem(QStringLiteral("Selecione para registrar"), QString());
   _accountGender->addItem(QStringLiteral("Masculino"), QStringLiteral("male"));
   _accountGender->addItem(QStringLiteral("Feminino"), QStringLiteral("female"));
   _accountGender->addItem(QStringLiteral("Não binário"), QStringLiteral("non_binary"));
   _accountGender->addItem(QStringLiteral("Prefiro não informar"), QStringLiteral("prefer_not_to_say"));
-  form->addRow(QStringLiteral("Gênero (nova conta)"), _accountGender);
+  _accountGender->hide();
   _accountUseReferral = new QCheckBox(QStringLiteral("Usar indicação configurada"));
   _accountUseReferral->setChecked(true);
   form->addRow(QString(), _accountUseReferral);
-  form->addRow(quietLabel(QStringLiteral("Nascimento e gênero são usados somente no registro de uma nova conta.")));
+  form->addRow(quietLabel(QStringLiteral("Criamos Crowtado + Minute, confirmamos o e-mail e verificamos bloqueios de acesso. Idade, equipamento e vínculo em Tarefas ficam para você concluir no site.")));
+  _accountProxy = new ComboBox;
+  _accountProxy->addItem(QStringLiteral("Carregando proxies…"), QString());
+  _accountProxyImport = new QPushButton(QStringLiteral("Importar proxies…"));
+  auto* accountProxyRow = new QWidget;
+  auto* accountProxyLayout = new QHBoxLayout(accountProxyRow);
+  accountProxyLayout->setContentsMargins(0,0,0,0);
+  accountProxyLayout->addWidget(_accountProxy,1); accountProxyLayout->addWidget(_accountProxyImport);
+  form->addRow(QStringLiteral("Proxy (nova conta)"), accountProxyRow);
+  connect(_accountProxyImport, &QPushButton::clicked, this, [this] {
+    const auto path=QFileDialog::getOpenFileName(this,QStringLiteral("Importar proxies"),{},QStringLiteral("Lista de proxies (*.txt);;Todos os arquivos (*)"));
+    if (!path.isEmpty()) importRegistrationProxiesFile(path);
+  });
   auto* actions = new QWidget;
   auto* actionLayout = new QHBoxLayout(actions);
   actionLayout->setContentsMargins(0, 0, 0, 0);
@@ -2481,6 +2493,17 @@ QWidget* MainWindow::buildAccountsPage() {
   _bulkRegisterCount->setValue(1);
   _bulkRegisterCount->setMaximumWidth(200);
   bulkForm->addRow(QStringLiteral("Quantidade"), _bulkRegisterCount);
+  _bulkRegisterProxy = new ComboBox;
+  _bulkRegisterProxy->addItem(QStringLiteral("Carregando proxies…"), QString());
+  _bulkProxyImport = new QPushButton(QStringLiteral("Importar proxies…"));
+  auto* proxyRow = new QWidget;
+  auto* proxyLayout = new QHBoxLayout(proxyRow);
+  proxyLayout->setContentsMargins(0,0,0,0);
+  proxyLayout->addWidget(_bulkRegisterProxy,1); proxyLayout->addWidget(_bulkProxyImport);
+  bulkForm->addRow(QStringLiteral("Proxy"), proxyRow);
+  bulkForm->addRow(quietLabel(QStringLiteral("Arquivo TXT: host:porta:login:senha. Em automático, cada conta recebe um proxy; retomadas mantêm o mesmo proxy.")));
+  connect(_bulkRegisterProxy,qOverload<int>(&QComboBox::currentIndexChanged),this,[this] {checkBulkRegisterDomain();});
+  connect(_bulkProxyImport,&QPushButton::clicked,_accountProxyImport,&QPushButton::click);
   _bulkRegisterUseReferral = new QCheckBox(QStringLiteral("Usar indicação configurada"));
   _bulkRegisterUseReferral->setChecked(true);
   bulkForm->addRow(QString(), _bulkRegisterUseReferral);
@@ -2507,8 +2530,8 @@ QWidget* MainWindow::buildAccountsPage() {
   bulkActionLayout->addWidget(_bulkRegisterStop);
   bulkForm->addRow(QString(), bulkActions);
   _bulkRegisterStatus = quietLabel(QStringLiteral(
-      "Fluxo completo: Crowtado → demografia → Minute → vínculo. "
-      "Cada conta leva alguns minutos (Turnstile + verificação de email)."));
+      "Crowtado + Minute, com e-mail automático e verificação de bloqueios. "
+      "Depois, conclua idade, equipamento e vínculo manualmente no site Crowtado. CAPTCHA pode exigir sua intervenção no Chrome."));
   _bulkRegisterStatus->setWordWrap(true);
   bulkForm->addRow(QString(), _bulkRegisterStatus);
   _bulkRegisterWebmail = new QLabel;
@@ -6048,7 +6071,11 @@ void MainWindow::setAccountTransferBusy(bool busy) {
   _accountsExport->setEnabled(!busy);
   _accountsExportSelected->setEnabled(!busy);
   _accountAdd->setEnabled(!busy);
-  _accountRegister->setEnabled(!busy);
+  _accountRegister->setEnabled(!busy && _registrationProxiesReady);
+  _accountProxy->setEnabled(!busy && _registrationProxiesReady);
+  _bulkRegisterProxy->setEnabled(!busy && _registrationProxiesReady);
+  _accountProxyImport->setEnabled(!busy);
+  _bulkProxyImport->setEnabled(!busy);
   _accountsCheckAll->setEnabled(!busy && _accountsTable->rowCount() > 0);
   _accountsTable->setEnabled(!busy);
   _accountsMigrate->setEnabled(!busy && _accountsTable->rowCount() > 0);
@@ -6339,7 +6366,10 @@ void MainWindow::renderAccounts(const QJsonArray& accounts) {
       delete orgCell;
       const auto registration = account.value("registration").toObject();
       const QString registrationState = registration.value("state").toString();
-      auto* registrationCell = cell(registrationState == "complete" ? QStringLiteral("Completo")
+      bool siteManual = false;
+      const auto registrationSteps = registration.value("steps").toObject();
+      for (const auto value : registrationSteps) siteManual |= value.toObject().value("status").toString() == "manual";
+      auto* registrationCell = cell(registrationState == "complete" ? (siteManual ? QStringLiteral("Criada · site manual") : QStringLiteral("Completo"))
           : registrationState.isEmpty() ? QStringLiteral("Conta conectada") : QStringLiteral("Cadastro incompleto"));
       registrationCell->setToolTip(registration.value("error").toString(QStringLiteral("Abra os detalhes para conferir as etapas.")));
       _accountsTable->setItem(row, 1, registrationCell);
@@ -6465,15 +6495,15 @@ void MainWindow::showAccountDetails(const QJsonObject& account) {
     account.value("restriction").toObject().value("reason").toString(), QStringLiteral("\nEtapas do cadastro:")};
   const auto registration = account.value("registration").toObject();
   const auto steps = registration.value("steps").toObject();
-  const QStringList keys{"ban_check","save_partial","crowtado_signup","demographics","minute_register","link_minute","validate"};
-  const QStringList names{QStringLiteral("Verificação de restrições"),QStringLiteral("Proteção da credencial"),QStringLiteral("Criação Crowtado"),
-      QStringLiteral("Dados de cadastro"),QStringLiteral("Registro Minute"),QStringLiteral("Vínculo Crowtado / Minute"),QStringLiteral("Validação final")};
+  const QStringList keys{"proxy","ban_check","save_partial","crowtado_signup","demographics","minute_register","link_minute","validate"};
+  const QStringList names{QStringLiteral("Proxy / IP de saída"),QStringLiteral("Verificação de restrições"),QStringLiteral("Proteção da credencial"),QStringLiteral("Criação Crowtado"),
+      QStringLiteral("Confirmações manuais no site"),QStringLiteral("Registro Minute"),QStringLiteral("Vínculo Crowtado / Minute"),QStringLiteral("Validação final")};
   for (int i=0; i<keys.size(); ++i) {
     const auto& key=keys.at(i);
     const auto step=steps.value(key).toObject();
     const QString status=step.value("status").toString();
     lines << QStringLiteral("%1 · %2\n%3").arg(names.at(i),status=="ok"?QStringLiteral("Confirmada")
-      :status=="skip"?QStringLiteral("Já confirmada"):status=="fail"?QStringLiteral("Não concluída"):QStringLiteral("Não executada"),step.value("detail").toString());
+      :status=="skip"?QStringLiteral("Já confirmada"):status=="manual"?QStringLiteral("Pendente no site"):status=="fail"?QStringLiteral("Não concluída"):QStringLiteral("Não executada"),step.value("detail").toString());
   }
   lines << registration.value("error").toString();
   text->setPlainText(lines.join(QStringLiteral("\n")));
@@ -6680,8 +6710,6 @@ void MainWindow::addAccount(bool registerNew) {
   if (email.isEmpty() || password.isEmpty()) {
     return showError(QStringLiteral("Dados incompletos"), QStringLiteral("Informe email e senha."));
   }
-  if (registerNew && (_accountBirthMonth->value() < 1 || _accountBirthYear->value() < 1900 || _accountGender->currentData().toString().isEmpty()))
-    return showError(QStringLiteral("Dados incompletos"), QStringLiteral("Informe mês, ano de nascimento e gênero para registrar a nova conta."));
   _accountConnecting = true;
   setAccountTransferBusy(_accountTransferBusy);
   _accountAdd->setEnabled(false);
@@ -6696,8 +6724,7 @@ void MainWindow::addAccount(bool registerNew) {
   QJsonObject body{{QStringLiteral("email"), email}, {QStringLiteral("password"), password}};
   if (registerNew) {
     body.insert("request_id", QUuid::createUuid().toString(QUuid::WithoutBraces));
-    body.insert("birth_month", _accountBirthMonth->value()); body.insert("birth_year", _accountBirthYear->value());
-    body.insert("gender", _accountGender->currentData().toString());
+    body.insert("proxy_id", _accountProxy->currentData().toString());
     body.insert("use_referral", _accountUseReferral->isChecked());
     _bulkRegisterStarting = true;
   }
@@ -6722,7 +6749,64 @@ void MainWindow::addAccount(bool registerNew) {
   });
 }
 
+void MainWindow::loadRegistrationProxies(bool selectAuto) {
+  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _accountTransferBusy) return;
+  const int revision=++_registrationProxiesRevision, generation=_operationBackendGeneration;
+  _api.get(QStringLiteral("/api/accounts/proxies"), [this,revision,generation,selectAuto](bool ok,const QJsonDocument& doc,const QString& error) {
+    if (!_backendReady || generation!=_operationBackendGeneration || revision!=_registrationProxiesRevision
+        || _bulkRegisterPolling || _bulkRegisterStarting) return;
+    const auto rows=doc.object().value("proxies");
+    _registrationProxiesReady=ok && rows.isArray();
+    if (!_registrationProxiesReady) {
+      _bulkRegisterStatus->setText(QStringLiteral("Não foi possível carregar os proxies. Atualize antes de criar contas. ")+error);
+      setAccountTransferBusy(_accountTransferBusy); return;
+    }
+    for (auto* combo : {_accountProxy,_bulkRegisterProxy}) {
+      const QSignalBlocker block(combo);
+      const auto previous=combo->currentData().toString();
+      const bool initial=combo->count()==1 && combo->currentText().contains(QStringLiteral("Carregando"));
+      combo->clear(); combo->addItem(QStringLiteral("Sem proxy"),QString());
+      if (!rows.toArray().isEmpty()) combo->addItem(QStringLiteral("Automático · alternar por conta"),QStringLiteral("auto"));
+      for (const auto value : rows.toArray()) {
+        const auto row=value.toObject();
+        if (!row.value("id").isString() || !row.value("label").isString()) {
+          _registrationProxiesReady=false; break;
+        }
+        combo->addItem(row.value("label").toString(),row.value("id").toString());
+      }
+      const auto selected=((selectAuto || initial) && !rows.toArray().isEmpty()) ? QStringLiteral("auto") : previous;
+      combo->setCurrentIndex(qMax(0,combo->findData(selected)));
+    }
+    setAccountTransferBusy(_accountTransferBusy); checkBulkRegisterDomain();
+  });
+}
+
+void MainWindow::importRegistrationProxiesFile(const QString& path) {
+  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _accountTransferBusy || _accountConnecting) return;
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly) || file.size()>256*1024) {
+    showError(QStringLiteral("Importação não concluída"),QStringLiteral("Selecione um TXT acessível de até 256 KB.")); return;
+  }
+  const auto bytes=file.readAll();
+  if (!bytes.isValidUtf8()) {
+    showError(QStringLiteral("Importação não concluída"),QStringLiteral("Salve o arquivo TXT em UTF-8.")); return;
+  }
+  ++_registrationProxiesRevision;
+  const int generation=_operationBackendGeneration;
+  setAccountTransferBusy(true);
+  _bulkRegisterStart->setEnabled(false);
+  _api.post(QStringLiteral("/api/accounts/proxies/import"),{{"text",QString::fromUtf8(bytes)}},
+    [this,generation](bool ok,const QJsonDocument& doc,const QString& error) {
+      if (!_backendReady || generation!=_operationBackendGeneration) return;
+      setAccountTransferBusy(false);
+      if (!ok) {loadRegistrationProxies();showError(QStringLiteral("Importação não concluída"),error);return;}
+      setStatus(QStringLiteral("%1 proxies disponíveis. Login e senha armazenados no cofre local.").arg(doc.object().value("total").toInt()));
+      loadRegistrationProxies(true);
+    });
+}
+
 void MainWindow::loadBulkRegisterDomains() {
+  loadRegistrationProxies();
   if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
   const int revision = ++_bulkRegisterDomainsRevision;
   const QString selectedDomain = _bulkRegisterDomain->currentData().toString();
@@ -6776,14 +6860,14 @@ void MainWindow::loadBulkRegisterDomains() {
 }
 
 void MainWindow::checkBulkRegisterDomain() {
-    if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
+    if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _accountTransferBusy || !_registrationProxiesReady) return;
     const int revision = ++_bulkRegisterPreflightRevision;
     const QString domain = _bulkRegisterDomain->currentData().toString();
     _bulkRegisterStart->setEnabled(false);
     if (domain.isEmpty()) return;
     _bulkRegisterStatus->setText(QStringLiteral("Validando dependências (Hostinger, Chrome, APIs)…"));
     _api.get(QStringLiteral("/api/accounts/bulk-register/preflight?domain=")
-                 + QString::fromLatin1(QUrl::toPercentEncoding(domain)),
+                 + QString::fromLatin1(QUrl::toPercentEncoding(domain)) + QStringLiteral("&proxy_id=") + encoded(_bulkRegisterProxy->currentData().toString()),
              [this, revision](bool ok, const QJsonDocument& doc, const QString& error) {
       if (revision != _bulkRegisterPreflightRevision || _bulkRegisterPolling || _bulkRegisterStarting) return;
       if (!ok) {
@@ -6809,9 +6893,11 @@ void MainWindow::checkBulkRegisterDomain() {
                         .arg(checkNames.at(i), check.value(QStringLiteral("detail")).toString());
         }
       }
-      if (ready) {
+      if (checks.contains("proxy") && !checks.value("proxy").toObject().value("ok").toBool())
+        issues.prepend(QStringLiteral("Proxy: ") + checks.value("proxy").toObject().value("detail").toString());
+      if (ready && _registrationProxiesReady && !_accountTransferBusy) {
         _bulkRegisterStatus->setText(QStringLiteral(
-            "Todas as dependências OK. Pronto para criar contas."));
+            "Pronto para criar Crowtado + Minute. Depois, conclua as etapas manuais no site Crowtado."));
         _bulkRegisterStart->setEnabled(true);
       } else {
         _bulkRegisterStatus->setText(
@@ -6841,7 +6927,7 @@ void MainWindow::startBulkRegister() {
   _bulkRegisterStatus->setText(QStringLiteral("Iniciando criação de %1 contas…").arg(count));
   const int generation = _operationBackendGeneration;
   _api.post(QStringLiteral("/api/accounts/bulk-register"),
-            {{QStringLiteral("count"), count}, {QStringLiteral("domain"), domain},
+            {{QStringLiteral("proxy_id"), _bulkRegisterProxy->currentData().toString()}, {QStringLiteral("count"), count}, {QStringLiteral("domain"), domain},
              {QStringLiteral("use_referral"), _bulkRegisterUseReferral->isChecked()},
              {QStringLiteral("request_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}},
             [this,generation](bool ok, const QJsonDocument& doc, const QString& error) {
@@ -6987,13 +7073,13 @@ void MainWindow::pollBulkRegister() {
       QStringList stepLines;
       const auto steps = item.value(QStringLiteral("steps")).toObject();
       const QStringList stepKeys = {
-          QStringLiteral("ban_check"), QStringLiteral("save_partial"),
+          QStringLiteral("proxy"), QStringLiteral("ban_check"), QStringLiteral("save_partial"),
           QStringLiteral("crowtado_signup"), QStringLiteral("demographics"),
           QStringLiteral("minute_register"), QStringLiteral("link_minute"),
           QStringLiteral("validate"),
       };
       const QStringList stepNames = {
-          QStringLiteral("Verificação"), QStringLiteral("Credenciais"),
+          QStringLiteral("Proxy"), QStringLiteral("Verificação"), QStringLiteral("Credenciais"),
           QStringLiteral("Crowtado"), QStringLiteral("Demografia"),
           QStringLiteral("Minute"), QStringLiteral("Vínculo"),
           QStringLiteral("Validação"),
@@ -7019,7 +7105,7 @@ void MainWindow::pollBulkRegister() {
       if (removed) {
         outcome = QStringLiteral("Removida deste QMoney");
       } else if (item.value("created").toBool() && errorText.isEmpty()) {
-        outcome = QStringLiteral("✓ completa");
+        outcome = QStringLiteral("✓ criada · site manual");
       } else {
         // Descobrir em qual etapa falhou
         QString failedStep;
@@ -7074,8 +7160,8 @@ void MainWindow::pollBulkRegister() {
                                      + root.value(QStringLiteral("error")).toString());
       } else {
         _bulkRegisterStatus->setText(
-            (root.value("stopped").toBool() ? QStringLiteral("Lote parado: %1 completa(s), %2 pendência(s), %3 planejada(s).")
-                                            : QStringLiteral("Concluído: %1 completa(s), %2 pendência(s) de %3."))
+            (root.value("stopped").toBool() ? QStringLiteral("Lote parado: %1 criada(s), %2 pendência(s), %3 planejada(s).")
+                                            : QStringLiteral("Concluído: %1 criada(s), %2 pendência(s) de %3."))
                 .arg(created).arg(failed).arg(total));
       }
       loadAccounts();
