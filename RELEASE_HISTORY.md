@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **104 releases públicas**, consultado em **05/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **105 releases públicas**, consultado em **05/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.34](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.34). Destaques solicitados: [v1.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v1.0.73) e [v2.0.2](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.2).
+Versão atual: [v2.0.35](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.35). Destaques solicitados: [v1.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v1.0.73) e [v2.0.2](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.2).
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.35](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.35) | 05/10/2026 | Corrige categorias Ego4D zeradas quando a API Minute retorna nomes traduzidos: a consulta solicita nomes canônicos para seleção e preserva a apresentação em português. | [Desde v2.0.34](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.34...v2.0.35) |
 | [v2.0.34](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.34) | 05/10/2026 | Criador com importação de proxies protegidos e fluxo reduzido Crowtado + Minute; banimentos e consultas inconclusivas não contam como sucesso. Código de e-mail automático, etapas do site manuais e nova indicação. Inclui as revisões de Carteira, Operação e Contas. | [Desde v2.0.32](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.32...v2.0.34) |
 | [v2.0.32](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.32) | 05/10/2026 01:25 | Corrige bloqueios de teste e publicação, mantém o catálogo portátil offline e verifica o pacote Windows antes de publicar. | [Desde v2.0.31](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.31...v2.0.32) |
 | [v2.0.31](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.31) | 05/10/2026 | Campanha Ego4D: envelope Minute 1.29 (IMU no elapsedRealtime, gap 25 ms, imuDiagnostics do resample, SM-S901E), sem gate artificial de delivery; restaura expansao do cache do Acelerador (best-of v1.0.73/v2.0.2). | [Desde v2.0.30](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.30...v2.0.31) |

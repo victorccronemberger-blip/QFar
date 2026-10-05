@@ -50,7 +50,11 @@ def minute_lang_code() -> str:
     return primary if primary in ("pt", "es", "en") else ""
 
 
-def _tasks_lang_query() -> str:
+def _tasks_lang_query(*, canonical: bool = False) -> str:
+    # Selection rules and the portable Ego4D index use canonical English task
+    # names. A translated name must never become a different activity key.
+    if canonical:
+        return "?langCode=en"
     code = minute_lang_code()
     if not code or code == "en":
         return ""
@@ -1279,8 +1283,8 @@ class Session:
         return (self.me() or {}).get("organizations") or []
 
     def all_tasks(self, org_key: str) -> list[dict[str, Any]]:
-        """Tasks de uma org, sempre como lista (normaliza list/dict)."""
-        query = _tasks_lang_query()
+        """Tasks com nomes canônicos para seleção; a interface traduz os rótulos."""
+        query = _tasks_lang_query(canonical=True)
         body = self._catalog_json(f"/api/v1/orgs/{org_key}/tasks{query}")
         return validate_task_catalog(_as_list(body))
 
