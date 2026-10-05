@@ -1,5 +1,8 @@
 # Compatibilidade configurada com Minute 1.28.0
 
+> **Supersedido:** defaults atuais são Minute **1.29.0 / 1004038** (Galaxy S22).
+> Ver `VALIDACAO_MINUTE_1_29_0.md`. Este arquivo permanece como histórico 1.28.
+
 Atualizados os defaults X-App-Version=1.28.0 e versionCode=1004033.
 Valores de ambiente podem substituí-los. Isso não certifica o formato de upload,
 telemetria, sidecar ou equivalência do cliente Windows com o aplicativo Android.

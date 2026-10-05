@@ -4,9 +4,6 @@ Aplicativo nativo para Windows, construído com Qt 6 e
 [Qlementine](https://github.com/oclero/qlementine). Não existe interface web:
 o serviço HTTP interno atende exclusivamente ao aplicativo desktop.
 
-Consulte o [histórico completo de releases](RELEASE_HISTORY.md) para ver as
-versões publicadas, seus arquivos e as mudanças entre uma versão e a anterior.
-
 ## Para o usuário
 
 Em **Solicitar saque** ou **Sacar tudo**, escolha **Wise**, informe o nome legal e
@@ -149,9 +146,10 @@ Cada Release precisa conter exatamente estes três arquivos:
 - `QMoney-windows-x64.zip.sig` (assinatura RSA-3072)
 
 O workflow `Build e verificar QMoney` gera e testa os três arquivos ao enviar
-uma tag `v*` ao GitHub. Baixe o artefato `QMoney-windows-x64` da execução
-concluída, confira o checksum e a assinatura e anexe os três arquivos à Release
-antes de publicá-la. Configure o secret `QMONEY_UPDATE_PRIVATE_KEY` com a chave
+uma tag `v*` ao GitHub, anexa os arquivos a um rascunho e publica a Release
+somente depois de concluir todas as etapas. As notas vêm de
+`RELEASE_NOTES_<versão>.md`. Execuções manuais geram apenas o artefato
+`QMoney-windows-x64`. Configure o secret `QMONEY_UPDATE_PRIVATE_KEY` com a chave
 privada correspondente à chave pública embutida no aplicativo. A versão vem
 da tag, por exemplo `v1.1.0`.
 

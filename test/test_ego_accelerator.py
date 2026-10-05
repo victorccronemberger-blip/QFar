@@ -329,10 +329,25 @@ class EgoBudgetTests(unittest.TestCase):
     def test_cache_only_can_use_ready_scenario_when_preparation_is_disabled(self):
         clip = {"clip_uid": "g", "dur_s": 90}
         with patch.object(ego_accelerator, "configured_budget_gb", return_value=0), \
+             patch.object(ego_accelerator, "catalog_installed", return_value=True), \
              patch.object(ego_accelerator, "scenario_buckets", return_value={"Gardening": [clip]}), \
              patch.object(campaign, "ego_clip_cache_state", return_value="ready"):
             self.assertEqual(ego_accelerator.ready_scenario_clips(
                 "Gardening", allow_disabled=True), [clip])
+
+    def test_ready_cache_does_not_download_missing_or_partial_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for partial in (False, True):
+                with self.subTest(partial=partial):
+                    if partial:
+                        (root / "ego4d.json").write_text("{}", encoding="utf-8")
+                    with patch.object(ego_accelerator, "data_dir", return_value=root), \
+                         patch.object(ego_accelerator, "_scenario_cache", None), \
+                         patch.object(ego_accelerator.ego4d, "list_clips") as catalog:
+                        self.assertEqual(ego_accelerator.ready_scenario_clips(
+                            "Gardening", allow_disabled=True), [])
+                        catalog.assert_not_called()
 
 
 class NarrationEvidenceTests(unittest.TestCase):

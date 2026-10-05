@@ -146,7 +146,7 @@ class IdentityConsistencyTests(unittest.TestCase):
         self.assertEqual(
             self.profile.sidecar_platform_meta()["version"], 34)
         self.assertEqual(
-            self.profile.sidecar_platform_meta()["type"], "android")
+            self.profile.sidecar_platform_meta()["os"], "android")
 
     def test_sidecar_timebase_uses_profile_uptime_and_app_version(self) -> None:
         recorded_at = "2026-07-27T20:42:54.562Z"
@@ -166,7 +166,7 @@ class IdentityConsistencyTests(unittest.TestCase):
         self.assertEqual(meta["createdAt"], recorded_at)
         self.assertEqual(meta["device"]["model"], "SM-S918B")
         self.assertEqual(meta["device"]["systemVersion"], "14")
-        self.assertEqual(meta["platform"]["type"], "android")
+        self.assertEqual(meta["platform"]["os"], "android")
         self.assertEqual(meta["platform"]["version"], 34)
         self.assertEqual(
             meta["timebase"]["clockDomain"], "android_elapsedRealtimeNanos")
@@ -614,7 +614,7 @@ class SensorFidelityTests(unittest.TestCase):
             uptime_ns=88_000_000_000_000,
             device_meta={"model": "SM-S918B", "systemName": "Android",
                          "systemVersion": "14"},
-            platform_meta={"type": "android", "version": 34},
+            platform_meta={"os": "android", "version": 34},
             imu_seed="android.ssaid:0123456789abcdef",
         )
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -640,7 +640,7 @@ class ValidatorTests(unittest.TestCase):
             uptime_ns=88_000_000_000_000,
             device_meta={"model": "SM-S918B", "systemName": "Android",
                          "systemVersion": "14"},
-            platform_meta={"type": "android", "version": 34},
+            platform_meta={"os": "android", "version": 34},
             imu_seed="android.ssaid:aaaaaaaaaaaaaaaa",
         )
 
@@ -702,7 +702,7 @@ class PropertyAuditTests(unittest.TestCase):
                         uptime_ns=88_000_000_000_000,
                         device_meta={"model": model, "systemName": "Android",
                                      "systemVersion": "14"},
-                        platform_meta={"type": "android", "version": 34},
+                        platform_meta={"os": "android", "version": 34},
                         imu_seed=seed,
                     )
                     summary = summarize(validate_sidecar_zip(
@@ -733,7 +733,7 @@ class PropertyAuditTests(unittest.TestCase):
                 uptime_ns=88_000_000_000_000,
                 device_meta={"model": "SM-S918B", "systemName": "Android",
                              "systemVersion": "14"},
-                platform_meta={"type": "android", "version": 34},
+                platform_meta={"os": "android", "version": 34},
                 imu_csv=part, frames_csv=sidecar.build_frames_csv(
                     dur_ms, fps=30.0, gop=30, offset_ns=88_000_000_000_000),
                 imu_sample_count=n,
@@ -762,7 +762,7 @@ class ValidatorRegressionTests(unittest.TestCase):
             uptime_ns=88_000_000_000_000,
             device_meta={"model": "SM-S918B", "systemName": "Android",
                          "systemVersion": "14"},
-            platform_meta={"type": "android", "version": 34},
+            platform_meta={"os": "android", "version": 34},
             imu_seed="android.ssaid:aaaaaaaaaaaaaaaa",
         )
 

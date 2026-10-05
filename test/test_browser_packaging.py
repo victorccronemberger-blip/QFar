@@ -29,6 +29,7 @@ Get-QMoneyBrowserParts -ManifestPath $env:QMONEY_TEST_MANIFEST -BrowserSource $e
 '''
             def run():
                 return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                       "-ExecutionPolicy", "Bypass",
                                        "-Command", command], env=env, capture_output=True,
                                       text=True, timeout=30)
 

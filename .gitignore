@@ -24,6 +24,7 @@ research/reverse_engineering/captured_requests/*.json
 
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.egg-info/
 .venv/
@@ -51,6 +52,7 @@ tmp/
 research/tools/
 vendor/
 release/
+GIT_RELEASE_*.txt
 packaging/*.spec
 
 # Utilitários e documentação herdados do projeto operacional local

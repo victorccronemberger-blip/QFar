@@ -6,8 +6,9 @@ Modela a anotação no padrão EPIC-KITCHENS (tríade Verbo+Substantivo) e produ
 "manifesto de enquadramento" — o registro que liga um clipe local à categoria do
 Minute, com as métricas de qualidade que o app avalia (Clarity, Variety, Task).
 
-As categorias reais do Minute vêm da API (`Session.categories()`); aqui há um
-casador heurístico por texto para sugerir o encaixe, que deve ser conferido.
+As categorias reais do Minute 1.29 vêm embutidas em cada task
+(`categories[{slug,label}]` via `Session.all_tasks` / `categories_from_tasks`);
+aqui há um casador heurístico por texto para sugerir o encaixe.
 """
 from __future__ import annotations
 
@@ -109,7 +110,7 @@ def match_category(
 
     Heurística por sobreposição de tokens entre verbo/substantivo/narração e o
     nome/descrição de cada categoria. Devolve (categoria, confiança 0..1).
-    `categories` é a lista retornada por `Session.categories()`.
+    `categories` deve ser a lista agregada das tasks (`categories_from_tasks`).
     """
     query = _norm(f"{annotation.verb} {annotation.noun} {annotation.narration}")
     if not query:

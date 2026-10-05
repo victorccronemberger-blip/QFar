@@ -281,8 +281,10 @@ class CampaignSelectionTests(unittest.TestCase):
                     dataset_provider="ego4d", content_mode=mode)[0]["clip_count"]
                 for mode in ("dataset", "cache", "both")
             }
-        self.assertEqual(counts, {"dataset": 2, "cache": 1, "both": 2})
-        ready_scenario.assert_not_called()
+        self.assertEqual(counts, {"dataset": 2, "cache": 2, "both": 3})
+        self.assertEqual(ready_scenario.call_count, 4)
+        self.assertTrue(all(call.kwargs["allow_disabled"]
+                            for call in ready_scenario.call_args_list))
 
     def test_explicit_scenario_only_clip_does_not_bypass_action_proof(self):
         self.cfg.tasks = [TaskSpec("dog", "Walking the dog / pet", 180, 780,

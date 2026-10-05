@@ -52,9 +52,9 @@ def _offline_only(monkeypatch):
 def metadata():
     return {
         "id": LOG_ID, "logId": LOG_ID, "createdAt": "2026-10-03T00:00:00.000Z",
-        "durationMs": DURATION_MS, "appVersion": "1.28.0",
+        "durationMs": DURATION_MS, "appVersion": "1.29.0",
         "platform": {"os": "android", "version": 34},
-        "device": {"model": "fixture-model", "systemName": "Android", "systemVersion": "14"},
+        "device": {"model": "SM-S901E", "systemName": "Android", "systemVersion": "14"},
         "video": {"path": "/fixture/native-session_0.mp4", "width": 1440, "height": 1080, "rotationDeg": 90},
         "session": {"id": "native-session"},
         "chunk": {"index": 0, "startTimeMs": 1790985600000, "endTimeMs": 1790985601000},
@@ -218,7 +218,8 @@ def test_host_and_frame_intervals_must_overlap(metadata):
 def test_unknown_clock_is_explicitly_unconfirmed(metadata):
     metadata["timebase"]["clockDomain"] = "unrecognized_clock"
     result = checks(metadata)
-    assert result["timebase.clockDomain"].status == "warn"
+    # 1.29 writer only emits android_elapsedRealtimeNanos or trinet_camera_monotonic.
+    assert result["timebase.clockDomain"].status == "fail"
     assert result["xcheck.frames_timebase"].status == "warn"
 
 

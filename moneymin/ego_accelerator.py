@@ -240,6 +240,9 @@ def ready_scenario_clips(
     """
     if require_cached and not allow_disabled and configured_budget_gb() < 1:
         return []
+    # Consultar cache pronto não pode instalar o catálogo nem exigir AWS.
+    if require_cached and _scenario_cache is None and not catalog_installed():
+        return []
     canonical = task_matching.canonical_task_name(task)
     work = Path(work_dir or data_dir())
     selected: list[dict[str, Any]] = []

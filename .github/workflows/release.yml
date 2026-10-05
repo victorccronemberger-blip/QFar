@@ -187,3 +187,25 @@ jobs:
             dist/QMoney-windows-x64.zip.sha256
             dist/QMoney-windows-x64.zip.sig
             dist/packaged-service-report.json
+
+      - name: Publicar release com pacote verificado
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          QMONEY_TAG: ${{ github.ref_name }}
+        run: |
+          $notes = "RELEASE_NOTES_$($env:QMONEY_VERSION).md"
+          if (-not (Test-Path -LiteralPath $notes)) { throw "Notas da release ausentes: $notes" }
+          $draft = gh release view $env:QMONEY_TAG --json isDraft --jq '.isDraft' 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:QMONEY_TAG --verify-tag --draft --title "QMoney $env:QMONEY_VERSION" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw "Criação do rascunho da release falhou." }
+          } elseif ($draft -ne 'true') {
+            throw "A release já está publicada; seus arquivos foram preservados."
+          }
+          gh release upload $env:QMONEY_TAG dist/QMoney-windows-x64.zip dist/QMoney-windows-x64.zip.sha256 dist/QMoney-windows-x64.zip.sig --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Envio dos arquivos da release falhou; rascunho preservado." }
+          gh release edit $env:QMONEY_TAG --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "Publicação da release falhou; rascunho preservado." }

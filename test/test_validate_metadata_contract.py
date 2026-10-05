@@ -23,9 +23,9 @@ IMU = "t,ax,ay,az,wx,wy,wz\n1000000000,0,0,9.81,0,0,0\n2000000000,0,0,9.81,0,0,0
 def native_fixture():
     return {
         "id": LOG_ID, "logId": LOG_ID, "createdAt": "2026-10-03T00:00:00.000Z",
-        "durationMs": 1000, "appVersion": "1.28.0",
+        "durationMs": 1000, "appVersion": "1.29.0",
         "platform": {"os": "android", "version": 34},
-        "device": {"model": "fixture-model", "systemName": "Android", "systemVersion": "14"},
+        "device": {"model": "SM-S901E", "systemName": "Android", "systemVersion": "14"},
         "video": {"path": "/fixture/recording.mp4", "width": 1280, "height": 720, "rotationDeg": 90},
         "session": {"id": "fixture-session"},
         "chunk": {"index": 0, "startTimeMs": 1790985600000, "endTimeMs": 1790985601000},
