@@ -4,6 +4,9 @@ Aplicativo nativo para Windows, construído com Qt 6 e
 [Qlementine](https://github.com/oclero/qlementine). Não existe interface web:
 o serviço HTTP interno atende exclusivamente ao aplicativo desktop.
 
+Consulte o [histórico completo de releases](RELEASE_HISTORY.md) para ver as
+versões publicadas, seus arquivos e as mudanças entre uma versão e a anterior.
+
 ## Para o usuário
 
 Em **Solicitar saque** ou **Sacar tudo**, escolha **Wise**, informe o nome legal e
