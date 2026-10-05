@@ -7,13 +7,17 @@ from typing import Callable
 
 
 class CatalogLoader:
-    def __init__(self, *, ttl_s: float = 30, max_pending: int = 2, timeout_s: float = 300):
+    def __init__(self, *, ttl_s: float = 30, max_pending: int = 2, timeout_s: float = 300,
+                 timeout_message: str | None = None):
         self._lock = threading.Lock()
         self._worker = threading.Semaphore(1)
         self._jobs: dict[tuple, dict] = {}
         self._ttl_s = ttl_s
         self._max_pending = max_pending
         self._timeout_s = timeout_s
+        self._timeout_message = timeout_message or (
+            "A preparação das categorias excedeu o tempo esperado. "
+            "O cálculo continua no serviço. Tente recarregar em instantes.")
 
     def get(self, key: tuple, work: Callable, *, scope: str | None = None, refresh: bool = False) -> tuple[dict, int]:
         with self._lock:
@@ -50,8 +54,7 @@ class CatalogLoader:
                 return row["result"]
             if now - row["started"] >= self._timeout_s:
                 # Keep the worker registered: a retry must not spawn duplicates.
-                return {"error": "A preparação das categorias excedeu o tempo esperado. "
-                        "O cálculo continua no serviço. Tente recarregar em instantes."}, 504
+                return {"error": self._timeout_message}, 504
             return {"loading": True, "state": row["state"], "message": row["message"],
                     "elapsed_s": int(now - row["started"])}, 202
 

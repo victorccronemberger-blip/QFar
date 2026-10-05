@@ -32,6 +32,11 @@ campanhas e preferências ficam em `%LOCALAPPDATA%\QMoney` e não são apagados
 por atualizações. Quando uma nova Release estiver disponível, o próprio app
 oferecerá a instalação, validará o SHA-256 e abrirá novamente após concluir.
 
+Use **Corrigir instalação**, no topo da tela ou em **Integrações**, para baixar
+novamente o pacote oficial assinado e restaurar os componentes. O aplicativo
+preserva contas, credenciais, campanhas e configurações e aguarda o encerramento
+seguro das operações antes de instalar. O reparo pode reinstalar a mesma versão.
+
 Na primeira abertura, use a página **Integrações** para configurar e testar:
 
 - credenciais AWS temporárias recebidas após a aprovação da licença Ego4D;
@@ -77,6 +82,10 @@ A prévia confirma os e-mails escolhidos antes de iniciar. Ao trocar contas ou
 origem, a seleção manual de categorias compatíveis é preservada. A busca por
 e-mail facilita listas longas, e o rascunho da campanha (contas, categorias e
 parâmetros) é salvo localmente para continuar após fechar o aplicativo.
+Na verificação, a tela acompanha o progresso em segundo plano, mesmo quando
+as consultas das contas demoram. Nenhum envio começa antes da revisão. Falhas
+de comunicação com o serviço local mostram uma orientação em português;
+o reparo dos componentes não substitui a reconexão de uma conta quando necessária.
 
 Também é possível escolher a quantidade de contas pelos saldos **aprovados** ou
 **pendentes**, em ordem crescente ou decrescente. A seleção usa somente contas

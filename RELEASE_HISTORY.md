@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **108 releases públicas**, consultado em **05/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **109 releases públicas**, consultado em **05/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.41](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.41). Destaques: campanha com Ego4D, Nymeria ou ambos.
+Versão atual: [v2.0.42](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.42). Destaques: verificação de campanha em segundo plano e correção da instalação.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.42](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.42) | 05/10/2026 | A verificação da campanha acompanha o progresso sem travar a tela. Corrigir instalação restaura o pacote oficial e preserva contas, credenciais e campanhas. | [Desde v2.0.41](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.41...v2.0.42) |
 | [v2.0.41](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.41) | 05/10/2026 | A origem da campanha oferece Ego4D, Nymeria e Ambos. Ambos usa os dois juntos e não inclui HoloAssist. | [Desde v2.0.40](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.40...v2.0.41) |
 | [v2.0.40](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.40) | 05/10/2026 | Provedor NymeriaPlus (Aria VRS→Minute 1.29) + Ego4D endurecido (forge/zip/mirrors/carve). Sem cap artificial no Nymeria; envelope SM-S901E. | [Desde v2.0.39](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.39...v2.0.40) |
 | [v2.0.39](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.39) | 05/10/2026 | Corrige a leitura concorrente de recuperação com proteção curta dos registros de envio e acrescenta diagnóstico específico para HTTP 409, acesso direto à recuperação, nova tentativa e cópia do diagnóstico sem credenciais. Registros ilegíveis continuam bloqueando novos envios para evitar duplicação. Inclui sincronização dos testes assíncronos da biblioteca no Windows. | [Desde v2.0.36](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.36...v2.0.39) |

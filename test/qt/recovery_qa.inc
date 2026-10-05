@@ -16,7 +16,7 @@
         socket->setProperty("answered", true);
         QJsonObject result;
         QByteArray status = "200 OK";
-        if (input.startsWith("POST /api/campaigns/preflight ")) {
+        if (input.startsWith("POST /api/campaigns/preflight?async=1&request_id=")) {
           ++state->preflights;
           result = {{"ok", false}, {"preflight_id", QJsonValue::Null},
                     {"blockers", QJsonArray{"Registro ilegível preservado."}}, {"recovery_error", detail}};

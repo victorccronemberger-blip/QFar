@@ -54,6 +54,8 @@ void ApiClient::request(const QByteArray& method, const QString& path,
 
   if (method == "POST" && path == QStringLiteral("/api/campaigns/preflight"))
     req.setTransferTimeout(180000);
+  else if (method == "POST" && path.startsWith(QStringLiteral("/api/campaigns/preflight?")))
+    req.setTransferTimeout(15000);
   else if (method == "POST" && (path.startsWith(QStringLiteral("/api/campaigns/"))
                                || path == QStringLiteral("/api/sent/reset")))
     req.setTransferTimeout(60000);
@@ -74,9 +76,17 @@ void ApiClient::request(const QByteArray& method, const QString& path,
     QString error;
     if (!ok) {
       if (doc.isObject()) error = doc.object().value(QStringLiteral("error")).toString();
-      if (error.isEmpty()) error = reply->errorString();
+      const bool timedOut = status == 0 && (reply->error() == QNetworkReply::TimeoutError
+          || reply->error() == QNetworkReply::OperationCanceledError);
+      if (error.isEmpty()) error = timedOut
+          ? QStringLiteral("O serviço local não respondeu a tempo. Confira se o QMoney está aberto e tente novamente. "
+                           "Se o problema persistir, use Corrigir instalação.")
+          : status == 0 ? QStringLiteral("Não foi possível comunicar com o serviço local: %1. "
+                                        "Use Corrigir instalação se o problema persistir.").arg(reply->errorString())
+                        : reply->errorString();
       if (status) error = QStringLiteral("%1 (HTTP %2)").arg(error).arg(status);
-      else doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
+      else doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"},
+                                           {"transport_error", timedOut ? "timeout" : "connection"}});
     } else if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
       error = QStringLiteral("O serviço retornou uma resposta JSON inválida ou incompleta.");
       if (method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration))

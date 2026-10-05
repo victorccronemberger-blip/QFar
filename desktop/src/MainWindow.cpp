@@ -414,7 +414,7 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
             _updateButton->setText(QStringLiteral("↻  Verificar atualização"));
             if (_repairInstall) {
               _repairInstall->setEnabled(true);
-              _repairInstall->setText(QStringLiteral("Reparar instalação"));
+              _repairInstall->setText(QStringLiteral("Corrigir instalação"));
             }
             if (interactive) QMessageBox::warning(
                 this, _updates.isRepair() ? QStringLiteral("Reparo da instalação")
@@ -426,7 +426,7 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
             if (!_updates.isBusy()) _updateButton->setEnabled(true);
             if (_repairInstall && !_updates.isBusy()) {
               _repairInstall->setEnabled(true);
-              _repairInstall->setText(QStringLiteral("Reparar instalação"));
+              _repairInstall->setText(QStringLiteral("Corrigir instalação"));
             }
             if (!available) {
               _updateButton->setText(QStringLiteral("✓  QMoney %1").arg(QCoreApplication::applicationVersion()));
@@ -466,7 +466,7 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
                   QStringLiteral("✓  QMoney %1").arg(QCoreApplication::applicationVersion()));
               if (_repairInstall) {
                 _repairInstall->setEnabled(true);
-                _repairInstall->setText(QStringLiteral("Reparar instalação"));
+                _repairInstall->setText(QStringLiteral("Corrigir instalação"));
               }
             }
           });
@@ -873,6 +873,16 @@ QWidget* MainWindow::pageShell(const QString& title, const QString& subtitle, QW
     headerActionsLayout->setContentsMargins(0, 0, 0, 0);
     headerActionsLayout->setSpacing(18);
     headerActionsLayout->addWidget(search, 1);
+    auto* repair = new QPushButton(QStringLiteral("Corrigir instalação"));
+    repair->setObjectName(QStringLiteral("repairInstallation"));
+    repair->setToolTip(QStringLiteral("Restaura os componentes oficiais, preservando contas, credenciais e campanhas."));
+    connect(repair, &QPushButton::clicked, this, [this] {
+      if (_repairInstall && !_updates.isBusy()) _repairInstall->click();
+    });
+    connect(&_updates, &UpdateManager::statusChanged, repair, [this, repair] {
+      repair->setEnabled(!_updates.isBusy());
+    });
+    headerActionsLayout->addWidget(repair);
     auto* recovery = new QToolButton;
     recovery->setIcon(QIcon(QStringLiteral(":/qmoney/icons/bell.svg")));
     recovery->setIconSize(QSize(26, 26));
@@ -1645,7 +1655,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
   connect(readinessButton, &QPushButton::clicked, this,
           [this] { _navigation->setCurrentRow(1); });
   localLayout->addWidget(readinessButton);
-  _repairInstall = new QPushButton(QStringLiteral("Reparar instalação"));
+  _repairInstall = new QPushButton(QStringLiteral("Corrigir instalação"));
   _repairInstall->setToolTip(QStringLiteral(
       "Baixa novamente o pacote oficial assinado sem apagar contas ou configurações."));
   connect(_repairInstall, &QPushButton::clicked, this, [this] {
@@ -4477,7 +4487,7 @@ void MainWindow::loadIntegrations() {
         : QStringLiteral("○ Será preparado automaticamente quando HoloAssist for usado."));
     _runtimeIntegrationStatus->setText(runtimeReady
         ? QStringLiteral("✓ Motor, FFmpeg, FFprobe e navegador acompanham o aplicativo.")
-        : QStringLiteral("! Componente ausente; use Reparar instalação nesta tela."));
+        : QStringLiteral("! Componente ausente; use Corrigir instalação nesta tela."));
     setStatus(QStringLiteral("Estado das integrações atualizado."));
   });
 }
@@ -5062,14 +5072,34 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
                        QStringLiteral("Validando contas e clipes. Nenhum envio iniciado."), QStringLiteral("starting"), true);
   _campaignStart->setEnabled(false);
   _campaignStart->setText(QStringLiteral("Verificando campanha…"));
-  _api.post(QStringLiteral("/api/campaigns/preflight"), body,
-            [this, body, selectedAccountNames](bool ok, const QJsonDocument& doc, const QString& error) {
+  const QString path = QStringLiteral("/api/campaigns/preflight?async=1&request_id=%1")
+      .arg(QUuid::createUuid().toString(QUuid::Id128));
+  pollCampaignPreflight(body, selectedAccountNames, path);
+}
+
+void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAccountNames, const QString& path) {
+  _api.post(path, body,
+            [this, body, selectedAccountNames, path](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (!_closing && !_campaignClosePending && ok && doc.object().value(QStringLiteral("loading")) == QJsonValue(true)) {
+      QString message = doc.object().value(QStringLiteral("message")).toString(QStringLiteral("Verificando campanha…"));
+      const int elapsed = doc.object().value(QStringLiteral("elapsed_s")).toInt();
+      if (elapsed > 0) message += QStringLiteral(" (%1 s)").arg(elapsed);
+      setCampaignIndicator(QStringLiteral("Verificando campanha"), message, QStringLiteral("starting"), true);
+      QTimer::singleShot(1200, this, [this, body, selectedAccountNames, path] {
+        if (_closing || _campaignClosePending) {
+          _campaignPreflightPending = false;
+          return;
+        }
+        pollCampaignPreflight(body, selectedAccountNames, path);
+      });
+      return;
+    }
     const auto finishVerification = qScopeGuard([this] {
       _campaignPreflightPending = false;
       if (!_campaignStartPending) _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       updateCampaignActions();
     });
-    if (_closing) return;
+    if (_closing || _campaignClosePending) return;
     if (!ok) {
       _campaignStart->setText(QStringLiteral("Iniciar campanha"));
       updateCampaignActions();

@@ -60,6 +60,13 @@ int main(int argc, char** argv) {
   bool timedOut = false;
   bool postTimedOut = false;
   bool operationTimedOut = false;
+  bool preflightTimedOut = false;
+  api.post(QStringLiteral("/api/campaigns/preflight?async=1&request_id=fixture"), {},
+           [&](bool ok, const QJsonDocument& doc, const QString& error) {
+    preflightTimedOut = !ok && elapsed.elapsed() >= 12000 && elapsed.elapsed() < 25000
+        && error.contains(QStringLiteral("não respondeu a tempo")) && !error.contains("Operation canceled")
+        && doc.object().value("transport_error").toString() == "timeout";
+  });
   api.get(QStringLiteral("/api/campaigns/current"),
           [&](bool ok, const QJsonDocument&, const QString& error) {
     operationTimedOut = !ok && !error.isEmpty() && elapsed.elapsed() >= 8000 && elapsed.elapsed() < 20000;
@@ -77,7 +84,7 @@ int main(int argc, char** argv) {
   });
   QTimer::singleShot(70000, &loop, &QEventLoop::quit);
   loop.exec();
-  if (!timedOut || !postTimedOut || !operationTimedOut) {
+  if (!timedOut || !postTimedOut || !operationTimedOut || !preflightTimedOut) {
     std::cerr << "Stalled GET did not time out\n";
     return 1;
   }

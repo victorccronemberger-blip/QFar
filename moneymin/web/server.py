@@ -2389,6 +2389,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config["QMONEY_LOCAL_API_AUTHENTICATED"] = bool(local_api_token)
     task_catalog = CatalogLoader()
+    campaign_verifications = CatalogLoader(ttl_s=30, max_pending=1, timeout_s=900,
+        timeout_message="A verificação demorou mais que o esperado. Nenhum envio foi iniciado. "
+                        "Confira a conexão e tente verificar novamente em instantes.")
     accelerator_catalog = CatalogLoader()
     recovery_catalog = CatalogLoader(ttl_s=2)
     original_library_index = CatalogLoader(max_pending=1, timeout_s=180)
@@ -4264,6 +4267,32 @@ def create_app(*, for_testing: bool = False) -> Flask:
             _validate_campaign_request(body)
         except (ValueError, TypeError, OverflowError) as exc:
             return jsonify({"error": f"parâmetros inválidos: {exc}"}), 400
+        if request.args.get("async") == "1":
+            request_id = request.args.get("request_id", "")
+            if not re.fullmatch(r"[a-f0-9]{32}", request_id):
+                return jsonify({"error": "Identificador de verificação inválido."}), 400
+            body_digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            result, status = campaign_verifications.get(
+                (request_id, body_digest), lambda progress: background_campaign_preflight(body, progress))
+        else:
+            result, status = run_campaign_preflight(body)
+        return jsonify(result), status
+
+    def background_campaign_preflight(body, progress):
+        # Updates and shutdown must also wait for authentication/token writes
+        # performed by the worker after its initiating HTTP request has ended.
+        with _HEAVY_RUNNER_LOCK:
+            if campaign_drain["requested"]:
+                return {"error_code": "campaign_closing", "error": "O aplicativo está encerrando a operação."}, 409
+            campaign_drain["requests"] += 1
+        try:
+            return run_campaign_preflight(body, progress)
+        finally:
+            with _HEAVY_RUNNER_LOCK:
+                campaign_drain["requests"] -= 1
+
+    def run_campaign_preflight(body, progress=lambda message: None):
+        """Same admission checks for legacy callers and background verification."""
         blockers: list[str] = []
         warnings: list[str] = []
         if RUNNER.running:
@@ -4281,7 +4310,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             count = max(1, min(int(body.get("count", 1)), 200))
             target_hours = max(0.0, min(float(body.get("target_hours") or 0), 12.0))
         except (TypeError, ValueError, OverflowError) as exc:
-            return jsonify({"error": f"parâmetros inválidos: {exc}"}), 400
+            return {"error": f"parâmetros inválidos: {exc}"}, 400
 
         emails = [str(e).strip() for e in body.get("accounts", []) if str(e).strip()]
         raw_tasks = body.get("tasks", [])
@@ -4292,7 +4321,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         try:
             known = {account["email"] for account in _list_accounts()}
         except ValueError:
-            return jsonify({"error": "Registro de contas inválido. Restaure os dados antes de continuar."}), 400
+            return {"error": "Registro de contas inválido. Restaure os dados antes de continuar."}, 400
         missing_accounts = [email for email in emails if email not in known]
         accounts: list[AccountSpec] = []
         account_errors: list[str] = []
@@ -4300,6 +4329,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         for email in missing_accounts:
             account_issues.append(account_issue(email, AuthError("sem token salvo")))
         if emails:
+            progress("Conferindo acesso e organização das contas…")
             resolved: list[AccountSpec | None] = [None] * len(emails)
             with ThreadPoolExecutor(max_workers=max(1, min(6, len(emails)))) as pool:
                 futures = {pool.submit(_resolve_org, email): i
@@ -4316,6 +4346,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         unavailable: list[str] = []
         catalog_loaded = False
         if accounts and raw_tasks:
+            progress("Conferindo categorias e conteúdo selecionado…")
             try:
                 catalog = campaign.available_tasks(
                     accounts[0].email, accounts[0].org_key,
@@ -4364,6 +4395,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 return account.email, selected_ids - account_ids
 
             others = accounts[1:]
+            progress("Conferindo categorias nas demais contas…")
             with ThreadPoolExecutor(max_workers=max(1, min(4, len(others)))) as pool:
                 checks = pool.map(_check_account_tasks, others)
                 for email, result in checks:
@@ -4392,6 +4424,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             estimated_sends = max(1, math.ceil(target_hours * 4)) * len(accounts)
         else:
             estimated_sends = len(selected) * count * len(accounts)
+        progress("Conferindo requisitos da instalação e pendências de envio…")
         try:
             ready = readiness.campaign_readiness(provider, content_mode=content_mode)
         except Exception:  # Os outros checks continuam sem exportar dados da exceção.
@@ -4439,6 +4472,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         clip_review = []
         sent_fingerprint = None
         if reusable and body.get("include_clip_plan") is True:
+            progress("Preparando a prévia dos clipes…")
             from .. import campaign_plan
             review_tasks = [TaskSpec(
                 task_id=str(item["id"]), scenario=str(item["scenario"]),
@@ -4487,7 +4521,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                                           "issues": account_issues, "expires": now + 600,
                                           "fingerprint": _preflight_fingerprint(emails)}
 
-        return jsonify({
+        return {
             "ok": not blockers,
             "preflight_id": receipt_id,
             "clip_plan": clip_review,
@@ -4507,7 +4541,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             "account_issues": account_issues,
             "readiness": ready,
             "storage": storage,
-        }), 200
+        }, 200
 
     @app.post("/api/campaigns")
     def start_campaign():

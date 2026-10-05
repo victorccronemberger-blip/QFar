@@ -395,6 +395,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
              patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
              patch.object(campaign.holoassist, "list_clips", return_value=[]), \
+             patch.object(campaign.nymeria, "automatic_candidates", return_value=[]), \
              patch("moneymin.ego_accelerator.configured_budget_gb", return_value=400), \
              patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \
              patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] == "local"), \

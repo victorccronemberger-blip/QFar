@@ -89,6 +89,7 @@ private:
                          const QJsonArray& issues, std::function<void()> continueAction = {});
   void submitCampaign(QJsonObject body);
   void preflightCampaign(QJsonObject body, QStringList selectedAccountNames);
+  void pollCampaignPreflight(QJsonObject body, QStringList selectedAccountNames, const QString& path);
   void chooseOriginalCapture();
   void preflightOriginalCapture(QJsonObject body);
   void submitOriginalCapture(QJsonObject body, QJsonObject reviewedSummary);

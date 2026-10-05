@@ -495,7 +495,7 @@ public:
   static void campaignControlsSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(100); return; }
-    struct Flow { int preflights=0, starts=0, stops=0, pauses=0, resumes=0, phase=0; bool running=false, paused=false; };
+    struct Flow { int preflights=0, starts=0, stops=0, pauses=0, resumes=0, phase=0; bool running=false, paused=false; QByteArray preflightPath; };
     auto flow=std::make_shared<Flow>();
     QObject::connect(server,&QTcpServer::newConnection,server,[server,flow] {
       auto* socket=server->nextPendingConnection();
@@ -508,9 +508,13 @@ public:
         if(match.hasMatch() && input.size()<end+4+match.captured(1).toInt()) return;
         socket->setProperty("answered",true);
         QJsonObject result; int delay=0;
-        if(input.startsWith("POST /api/campaigns/preflight ")) {
+        if(input.startsWith("POST /api/campaigns/preflight?async=1&request_id=")) {
           ++flow->preflights; delay=250;
-          result={{"ok",true},{"preflight_id","fixture"},{"accounts",QJsonObject{{"validated",1}}},
+          const auto path = input.split(' ').at(1);
+          if (flow->preflights == 1) flow->preflightPath = path;
+          if (flow->preflights <= 3 && flow->preflightPath != path) { qApp->exit(115); return; }
+          if (flow->preflights < 3) result={{"loading",true},{"message","Conferindo acesso…"},{"elapsed_s",137}};
+          else result={{"ok",true},{"preflight_id","fixture"},{"accounts",QJsonObject{{"validated",1}}},
                   {"tasks",QJsonObject{{"compatible",1}}},{"blockers",QJsonArray{}},{"warnings",QJsonArray{}}};
         } else if(input.startsWith("POST /api/campaigns ")) {
           ++flow->starts; flow->running=true; delay=200; result={{"ok",true},{"accounts",QJsonArray{"fixture@example.com"}}};
@@ -572,7 +576,7 @@ public:
         if(!window._campaignPreflightPending || window._campaignStart->isEnabled()) qApp->exit(104);
       } else if(flow->phase==1 && window._campaignIndicatorTitle->text()!=QStringLiteral("Verificando campanha")) qApp->exit(105);
       else if(flow->phase==2 && !window._campaignPreflightPending) {
-        if(flow->preflights!=1 || flow->starts || !window._campaignStart->isEnabled()) { qApp->exit(106); return; }
+        if(flow->preflights!=3 || flow->starts || !window._campaignStart->isEnabled()) { qApp->exit(106); return; }
         flow->phase=3; window._campaignStart->click();
       } else if(flow->phase==4 && window._campaignActive && !window._campaignStartPending) {
         if(flow->starts!=1 || window._campaignStart->isEnabled() || !window._campaignStop->isEnabled()) { qApp->exit(107); return; }
@@ -1260,7 +1264,7 @@ public:
               && body.value("remove_restricted").toBool() && body.value("accounts").toArray().size()==2;
           qApp->exit(correct?0:34); return;
         }
-        if (!input.startsWith("POST /api/campaigns/preflight ")) { qApp->exit(31); return; }
+        if (!input.startsWith("POST /api/campaigns/preflight?async=1&request_id=")) { qApp->exit(31); return; }
         if(qApp->arguments().contains("--expired-review")) {
           const auto requestBody=QJsonDocument::fromJson(input.mid(headerEnd+4)).object();
           if(requestBody.contains("preflight_id") || requestBody.contains("remove_restricted")) {qApp->exit(35);return;}
