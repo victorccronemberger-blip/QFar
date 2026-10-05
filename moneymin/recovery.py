@@ -211,13 +211,11 @@ def snapshot() -> dict:
     # journal must not be mistaken for a corrupt store during local cleanup.
     try:
         with media_state_lease(wait=True):
-            return _snapshot_locked()
+            groups = _groups(include_reconciled=True)
     except OperationLeaseError:
         raise RecoveryReadError("busy") from None
-
-
-def _snapshot_locked() -> dict:
-    groups = _groups(include_reconciled=True)
+    # History scans and archive inspection may be large. They use the copied
+    # journal rows and must not hold the short checkpoint/cleanup barrier.
     publications = _read_required_publications(groups)
     groups = _visible_groups(groups, publications)
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups

@@ -215,6 +215,26 @@ class RecoveryViewTests(unittest.TestCase):
         groups.assert_not_called()
         self.assertNotIn("private", json.dumps(error_response(caught.exception)))
 
+    def test_history_inspection_does_not_block_checkpoint_writers(self):
+        self.save()
+        original = recovery._read_required_publications
+        results = []
+        def read(groups):
+            def checkpoint():
+                try:
+                    with media_state_lease():
+                        results.append("available")
+                except OperationLeaseError:
+                    results.append("blocked")
+            thread = threading.Thread(target=checkpoint)
+            thread.start()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            return original(groups)
+        with patch.object(recovery, "_read_required_publications", side_effect=read):
+            self.assertEqual(recovery.snapshot()["confirmed"], 1)
+        self.assertEqual(results, ["available"])
+
     def test_api_exposes_specific_diagnostic_for_sync_and_async(self):
         from moneymin.web import server
         client = server.create_app(for_testing=True).test_client()
