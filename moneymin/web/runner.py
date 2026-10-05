@@ -753,6 +753,12 @@ class BalancesRunner:
         self.fallbacks = 0
         self.failed = 0
         self.error = ""
+        self.current_email = ""
+        self.phase = "idle"
+        self.started_at = None
+        self.finished_at = None
+        self.results: dict[str, dict[str, Any]] = {}
+        self._stop = threading.Event()
 
     @property
     def running(self) -> bool:
@@ -770,6 +776,12 @@ class BalancesRunner:
             self.fallbacks = 0
             self.failed = 0
             self.error = ""
+            self._stop.clear()
+            self.current_email = ""
+            self.phase = "queued"
+            self.started_at = time.time()
+            self.finished_at = None
+            self.results = {email: {"email": email, "state": "queued"} for email in creds}
             self.current = "iniciando consulta sequencial…"
             try:
                 self._thread = threading.Thread(target=self._run, args=(creds, on_result),
@@ -779,7 +791,26 @@ class BalancesRunner:
                 self._thread = None
                 self.state = "error"
                 self.current = ""
+                self.phase = "error"
+                self.finished_at = time.time()
                 raise RuntimeError("Não foi possível iniciar a operação. Tente novamente.") from exc
+
+    def stop(self) -> None:
+        """Finish the active read/save before starting any further account."""
+        with self._lock:
+            if self.running:
+                self._stop.set()
+                self.phase = "stopping"
+
+    def _account_phase(self, email: str, phase: str, index: int, total: int) -> None:
+        with self._lock:
+            self.current_email = email
+            self.phase = "stopping" if self._stop.is_set() else phase
+            label = {"api": "consultando", "browser": "consulta pelo navegador", "saving": "salvando"}[phase]
+            self.current = f"{label} conta {index}/{total}: {email}…"
+            previous = self.results.get(email, {"email": email})
+            self.results[email] = {**previous, "state": phase,
+                                   "started_at": previous.get("started_at") or time.time()}
 
     def _run(self, creds: dict[str, str], on_result) -> None:
         # Import tardio: Playwright só é carregado se algum fallback for necessário.
@@ -796,6 +827,8 @@ class BalancesRunner:
                     except CrowtadoError as exc:
                         summary, error = None, exc
                 try:
+                    with self._lock:
+                        self.phase = "stopping" if self._stop.is_set() else "saving"
                     on_result(email, summary, error)
                 except Exception:
                     # A failed local write must not silently abort all remaining
@@ -807,10 +840,15 @@ class BalancesRunner:
                     self.done += 1
                     self.failed += int(error is not None)
                     self.fast_done += int(fast and error is None)
+                    previous = self.results.get(email, {"email": email})
+                    self.results[email] = {**previous, "state": "error" if error is not None else "confirmed",
+                        "finished_at": time.time(), "source": "browser" if previous.get("state") == "browser" else "api",
+                        "issue_code": getattr(error, "account_issue_code", None) if error else None}
 
             for index, (email, senha) in enumerate(creds.items(), 1):
-                with self._lock:
-                    self.current = f"consultando conta {index}/{len(creds)}: {email}…"
+                if self._stop.is_set():
+                    break
+                self._account_phase(email, "api", index, len(creds))
                 try:
                     summary = consultar_saldo_api(email, senha)
                 except Exception as exc:  # noqa: BLE001 — resolve antes da próxima conta
@@ -819,7 +857,7 @@ class BalancesRunner:
                         continue
                     with self._lock:
                         self.fallbacks += 1
-                        self.current = f"consulta pelo navegador {index}/{len(creds)}: {email}…"
+                    self._account_phase(email, "browser", index, len(creds))
                     try:
                         summary = consultar_saldo_navegador(email, senha, headed=False)
                     except Exception as browser_error:
@@ -829,12 +867,21 @@ class BalancesRunner:
                 else:
                     finish(email, summary, None, fast=True)
             with self._lock:
-                self.state = "error" if self.error else "done"
+                self.state = "error" if self.error else "stopped" if self._stop.is_set() else "done"
                 self.current = ""
+                self.current_email = ""
+                self.phase = self.state
+                self.finished_at = time.time()
+                for result in self.results.values():
+                    if result["state"] == "queued":
+                        result["state"] = "not_consulted"
         except Exception:  # noqa: BLE001
             with self._lock:
                 self.state = "error"
                 self.current = ""
+                self.current_email = ""
+                self.phase = "error"
+                self.finished_at = time.time()
                 self.error = "A consulta foi interrompida. Os resultados já salvos foram preservados; atualize as contas pendentes."
             raise
 
@@ -843,7 +890,11 @@ class BalancesRunner:
             return {"state": self.state, "current": self.current,
                     "total": self.total, "done": self.done,
                     "fast_done": self.fast_done, "fallbacks": self.fallbacks,
-                    "failed": self.failed, "error": self.error}
+                    "failed": self.failed, "error": self.error,
+                    "current_email": self.current_email, "phase": self.phase,
+                    "started_at": self.started_at, "finished_at": self.finished_at,
+                    "stop_requested": self._stop.is_set(),
+                    "results": [dict(row) for row in self.results.values()]}
 
 
 # Runner único de saldos: uma conta por vez, até persistir o resultado.

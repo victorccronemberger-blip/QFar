@@ -31,9 +31,13 @@
 #include <QSpinBox>
 #include <QCheckBox>
 #include <QLineEdit>
+#include <QPlainTextEdit>
+#include <QScrollBar>
 
 class OperationPreview {
 public:
+#include "operation_qa.inc"
+#include "accounts_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -408,6 +412,10 @@ public:
             {"delivery_confirmed", false}, {"log_name", *terminal ? QJsonValue("campaign_fixture.json") : QJsonValue()}};
         } else if (input.startsWith("GET /api/integrations ") || input.startsWith("GET /api/accounts/domains ")) {
           reply = {{"ok", true}};
+        } else if(input.startsWith("GET /api/accounts ")) {
+          reply={{"accounts",QJsonArray{}}};
+        } else if(input.startsWith("GET /api/accounts/migration ") || input.startsWith("GET /api/accounts/bulk-register/status ")) {
+          reply={{"state","idle"}};
         } else { qApp->exit(172); return; }
         const auto bytes = QJsonDocument(reply).toJson(QJsonDocument::Compact);
         socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
@@ -513,6 +521,7 @@ public:
         } else if(input.startsWith("GET /api/balances ")) { result={{"balances",QJsonObject{}}};
         } else if(input.startsWith("GET /api/campaigns/current")) {
           result={{"start_request_id",flow->starts>0?"fixture":""},{"state",flow->running?"running":flow->stops?"stopped":"idle"},{"pause_requested",flow->paused},
+                  {"operation",QJsonObject{{"accounts",QJsonArray{}},{"counts",QJsonObject{}}}},
                   {"totals",QJsonObject{{"total_sends",1},{"ok_sends",0}}}};
         } else if(input.startsWith("GET /api/logs ")) { result={{"logs",QJsonArray{}}};
         } else if(input.startsWith("GET /api/tasks?")) {
@@ -953,6 +962,114 @@ public:
     if (window._taskReload.isActive()) { qApp->exit(67); return; }
     QTimer::singleShot(10000, &window, [] { qApp->exit(65); });
   }
+  static QJsonObject walletFixture() {
+    const auto stamp = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    QJsonArray accounts, connected;
+    QJsonObject balances, rows, kinds;
+    const QStringList names{QStringLiteral("regular@example.com"), QStringLiteral("restrita@example.com"),
+        QStringLiteral("vencida@example.com"), QStringLiteral("falha@example.com"), QStringLiteral("sem-acesso@example.com")};
+    for (int i = 0; i < names.size(); ++i) {
+      const auto email = names[i];
+      accounts.append(email); kinds.insert(email, "crowtado");
+      if (i < 4) connected.append(email);
+      QJsonObject record{{"availableCents", i == 0 ? 4500 : i == 1 ? 5100 : 990000},
+          {"pendingCents", i == 0 ? 2300 : 2000}, {"inTransitCents",0}, {"lifetimeCents", 1200000},
+          {"updated_at", i == 2 ? "2020-01-01T12:00:00+00:00" : stamp}, {"checked_at", stamp}};
+      if (i == 1) record.insert("holdReason", QStringLiteral("Conta desativada — fale com o suporte."));
+      if (i == 3) {record.insert("error", QStringLiteral("Não foi possível alcançar a Crowtado."));record.insert("stale",true);}
+      if (i < 4) balances.insert(email, record);
+      const bool confirmed = i < 2;
+      const auto reason = i == 1 ? QStringLiteral("Conta desativada — fale com o suporte.")
+          : i == 2 ? QStringLiteral("A leitura venceu. Consulte novamente.")
+          : i == 3 ? QStringLiteral("Falha de conexão. O último valor foi preservado.")
+          : i == 4 ? QStringLiteral("Conecte o acesso Crowtado.") : QStringLiteral("Leitura completa nas últimas 24 horas.");
+      rows.insert(email, QJsonObject{{"kind","crowtado"},{"connected",i < 4},
+          {"reading",QJsonObject{{"confirmed",confirmed},{"code",confirmed?"confirmed":i==2?"expired":i==3?"error":"unqueried"},
+              {"label",confirmed?QStringLiteral("Saldo confirmado"):i==2?QStringLiteral("Leitura vencida"):i==3?QStringLiteral("Consulta inconclusiva"):QStringLiteral("Ainda não consultado")},{"reason",reason}}},
+          {"payout",QJsonObject{{"eligible",i==0},{"code",i==0?"ready":i==1?"hold":"refresh"},
+              {"label",i==0?QStringLiteral("Disponível para saque"):i==1?QStringLiteral("Saque retido"):QStringLiteral("Atualizar saldo")},{"reason",reason}}},
+          {"restriction",QJsonObject{{"code",i==0?"clear":i==1?"disabled":"unknown"},
+              {"label",i==0?QStringLiteral("Sem retenção informada"):i==1?QStringLiteral("Conta desativada · saque retido"):QStringLiteral("Restrição não verificada")},{"reason",reason}}}});
+    }
+    return {{"accounts",accounts},{"with_password",connected},{"with_saved_password",QJsonArray{}},
+        {"balances",balances},{"account_kinds",kinds},{"refresh_needed",QJsonArray{names[2],names[3]}},
+        {"runner",QJsonObject{{"state","done"},{"total",4},{"done",4},{"failed",1}}},
+        {"withdraw_bulk",QJsonObject{{"state","idle"}}},{"payout_method_bulk",QJsonObject{{"state","idle"}}},
+        {"wallet",QJsonObject{{"accounts",rows},{"withdrawable_total_cents",4500},{"counts",QJsonObject{{"confirmed",2},{"crowtado",5},{"attention",3},{"eligible",1}}},
+            {"totals",QJsonObject{{"availableCents",9600},{"pendingCents",4300},{"inTransitCents",0},{"onHoldCents",0}}},
+            {"field_coverage",QJsonObject{{"onHoldCents",0}}}}},
+        {"exchange",QJsonObject{{"available",true},{"rate",5.1},{"quote_date","2026-10-02"}}}};
+  }
+
+  static void walletContract(MainWindow& window, bool preview) {
+    window.applyStructuralStyle(qApp->arguments().contains("--dark"));
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(200); return; }
+    auto phase = std::make_shared<int>(0);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server,phase] {
+      auto* socket=server->nextPendingConnection();
+      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,phase] {
+        const auto input=socket->property("input").toByteArray()+socket->readAll();
+        socket->setProperty("input",input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered",true);
+        if (!input.startsWith("GET /api/balances ")) {qApp->exit(201);return;}
+        const auto body=QJsonDocument(*phase==1 ? QJsonObject{} : walletFixture()).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(body.size())+"\r\n\r\n"+body);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    page(window,6);
+    window.loadBalances();
+    QTimer::singleShot(350,&window,[&window,phase,preview] {
+      if (preview) {qApp->exit(window.grab().save(qApp->arguments().at(1)) ? 0 : 202);return;}
+      int enabled=0;bool restricted=false,historical=false;
+      for(int row=0;row<window._balancesTable->rowCount();++row) {
+        const auto email=window._balancesTable->item(row,0)->text();
+        if(email=="restrita@example.com") restricted=window._balancesTable->item(row,3)->text().contains(QStringLiteral("Conta desativada"));
+        if(email=="vencida@example.com") historical=window._balancesTable->item(row,2)->text().endsWith(" *");
+      }
+      for(auto* button:window._balancesTable->findChildren<QPushButton*>())
+        if(button->text()==QStringLiteral("Sacar") && button->isEnabled()) ++enabled;
+      if(window._balancesTable->rowCount()!=5 || enabled!=1 || !restricted || !historical
+          || !window._balancesApprovedUsd->text().contains("45") || window._walletMonitorTimer.isActive()) {qApp->exit(203);return;}
+      window._balancesOnlyAvailable->setChecked(true);
+      int visible=0;for(int row=0;row<5;++row) visible+=!window._balancesTable->isRowHidden(row);
+      if(visible!=2) {qApp->exit(204);return;}
+      window._balancesOnlyAvailable->setChecked(false);
+      *phase=1;window.loadBalances();
+      QTimer::singleShot(250,&window,[&window,phase] {
+        if(window._balancesTable->rowCount()!=5 || window._balancesWithdrawAll->isEnabled()
+            || !window._balancesApprovedUsd->text().contains(QStringLiteral("—"))) {qApp->exit(205);return;}
+        for(auto* button:window._balancesTable->findChildren<QPushButton*>())
+          if(button->property("walletAction").toBool() && button->isEnabled()) {qApp->exit(206);return;}
+        *phase=2;window.loadBalances();
+        QTimer::singleShot(250,&window,[&window] {
+          if(!window._balancesWithdrawAll->isEnabled() || !window._walletSnapshotHealthy) {qApp->exit(207);return;}
+          window._backendReady=true;
+          window._walletMonitoring->setChecked(true);
+          if(!window._walletMonitorTimer.isActive() || window._walletMonitorTimer.interval()!=900000) {qApp->exit(209);return;}
+          window._balancesSnapshot.insert("runner",QJsonObject{{"state","running"}});
+          QMetaObject::invokeMethod(&window._walletMonitorTimer,"timeout",Qt::DirectConnection);
+          if(!window._walletMonitorState->text().contains(QStringLiteral("adiada"))) {qApp->exit(210);return;}
+          window._walletMonitoring->setChecked(false);
+          window._balancesSnapshot.insert("runner",QJsonObject{{"state","done"}});
+          window.loadBalances();
+          window.disableWalletActions(); // A response started before a command must not re-enable it.
+          QTimer::singleShot(250,&window,[&window] {
+            bool disabled=!window._balancesWithdrawAll->isEnabled();
+            for(auto* button:window._balancesTable->findChildren<QPushButton*>())
+              if(button->property("walletAction").toBool() && button->isEnabled()) disabled=false;
+            qApp->exit(disabled && !window._walletMonitorTimer.isActive() ? 0 : 211);
+          });
+        });
+      });
+    });
+    QTimer::singleShot(8000,&window,[]{qApp->exit(208);});
+  }
+
   static void balancePollingSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(50); return; }
@@ -993,12 +1110,12 @@ public:
       QTimer::singleShot(450, &window, [&window, requests] {
         const bool recovered = *requests == 2 && !window._balancePolling
             && window._balancesState->text().contains(QStringLiteral("1 de 2"))
-            && !window._balancePoll.isActive() && !QApplication::activeModalWidget()
+            && window._balancePoll.isActive() && !QApplication::activeModalWidget()
             && !window._balancesWithdrawAll->isEnabled();
         bool foundWithdrawal = false;
         for (auto* button : window._balancesTable->findChildren<QPushButton*>()) {
-          if (button->text() == QStringLiteral("Solicitar saque")) foundWithdrawal = true;
-          if (button->text() == QStringLiteral("Solicitar saque")
+          if (button->text() == QStringLiteral("Sacar")) foundWithdrawal = true;
+          if (button->text() == QStringLiteral("Sacar")
               && (button->isEnabled() || !button->toolTip().contains(QStringLiteral("em trânsito")))) {
             qApp->exit(54); return;
           }
@@ -1094,10 +1211,10 @@ public:
         *phase=1;window.pollCampaign();
       } else if(*phase==1 && *oldPreviewReturned && window._campaignIndicatorDetail->text().contains("25%")) {
         if(window._campaignProgress->value()!=25){qApp->exit(47);return;}
-        window.renderOperation({{"state","running"},{"totals",QJsonObject{
+        window.renderOperation({{"state","running"},{"operation",QJsonObject{{"accounts",QJsonArray{}},{"counts",QJsonObject{}}}},{"totals",QJsonObject{
             {"progress_unit","seconds"},{"progress_target",3600},{"progress_completed",900},
             {"total_sends",4},{"done_sends",100}}}});
-        if(!window._operationTotal->text().contains("0.25 / 1.00")){qApp->exit(48);return;}
+        if(!window._operationTotal->text().contains("0,25 / 1,00")){qApp->exit(48);return;}
         if(qApp->arguments().contains("--indicator-proof")) window.grab().save(qApp->arguments().at(1));
         window._campaignTabs->setCurrentIndex(0);
         if(!window._campaignIndicator->isVisible() || window._campaignIndicatorProgress->value()!=25){qApp->exit(44);return;}
@@ -1318,7 +1435,7 @@ public:
         rows.append(QJsonObject{{"email", QStringLiteral("Conta %1").arg(i+1,2,10,QLatin1Char('0'))}, {"state",state}, {"session_id",QStringLiteral("demo_%1").arg(i+1)}, {"confirmed", i<38?1:0}, {"progress", i<38?100:60}});
       }
     }
-    window.renderOperation(QJsonObject{{"state", active?"running":"idle"}, {"operation",QJsonObject{{"accounts",rows}, {"counts",QJsonObject{{"confirmed",active?38:0},{"sending",active?6:0},{"confirming",active?4:0}}}}},
+    window.renderOperation(QJsonObject{{"state", active?"running":"idle"}, {"totals",QJsonObject{{"total_sends",active?48:0},{"ok_sends",active?38:0}}}, {"operation",QJsonObject{{"accounts",rows}, {"counts",QJsonObject{{"confirmed",active?38:0},{"sending",active?6:0},{"confirming",active?4:0}}}}},
       {"events", QJsonArray{QJsonObject{{"ts", 1790431200}, {"title", "Vídeo enviado"}, {"detail", "Conta 03"}}, QJsonObject{{"ts", 1790431380}, {"title", "Processando"}, {"detail", "Aguardando confirmação do recebimento."}}}}});
     window._operationBalance->setText(active ? QStringLiteral("US$ 284,50") : QStringLiteral("US$ —"));
     window._operationBalanceNote->setText(QStringLiteral("Dados de demonstração"));
@@ -1361,6 +1478,23 @@ int main(int argc, char** argv) {
   app.setFont(QFont(QStringLiteral("Inter"), 10));
   MainWindow window(style, nullptr, false);
   window.resize(app.arguments().contains("--compact") ? QSize(980, 680) : QSize(1586, 992));
+  if (app.arguments().contains("--accounts-qa-smoke") || app.arguments().contains("--accounts-qa-preview") || app.arguments().contains("--accounts-live-create")) {
+    window.show();
+    QTimer::singleShot(100,&window,[&window] {
+      if(qApp->arguments().contains("--accounts-live-create")) OperationPreview::accountsLiveCreate(window);
+      else if(qApp->arguments().contains("--accounts-qa-preview")) OperationPreview::accountsQaPreview(window);
+      else OperationPreview::accountsQaSmoke(window);
+    });
+    return app.exec();
+  }
+  if (app.arguments().contains("--operation-qa-smoke") || app.arguments().contains("--operation-qa-preview")) {
+    window.show();
+    const bool preview = app.arguments().contains("--operation-qa-preview");
+    QTimer::singleShot(100,&window,[&window,preview] {
+      if (preview) OperationPreview::operationQaPreview(window); else OperationPreview::operationQaSmoke(window);
+    });
+    return app.exec();
+  }
   if (app.arguments().contains("--continuation-smoke")) {
     QTimer::singleShot(0, &window, [&window]{OperationPreview::continuationSmoke(window);});
     return app.exec();
@@ -1432,6 +1566,11 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--balance-polling-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::balancePollingSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--wallet-smoke") || app.arguments().contains("--wallet-preview")) {
+    const bool preview = app.arguments().contains("--wallet-preview");
+    QTimer::singleShot(100,&window,[&window,preview] { OperationPreview::walletContract(window,preview); });
     return app.exec();
   }
   if (app.arguments().contains("--indicator-smoke")) {

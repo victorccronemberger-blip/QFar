@@ -59,6 +59,11 @@ int main(int argc, char** argv) {
   elapsed.start();
   bool timedOut = false;
   bool postTimedOut = false;
+  bool operationTimedOut = false;
+  api.get(QStringLiteral("/api/campaigns/current"),
+          [&](bool ok, const QJsonDocument&, const QString& error) {
+    operationTimedOut = !ok && !error.isEmpty() && elapsed.elapsed() >= 8000 && elapsed.elapsed() < 20000;
+  });
   api.post(QStringLiteral("/api/campaigns"), {},
            [&](bool ok, const QJsonDocument& doc, const QString& error) {
     postTimedOut = !ok && !error.isEmpty() && elapsed.elapsed() >= 50000
@@ -67,12 +72,12 @@ int main(int argc, char** argv) {
   });
   api.get(QStringLiteral("/api/accounts/bulk-register/status"),
           [&](bool ok, const QJsonDocument&, const QString& error) {
-    timedOut = !ok && !error.isEmpty() && elapsed.elapsed() >= 50000;
+    timedOut = !ok && !error.isEmpty() && elapsed.elapsed() >= 8000 && elapsed.elapsed() < 20000;
     if (postTimedOut) loop.quit();
   });
   QTimer::singleShot(70000, &loop, &QEventLoop::quit);
   loop.exec();
-  if (!timedOut || !postTimedOut) {
+  if (!timedOut || !postTimedOut || !operationTimedOut) {
     std::cerr << "Stalled GET did not time out\n";
     return 1;
   }

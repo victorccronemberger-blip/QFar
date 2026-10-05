@@ -37,7 +37,13 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   // Consultas sem resposta precisam liberar o polling para uma nova tentativa.
   // Operações de escrita podem incluir cadastro remoto e não são repetidas aqui.
   if (method == "GET")
-    req.setTransferTimeout(path == QStringLiteral("/api/health") ? 3000 : 60000);
+    req.setTransferTimeout(path == QStringLiteral("/api/health") ? 3000
+        : (path == QStringLiteral("/api/campaigns/current") || path == QStringLiteral("/api/accounts")
+           || path == QStringLiteral("/api/accounts/bulk-register/status")) ? 10000 : 60000);
+  const bool startsRegistration = path == QStringLiteral("/api/accounts/register?async=1")
+      || path == QStringLiteral("/api/accounts/bulk-register") || (path.startsWith(QStringLiteral("/api/accounts/")) && path.endsWith(QStringLiteral("/resume")));
+  if (method == "POST" && (startsRegistration || path == QStringLiteral("/api/accounts/bulk-register/stop")))
+    req.setTransferTimeout(15000);
   if (method == "POST" && (path == QStringLiteral("/api/accounts/password")
                            || path == QStringLiteral("/api/accounts/banned/password")))
     req.setTransferTimeout(60000);
@@ -59,7 +65,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   else if (method == "PUT") reply = _network.put(req, payload);
   else reply = _network.sendCustomRequest(req, method, payload);
 
-  connect(reply, &QNetworkReply::finished, this, [reply, method, path, callback = std::move(callback)]() {
+  connect(reply, &QNetworkReply::finished, this, [reply, method, path, startsRegistration, callback = std::move(callback)]() {
     const QByteArray bytes = reply->readAll();
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
@@ -73,7 +79,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       else doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
     } else if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
       error = QStringLiteral("O serviço retornou uma resposta JSON inválida ou incompleta.");
-      if (method == "POST" && path == QStringLiteral("/api/campaigns"))
+      if (method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration))
         doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
     } else if (method == "POST" && path == QStringLiteral("/api/campaigns")
                && !doc.object().value(QStringLiteral("ok")).toBool()) {
@@ -82,7 +88,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       if (!doc.object().contains(QStringLiteral("ok")))
         doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
     }
-    if (!ok && method == "POST" && path == QStringLiteral("/api/campaigns")
+    if (!ok && method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration)
         && (status == 0 || status >= 500) && doc.object().value("error_code").toString().isEmpty()) {
       auto uncertain = doc.object();
       uncertain.insert(QStringLiteral("error_code"), QStringLiteral("request_outcome_unknown"));

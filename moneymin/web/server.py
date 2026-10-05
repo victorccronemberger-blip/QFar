@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import configparser
 import datetime
+from functools import wraps
 import hashlib
 import json
 import math
@@ -92,6 +93,7 @@ from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import SecureStoreError, load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
+from . import wallet, registration_state
 from .catalog_loader import CatalogLoader
 from .org_migration import OrgMigrationRunner
 from .banned_monitor import BannedMonitor
@@ -116,6 +118,20 @@ from ..operation_lease import OperationLeaseError
 RECOVERY = recovery.RecoveryRunner()
 _WITHDRAW_LOCK = threading.Lock()
 _PAYOUT_OPERATION_LOCK = threading.Lock()
+_WALLET_COMMAND_LOCK = threading.Lock()
+
+
+def _serialize_wallet_command(handler):
+    """Admit one command at a time before publishing its worker state."""
+    @wraps(handler)
+    def command(*args, **kwargs):
+        if not _WALLET_COMMAND_LOCK.acquire(blocking=False):
+            return jsonify({"error": "aguarde a operação atual da Carteira terminar"}), 409
+        try:
+            return handler(*args, **kwargs)
+        finally:
+            _WALLET_COMMAND_LOCK.release()
+    return command
 _WITHDRAW_IN_FLIGHT: set[str] = set()
 _WITHDRAW_LAST_REQUEST: dict[str, float] = {}
 _WITHDRAW_COOLDOWN_S = 60.0
@@ -567,29 +583,11 @@ def _balance_refresh_needed(
 ) -> list[str]:
     """Contas conectadas sem leitura recente e confirmada de saldo."""
     now = time.time()
-    needed = []
-    for account in accounts:
-        email = str(account.get("email") or "")
-        if email not in connected or org_policy.account_kind(email) != "crowtado":
-            continue
-        record = balances.get(email)
-        if not isinstance(record, dict) or record.get("error") or record.get("stale"):
-            needed.append(email)
-            continue
-        amount = record.get("availableCents")
-        if (not isinstance(amount, (int, float)) or isinstance(amount, bool)
-                or not math.isfinite(amount)):
-            needed.append(email)
-            continue
-        try:
-            updated = datetime.datetime.fromisoformat(str(record["updated_at"]))
-            age = now - updated.timestamp()
-        except (KeyError, TypeError, ValueError, OverflowError):
-            needed.append(email)
-            continue
-        if age < 0 or age >= max_age_s:
-            needed.append(email)
-    return sorted(needed)
+    return sorted(str(account["email"]) for account in accounts
+        if str(account.get("email") or "") in connected
+        and org_policy.account_kind(str(account["email"])) == "crowtado"
+        and not wallet.reading(balances.get(str(account["email"])), now=now,
+                               max_age_s=max_age_s)["confirmed"])
 
 
 def _confirmed_available_balance(record: Any) -> bool:
@@ -669,6 +667,26 @@ _STEP_ORDER = [
 ]
 _CROWTADO_SIGNUP_RETRIES = 2
 _CROWTADO_SIGNUP_RETRY_DELAY_S = 5.0
+
+
+def _save_registration_batch() -> None:
+    # Called with the batch lock held. Contains progress only, never passwords.
+    save_json(config.DATA_DIR / "account_registration_batch.json", _BULK_REGISTER_STATE)
+
+
+def _restore_registration_batch() -> None:
+    saved = load_json_state(config.DATA_DIR / "account_registration_batch.json", {"state": "idle"})
+    if saved.get("state") not in ("idle", "running", "stopping", "done", "failed"):
+        _invalid_local_state()
+    for key in ("total", "completed", "created", "failed"):
+        if key in saved and (type(saved[key]) is not int or saved[key] < 0):
+            _invalid_local_state()
+    if saved["state"] in ("running", "stopping"):
+        saved.update(state="failed", current_email="", current_step="",
+                     error="O serviço reiniciou durante o cadastro. Confira as contas incompletas e retome a mesma conta.")
+    with _BULK_REGISTER_LOCK:
+        _BULK_REGISTER_STATE.clear()
+        _BULK_REGISTER_STATE.update(saved)
 
 
 def _mark_bulk_account_removed(email: str) -> None:
@@ -868,7 +886,7 @@ def _validate_minute_membership(email: str) -> str:
 
 def _full_register_account(
     email: str, password: str, identity_data: dict[str, Any],
-    *, on_step: Any = None,
+    *, on_step: Any = None, resume: bool = False,
 ) -> dict[str, Any]:
     """Fluxo completo com retry, save parcial e validação pós-criação.
 
@@ -884,10 +902,41 @@ def _full_register_account(
     from ..minute_api import register as minute_register, login as minute_login
 
     logger = logging.getLogger("moneymin.register")
-    steps: dict[str, dict[str, str]] = {}
+    # Do not overwrite the checkpoint or secret of an already connected account
+    # when a new attempt supplies a different password.
+    try:
+        saved_password = credential_store.lookup(config.SECRETS_DIR, email, strict=True)
+        if saved_password and saved_password != password:
+            raise ValueError("A conta já possui outra senha protegida. Reconecte o acesso com a senha correta antes de registrar.")
+    except ValueError as exc:
+        return {"steps": {"save_partial": _step_fail(str(exc))}, "error": str(exc), "partial": False}
+    previous = registration_state.load().get(email.strip().casefold(), {}) if resume else {}
+    steps: dict[str, dict[str, str]] = dict(previous.get("steps", {}))
     step_start: dict[str, float] = {}
 
+    def confirmed(name):
+        return resume and steps.get(name, {}).get("status") in ("ok", "skip")
+
+    def failure(exc):
+        result = _step_fail(str(exc))
+        code = getattr(exc, "account_issue_code", None)
+        if isinstance(code, str):
+            result["code"] = code
+        return result
+
+    def finish(result):
+        # Public diagnostics never contain the supplied secret.
+        result = dict(result)
+        if isinstance(result.get("error"), str):
+            result["error"] = result["error"].replace(password, "[senha protegida]")
+        registration_state.update(email, identity=identity_data, steps=steps,
+                                  state="incomplete" if result.get("error") else "complete",
+                                  error=result.get("error"))
+        result.setdefault("partial", bool(result.get("error") and steps.get("save_partial", {}).get("status") == "ok"))
+        return result
+
     def _notify(step_name: str) -> None:
+        registration_state.update(email, identity=identity_data, steps=steps)
         step_start[step_name] = time.monotonic()
         logger.info("[register] %s — iniciando etapa: %s", email, _STEP_LABELS.get(step_name, step_name))
         if callable(on_step):
@@ -897,7 +946,10 @@ def _full_register_account(
                 pass
 
     def _record_step(step_name: str, result: dict[str, str]) -> None:
+        result = dict(result)
+        result["detail"] = result.get("detail", "").replace(password, "[senha protegida]")
         steps[step_name] = result
+        registration_state.update(email, identity=identity_data, steps=steps)
         elapsed = time.monotonic() - step_start.get(step_name, time.monotonic())
         logger.info("[register] %s — %s: %s (%.1fs)",
                      email, step_name, result["status"], elapsed)
@@ -909,7 +961,7 @@ def _full_register_account(
         _record_step("ban_check", _step_ok())
     except ValueError as exc:
         _record_step("ban_check", _step_fail(str(exc)))
-        return {"steps": steps, "error": f"ban: {exc}"}
+        return finish({"steps": steps, "error": f"ban: {exc}"})
 
     # O checkpoint local vem antes de qualquer operação remota. Sem uma senha
     # exportável e relida, nenhuma conta nova será iniciada.
@@ -919,17 +971,31 @@ def _full_register_account(
     except Exception:
         detail = "Não foi possível confirmar o acesso no armazenamento local. Nenhuma criação remota foi iniciada; confira o armazenamento antes de tentar novamente."
         _record_step("save_partial", _step_fail(detail))
-        return {"steps": steps, "error": detail, "partial": False}
+        return finish({"steps": steps, "error": detail, "partial": False})
     _record_step("save_partial", _step_ok("credenciais salvas"))
 
     # Step 1: Crowtado signup (Chrome + Turnstile + email OTP) — com retry
     _notify("crowtado_signup")
-    crowtado_signup_ok = False
-    crowtado_existed = False
+    crowtado_signup_ok = confirmed("crowtado_signup")
+    crowtado_existed = crowtado_signup_ok
+    if crowtado_signup_ok:
+        # Resume only after authenticating the original Crowtado identity.
+        # A saved signup checkpoint cannot authorize Minute registration.
+        _notify("validate")
+        try:
+            crowtado.login(email, password)
+        except Exception as exc:
+            _record_step("validate", failure(exc))
+            return finish({"steps": steps, "error": f"acesso Crowtado: {exc}"})
     last_error: str = ""
     for attempt in range(1, _CROWTADO_SIGNUP_RETRIES + 1):
+        if crowtado_signup_ok:
+            break
         try:
-            crowtado.criar_conta(email, password)
+            if identity_data.get("use_referral") is False:
+                crowtado.criar_conta(email, password, ref="")
+            else:
+                crowtado.criar_conta(email, password)
             _record_step("crowtado_signup", _step_ok(
                 "conta criada" if attempt == 1 else f"conta criada (tentativa {attempt})"
             ))
@@ -956,21 +1022,23 @@ def _full_register_account(
                     crowtado_existed = True
                     break
                 except Exception as login_exc:
-                    _record_step("crowtado_signup", _step_fail(f"conta existe mas login falhou: {login_exc}"))
-                    return {"steps": steps, "error": f"crowtado: {login_exc}"}
+                    _record_step("crowtado_signup", failure(login_exc))
+                    return finish({"steps": steps, "error": f"crowtado: {login_exc}"})
             last_error = error_msg
             if attempt < _CROWTADO_SIGNUP_RETRIES:
-                logger.info("[register] %s — Crowtado falhou (tentativa %d/%d): %s",
-                             email, attempt, _CROWTADO_SIGNUP_RETRIES, error_msg)
+                logger.info("[register] %s — Crowtado falhou (tentativa %d/%d)",
+                             email, attempt, _CROWTADO_SIGNUP_RETRIES)
                 time.sleep(_CROWTADO_SIGNUP_RETRY_DELAY_S)
     if not crowtado_signup_ok:
         _record_step("crowtado_signup", _step_fail(f"{last_error} (após {_CROWTADO_SIGNUP_RETRIES} tentativas)"))
-        return {"steps": steps, "error": f"crowtado: {last_error}"}
+        return finish({"steps": steps, "error": f"crowtado: {last_error}"})
 
     # Step 3: Demographics (gate obrigatório desde 26/08)
     _notify("demographics")
     try:
-        if crowtado_existed:
+        if confirmed("demographics") and steps["demographics"]["status"] == "ok":
+            _record_step("demographics", steps["demographics"])
+        elif crowtado_existed and previous.get("steps", {}).get("crowtado_signup", {}).get("status") != "ok":
             _record_step("demographics", _step_skip("dados da conta existente preservados"))
         else:
             crowtado.preencher_demografia(
@@ -981,8 +1049,8 @@ def _full_register_account(
             )
             _record_step("demographics", _step_ok("preenchida"))
     except Exception as exc:
-        _record_step("demographics", _step_fail(str(exc)))
-        return {"steps": steps, "error": f"demografia: {exc}"}
+        _record_step("demographics", failure(exc))
+        return finish({"steps": steps, "error": f"demografia: {exc}"})
 
     # Step 4: Minute register (com invite code da org)
     _notify("minute_register")
@@ -991,7 +1059,11 @@ def _full_register_account(
         try:
             # O código é explícito para que nenhuma alteração de default consiga
             # cadastrar uma conta Crowtado em organização diferente.
-            minute_register(email, password, config.INVITE_CODE)
+            if confirmed("minute_register"):
+                minute_login(email, password)
+                existed = True
+            else:
+                minute_register(email, password, config.INVITE_CODE)
         except RuntimeError as exc:
             # Apenas uma resposta explícita de e-mail duplicado permite recuperação.
             detail = str(exc).casefold()
@@ -1006,8 +1078,8 @@ def _full_register_account(
         _record_step("minute_register", _step_skip("já existia; acesso e organização confirmados")
                      if existed else _step_ok("registro e organização confirmados"))
     except Exception as exc:
-        _record_step("minute_register", _step_fail(str(exc)))
-        return {"steps": steps, "error": f"minute: {exc}"}
+        _record_step("minute_register", failure(exc))
+        return finish({"steps": steps, "error": f"minute: {exc}"})
 
     # Step 5: Vincular email Minute dentro da Crowtado
     _notify("link_minute")
@@ -1017,7 +1089,8 @@ def _full_register_account(
         except Exception as exc:
             # O gate explícito permite completar cadastros interrompidos sem
             # alterar demografia de contas que já estão completas.
-            if not crowtado_existed or "DEMOGRAPHICS_REQUIRED" not in str(exc):
+            if not crowtado_existed or not (getattr(exc, "account_issue_code", None) == "demographics_required"
+                                            or "DEMOGRAPHICS_REQUIRED" in str(exc)):
                 raise
             _notify("demographics")
             try:
@@ -1026,22 +1099,24 @@ def _full_register_account(
                     birth_year=int(identity_data["birth_year"]), gender=identity_data.get("gender"))
                 _record_step("demographics", _step_ok("cadastro incompleto recuperado"))
             except Exception as demographic_exc:
-                _record_step("demographics", _step_fail(str(demographic_exc)))
+                _record_step("demographics", failure(demographic_exc))
                 raise
             _notify("link_minute")
             crowtado.vincular_minute(email, password)
         _record_step("link_minute", _step_ok("vinculado"))
     except Exception as exc:
-        _record_step("link_minute", _step_fail(str(exc)))
-        return {"steps": steps, "error": f"vínculo: {exc}"}
+        _record_step("link_minute", failure(exc))
+        return finish({"steps": steps, "error": f"vínculo: {exc}"})
 
     # Step 6: Validação pós-criação — confirma que tudo funciona
     _notify("validate")
     validation_issues: list[str] = []
+    validation_code = ""
     try:
         crowtado.login(email, password)
     except Exception as exc:
         validation_issues.append(f"login Crowtado: {exc}")
+        validation_code = getattr(exc, "account_issue_code", "") or ""
     try:
         minute_login(email, password)
         _validate_minute_membership(email)
@@ -1049,10 +1124,13 @@ def _full_register_account(
         validation_issues.append(f"login Minute: {exc}")
     if validation_issues:
         detail = "; ".join(validation_issues)
-        _record_step("validate", _step_fail(detail))
+        failed = _step_fail(detail)
+        if validation_code:
+            failed["code"] = validation_code
+        _record_step("validate", failed)
         logger.warning("[register] %s — validação parcial: %s", email, detail)
         # Não é fatal — a conta foi criada, mas algo não confere
-        return {"steps": steps, "error": f"validação: {detail}", "partial": True}
+        return finish({"steps": steps, "error": f"validação: {detail}", "partial": True})
     try:
         # O tombstone só é removido quando todo o fluxo remoto foi confirmado.
         # Assim uma tentativa falha nunca ressuscita uma conta excluida.
@@ -1060,11 +1138,13 @@ def _full_register_account(
     except (OSError, ValueError):
         detail = "conta criada e validada, mas a ativação local não pôde ser salva"
         _record_step("validate", _step_fail(detail))
-        return {"steps": steps, "error": f"validação: {detail}", "partial": True}
+        return finish({"steps": steps, "error": f"validação: {detail}", "partial": True})
     _record_step("validate", _step_ok("tudo confirmado e acesso local ativado"))
+    _save_account_check(email, {"email": email, "status": "active", "status_label": "Acesso verificado",
+                               "org_key": config.ORG_KEY, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
     logger.info("[register] %s — fluxo completo com sucesso", email)
 
-    return {"steps": steps, "error": None}
+    return finish({"steps": steps, "error": None})
 
 
 def _tree_size(path: Path) -> tuple[int, int]:
@@ -1660,6 +1740,7 @@ def _list_accounts() -> list[dict[str, Any]]:
     if not isinstance(org_keys, dict):
         org_keys = {}
     removed = _removed_accounts()
+    registrations = registration_state.load()
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for key, (path, data) in token_store.records(config.tokens_dir()).items():
@@ -1667,6 +1748,8 @@ def _list_accounts() -> list[dict[str, Any]]:
         if str(email).strip().casefold() in removed:
             continue
         key = str(email).strip().casefold()
+        if key in registrations and registrations[key]["state"] != "complete":
+            continue
         if key in seen:
             continue
         seen.add(key)
@@ -2004,6 +2087,9 @@ def _invalidate_balance_after_withdrawal(email: str, result: dict[str, Any]) -> 
             receipt["currency"] = result["currency"]
         rec.update(stale=True, lastWithdrawal=receipt,
                    error="Saldo anterior à tentativa de saque. Atualize para consultar o valor atual.")
+        if result.get("status") in {"on_hold", "hold"} and isinstance(result.get("holdReason"), str):
+            rec["holdReason"] = result["holdReason"][:500]
+            rec["error"] = "A Crowtado informou uma retenção de saque: " + rec["holdReason"]
         balances[email] = rec
         _save_balances(balances)
 
@@ -2022,7 +2108,8 @@ def _on_balance_result(email: str, summary: dict | None, erro: str | Exception |
                 summary, erro = None, exc
         rec["checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         if summary is not None:
-            rec.pop("inTransitReplaceable", None)
+            for field in crowtado.BALANCE_SUMMARY_FIELDS:
+                rec.pop(field, None)
             rec.update(summary)
             rec["updated_at"] = rec["checked_at"]
             rec["error"] = None
@@ -2112,6 +2199,11 @@ def _withdraw_message(email: str, result: dict[str, Any]) -> str:
         return f"solicitação de saque enviada para {email}"
     if status == "review_required":
         return f"saque de {email} enviado para revisão do Crowtado"
+    if status in {"on_hold", "hold"}:
+        reason = result.get("holdReason")
+        return "Os saques estão retidos: " + (reason[:500] if isinstance(reason, str) and reason else "Confira a restrição no painel da Crowtado.")
+    if status == "eligibility_unconfirmed":
+        return "Saque não enviado: não foi possível confirmar a elegibilidade no Minute pela Crowtado. Atualize a consulta e tente novamente."
     if status.endswith("_pending_retry"):
         return (f"A Crowtado registrou uma tentativa pendente para {email} e fará nova tentativa. "
                 "Não solicite outro saque; acompanhe o histórico da plataforma.")
@@ -2202,6 +2294,8 @@ def _require_local_api_token(*, for_testing: bool = False) -> str:
 def create_app(*, for_testing: bool = False) -> Flask:
     import hmac
     local_api_token = _require_local_api_token(for_testing=for_testing)
+    if not for_testing:
+        _restore_registration_batch()
     preflights: dict[str, dict] = {}
     preflight_lock = threading.RLock()
     # Original captures use their own bounded, server-owned receipts. They
@@ -2317,16 +2411,35 @@ def create_app(*, for_testing: bool = False) -> Flask:
         if request.path.startswith("/api/integrations/") and request.method in ("PUT", "DELETE"):
             _INTEGRATION_OPERATION_LOCK.acquire()
             g.integration_operation_locked = True
+            with _BULK_REGISTER_LOCK:
+                if _BULK_REGISTER_STATE.get("state") in ("running", "stopping"):
+                    return jsonify({"error": "Aguarde o cadastro terminar antes de alterar a integração de e-mail."}), 409
         account_write = request.path.startswith("/api/accounts") and request.method != "GET"
         campaign_start = request.path in ("/api/campaigns", "/api/campaigns/preflight",
                                          "/api/campaigns/original", "/api/campaigns/original/preflight") and request.method == "POST"
         synchronous_tasks = ((request.path == "/api/tasks" and request.args.get("async") != "1")
                              or request.path == "/api/campaigns/original/tasks")
         if account_write or campaign_start or synchronous_tasks:
-            _ACCOUNT_OPERATION_LOCK.acquire()
+            if not _ACCOUNT_OPERATION_LOCK.acquire(blocking=not account_write):
+                return jsonify({"error": "Aguarde a operação atual de contas terminar."}), 409
             g.account_operation_locked = True
             with _BULK_REGISTER_LOCK:
-                if _BULK_REGISTER_STATE.get("state") == "running":
+                registration_command = request.method == "POST" and (
+                    request.path == "/api/accounts/bulk-register"
+                    or request.path == "/api/accounts/register" and request.args.get("async") == "1"
+                    or request.path.startswith("/api/accounts/") and request.path.endswith("/resume"))
+                body = request.get_json(silent=True) or {}
+                request_id = body.get("request_id")
+                if (registration_command and isinstance(request_id, str) and request_id
+                        and _BULK_REGISTER_STATE.get("request_id") == request_id):
+                    fingerprint = hashlib.sha256((request.path + json.dumps(body, sort_keys=True)).encode()).hexdigest()
+                    if _BULK_REGISTER_STATE.get("request_fingerprint") != fingerprint:
+                        return jsonify({"error": "Este identificador já foi usado com outros dados de cadastro."}), 409
+                    return jsonify({"ok": True, "request_id": request_id, "existing": True,
+                                    "total": _BULK_REGISTER_STATE.get("total", 0),
+                                    "domain": _BULK_REGISTER_STATE.get("domain", "")})
+                if (_BULK_REGISTER_STATE.get("state") in ("running", "stopping")
+                        and request.path != "/api/accounts/bulk-register/stop"):
                     return jsonify({"error": "Aguarde o cadastro em lote terminar."}), 409
             if ORG_MIGRATION.running:
                 return jsonify({"error": "Aguarde a migração das organizações terminar."}), 409
@@ -2346,9 +2459,28 @@ def create_app(*, for_testing: bool = False) -> Flask:
     @app.get("/api/accounts")
     def get_accounts():
         accounts = _list_accounts()
+        registrations = registration_state.load()
+        removed = _removed_accounts()
+        known = {row["email"].strip().casefold() for row in accounts}
+        for email, registration in registrations.items():
+            if (email not in known and email not in removed
+                    and credential_store.record_path(config.SECRETS_DIR, email).exists()):
+                accounts.append({"email": email, "expires_at": 0, "org_key": None,
+                                 "org_name": "Não verificada", "account_kind": "crowtado",
+                                 "last_check": {}, "has_minute_access": config.token_path(email).exists()})
         passwords = _crowtado_creds()
+        balances = _load_balances()
         for account in accounts:
+            account.setdefault("has_minute_access", True)
+            registration = registrations.get(account["email"].strip().casefold())
+            if registration:
+                account["registration"] = registration
             account["has_password"] = bool(_saved_account_password(account["email"], passwords))
+            record = balances.get(account["email"], {})
+            account["restriction"] = wallet.restriction(record, wallet.reading(record), account)
+            if registration and any(step.get("code") == "restricted" for step in registration["steps"].values()):
+                account["restriction"] = {"code": "restricted", "confirmed": True,
+                    "label": "Conta restrita na Crowtado", "reason": "A autenticação Crowtado informou restrição explícita da conta. Solicite a regularização ao suporte da Crowtado."}
         return jsonify({"accounts": accounts})
 
     @app.post("/api/accounts/password")
@@ -2358,8 +2490,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
         if not email:
             return jsonify({"error": "informe a conta"}), 400
         with _PERSISTENCE_LOCK:
-            if not any(str(account["email"]).strip().casefold() == email
-                       for account in _list_accounts()):
+            active = any(str(account["email"]).strip().casefold() == email for account in _list_accounts())
+            if not active and (email in _removed_accounts() or email not in registration_state.load()):
                 return jsonify({"error": "conta não encontrada"}), 404
             password = _saved_account_password(email)
         if not password:
@@ -2639,6 +2771,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
         demográficos aleatórios. Roda Crowtado signup → demografia → Minute
         → vínculo → salva. Retorna o dict de steps.
         """
+        if request.args.get("async") == "1":
+            return bulk_register_accounts()
         body = request.get_json(silent=True) or {}
         email = body.get("email", "")
         password = body.get("password", "")
@@ -2660,10 +2794,13 @@ def create_app(*, for_testing: bool = False) -> Flask:
             "gender": gender,
             "birth_month": random.randint(1, 12),
             "birth_year": random.randint(1980, 2003),
+            "use_referral": body.get("use_referral", True),
         }
+        if type(identity_data["use_referral"]) is not bool:
+            return jsonify({"error": "use_referral deve ser booleano."}), 400
         result = _full_register_account(email, password, identity_data)
         ok = result["error"] is None
-        return jsonify({"ok": ok, "email": email, "steps": result["steps"],
+        return jsonify({"ok": ok, "email": email, "partial": result.get("partial", False), "steps": result["steps"],
                          "error": result["error"]}), 200 if ok else 400
 
     @app.get("/api/accounts/domains")
@@ -2687,30 +2824,84 @@ def create_app(*, for_testing: bool = False) -> Flask:
     @app.get("/api/accounts/bulk-register/status")
     def bulk_register_status():
         with _BULK_REGISTER_LOCK:
-            return jsonify(dict(_BULK_REGISTER_STATE))
+            response = jsonify(json.loads(json.dumps(_BULK_REGISTER_STATE)))
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+    @app.post("/api/accounts/bulk-register/stop")
+    def stop_bulk_register():
+        with _BULK_REGISTER_LOCK:
+            if _BULK_REGISTER_STATE.get("state") == "running":
+                _BULK_REGISTER_STATE["state"] = "stopping"
+                _save_registration_batch()
+            return jsonify({"ok": True, "state": _BULK_REGISTER_STATE.get("state", "idle")})
+
+    @app.post("/api/accounts/<email>/resume")
+    def resume_account(email: str):
+        try:
+            key = credential_store.email_key(email)
+            row = registration_state.load().get(key)
+            password = _saved_account_password(key)
+        except ValueError:
+            return jsonify({"error": "Conta inválida."}), 400
+        if not row or not password or key in _removed_accounts():
+            return jsonify({"error": "Cadastro ou credencial de retomada indisponível."}), 404
+        if row["state"] == "complete":
+            return jsonify({"error": "Esta conta já possui cadastro completo."}), 409
+        return bulk_register_accounts(single={"email": key, "password": password,
+                                             **row["identity"], "resume": True,
+                                             "request_id": (request.get_json(silent=True) or {}).get("request_id", "")})
 
     @app.post("/api/accounts/bulk-register")
-    def bulk_register_accounts():
+    def bulk_register_accounts(single=None):
         """Cria N contas novas com o fluxo completo (Crowtado + Minute + vínculo).
 
         Body: {count, domain}. Gera identidades via identity.gerar_identidade(),
         executa as 6 etapas por conta e reporta progresso via /status.
         """
         with _BULK_REGISTER_LOCK:
-            if _BULK_REGISTER_STATE.get("state") == "running":
+            if _BULK_REGISTER_STATE.get("state") in ("running", "stopping"):
                 return jsonify({"error": "Já existe uma criação em andamento."}), 409
 
-        body = request.get_json(silent=True) or {}
+        body = single or request.get_json(silent=True) or {}
+        use_referral = body.get("use_referral", True)
+        if type(use_referral) is not bool:
+            return jsonify({"error": "use_referral deve ser booleano."}), 400
+        request_body = request.get_json(silent=True) or {}
+        request_id = request_body.get("request_id", "")
+        if not isinstance(request_id, str) or len(request_id) > 80:
+            return jsonify({"error": "Identificador de cadastro inválido."}), 400
+        request_fingerprint = hashlib.sha256((request.path + json.dumps(request_body, sort_keys=True)).encode()).hexdigest()
+        manual = "email" in body
+        if manual:
+            try:
+                email = credential_store.email_key(body.get("email"))
+                password = body.get("password")
+                if not isinstance(password, str) or not password or len(password) > 4096:
+                    raise ValueError("Informe uma senha válida.")
+                month, year = body.get("birth_month"), body.get("birth_year")
+                if (type(month) is not int or not 1 <= month <= 12 or type(year) is not int
+                        or not 1900 <= year <= datetime.date.today().year
+                        or body.get("gender") not in crowtado.GENDERS):
+                    raise ValueError("Informe mês, ano de nascimento e gênero válidos para o cadastro.")
+                identity_data = {"email": email, "senha": password,
+                                 "nome": body.get("nome", email.split("@")[0]),
+                                 "sobrenome": body.get("sobrenome", ""),
+                                 "birth_month": month, "birth_year": year, "gender": body["gender"]}
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
         try:
-            count = int(body.get("count", 0))
+            count = 1 if manual else body.get("count", 0)
+            if type(count) is not int:
+                raise ValueError
         except (TypeError, ValueError):
             return jsonify({"error": "count inválido"}), 400
-        domain = str(body.get("domain", "")).strip().lower().lstrip("@")
+        domain = email.split("@", 1)[1] if manual else str(body.get("domain", "")).strip().lower().lstrip("@")
         if count < 1 or count > 50:
             return jsonify({"error": "count deve estar entre 1 e 50"}), 400
         if not domain:
             return jsonify({"error": "domain é obrigatório"}), 400
-        if RUNNER.running:
+        if RUNNER.running or RECOVERY.running or BALANCES_RUNNER.running:
             return jsonify({"error": "pare a campanha antes de criar contas"}), 409
         if not _hostinger_is_configured():
             return jsonify({"error": "Configure a integração Hostinger (domínio catch-all) antes de criar contas."}), 409
@@ -2734,7 +2925,20 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 "results": [],
                 "current_email": "",
                 "current_step": "",
+                "domain": domain,
+                "stopped": False,
+                "request_id": request_id,
+                "request_fingerprint": request_fingerprint,
             })
+            try:
+                _save_registration_batch()
+            except OSError:
+                # No remote work has started. Do not leave the UI locked in a
+                # running state when the initial durable checkpoint failed.
+                _BULK_REGISTER_STATE.update(
+                    state="failed", error="Não foi possível salvar o progresso local. Nenhuma conta foi criada."
+                )
+                return jsonify({"error": _BULK_REGISTER_STATE["error"]}), 503
 
         def _run_batch() -> bool:
             successes = 0
@@ -2742,8 +2946,12 @@ def create_app(*, for_testing: bool = False) -> Flask:
             results: list[dict[str, Any]] = []
             used_emails: set[str] = set(existing_emails)
             for index in range(count):
+                with _BULK_REGISTER_LOCK:
+                    if _BULK_REGISTER_STATE.get("state") == "stopping":
+                        _BULK_REGISTER_STATE["stopped"] = True
+                        break
                 try:
-                    identity_data = identity.gerar_identidade(
+                    account_identity = dict(identity_data) if manual else identity.gerar_identidade(
                         domain=domain,
                         existentes=used_emails,
                     )
@@ -2752,16 +2960,19 @@ def create_app(*, for_testing: bool = False) -> Flask:
                         _BULK_REGISTER_STATE["state"] = "failed"
                         _BULK_REGISTER_STATE["error"] = str(exc)
                     return False
-                email = identity_data["email"]
-                password = identity_data["senha"]
+                email = account_identity["email"]
+                password = account_identity["senha"]
+                account_identity["use_referral"] = use_referral
                 used_emails.add(email.lower())
 
                 def _on_step(step_name: str) -> None:
                     with _BULK_REGISTER_LOCK:
                         _BULK_REGISTER_STATE["current_email"] = email
                         _BULK_REGISTER_STATE["current_step"] = _STEP_LABELS.get(step_name, step_name)
+                        _save_registration_batch()
 
-                result = _full_register_account(email, password, identity_data, on_step=_on_step)
+                result = _full_register_account(email, password, account_identity, on_step=_on_step,
+                                                **({"resume": True} if body.get("resume") is True else {}))
                 ok = result["error"] is None
                 removable = (
                     config.token_path(email).exists()
@@ -2773,12 +2984,13 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     failures += 1
                 results.append({
                     "email": email,
-                    "nome": identity_data["nome"],
-                    "sobrenome": identity_data["sobrenome"],
-                    "gender": identity_data["gender"],
-                    "birth_month": identity_data["birth_month"],
-                    "birth_year": identity_data["birth_year"],
+                    "nome": account_identity["nome"],
+                    "sobrenome": account_identity["sobrenome"],
+                    "gender": account_identity["gender"],
+                    "birth_month": account_identity["birth_month"],
+                    "birth_year": account_identity["birth_year"],
                     "created": ok,
+                    "partial": result.get("partial", False),
                     "removable": removable,
                     "removed": False,
                     "error": result["error"],
@@ -2789,6 +3001,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     _BULK_REGISTER_STATE["created"] = successes
                     _BULK_REGISTER_STATE["failed"] = failures
                     _BULK_REGISTER_STATE["results"] = list(results)
+                    _save_registration_batch()
             return True
         def _worker() -> None:
             terminal = {"state": "failed", "error": "Cadastro interrompido."}
@@ -2805,6 +3018,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     _BULK_REGISTER_STATE.update(terminal)
                     _BULK_REGISTER_STATE["current_email"] = ""
                     _BULK_REGISTER_STATE["current_step"] = ""
+                    try:
+                        _save_registration_batch()
+                    except OSError:
+                        _BULK_REGISTER_STATE.update(state="failed", error="Não foi possível salvar o progresso local. Confira as credenciais e os cadastros antes de tentar novamente.")
 
         try:
             thread = threading.Thread(target=_worker, name="moneymin-bulk-register", daemon=True)
@@ -2813,7 +3030,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             with _BULK_REGISTER_LOCK:
                 _BULK_REGISTER_STATE.update(state="failed", error="Não foi possível iniciar o cadastro.")
             return jsonify({"error": "Não foi possível iniciar o cadastro."}), 500
-        return jsonify({"ok": True, "total": count, "domain": domain})
+        return jsonify({"ok": True, "total": count, "domain": domain, "request_id": request_id})
 
     @app.delete("/api/accounts/<email>")
     def remove_account(email: str):
@@ -4877,8 +5094,12 @@ def create_app(*, for_testing: bool = False) -> Flask:
         with_password = sorted(
             email for email in _configured_crowtado_creds() if email in configured_set
         )
+        kinds = {str(account["email"]): org_policy.account_kind(str(account["email"]))
+                 for account in account_rows}
+        runner_state = BALANCES_RUNNER.snapshot()
+        wallet_state = wallet.snapshot(account_rows, balances, set(with_password), kinds, runner_state)
         return jsonify({
-            "balances": balances,
+            "balances": {email: record for email, record in balances.items() if email in configured_set},
             "accounts": configured,
             "account_kinds": {
                 str(account["email"]): org_policy.account_kind(str(account["email"]))
@@ -4889,8 +5110,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 account["email"] for account in account_rows
                 if _saved_account_password(account["email"], saved_passwords)
             ),
-            "refresh_needed": _balance_refresh_needed(account_rows, balances, set(with_password)),
-            "runner": BALANCES_RUNNER.snapshot(),
+            "refresh_needed": sorted(email for email, row in wallet_state["accounts"].items() if row["refresh_needed"]),
+            "runner": runner_state,
+            "wallet": wallet_state,
             "withdraw_bulk": _withdraw_bulk_snapshot(),
             "payout_method_bulk": _payout_method_snapshot(),
             "wise_cleanup": _wise_cleanup_snapshot(),
@@ -4899,6 +5121,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         })
 
     @app.post("/api/balances/wise-cleanup")
+    @_serialize_wallet_command
     def finish_pending_wise_cleanup():
         """Retoma apenas a remoção Wise e a preferência Dots, inclusive após reiniciar."""
         if not _PAYOUT_OPERATION_LOCK.acquire(blocking=False):
@@ -4922,6 +5145,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             _PAYOUT_OPERATION_LOCK.release()
 
     @app.post("/api/balances/payout-methods/apply-all")
+    @_serialize_wallet_command
     def apply_all_payout_methods():
         if _wise_cleanup_snapshot().get("pending"):
             return jsonify({"error": "conclua a limpeza Wise pendente antes de configurar métodos"}), 409
@@ -4962,8 +5186,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
         return jsonify({"ok": True, "total": len(creds)})
 
     @app.post("/api/balances/refresh")
+    @_serialize_wallet_command
     def refresh_balances():
-        if _withdraw_bulk_snapshot()["state"] == "running":
+        if (_withdraw_bulk_snapshot()["state"] == "running"
+                or _payout_method_snapshot()["state"] == "running"
+                or _PAYOUT_OPERATION_LOCK.locked()):
             return jsonify({"error": "aguarde o saque em lote terminar"}), 409
         body = request.get_json(silent=True) or {}
         if (not isinstance(body, dict) or not isinstance(body.get("emails", []), list)
@@ -5002,7 +5229,13 @@ def create_app(*, for_testing: bool = False) -> Flask:
             return jsonify({"error": str(exc)}), 409
         return jsonify({"ok": True, "total": len(creds)})
 
+    @app.post("/api/balances/stop")
+    def stop_balance_refresh():
+        BALANCES_RUNNER.stop()
+        return jsonify({"ok": True, "runner": BALANCES_RUNNER.snapshot()})
+
     @app.post("/api/balances/withdraw")
+    @_serialize_wallet_command
     def request_balance_withdraw():
         """Solicita o método salvo ou o fluxo Wise confirmado pelo usuário."""
         body = request.get_json(silent=True) or {}
@@ -5034,6 +5267,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
             return jsonify({"error": "há um pagamento em trânsito que a Crowtado não permite substituir; atualize o saldo após a conclusão"}), 409
         if not _confirmed_available_balance(balance):
             return jsonify({"error": "atualize o saldo desta conta antes de solicitar saque; é necessário saldo aprovado superior a US$ 25,00"}), 400
+        eligibility = wallet.payout(balance, wallet.reading(balance), True)
+        if not eligibility["eligible"]:
+            return jsonify({"error": eligibility["reason"], "code": eligibility["code"]}), 409
         if wise and wise.get("method") != "paypal" and body.get("background") is True:
             if _wise_cleanup_snapshot().get("pending"):
                 return jsonify({"error": "há uma limpeza Wise pendente; nenhum novo saque será enviado"}), 409
@@ -5044,6 +5280,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         return jsonify(result), status
 
     @app.post("/api/balances/withdraw-all")
+    @_serialize_wallet_command
     def request_all_balance_withdrawals():
         """Processa contas elegíveis sequencialmente, incluindo a limpeza Wise."""
         if _wise_cleanup_snapshot().get("pending"):
@@ -5067,7 +5304,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             if org_policy.account_kind(email) != "crowtado" or email not in passwords:
                 continue
             balance = balances.get(email) or {}
-            if not _confirmed_available_balance(balance):
+            if not wallet.payout(balance, wallet.reading(balance), True)["eligible"]:
                 continue
             eligible[email] = passwords[email]
         if not eligible:
@@ -5076,7 +5313,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
         return jsonify(payload), (200 if status == 202 else status)
 
     @app.put("/api/balances/credentials")
+    @_serialize_wallet_command
     def put_balance_credentials():
+        if (BALANCES_RUNNER.running or _withdraw_bulk_snapshot()["state"] == "running"
+                or _payout_method_snapshot()["state"] == "running" or _PAYOUT_OPERATION_LOCK.locked()):
+            return jsonify({"error": "aguarde a operação da Carteira terminar antes de alterar o acesso"}), 409
         body = request.get_json(silent=True) or {}
         email = body.get("email", "")
         password = body.get("password", "")

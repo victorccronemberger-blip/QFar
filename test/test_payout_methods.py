@@ -7,6 +7,10 @@ from moneymin import crowtado
 from moneymin.web import server
 
 
+BALANCE = {"availableCents": 3500, "pendingCents": 0, "inTransitCents": 0, "lifetimeCents": 3500}
+ELIGIBILITY = {"available": True, "blocked": False}
+
+
 class PayoutMethodTests(unittest.TestCase):
     def setUp(self):
         pause = patch.object(crowtado.time, "sleep")
@@ -43,14 +47,14 @@ class PayoutMethodTests(unittest.TestCase):
 
     def test_saved_wise_cannot_withdraw_without_explicit_confirmation(self):
         with patch.object(crowtado, "_cached_login", return_value=object()), \
-             patch.object(crowtado, "_site_trpc", return_value={"payoutPreference": "wise"}) as trpc:
+             patch.object(crowtado, "_site_trpc", return_value={**BALANCE, "payoutPreference": "wise"}) as trpc:
             with self.assertRaisesRegex(crowtado.CrowtadoError, "confirme Wise"):
                 crowtado.solicitar_link_saque("account@example.com", "pw")
         trpc.assert_called_once()
 
     def test_confirmed_wise_never_withdraws_through_another_method(self):
         with patch.object(crowtado, "_cached_login", return_value=object()), \
-             patch.object(crowtado, "_site_trpc", return_value={"payoutPreference": "other"}) as trpc:
+             patch.object(crowtado, "_site_trpc", return_value={**BALANCE, "payoutPreference": "other"}) as trpc:
             with self.assertRaises(crowtado.CrowtadoError):
                 crowtado.solicitar_link_saque("account@example.com", "pw", expected_method="wise", cleanup_wise=False)
         trpc.assert_called_once()
@@ -72,10 +76,10 @@ class PayoutMethodTests(unittest.TestCase):
                     crowtado.desvincular_wise("account@example.com", "pw")
 
     def test_unlink_rejection_preserves_accepted_withdrawal_and_restores_dots(self):
-        summary = {"payoutPreference": "wise", "wiseReady": True,
+        summary = {**BALANCE, "payoutPreference": "wise", "wiseReady": True,
                    "manualDestinations": [{"method": "wise", "isPreferred": True}]}
         with patch.object(crowtado, "_cached_login", return_value=object()), \
-             patch.object(crowtado, "_site_trpc", side_effect=[summary, {"status": "ok"}, summary, {**summary, "payoutPreference": "other"}]), \
+             patch.object(crowtado, "_site_trpc", side_effect=[summary, ELIGIBILITY, {"status": "ok"}, summary, {**summary, "payoutPreference": "other"}]), \
              patch.object(crowtado, "desvincular_wise", side_effect=crowtado.CrowtadoError("conflict")), \
              patch.object(crowtado, "configurar_metodo_saque") as restore:
             result = crowtado.solicitar_link_saque("account@example.com", "pw", expected_method="wise")
@@ -112,8 +116,10 @@ class PayoutMethodTests(unittest.TestCase):
                     self.assertEqual(state["withdrawals"], 1)
                 state["preference"] = payload["method"]
                 return {"ok": True}
+            if procedure == "externalMobileCapture.eligibilityStatus":
+                return ELIGIBILITY
             if procedure == "payouts.summary":
-                return {"payoutPreference": state["preference"], "wiseReady": state["linked"],
+                return {**BALANCE, "payoutPreference": state["preference"], "wiseReady": state["linked"],
                         "manualDestinations": [{"method": "wise", "isPreferred": True}]
                         if state["linked"] else []}
             if procedure == "payouts.withdraw":
@@ -145,7 +151,7 @@ class PayoutMethodTests(unittest.TestCase):
         expected_procedures = [
             "payouts.payoutMethods", "kyc.saveManualPayoutMethod",
             "payouts.savePayoutPreference", "payouts.summary", "payouts.summary",
-            "payouts.withdraw", "payouts.summary", "kyc.removeManualPayoutMethod", "payouts.summary", "payouts.payoutMethods",
+            "externalMobileCapture.eligibilityStatus", "payouts.withdraw", "payouts.summary", "kyc.removeManualPayoutMethod", "payouts.summary", "payouts.payoutMethods",
             "payouts.savePayoutPreference", "payouts.summary", "payouts.summary"]
         self.assertEqual(events, [(email, procedure) for email in accounts
                                   for procedure in expected_procedures])
@@ -166,8 +172,10 @@ class PayoutMethodTests(unittest.TestCase):
                 linked = True
             if procedure == "kyc.removeManualPayoutMethod":
                 linked = False
+            if procedure == "externalMobileCapture.eligibilityStatus":
+                return ELIGIBILITY
             if procedure == "payouts.summary":
-                return {"payoutPreference": preference, "wiseReady": linked,
+                return {**BALANCE, "payoutPreference": preference, "wiseReady": linked,
                         "manualDestinations": [{"method": "wise", "isPreferred": True}] if linked else []}
             if procedure == "payouts.withdraw":
                 self.assertEqual(preference, "wise")
@@ -186,17 +194,17 @@ class PayoutMethodTests(unittest.TestCase):
         self.assertEqual([name for name, _ in calls], [
             "payouts.payoutMethods", "kyc.saveManualPayoutMethod",
             "payouts.savePayoutPreference", "payouts.summary", "payouts.summary",
-            "payouts.withdraw", "payouts.summary", "kyc.removeManualPayoutMethod", "payouts.summary", "payouts.payoutMethods",
+            "externalMobileCapture.eligibilityStatus", "payouts.withdraw", "payouts.summary", "kyc.removeManualPayoutMethod", "payouts.summary", "payouts.payoutMethods",
             "payouts.savePayoutPreference", "payouts.summary", "payouts.summary"])
 
     def test_wise_restores_after_rejection_review_and_lost_response(self):
-        summary = {"payoutPreference": "wise", "wiseReady": True,
+        summary = {**BALANCE, "payoutPreference": "wise", "wiseReady": True,
                    "manualDestinations": [{"method": "wise", "isPreferred": True}]}
         for response in ({"status": "below_minimum"}, {"status": "review_required"},
                          {}, crowtado.CrowtadoError("timeout")):
             with self.subTest(response=response), \
                  patch.object(crowtado, "_cached_login", return_value=object()), \
-                 patch.object(crowtado, "_site_trpc", side_effect=[summary, response]), \
+                 patch.object(crowtado, "_site_trpc", side_effect=[summary, ELIGIBILITY, response]), \
                  patch.object(crowtado, "configurar_metodo_saque") as restore:
                 if not response or isinstance(response, Exception):
                     with self.assertRaises(crowtado.CrowtadoError):
@@ -206,10 +214,10 @@ class PayoutMethodTests(unittest.TestCase):
                 restore.assert_called_once_with("test@example.com", "pw", "dots")
 
     def test_restore_failure_preserves_success_and_warns(self):
-        summary = {"payoutPreference": "wise", "wiseReady": True,
+        summary = {**BALANCE, "payoutPreference": "wise", "wiseReady": True,
                    "manualDestinations": [{"method": "wise", "isPreferred": True}]}
         with patch.object(crowtado, "_cached_login", return_value=object()), \
-             patch.object(crowtado, "_site_trpc", side_effect=[summary, {"status": "ok"}]), \
+             patch.object(crowtado, "_site_trpc", side_effect=[summary, ELIGIBILITY, {"status": "ok"}]), \
              patch.object(crowtado, "configurar_metodo_saque", side_effect=RuntimeError("secret")):
             result = crowtado.solicitar_link_saque("test@example.com", "pw", expected_method="wise")
         self.assertEqual(result["status"], "ok")
@@ -224,8 +232,10 @@ class PayoutMethodTests(unittest.TestCase):
             calls.append((procedure, payload, method))
             if procedure == "payouts.payoutMethods":
                 return ["other", "paypal", "wise"]
+            if procedure == "externalMobileCapture.eligibilityStatus":
+                return ELIGIBILITY
             if procedure == "payouts.summary":
-                return {"payoutPreference": "paypal", "manualDestinations": []}
+                return {**BALANCE, "payoutPreference": "paypal", "manualDestinations": []}
             return {"ok": True}
 
         with patch.object(crowtado, "_cached_login", return_value=object()), \
@@ -241,8 +251,10 @@ class PayoutMethodTests(unittest.TestCase):
             calls.append((procedure, payload))
             if procedure == "payouts.payoutMethods":
                 return ["other", "paypal"]
+            if procedure == "externalMobileCapture.eligibilityStatus":
+                return ELIGIBILITY
             if procedure == "payouts.summary":
-                return {"payoutPreference": "other"}
+                return {**BALANCE, "payoutPreference": "other"}
             return {}
 
         with patch.object(crowtado, "_cached_login", return_value=object()), \
@@ -278,15 +290,17 @@ class PayoutMethodTests(unittest.TestCase):
 
         def trpc(_session, procedure, payload, method="POST"):
             calls.append((procedure, payload))
+            if procedure == "externalMobileCapture.eligibilityStatus":
+                return ELIGIBILITY
             if procedure == "payouts.summary":
-                return {"payoutPreference": "wise", "wiseReady": True,
+                return {**BALANCE, "payoutPreference": "wise", "wiseReady": True,
                         "manualDestinations": [{"method": "wise", "isPreferred": True}]}
             return {"status": "ok", "rail": "wise"}
 
         with patch.object(crowtado, "_cached_login", return_value=object()), \
              patch.object(crowtado, "_site_trpc", side_effect=trpc):
             result = crowtado.solicitar_link_saque("account@example.com", "pw", expected_method="wise")
-        self.assertEqual(calls[1], ("payouts.withdraw", {"method": "wise"}))
+        self.assertEqual(calls[2], ("payouts.withdraw", {"method": "wise"}))
         self.assertEqual(result["rail"], "wise")
         self.assertFalse(result["payoutPreferenceRestored"])
 

@@ -80,7 +80,7 @@ class BalanceForensicsTests(unittest.TestCase):
         expired = crowtado.CrowtadoError("expired", code="authentication")
         with patch.object(crowtado, "_cached_login", side_effect=["old", "new"]) as login, \
              patch.object(crowtado, "_site_trpc", side_effect=[expired, SUMMARY]) as query:
-            self.assertEqual(crowtado.consultar_saldo_api("a", "pw"), SUMMARY)
+            self.assertEqual(crowtado.consultar_saldo_api("a", "pw"), {**SUMMARY, "contributorEligibility": {"checked": False}})
         self.assertEqual(login.call_count, 2)
         self.assertTrue(all(c.kwargs["method"] == "GET" for c in query.call_args_list))
 

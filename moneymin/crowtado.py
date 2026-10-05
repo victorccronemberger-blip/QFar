@@ -64,13 +64,16 @@ def _remote_error(stage: str, status: int, body: Any) -> CrowtadoError:
     errors = body.get("errors", []) if isinstance(body, dict) else []
     errors = errors if isinstance(errors, list) else []
     codes = {str(item.get("code")) for item in errors if isinstance(item, dict)}
-    code = ("crowtado_account_missing" if "form_identifier_not_found" in codes else
+    restricted = codes & {"user_banned", "user_locked", "user_account_disabled", "user_disabled"}
+    code = ("restricted" if restricted else "crowtado_account_missing" if "form_identifier_not_found" in codes else
             "authentication" if codes & {"form_password_incorrect", "form_password_pwned", "session_invalid"}
             or status == 401 else
             "rate_limit" if status == 429 else
             "service" if status >= 500 else
             "forbidden" if status == 403 else "invalid_response")
-    return CrowtadoError(f"{stage} (HTTP {status})", code=code, http_status=status)
+    message = ("A Crowtado confirmou restrição desta conta. Fale com o suporte"
+               if restricted else stage)
+    return CrowtadoError(f"{message} (HTTP {status})", code=code, http_status=status)
 
 
 def can_use_browser_fallback(error: Exception) -> bool:
@@ -78,7 +81,7 @@ def can_use_browser_fallback(error: Exception) -> bool:
     # duplicates requests and hides the original diagnosis.
     return getattr(error, "account_issue_code", None) not in {
         "authentication", "crowtado_account_missing", "rate_limit", "service",
-        "network", "timeout", "tls", "email_verification",
+        "network", "timeout", "tls", "email_verification", "restricted", "device",
     }
 
 
@@ -261,33 +264,80 @@ def _login_locked(email: str, password: str) -> CrowtadoSession:
 
 def _extrai_summary(texto: str) -> dict[str, int]:
     """Extrai o payouts.summary de um payload flight RSC (com escapes ou não)."""
-    normalized = re.sub(r'\\+"', '"', texto)
-    for match in re.finditer(r'\{[^{}]*"availableCents"[^{}]*\}', normalized):
-        try:
-            result = _summary_from_payload(json.loads(match.group()))
-            if result:
-                return result
-        except (ValueError, CrowtadoError):
-            continue
+    decoder = json.JSONDecoder()
+    # Decode the enclosing object rather than stopping at a nested destination.
+    # Limit scanning to avoid quadratic work on an unrelated Flight document.
+    for normalized in (texto, re.sub(r'\\+"', '"', texto)):
+        for match in list(re.finditer(r'"availableCents"\s*:', normalized))[:32]:
+            starts = [m.start() for m in re.finditer(r'\{', normalized[max(0, match.start()-8192):match.start()])]
+            offset = max(0, match.start()-8192)
+            for start in reversed(starts[-32:]):
+                try:
+                    payload, _ = decoder.raw_decode(normalized, offset + start)
+                    result = _summary_from_payload(payload)
+                    if result:
+                        return result
+                except (ValueError, CrowtadoError):
+                    continue
     return {}
 
 
-def _summary_from_payload(payload: Any) -> dict[str, int]:
+def _read_balance_summary(session: CrowtadoSession) -> dict[str, Any]:
+    """Retry one transient GET using the same authenticated session."""
+    for attempt in range(2):
+        try:
+            payload = _site_trpc(session, "payouts.summary", None, method="GET")
+            summary = _summary_from_payload(payload)
+            if not summary:
+                raise CrowtadoError("payouts.summary sem saldo completo reconhecível", code="invalid_response")
+            return summary
+        except CrowtadoError as exc:
+            if attempt or exc.account_issue_code not in {"network", "timeout", "service", "invalid_response"}:
+                raise
+            time.sleep(0.5)
+    raise AssertionError("unreachable")
+
+
+BALANCE_SUMMARY_FIELDS = frozenset({
+    "availableCents", "inTransitCents", "lifetimeCents", "pendingCents",
+    "onHoldCents", "notApprovedCents", "pendingCount", "notApprovedCount", "withdrawMinimumCents",
+    "inTransitReplaceable", "pendingIsEstimate", "dotsReady", "wiseReady", "bankTransferViaTremendous",
+    "currency", "payoutPreference", "onHoldReason", "holdReason", "holdReleaseAt",
+    "contributorEligibility",
+})
+
+
+def _summary_from_payload(payload: Any) -> dict[str, Any]:
     """Normaliza as formas direta/aninhada usadas pelo payouts.summary."""
     required = ("availableCents", "inTransitCents", "lifetimeCents", "pendingCents")
     if isinstance(payload, dict):
         if all(name in payload for name in required):
             try:
                 values = {}
-                for name in required:
+                for name in (*required, "onHoldCents", "notApprovedCents", "pendingCount", "notApprovedCount", "withdrawMinimumCents"):
+                    if name not in payload and name not in required:
+                        continue
                     value = payload[name]
                     if isinstance(value, bool) or not (
                             isinstance(value, int) or isinstance(value, str)
                             and re.fullmatch(r"-?\d+", value)):
                         raise ValueError("invalid cents")
                     values[name] = int(value)
-                if type(payload.get("inTransitReplaceable")) is bool:
-                    values["inTransitReplaceable"] = payload["inTransitReplaceable"]
+                    if not 0 <= values[name] <= 2**53 - 1:
+                        raise ValueError("invalid cents range")
+                for name in ("inTransitReplaceable", "pendingIsEstimate", "dotsReady", "wiseReady", "bankTransferViaTremendous"):
+                    if name in payload:
+                        if type(payload[name]) is not bool:
+                            raise ValueError("invalid flag")
+                        values[name] = payload[name]
+                for name in ("currency", "payoutPreference", "onHoldReason", "holdReason", "holdReleaseAt"):
+                    if name in payload:
+                        value = payload[name]
+                        if value is not None and (not isinstance(value, str) or len(value) > 500):
+                            raise ValueError("invalid payout state")
+                        values[name] = value
+                if "contributorEligibility" in payload:
+                    values["contributorEligibility"] = _normalize_eligibility(payload["contributorEligibility"])
                 return values
             except (TypeError, ValueError, OverflowError) as exc:
                 raise CrowtadoError("payouts.summary devolveu valores inválidos", code="invalid_response") from exc
@@ -304,21 +354,51 @@ def _summary_from_payload(payload: Any) -> dict[str, int]:
     return {}
 
 
-def consultar_saldo_api(email: str, senha: str) -> dict[str, int]:
+def _normalize_eligibility(payload: Any) -> dict[str, Any]:
+    """Only retain public eligibility flags, never device or identity details."""
+    if isinstance(payload, dict):
+        if type(payload.get("available")) is bool and type(payload.get("blocked")) is bool:
+            return {"checked": payload.get("checked", True) is True,
+                    "available": payload["available"], "blocked": payload["blocked"],
+                    "withdrawalOverride": payload.get("withdrawalOverride") is True,
+                    "reasons": sorted({reason for reason in payload.get("reasons", [])
+                        if isinstance(reason, str) and reason in {"vpn", "device", "account"}})
+                        if isinstance(payload.get("reasons", []), list) else []}
+        for key in ("result", "data", "json"):
+            if key in payload:
+                result = _normalize_eligibility(payload[key])
+                if result["checked"]:
+                    return result
+    if isinstance(payload, list):
+        for item in payload:
+            result = _normalize_eligibility(item)
+            if result["checked"]:
+                return result
+    return {"checked": False}
+
+
+def _read_contributor_eligibility(session: CrowtadoSession) -> dict[str, Any]:
+    try:
+        payload = _site_trpc(session, "externalMobileCapture.eligibilityStatus", None, method="GET")
+        return _normalize_eligibility(payload)
+    except Exception:
+        # Eligibility failure must not erase a successfully read monetary balance.
+        return {"checked": False}
+
+
+def consultar_saldo_api(email: str, senha: str) -> dict[str, Any]:
     """Consulta o saldo pela API tRPC, sem iniciar navegador."""
     session = _cached_login(email, senha)
     try:
-        payload = _site_trpc(session, "payouts.summary", None, method="GET")
+        summary = _read_balance_summary(session)
     except CrowtadoError as exc:
         if exc.account_issue_code != "authentication":
             raise
         # Only the read is retried. Never replay a financial mutation.
         clear_cached_session(email)
         session = _cached_login(email, senha)
-        payload = _site_trpc(session, "payouts.summary", None, method="GET")
-    summary = _summary_from_payload(payload)
-    if not summary:
-        raise CrowtadoError("payouts.summary sem saldo completo reconhecível", code="invalid_response")
+        summary = _read_balance_summary(session)
+    summary["contributorEligibility"] = _read_contributor_eligibility(session)
     return summary
 
 
@@ -488,6 +568,26 @@ def _request_withdrawal(email: str, senha: str, *, expected_method: str | None =
         if not any(isinstance(item, dict) and item.get("method") == method
                    and item.get("isPreferred") for item in destinations):
             raise CrowtadoError("destino preferido não confirmado; saque não solicitado")
+    confirmed = _summary_from_payload(summary)
+    if not confirmed:
+        raise CrowtadoError("saldo atual incompleto; saque não enviado", code="invalid_response")
+    if confirmed.get("currency", "USD") != "USD":
+        raise CrowtadoError("moeda do saldo atual não confirmada; saque não enviado")
+    if confirmed.get("onHoldReason") or confirmed.get("holdReason"):
+        return {"status": "on_hold", "holdReason": confirmed.get("onHoldReason") or confirmed["holdReason"],
+                "withdrawalAttempted": False}
+    if confirmed["availableCents"] <= 2500:
+        return {"status": "below_minimum", "thresholdCents": 2500}
+    eligibility = _read_contributor_eligibility(session)
+    if not eligibility.get("checked") or (not eligibility.get("withdrawalOverride") and eligibility.get("available") is not True):
+        return {"status": "eligibility_unconfirmed", "withdrawalAttempted": False}
+    if not eligibility.get("withdrawalOverride") and eligibility.get("blocked") is not False:
+        reasons = eligibility.get("reasons", [])
+        reason = ("Conta desativada — fale com o suporte." if "account" in reasons else
+                  "VPN detectada — confira a elegibilidade no Minute." if "vpn" in reasons else
+                  "Dispositivo não compatível — confira a elegibilidade no Minute." if "device" in reasons else
+                  "Elegibilidade de saque bloqueada no Minute — confira o painel da Crowtado.")
+        return {"status": "on_hold", "holdReason": reason, "withdrawalAttempted": False}
     try:
         payload = _site_trpc(
             session, "payouts.withdraw", {"method": method}, method="POST")
@@ -521,11 +621,15 @@ def consultar_saldo_navegador(
     from .hostinger_mail import max_uid, wait_for_code
 
     summary: dict[str, Any] = {}
+    eligibility: dict[str, Any] = {"checked": False}
 
     def _on_response(resp) -> None:
-        if summary:
-            return
         try:
+            if "externalMobileCapture.eligibilityStatus" in resp.url:
+                eligibility.update(_normalize_eligibility(resp.json()))
+                return
+            if summary:
+                return
             if "payouts.summary" in resp.url:
                 body = resp.json()
                 for item in (body if isinstance(body, list) else [body]):
@@ -612,8 +716,11 @@ def consultar_saldo_navegador(
 
             page.on("response", _on_response)
             page.goto(SITE_BASE + EARNINGS_PATH, wait_until="domcontentloaded")
+            summary_waits = 0
             for _ in range(30):
                 if summary:
+                    summary_waits += 1
+                if summary and (eligibility.get("checked") or summary_waits >= 5):
                     break
                 page.wait_for_timeout(1000)
 
@@ -625,6 +732,7 @@ def consultar_saldo_navegador(
 
     if not summary:
         raise CrowtadoError("não capturei o payouts.summary (layout/rede mudou?).")
+    summary["contributorEligibility"] = eligibility
     return summary
 
 
@@ -658,6 +766,13 @@ def _trpc_error(proc: str, status: int, body: Any) -> CrowtadoError:
     message = str(error.get("message", "")).casefold() if isinstance(error, dict) else ""
     # Classify known business errors without exposing the remote message,
     # which can echo an email, legal name or payment token.
+    if status == 412 and ("demographics_required" in message
+                         or message == "birth month, birth year, and gender are required"):
+        return CrowtadoError("Complete nascimento e gênero na Crowtado (DEMOGRAPHICS_REQUIRED).",
+                            code="demographics_required", http_status=status)
+    if status == 412 and message == "minute_task_unavailable":
+        return CrowtadoError("A tarefa Minute está indisponível na Crowtado. O cadastro foi preservado; retome quando a tarefa estiver disponível.",
+                            code="minute_task_unavailable", http_status=status)
     if proc.startswith(("kyc.", "payouts.")):
         if "already linked to another" in message:
             return CrowtadoError("O destino já está vinculado a outra conta Crowtado.",
@@ -895,7 +1010,10 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
             ctx = browser.contexts[0]
             ctx.clear_cookies()  # sessão da conta anterior (batch) não vaza
             page = ctx.new_page()
-            page.goto(f"{SITE_BASE}/pt-BR/sign-up?ref={ref}",
+            signup_url = f"{SITE_BASE}/pt-BR/sign-up"
+            if ref:
+                signup_url += "?" + urllib.parse.urlencode({"ref": ref})
+            page.goto(signup_url,
                       wait_until="domcontentloaded", timeout=90_000)
             page.wait_for_timeout(4000)
 

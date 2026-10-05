@@ -16,7 +16,7 @@ class BalanceRefreshNeededTests(unittest.TestCase):
             "recent@example.com", "old@example.com", "missing@example.com",
             "failed@example.com", "claru@example.com", "unconnected@example.com")]
         balances = {
-            "recent@example.com": {"availableCents": 0, "updated_at": recent},
+            "recent@example.com": {"availableCents": 0, "pendingCents": 0, "inTransitCents": 0, "lifetimeCents": 0, "updated_at": recent},
             "old@example.com": {"availableCents": 500, "updated_at": old},
             "failed@example.com": {"availableCents": 100, "updated_at": recent,
                                    "error": "consulta falhou"},

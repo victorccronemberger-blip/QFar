@@ -68,7 +68,7 @@ public:
   InertProcess _backend;
   QPushButton* _updateButton{};
   QTimer _campaignDraftSave, _campaignPoll, _previewPoll, _cachePoll;
-  QTimer _orgMigrationPoll, _balancePoll, _backendProbe, _campaignClosePoll, _operationPoll;
+  QTimer _orgMigrationPoll, _balancePoll, _walletMonitorTimer, _backendProbe, _campaignClosePoll, _operationPoll;
   bool _closing{}, _backendReady{}, _campaignActive{}, _campaignStartPending{};
   bool _campaignPreflightPending{}, _campaignStartUncertain{};
   bool _campaignClosePending{}, _campaignCloseReady{}, _campaignCloseInFlight{};

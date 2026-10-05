@@ -39,7 +39,7 @@ def _fixture_path(path):
 
 
 class LocalApiSessionBoundaryTests(unittest.TestCase):
-    def test_all_73_product_operations_reject_bad_sessions_before_later_hooks_and_handlers(self):
+    def test_all_74_product_operations_reject_bad_sessions_before_later_hooks_and_handlers(self):
         with patch.dict(os.environ, {"QMONEY_LOCAL_API_TOKEN": TOKEN}):
             application = server.create_app()
         calls = []
@@ -55,7 +55,9 @@ class LocalApiSessionBoundaryTests(unittest.TestCase):
         operations = _product_operations()
         registered = {(rule.rule, method) for rule in application.url_map.iter_rules()
                       for method in rule.methods - {"HEAD", "OPTIONS"}}
-        self.assertEqual(len(operations), 73)
+        self.assertEqual(len(operations), 76)
+        self.assertIn(("/api/accounts/bulk-register/stop", "POST"), operations)
+        self.assertIn(("/api/accounts/<email>/resume", "POST"), operations)
         self.assertIn(("/api/campaigns/starts/<start_id>", "GET"), operations)
         self.assertEqual(registered, operations)
         client = application.test_client()
