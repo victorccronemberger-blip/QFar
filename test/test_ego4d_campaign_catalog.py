@@ -1,6 +1,7 @@
 """Campanha Ego4D: narração local, download e prova antes do preparo."""
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -146,6 +147,35 @@ class NarratedCampaignCatalogTests(unittest.TestCase):
         print("OBSERVATION dataset keeps clip with no mp4 on disk")
         print("OBSERVATION both keeps narrated parent:", PARENT in parents(both))
         print("OBSERVATION cache discards narrated parent:", PARENT not in parents(cached))
+
+    def test_duration_cache_with_live_narration_stamp_still_selects_narration(self):
+        campaign._duration_ranked_pools.cache_clear()
+        stamp = [list(item) for item in campaign._rank_cache_stamp()]
+        key = hashlib.sha256(f"{300.0:.6f}|{1800.0:.6f}".encode("ascii")).hexdigest()[:16]
+        path = self.root / f"task_rank_cache_{key}.pkl"
+        path.write_text(json.dumps({
+            "schema": 3,
+            "narration_scan": False,
+            "stamp": stamp,
+            "buckets": {TASK: [{
+                "clip_uid": "seed-only-300",
+                "parent_video_uid": "seed-parent-not-narrated",
+                "source": "ego4d",
+                "dur_s": 400,
+                "window_s": [0, 400],
+                "s3_path": "s3://fixture/seed-only.mp4",
+            }]},
+        }), encoding="utf-8")
+        spec = TaskSpec("fold", "Cleaning / laundry", 300, 1800, task_name=TASK, count=1)
+        cfg = CampaignConfig(
+            accounts=[AccountSpec("fixture@example.invalid", "org")],
+            tasks=[spec], work_dir=self.library, dataset_provider="ego4d",
+            content_mode="dataset", cleanup_after_upload=True)
+        selected = campaign.automatic_candidates(spec, cfg)
+        parents = {row.get("parent_video_uid") for row in selected}
+        self.assertIn(PARENT, parents)
+        self.assertNotIn("seed-parent-not-narrated", parents)
+        print("OBSERVATION 300-1800 duration cache with live narration stamp selects", PARENT)
 
     def test_selected_narration_revalidates_and_unproven_seed_stays_out(self):
         dataset = self.narrated_clip("dataset")

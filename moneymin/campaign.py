@@ -3628,8 +3628,9 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
             relative = path.name
         source = ego4d._selection_source(path)
         stamp.append((relative, source[1], source[2]))
-    # v7 migrates stat-only approvals: old disk caches are recomputed suggestions.
-    stamp.append(("ranked-union", 7, "parsed-content-selection-evidence"))
+    # v8 descarta caches de duração cujo carimbo já tinha o hash das narrações,
+    # mas os buckets ainda eram só o índice portátil.
+    stamp.append(("ranked-union", 8, "narration-catalog-selection"))
     return tuple(stamp)
 
 
@@ -3916,11 +3917,14 @@ def _load_rank_cache(
     try:
         # Legacy pickle caches are discarded, never executed during migration.
         payload = json.loads(path.read_bytes())
-        if payload.get("schema") != 2:
+        if payload.get("schema") != 3:
             return None
         stamp, buckets = payload["stamp"], payload["buckets"]
         stamp = tuple(tuple(item) for item in stamp)
+        narration_scan = payload.get("narration_scan") is True
     except Exception:  # noqa: BLE001 — cache corrompido = recompute
+        return None
+    if _local_narration_catalog() and not narration_scan:
         return None
     if _stamp_hides_present_narration(stamp):
         return None
@@ -3937,9 +3941,12 @@ def _load_rank_cache(
 def _save_rank_cache(
     buckets: dict[str, tuple[dict[str, Any], ...]],
     path: Path | None = None,
+    *,
+    narration_scan: bool = False,
 ) -> None:
     try:
-        payload = json.dumps({"schema": 2, "stamp": _rank_cache_stamp(),
+        payload = json.dumps({"schema": 3, "narration_scan": narration_scan,
+                              "stamp": _rank_cache_stamp(),
                               "buckets": _rank_evidenced(buckets)},
                              ensure_ascii=False, allow_nan=False).encode("utf-8")
         path = path or _rank_cache_path()
@@ -3970,14 +3977,14 @@ def _ranked_pools_snapshot(stamp) -> dict[str, tuple[dict[str, Any], ...]]:
         buckets = _union_ranked_clips(
             _union_ranked_clips(spans, official), evidenced)
         result = _rank_evidenced(_merge_rank_seed(buckets))
-        _save_rank_cache(result)
+        _save_rank_cache(result, narration_scan=True)
         return result
     seed = _load_rank_seed()
     if seed and any(seed.values()):
         # Sem narração local, o índice portátil é o piso. Com narração, ele
         # só completa tarefas que a biblioteca não cobre.
         result = _rank_evidenced(_merge_rank_seed({}))
-        _save_rank_cache(result)
+        _save_rank_cache(result, narration_scan=False)
         return result
     spans = ego4d.rank_all_task_spans(min_dur_s=60, max_dur_s=1800) if ego4d.has_timed_narrations() else {}
     official = task_matching.rank_all_tasks(_task_candidates())
@@ -3986,7 +3993,7 @@ def _ranked_pools_snapshot(stamp) -> dict[str, tuple[dict[str, Any], ...]]:
     buckets = _union_ranked_clips(
         _union_ranked_clips(spans, official), evidenced)
     result = _rank_evidenced(_merge_rank_seed(buckets))
-    _save_rank_cache(result)
+    _save_rank_cache(result, narration_scan=_local_narration_catalog())
     return result
 
 
@@ -4050,7 +4057,7 @@ def _duration_ranked_snapshot(stamp, min_dur_s: float, max_dur_s: float):
         for name, rows in _ranked_pools_cached().items()
     }
     result = _rank_evidenced(result)
-    _save_rank_cache(result, path)
+    _save_rank_cache(result, path, narration_scan=_local_narration_catalog())
     return result
 
 
