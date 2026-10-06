@@ -5120,6 +5120,25 @@ void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAcc
       setCampaignIndicator(QStringLiteral("Verificação não concluída"), message, QStringLiteral("error"));
       return showError(QStringLiteral("Verificação não concluída"), message);
     }
+    QSet<QString> removedNow;
+    for (const auto value : result.value(QStringLiteral("removed_accounts")).toArray())
+      removedNow.insert(value.toString());
+    QStringList reviewNames = selectedAccountNames;
+    if (!removedNow.isEmpty()) {
+      const QSignalBlocker listBlocker(_campaignAccounts);
+      for (int i = _campaignAccounts->count() - 1; i >= 0; --i)
+        if (removedNow.contains(_campaignAccounts->item(i)->data(Qt::UserRole).toString()))
+          delete _campaignAccounts->takeItem(i);
+      updateCampaignAccountCount();
+      reviewNames.clear();
+      const auto requestedAccounts = body.value(QStringLiteral("accounts")).toArray();
+      for (int i = 0; i < requestedAccounts.size(); ++i)
+        if (!removedNow.contains(requestedAccounts.at(i).toString()))
+          reviewNames.append(selectedAccountNames.value(i));
+      setStatus(QStringLiteral("%1 conta(s) com restrição confirmada foram para Banidas e saíram desta campanha.")
+          .arg(removedNow.size()));
+      loadAccounts();
+    }
     const auto blockers = result.value(QStringLiteral("blockers")).toArray();
     QStringList blockerLines;
     for (const auto& value : blockers) blockerLines << QStringLiteral("• ") + value.toString();
@@ -5186,7 +5205,7 @@ void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAcc
                                blockerLines, issues, continueAction);
     }
 
-    CampaignReviewDialog review(result, selectedAccountNames, this, body);
+    CampaignReviewDialog review(result, reviewNames, this, body);
     setCampaignIndicator(QStringLiteral("Aguardando sua confirmação"),
                          QStringLiteral("Confira a prévia antes de iniciar os envios."), QStringLiteral("idle"));
     if (review.exec() != QDialog::Accepted) {

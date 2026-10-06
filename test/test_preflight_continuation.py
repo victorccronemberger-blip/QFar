@@ -45,15 +45,20 @@ class PreflightContinuationTests(unittest.TestCase):
 
     def preflight(self):
         response = self.client.post('/api/campaigns/preflight', json=self.body)
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return response.get_json()
 
     def test_remove_continue_archives_password_and_date_without_tokens(self):
         result = self.preflight()
-        self.assertTrue(result['can_remove_and_continue'])
-        self.assertTrue(server.config.token_path('bad@example.com').exists())
+        self.assertTrue(result['ok'])
+        self.assertFalse(result['can_remove_and_continue'])
+        self.assertEqual(result['removed_accounts'], ['bad@example.com'])
+        self.assertEqual(result['account_issues'], [])
+        self.assertNotIn('bad@example.com', ' '.join(result['blockers']))
+        self.assertIn('Banidas', ' '.join(result['warnings']))
+        self.assertFalse(server.config.token_path('bad@example.com').exists())
         before = (self.resolve.call_count, self.catalog.call_count, self.ready.call_count)
-        response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
+        response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(before[:2], (self.resolve.call_count, self.catalog.call_count))
         self.assertEqual(self.ready.call_count, before[2] + 1)
@@ -87,6 +92,9 @@ class PreflightContinuationTests(unittest.TestCase):
         result = self.preflight()
         self.assertFalse(result['can_remove_and_continue'])
         self.assertIsNone(result['preflight_id'])
+        self.assertEqual(result['removed_accounts'], [])
+        self.assertTrue(server.config.token_path('bad@example.com').exists())
+        self.assertFalse((self.root / 'banned_accounts.json').exists())
 
     def test_recovery_read_failure_keeps_preflight_blocked_and_returns_diagnostic(self):
         from moneymin import recovery
@@ -103,16 +111,20 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertTrue(server.config.token_path('good@example.com').exists())
 
     def test_modified_request_or_changed_token_rejects_without_removal(self):
-        for mutation in ['body', 'token', 'expired']:
-            with self.subTest(mutation=mutation):
-                result = self.preflight()
-                body = {**self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True}
-                if mutation == 'body': body['count'] = 99
-                if mutation == 'token': server.config.token_path('good@example.com').write_text(json.dumps({'email': 'good@example.com', 'idToken': 'changed'}))
-                with patch.object(server.time, 'monotonic', return_value=10**15) if mutation == 'expired' else ExitStack():
-                    response = self.client.post('/api/campaigns', json=body)
-                self.assertEqual(response.status_code, 409)
-                self.assertTrue(server.config.token_path('bad@example.com').exists())
+        result = self.preflight()
+        receipt = result['preflight_id']
+        self.assertTrue(receipt)
+        self.assertFalse(server.config.token_path('bad@example.com').exists())
+        changed = {**self.body, 'preflight_id': receipt, 'count': 99}
+        self.assertEqual(self.client.post('/api/campaigns', json=changed).status_code, 409)
+        with patch.object(server.time, 'monotonic', return_value=10**15):
+            expired = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': receipt})
+        self.assertEqual(expired.status_code, 409)
+        self.assertEqual(expired.get_json()['error_code'], 'preflight_expired')
+        server.config.token_path('good@example.com').write_text(json.dumps({'email': 'good@example.com', 'idToken': 'changed'}))
+        changed_token = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': receipt})
+        self.assertEqual(changed_token.status_code, 409)
+        self.assertTrue(server.config.token_path('good@example.com').exists())
         self.runner.start.assert_not_called()
 
     def test_background_token_rotation_does_not_invalidate_preflight(self):
@@ -202,11 +214,10 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertTrue(runner.snapshot()['events'][-1]['permanently_removed'])
 
     def test_archive_failure_prevents_deletion_and_start(self):
-        result = self.preflight()
         (self.root / 'banned_accounts.json').write_text('[]')
-        response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id'], 'remove_restricted': True})
+        response = self.client.post('/api/campaigns/preflight', json=self.body)
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["code"], "archived_accounts_unreadable")
+        self.assertEqual(response.get_json()['code'], 'archived_accounts_unreadable')
         self.assertTrue(server.config.token_path('bad@example.com').exists())
         self.runner.start.assert_not_called()
 
@@ -222,8 +233,11 @@ class PreflightContinuationTests(unittest.TestCase):
 
     def test_confirmation_required_and_unknown_receipt_rejected(self):
         result = self.preflight()
-        for body, status in [({**self.body, 'preflight_id': result['preflight_id']}, 400),
-                             ({**self.body, 'remove_restricted': True}, 400),
-                             ({**self.body, 'preflight_id': 'forged', 'remove_restricted': True}, 409)]:
-            self.assertEqual(self.client.post('/api/campaigns', json=body).status_code, status)
+        forged = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': 'forged', 'remove_restricted': True})
+        self.assertEqual(forged.status_code, 409)
+        missing = self.client.post('/api/campaigns', json={**self.body, 'remove_restricted': True})
+        self.assertEqual(missing.status_code, 400)
         self.runner.start.assert_not_called()
+        started = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
+        self.assertEqual(started.status_code, 200, started.get_json())
+        self.assertEqual([account.email for account in self.runner.start.call_args.args[0].accounts], ['good@example.com'])

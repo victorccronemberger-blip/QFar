@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **109 releases públicas**, consultado em **05/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **110 releases públicas**, consultado em **05/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.42](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.42). Destaques: verificação de campanha em segundo plano e correção da instalação.
+Versão atual: [v2.0.43](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.43). Destaques: conta com restrição confirmada vai para Banidas e sai da campanha.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.43](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.43) | 05/10/2026 | Conta com restrição confirmada é arquivada em Banidas e deixa de bloquear a campanha. Rede, senha e tempo esgotado não removem a conta. | [Desde v2.0.42](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.42...v2.0.43) |
 | [v2.0.42](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.42) | 05/10/2026 | A verificação da campanha acompanha o progresso sem travar a tela. Corrigir instalação restaura o pacote oficial e preserva contas, credenciais e campanhas. Clipe oficial do Ego4D usa o início da janela como deslocamento do arquivo. | [Desde v2.0.41](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.41...v2.0.42) |
 | [v2.0.41](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.41) | 05/10/2026 | A origem da campanha oferece Ego4D, Nymeria e Ambos. Ambos usa os dois juntos e não inclui HoloAssist. | [Desde v2.0.40](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.40...v2.0.41) |
 | [v2.0.40](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.40) | 05/10/2026 | Provedor NymeriaPlus (Aria VRS→Minute 1.29) + Ego4D endurecido (forge/zip/mirrors/carve). Sem cap artificial no Nymeria; envelope SM-S901E. | [Desde v2.0.39](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.39...v2.0.40) |

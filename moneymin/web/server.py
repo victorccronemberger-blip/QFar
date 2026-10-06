@@ -4320,6 +4320,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
             blockers.append("selecione ao menos uma categoria")
         try:
             known = {account["email"] for account in _list_accounts()}
+        except banned_store.BannedStoreError:
+            raise
         except ValueError:
             return {"error": "Registro de contas inválido. Restaure os dados antes de continuar."}, 400
         missing_accounts = [email for email in emails if email not in known]
@@ -4414,10 +4416,35 @@ def create_app(*, for_testing: bool = False) -> Flask:
             blockers.append("nenhuma categoria selecionada possui clipe compatível")
 
         account_issues.sort(key=lambda item: (emails.index(item["email"]), item["stage"]))
+        # Restrição confirmada sai da seleção na hora. Timeout, senha e rede
+        # continuam pendências e não autorizam arquivo na lista de banidas.
+        confirmed = [item for item in account_issues if item.get("restriction_confirmed") is True]
+        removed_now: list[str] = []
+        if confirmed:
+            try:
+                _ban_accounts(confirmed)
+            except (OSError, ValueError):
+                blockers.append(
+                    "Não foi possível mover as contas restritas para Banidas. "
+                    "A campanha não foi alterada.")
+            else:
+                removed_now = [str(item["email"]) for item in confirmed]
+                account_issues = [
+                    item for item in account_issues if item.get("restriction_confirmed") is not True]
+                listed = ", ".join(removed_now)
+                warnings.append(
+                    f"{listed} foi movida para Banidas e não entra nesta campanha."
+                    if len(removed_now) == 1 else
+                    f"{len(removed_now)} contas com restrição confirmada foram movidas "
+                    f"para Banidas e não entram nesta campanha: {listed}.")
         account_errors = [issue_text(item) for item in account_issues]
         # Compatibilidade: clientes antigos leem apenas blockers. Não esconder
         # a conta nem classificar falhas de rede como credenciais inválidas.
         blockers.extend(account_errors)
+        if emails and not accounts and not account_issues:
+            blockers.append(
+                "Nenhuma conta selecionada permanece disponível. "
+                "As contas com restrição confirmada foram movidas para Banidas.")
 
         clip_count = sum(int(item.get("clip_count") or 0) for item in selected)
         if target_hours > 0:
@@ -4527,6 +4554,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             "clip_plan": clip_review,
             "can_remove_and_continue": reusable and bool(removable),
             "removable_accounts": sorted(removable),
+            "removed_accounts": removed_now,
             "provider": provider,
             "accounts": {"selected": len(emails), "validated": len(accounts)},
             "tasks": {"selected": len(raw_tasks), "compatible": len(selected)},
