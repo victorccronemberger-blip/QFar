@@ -1,5 +1,6 @@
 """Explicit reset uses isolated local files; no accounts or provider network."""
 from contextlib import ExitStack
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -193,7 +194,8 @@ class CampaignFullResetTests(unittest.TestCase):
         before = {path: path.read_bytes() for path in (old, current)}
         rename = Path.rename
         def fail_current(path, target):
-            if path == current:
+            # TEMP may use an NTFS 8.3 alias while reset resolves its roots.
+            if path.resolve() == current.resolve():
                 raise PermissionError("inert retry failure")
             return rename(path, target)
         with patch.object(Path, "rename", fail_current):
@@ -205,6 +207,31 @@ class CampaignFullResetTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/campaign/reset", json={}).status_code, 200)
         self.assertFalse(campaign_reset.pending())
         self.assertFalse(old.exists() or current.exists())
+
+    @unittest.skipUnless(os.name == "nt", "NTFS short-path aliases are Windows-specific")
+    def test_retry_move_failure_with_short_windows_temp_alias(self):
+        import ctypes
+        from ctypes import wintypes
+
+        long_root = self.root.resolve()
+        get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+        get_short_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        get_short_path.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        count = get_short_path(str(long_root), buffer, len(buffer))
+        if not count:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.assertLess(count, len(buffer))
+        short_root = Path(buffer.value)
+        if short_root == long_root:
+            self.skipTest("Host volume does not provide a distinct 8.3 alias")
+        self.assertTrue(short_root.samefile(long_root))
+        alias_data = short_root / "installation" / "data"
+        self.assertNotEqual(alias_data, alias_data.resolve())
+        # Exercise the same failure, byte preservation, barrier and retry
+        # assertions with the real alias used by Windows CI TEMP directories.
+        with patch.object(self, "data", alias_data), patch.object(config, "DATA_DIR", alias_data):
+            self.test_retry_move_failure_keeps_previous_barrier_and_bytes()
 
     def test_old_backup_is_removed_even_if_its_data_directory_was_deleted(self):
         self.media.rmdir()
