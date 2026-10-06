@@ -83,6 +83,36 @@ class RecoveryViewTests(unittest.TestCase):
         reads.assert_called_once()
         self.assertNotIn("session0", [item["session_id"] for item in result["items"]])
 
+    def test_history_reset_preserves_interrupted_sessions_and_their_reservations(self):
+        reset_path = self.root / "sent_reset_history.json"
+        reset_path.write_text(json.dumps({"all": ["campaign_old.json"],
+                                         "completed_sessions": ["session1"]}), encoding="utf-8")
+        context = {**self.row["campaign_context"], "history_name": "campaign_old.json"}
+        for phase, state, receipt in (("queued", "creating", None),
+                                      ("sas_ready", "transport", "accepted-session1-upload"),
+                                      ("transport_done", "completing", "accepted-session1-upload")):
+            with self.subTest(phase=phase):
+                row = {**self.row, "campaign_context": context, "phase": phase,
+                       "state": state, "finalized": False, "upload_id": receipt,
+                       "create_attempted": receipt is not None,
+                       "recorded_at": "2026-10-06T15:30:00Z"}
+                self.save(row)
+                before = (self.journals / "session1.json").read_bytes()
+                result = recovery.snapshot()
+                self.assertEqual(result["pending"], 1)
+                self.assertEqual(recovery.campaign_exclusions(result["items"]),
+                                 {"clip": ["one@example.com"]})
+                self.assertEqual((self.journals / "session1.json").read_bytes(), before)
+
+    def test_explicit_completed_session_reset_survives_archived_legacy_history(self):
+        row = {**self.row, "campaign_context": None}
+        self.save(row)
+        before = (self.journals / "session1.json").read_bytes()
+        (self.root / "sent_reset_history.json").write_text(
+            json.dumps({"completed_sessions": ["session1"]}), encoding="utf-8")
+        self.assertEqual(recovery.snapshot()["items"], [])
+        self.assertEqual((self.journals / "session1.json").read_bytes(), before)
+
     def test_legacy_media_mapping_requires_unique_clip_task_and_account(self):
         row = {**self.row, "campaign_context": None, "local_video_path": "C:/old/clip_native.mp4"}
         self.save(row)

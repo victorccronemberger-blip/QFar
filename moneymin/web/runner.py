@@ -43,6 +43,15 @@ def friendly_campaign_error(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return "O QMoney não conseguiu concluir esta etapa. Tente novamente."
+    if any(term in text for term in (
+            "registro de envio já está em uso", "sessão selecionada está em uso",
+            "registros estão em uso")):
+        return ("Uma operação local está usando o registro deste envio. "
+                "A sessão foi preservada; aguarde e consulte Recuperação de envios "
+                "antes de tentar novamente.")
+    if "identidade do registro de envio existente" in text:
+        return ("O registro salvo não corresponde aos dados desta tentativa. "
+                "Preserve os arquivos e confira o recibo em Recuperação de envios.")
     if "origem da gravação não permitida" in text:
         return "A organização não permite a origem de câmera declarada neste envio. Confira a política da organização; repetir o envio não resolve essa restrição."
     if "origens de gravação permitidas não foram confirmadas" in text:
@@ -91,7 +100,8 @@ def friendly_campaign_error(value: Any) -> str:
             "clip", "video", "vídeo", "manifest", "duração", "duration",
             "ffmpeg", "ffprobe")):
         return "Não foi possível preparar este vídeo. O QMoney o preservou e seguirá para o próximo."
-    return "O envio não foi concluído após as tentativas automáticas. Valide a conta e tente novamente."
+    return ("O envio não foi concluído. Confira o diagnóstico no Histórico e o recibo "
+            "em Recuperação de envios antes de tentar novamente.")
 
 
 def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:

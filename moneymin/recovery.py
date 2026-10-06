@@ -102,7 +102,7 @@ def _groups(directory=None, *, include_reconciled=False,
         # must not rewrite the original bytes merely to inspect recovery.
         row = {**row, "chunk_index": row.get("chunk_index", 0)}
         key = tuple(row.get(field) for field in ("account_email", "org_key", "session_id"))
-        if any(not isinstance(value, str) or not value for value in key):
+        if any(not isinstance(value, str) or not value.strip() for value in key):
             raise RecoveryReadError("journal_identity", path)
         try:
             expected_name = upload._sidecar_filename(key[2], row.get("chunk_index"))
@@ -151,15 +151,19 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
                   and (not context.get("task_id") or context["task_id"] == first.get("task_id"))
                   and all(row.get("campaign_context") == first.get("campaign_context")
                           and row.get("task_id") == first.get("task_id") for row in rows))
-    if (reset_checker or sent_registry.recovery_was_reset)(sid, context.get("registry_key", "") if identified else "",
-                                         context.get("history_name", "") if identified else ""):
-        return None
     expected = first.get("expected_chunk_count", 1)
     complete_group = _complete_chunk_group(rows)
-    confirmed = (identified and complete_group
-                 and all(journal_delivery_confirmed(row)
-                         and row.get("campaign_context") == first.get("campaign_context")
-                         for row in rows))
+    delivery_confirmed = (complete_group
+                          and all(journal_delivery_confirmed(row)
+                                  and row.get("campaign_context") == first.get("campaign_context")
+                                  for row in rows))
+    confirmed = identified and delivery_confirmed
+    # A history reset releases only confirmed deliveries. An interrupted
+    # session stays visible and reserved even when its old history was reset.
+    if delivery_confirmed and (reset_checker or sent_registry.recovery_was_reset)(
+            sid, context["registry_key"] if identified else "",
+            context.get("history_name", "") if identified else ""):
+        return None
     index_reconciled = all(row.get('campaign_reconciled') is True for row in rows)
     publication_pending = False
     if confirmed and index_reconciled:

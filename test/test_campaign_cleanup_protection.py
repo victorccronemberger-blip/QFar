@@ -63,7 +63,10 @@ class CleanupProtectionTests(unittest.TestCase):
         worker=threading.Thread(target=hold);worker.start()
         try:
             self.assertTrue(held.wait(2))
-            with self.assertRaises(upload.UploadError):upload.save_sidecar(self.row(owned))
+            # Keep the actual barrier held while only the publisher's clock
+            # passes its bounded 30-second deadline. Cleanup remains immediate.
+            with patch('moneymin.media_lifecycle.time.monotonic', side_effect=[0.0, 30.1]):
+                with self.assertRaises(upload.UploadError):upload.save_sidecar(self.row(owned))
             with self.assertRaises(ValueError):campaign.cleanup_media_cache(self.work)
             self.assertFalse(upload._sidecar_path('pending-fixture',0).exists())
             self.assertTrue(owned.exists())

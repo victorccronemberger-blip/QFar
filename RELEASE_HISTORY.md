@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **111 releases públicas**, atualizado em **06/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **112 releases públicas**, atualizado em **06/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.45](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.45). Destaques: Biblioteca mostra o acervo local geral e preserva mídia vinculada a operações pendentes.
+Versão atual: [v2.0.46](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.46). Destaques: capacidade por conta antes da campanha, gravação de registros concorrentes e acompanhamento separado de envios, recibos e prévias.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.46](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.46) | 06/10/2026 | Verifica capacidade e déficit por conta antes de aceitar a meta de horas. Checkpoints aguardam leituras concorrentes; falhas locais orientam a recuperação. Resultados da campanha, recibos e prévias permanecem separados. | [Desde v2.0.45](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.45...v2.0.46) |
 | [v2.0.45](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.45) | 06/10/2026 | Biblioteca com arquivos locais de todas as origens, busca, filtros, tamanhos e caminhos. Preparação com faixa de duração e espaço configuráveis; proteção de vídeos e sensores pendentes, seleção temporal Ego4D e diagnósticos IMU por parte. | [Desde v2.0.43](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.43...v2.0.45) |
 | [v2.0.43](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.43) | 05/10/2026 | Conta com restrição confirmada é arquivada em Banidas e deixa de bloquear a campanha. Rede, senha e tempo esgotado não removem a conta. | [Desde v2.0.42](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.42...v2.0.43) |
 | [v2.0.42](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.42) | 05/10/2026 | A verificação da campanha acompanha o progresso sem travar a tela. Corrigir instalação restaura o pacote oficial e preserva contas, credenciais e campanhas. Clipe oficial do Ego4D usa o início da janela como deslocamento do arquivo. | [Desde v2.0.41](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.41...v2.0.42) |

@@ -5,6 +5,30 @@ from unittest.mock import Mock, patch
 from moneymin.web import runner
 
 
+class CampaignErrorPresentationTests(unittest.TestCase):
+    def test_real_local_journal_conflict_preserves_recovery_guidance(self):
+        event = runner._public_event('account_done', {
+            'email': 'fixture@example.invalid', 'ok': False,
+            'error': 'O registro de envio já está em uso; preserve a retomada.',
+            'session_id': 'private-session', 'campaign_attempts': 1,
+        })
+        self.assertEqual(event['level'], 'error')
+        self.assertIn('operação local', event['detail'])
+        self.assertIn('sessão foi preservada', event['detail'])
+        self.assertIn('Recuperação de envios', event['detail'])
+        self.assertNotIn('Valide a conta', event['detail'])
+        self.assertNotIn('private-session', event['detail'])
+
+    def test_unclassified_error_does_not_claim_account_failure_or_retries(self):
+        message = runner.friendly_campaign_error(
+            'unclassified private-session secret-value https://example.invalid/?token=private')
+        self.assertIn('Histórico', message)
+        self.assertIn('Recuperação de envios', message)
+        for private in ('private-session', 'secret-value', 'token=', 'Valide a conta',
+                        'tentativas automáticas'):
+            self.assertNotIn(private, message)
+
+
 class RunnerLifecycleTests(unittest.TestCase):
     def test_failed_thread_creation_or_start_allows_retry(self):
         for kind in (runner.CampaignRunner, runner.BalancesRunner, runner.HoloCacheRunner):

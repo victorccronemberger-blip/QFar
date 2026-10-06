@@ -4548,7 +4548,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
 
         clip_count = sum(int(item.get("clip_count") or 0) for item in selected)
         if target_hours > 0:
-            estimated_sends = max(1, math.ceil(target_hours * 4)) * len(accounts)
+            estimated_sends = 0  # The reviewed pool determines this estimate.
         else:
             estimated_sends = len(selected) * count * len(accounts)
         progress("Conferindo requisitos da instalação e pendências de envio…")
@@ -4598,7 +4598,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
         candidate_plan = None
         clip_review = []
         sent_fingerprint = None
-        if reusable and body.get("include_clip_plan") is True:
+        capacity_summary = None
+        if reusable and (body.get("include_clip_plan") is True or target_hours > 0):
             progress("Preparando a prévia dos clipes…")
             from .. import campaign_plan
             review_tasks = [TaskSpec(
@@ -4612,22 +4613,18 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     accounts=survivors, tasks=review_tasks, dataset_provider=provider,
                     content_mode=content_mode, recovery_exclusions=recovery_exclusions))
                 clip_count = len(clip_review)
+                capacity_summary = campaign_plan.capacity(
+                    clip_review, [a.email for a in survivors], target_seconds=target_hours * 3600,
+                    count_per_task=None if target_hours > 0 else count)
+                estimated_sends = capacity_summary["estimated_sends"]
                 refined_count = sum(bool(row.get("imu_refined_from")) for row in clip_review)
                 if refined_count:
                     warnings.append(f"{refined_count} trecho(s) recortado(s) para evitar lacunas nos sensores. "
                                     "A prévia já usa essas durações; partes de vídeos já recebidos continuam excluídas.")
                 if target_hours > 0:
-                    available_seconds = campaign_plan.available_seconds(
-                        clip_review, [a.email for a in survivors])
-                    short = [value for value in available_seconds.values()
-                             if value < target_hours * 3600]
-                    if short:
-                        warnings.append(
-                            f"Conteúdo novo insuficiente para a meta em {len(short)} conta(s): "
-                            f"o catálogo oferece até {min(short) / 3600:.2f}–{max(short) / 3600:.2f} h "
-                            f"por conta, para uma meta de {target_hours:g} h. "
-                            "Selecione mais categorias ou reveja a faixa de duração. "
-                            "Vídeos já enviados não contam para a nova campanha.")
+                    if not capacity_summary["can_reach_goal"]:
+                        blockers.append(campaign_plan.capacity_error(capacity_summary))
+                        reusable = False
                 if not any(row["eligible_accounts"] for row in clip_review):
                     blockers.append("Nenhum clipe candidato está disponível para as contas selecionadas. Revise o conteúdo e a lista de vídeos usados.")
                     reusable = False
@@ -4662,6 +4659,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             "estimated_sends": estimated_sends,
             "account_workers": campaign.clamp_account_workers(requested_workers, len(accounts)),
             "target_hours": target_hours,
+            "capacity": capacity_summary,
             "blockers": blockers,
             "recovery_error": recovery_error,
             "warnings": warnings,
@@ -4989,6 +4987,26 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 return jsonify({
                     "error": "pare o acelerador antes de iniciar a campanha",
                 }), 409
+            capacity_summary = None
+            if target_hours > 0:
+                # Re-read history/reservations even for a frozen review. This
+                # admission happens before claiming a start or writing a new
+                # campaign/journal; legacy callers cannot bypass it.
+                from .. import campaign_plan
+                try:
+                    candidate_plan, clip_review, _ = campaign_plan.build(cfg)
+                    capacity_summary = campaign_plan.capacity(
+                        clip_review, [a.email for a in accounts], target_seconds=target_hours * 3600)
+                except (ValueError, OSError, RuntimeError):
+                    return jsonify({"error_code": "campaign_capacity_unavailable",
+                                    "error": "Não foi possível verificar o conteúdo novo para a meta. Revise a campanha novamente.",
+                                    "capacity": None}), 409
+                if not capacity_summary["can_reach_goal"]:
+                    return jsonify({"error_code": "campaign_capacity_insufficient",
+                                    "error": campaign_plan.capacity_error(capacity_summary),
+                                    "capacity": capacity_summary}), 409
+                if cfg.candidate_plan is None:
+                    cfg.candidate_plan = candidate_plan
             # Readiness and recovery may take time. Validate the same reviewed
             # operation at admission, before its first local effect. Keep its
             # store entry protected until successful start consumes it.

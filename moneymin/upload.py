@@ -967,8 +967,13 @@ def save_sidecar(sidecar: dict[str, Any]) -> Path:
     from .operation_lease import operation_lease, OperationLeaseError
     from .media_lifecycle import media_state_lease
     try:
-        with media_state_lease(wait=True), operation_lease(path.with_suffix('.write.lock')):
-            previous = load_sidecar(sid, chunk_index)
+        # Readers can scan thousands of journals under this shared barrier.
+        # Publishing a checkpoint must wait for that coherent read, while
+        # ownership of this specific journal remains nonblocking. Reuse the
+        # already-resolved path so migration/account discovery does not run
+        # again while the media barrier is held.
+        with media_state_lease(wait=True, timeout_s=30.0), operation_lease(path.with_suffix('.write.lock')):
+            previous = _load_sidecar_from_path(path, sid, chunk_index)
             if previous is not None and (any(
                     previous.get(key) is not None and previous.get(key) != candidate.get(key)
                     for key in ("account_email", "org_key", "task_id", "expected_chunk_count", "campaign_context"))
@@ -995,9 +1000,9 @@ def _read_sidecar_file(path: Path) -> dict[str, Any] | None:
     return data
 
 
-def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None:
-    """Lê um recibo; somente a ausência real retorna None."""
-    path = _sidecar_path(session_id, chunk_index)
+def _load_sidecar_from_path(path: Path, session_id: str,
+                            chunk_index: int) -> dict[str, Any] | None:
+    """Decode one resolved journal without repeating storage migration."""
     try:
         data = _read_sidecar_file(path)
         if data is None:
@@ -1012,6 +1017,12 @@ def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None
         raise UploadError("Não foi possível validar o registro de envio; preserve o arquivo para revisão.",
                           transient=False, phase="recovery") from None
     return data
+
+
+def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None:
+    """Lê um recibo; somente a ausência real retorna None."""
+    return _load_sidecar_from_path(_sidecar_path(session_id, chunk_index),
+                                  session_id, chunk_index)
 
 
 def list_sidecars(state: str | None = None) -> list[dict[str, Any]]:

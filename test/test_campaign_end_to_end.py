@@ -176,19 +176,21 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(snapshot["state"], "done")
         self.assertEqual([item["clip_uid"] for item in log["items"]], ["clip"])
 
-    def test_review_warns_when_new_content_cannot_fill_hours_goal(self):
+    def test_review_blocks_when_new_content_cannot_fill_hours_goal(self):
         (self.root / "sent_videos.json").write_text(json.dumps({
             "minute|task|Furniture Assembly": {"clip": [self.emails[0]]}}), encoding="utf-8")
         review = self.client.post("/api/campaigns/preflight", json={
             **self.body, "include_clip_plan": True, "target_hours": 1}).get_json()
-        self.assertTrue(review["ok"], review)
-        warning = next(w for w in review["warnings"] if "Conteúdo novo insuficiente" in w)
-        self.assertIn("2 conta(s)", warning)
-        self.assertIn("0.00–0.08 h", warning)
+        self.assertFalse(review["ok"], review)
+        self.assertIsNone(review["preflight_id"])
+        blocker = next(w for w in review["blockers"] if "Conteúdo novo insuficiente" in w)
+        self.assertIn("2 conta(s)", blocker)
+        self.assertIn("0.00–0.08 h", blocker)
+        self.assertEqual(review["estimated_sends"], 1)
         self.prepare.assert_not_called()
         self.send.assert_not_called()
 
-    def test_preflight_does_not_use_overlapping_footage_to_claim_hours_capacity(self):
+    def test_preflight_counts_permitted_overlap_as_admitted_delivery_duration(self):
         clips = [dict(clip_uid=uid, parent_video_uid="same-parent", source="ego4d",
                       dur_s=300, window_s=window)
                  for uid, window in (("one", [0, 300]), ("two", [150, 450]))]
@@ -196,8 +198,9 @@ class CampaignEndToEndTests(unittest.TestCase):
             review = self.client.post("/api/campaigns/preflight", json={
                 **self.body, "include_clip_plan": True, "target_hours": 0.15}).get_json()
         self.assertTrue(review["ok"], review)
-        warning = next(w for w in review["warnings"] if "Conteúdo novo insuficiente" in w)
-        self.assertIn("0.12–0.12 h", warning)
+        self.assertTrue(review["preflight_id"])
+        self.assertEqual(review["capacity"]["available_seconds_min"], 600)
+        self.assertEqual(review["capacity"]["accounts"][0]["unique_footage_seconds"], 450)
         self.prepare.assert_not_called()
         self.send.assert_not_called()
 
@@ -503,13 +506,14 @@ class CampaignEndToEndTests(unittest.TestCase):
         public = server._campaign_log_view(log)
         self.assertTrue(any(i["title"] == "Meta não atingida" for i in public["issues"]))
 
-    def test_unreached_hours_goal_is_partial_not_completed(self):
+    def test_unreachable_hours_goal_is_rejected_before_campaign(self):
         response = self.client.post("/api/campaigns", json={**self.body, "target_hours": 1})
-        self.assertEqual(response.status_code, 200)
-        snap, log = self.finish()
-        self.assertEqual(log["status"], "partial")
-        issue = next(i for i in log["issues"] if i["kind"] == "goal_shortfall")
-        self.assertEqual(issue["remaining_seconds"], {e: 3300 for e in self.emails})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error_code"], "campaign_capacity_insufficient")
+        self.assertFalse(self.instance.running)
+        self.assertEqual(list(self.root.glob("campaign_*.json")), [])
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
 
     def test_transient_failure_before_session_creation_retries_once(self):
         attempts = {}

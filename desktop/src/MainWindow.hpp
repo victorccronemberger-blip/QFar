@@ -133,6 +133,7 @@ private:
   void lookupCampaignStart();
   void setCampaignIndicator(const QString& title, const QString& detail, const QString& state, bool busy = false);
   void pollCampaignPreviews();
+  void resetCampaignPreviewDisplay();
   void loadAccelerator();
   void loadLocalMediaLibrary(bool refresh = false);
   void localMediaFiltersChanged();
@@ -389,6 +390,12 @@ private:
   QLabel* _campaignStage{};
   QLabel* _campaignCurrent{};
   QLabel* _campaignStats{};
+  QWidget* _campaignPreviewPanel{};
+  QLabel* _campaignPreviewStage{};
+  QLabel* _campaignPreviewDetail{};
+  QLabel* _campaignPreviewStats{};
+  QLabel* _campaignReceiptStats{};
+  QProgressBar* _campaignPreviewProgress{};
   QPlainTextEdit* _campaignFeed{};
   QJsonArray _taskRecords;
   int _taskLoadGeneration{};

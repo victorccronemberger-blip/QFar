@@ -14,6 +14,170 @@ import urllib.request
 import uuid
 
 
+class _ProbeProcess:
+    """Own only this probe's Windows job, including a onefile bootloader child."""
+
+    def __init__(self, command: list[str], *, cwd: Path, env: dict[str, str]):
+        if os.name != "nt":
+            raise RuntimeError("This package verification requires Windows")
+        import ctypes
+        from ctypes import wintypes
+        import _winapi
+        import msvcrt
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+                        ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
+                        ("max_working_set", ctypes.c_size_t), ("active_limit", wintypes.DWORD),
+                        ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                        ("scheduling", wintypes.DWORD)]
+
+        class Limits(ctypes.Structure):
+            _fields_ = [("basic", BasicLimits), ("io_counters", ctypes.c_uint64 * 6),
+                        ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                        ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [("user_time", ctypes.c_int64), ("kernel_time", ctypes.c_int64),
+                        ("period_user_time", ctypes.c_int64), ("period_kernel_time", ctypes.c_int64),
+                        ("page_faults", wintypes.DWORD), ("total_processes", wintypes.DWORD),
+                        ("active_processes", wintypes.DWORD), ("terminated_processes", wintypes.DWORD)]
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        for name, arguments, result in (
+            ("CreateJobObjectW", [ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+            ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+            ("QueryInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+            ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            ("IsProcessInJob", [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+            ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            ("ResumeThread", [wintypes.HANDLE], wintypes.DWORD),
+        ):
+            function = getattr(kernel, name)
+            function.argtypes, function.restype = arguments, result
+        self._kernel, self._ctypes, self._winapi = kernel, ctypes, _winapi
+        self._accounting = Accounting
+        self._bool = wintypes.BOOL
+        self._handle = self._job = None
+        self.returncode = None
+        thread = None
+        try:
+            self._job = kernel.CreateJobObjectW(None, None)
+            if not self._job:
+                raise ctypes.WinError(ctypes.get_last_error())
+            limits = Limits()
+            limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no breakaway.
+            if not kernel.SetInformationJobObject(self._job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # Keep the primary thread handle, which Popen normally closes. Attach
+            # the suspended process before any onefile child can be created.
+            with open(os.devnull, "r+b") as null:
+                null_handle = msvcrt.get_osfhandle(null.fileno())
+                os.set_handle_inheritable(null_handle, True)
+                startup = subprocess.STARTUPINFO()
+                startup.dwFlags = subprocess.STARTF_USESTDHANDLES
+                startup.hStdInput = startup.hStdOutput = startup.hStdError = null_handle
+                startup.lpAttributeList = {"handle_list": [null_handle]}
+                self._handle, thread, self.pid, _ = _winapi.CreateProcess(
+                    None, subprocess.list2cmdline(command), None, None, True,
+                    subprocess.CREATE_NO_WINDOW | 0x4, env, str(cwd), startup)  # CREATE_SUSPENDED
+            if not kernel.AssignProcessToJobObject(self._job, self._handle):
+                error = ctypes.WinError(ctypes.get_last_error())
+                _winapi.TerminateProcess(self._handle, 1)
+                _winapi.WaitForSingleObject(self._handle, 15000)
+                raise error
+            if kernel.ResumeThread(thread) == 0xFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            if thread is not None:
+                _winapi.CloseHandle(thread)
+
+    def poll(self):
+        if self.returncode is None and self._winapi.WaitForSingleObject(self._handle, 0) == self._winapi.WAIT_OBJECT_0:
+            self.returncode = self._winapi.GetExitCodeProcess(self._handle)
+        return self.returncode
+
+    def _owned_process_handles(self) -> list[int]:
+        ctypes = self._ctypes
+        capacity = 8
+        while True:
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [("assigned", ctypes.c_uint32), ("count", ctypes.c_uint32),
+                            ("pids", ctypes.c_size_t * capacity)]
+
+            members = ProcessIds()
+            success = self._kernel.QueryInformationJobObject(
+                self._job, 3, ctypes.byref(members), ctypes.sizeof(members), None)
+            if success:
+                break
+            if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA: a descendant was added.
+                raise ctypes.WinError(ctypes.get_last_error())
+            capacity = max(capacity * 2, members.assigned)
+        handles = []
+        try:
+            for pid in members.pids[:members.count]:
+                try:
+                    # Membership is checked against the retained process handle,
+                    # so a recycled PID cannot make us wait on another program.
+                    handle = self._winapi.OpenProcess(0x101000, False, pid)
+                except OSError as error:
+                    if error.winerror == 87:  # Process exited between snapshot and open.
+                        continue
+                    raise
+                belongs = self._bool()
+                checked = self._kernel.IsProcessInJob(handle, self._job, ctypes.byref(belongs))
+                if checked and belongs.value:
+                    handles.append(handle)
+                else:
+                    self._winapi.CloseHandle(handle)
+                    if not checked:
+                        raise ctypes.WinError(ctypes.get_last_error())
+            return handles
+        except BaseException:
+            for handle in handles:
+                self._winapi.CloseHandle(handle)
+            raise
+
+    def close(self, timeout: float = 15) -> None:
+        if self._job is None:
+            return
+        handles = []
+        try:
+            # This also terminates descendants after the bootloader already
+            # exited. PID/name enumeration cannot provide that ownership proof.
+            handles = self._owned_process_handles()
+            if not self._kernel.TerminateJobObject(self._job, 1):
+                raise self._ctypes.WinError(self._ctypes.get_last_error())
+            deadline = time.monotonic() + timeout
+            while True:
+                accounting = self._accounting()
+                if not self._kernel.QueryInformationJobObject(
+                        self._job, 1, self._ctypes.byref(accounting), self._ctypes.sizeof(accounting), None):
+                    raise self._ctypes.WinError(self._ctypes.get_last_error())
+                if accounting.active_processes == 0:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Probe process tree did not exit before temporary-directory cleanup")
+                time.sleep(.02)
+            # Job accounting can reach zero while a process is still completing
+            # termination and releasing its file handles. Wait for real exits.
+            for handle in handles:
+                remaining = max(0, int((deadline - time.monotonic()) * 1000))
+                if self._winapi.WaitForSingleObject(handle, remaining) != self._winapi.WAIT_OBJECT_0:
+                    raise RuntimeError("Probe child did not release its handles before temporary-directory cleanup")
+        finally:
+            for handle in handles:
+                self._winapi.CloseHandle(handle)
+            if self._handle is not None:
+                self._winapi.CloseHandle(self._handle)
+                self._handle = None
+            self._winapi.CloseHandle(self._job)
+            self._job = None
+
+
 def probe(service: Path, user_root: Path, library: Path, expected: list[str]) -> None:
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -28,10 +192,8 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
                        AWS_SHARED_CREDENTIALS_FILE=str(user_root / "secrets/aws/credentials"),
                        AWS_CONFIG_FILE=str(user_root / "secrets/aws/config"), AWS_EC2_METADATA_DISABLED="true")
     user_root.mkdir(parents=True, exist_ok=True)
-    process = subprocess.Popen([str(service), "--no-browser", "--host", "127.0.0.1", "--porta", str(port),
-                                "--parent-pid", str(os.getpid())], cwd=user_root, env=environment,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    process = _ProbeProcess([str(service), "--no-browser", "--host", "127.0.0.1", "--porta", str(port),
+                             "--parent-pid", str(os.getpid())], cwd=user_root, env=environment)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def get(route, authenticated=True, method='GET'):
@@ -97,12 +259,7 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
         except urllib.error.HTTPError as error:
             assert error.code == 401
     finally:
-        # Target only the process tree created above, including the onefile child.
-        if process.poll() is None:
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
-            process.wait(timeout=15)
+        process.close()
 
 
 def main() -> None:
@@ -142,7 +299,7 @@ def main() -> None:
         "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started",
         "original_library_index_and_fts", "original_duration_and_unknown_sensor_state",
         "prepared_library_inventory", "prepared_library_authentication",
-        "general_local_media_inventory"]}, indent=2), encoding="utf-8")
+        "general_local_media_inventory", "owned_process_tree_shutdown"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 
 

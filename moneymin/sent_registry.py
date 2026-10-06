@@ -21,6 +21,7 @@ Semântica:
 from __future__ import annotations
 
 import threading
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -76,17 +77,21 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
     return data
 
 
-def load() -> dict[str, dict[str, list[str]]]:
-    """Carrega o registro (semando dos logs de campanha na 1ª vez)."""
+def load(*, persist_seed: bool = True) -> dict[str, dict[str, list[str]]]:
+    """Carrega o registro, semeando dos logs na 1ª vez.
+
+    Planejamento usa persist_seed=False para observar o mesmo histórico sem
+    gravar o índice antes de a campanha ser admitida.
+    """
     with _LOCK:
-        return _load_locked()
+        return _load_locked(persist_seed=persist_seed)
 
 
-def _load_locked() -> dict[str, dict[str, list[str]]]:
+def _load_locked(*, persist_seed: bool = True) -> dict[str, dict[str, list[str]]]:
     path = _path()
     if not path.exists():
         data = _seed_from_logs()
-        if data:
+        if data and persist_seed:
             _save(data)
         return data
     try:
@@ -217,9 +222,179 @@ def filter_unsent(scenario: str, clip_uids: list[str], emails: list[str]) -> lis
     return [u for u in clip_uids if not is_sent_to_all(scenario, u, emails)]
 
 
-def reset(scenario: str | None = None) -> None:
-    """Limpa o registro — de um cenário ou de tudo (botão de reset / 100%)."""
+def _delivery_identity(scenario: str, uid: str, email: str) -> tuple[str, str, str]:
+    parts = scenario.split("|", 2)
+    return (("minute|" + parts[1]) if len(parts) >= 2 and parts[0] == "minute" and parts[1]
+            else scenario, uid, email)
+
+
+def _history_deliveries(path: Path) -> list[tuple[str, str, str, str | None, bool]]:
+    history = load_json_state(path, None)
+    # Legacy CLI configurations share the campaign_*.json namespace with
+    # receipts. They contain no attempts and must not invent sent deliveries.
+    if (isinstance(history, dict) and "items" not in history
+            and "started_at" not in history and "status" not in history
+            and isinstance(history.get("work_dir"), str)
+            and isinstance(history.get("accounts"), list)
+            and isinstance(history.get("tasks"), list)):
+        return []
+    if not isinstance(history, dict) or not isinstance(history.get("items"), list):
+        raise ValueError("Histórico de campanha inválido; preserve os arquivos para revisão.")
+    deliveries = []
+    for item in history["items"]:
+        if not isinstance(item, dict):
+            raise ValueError("Histórico de campanha inválido; preserve os arquivos para revisão.")
+        uid, task_id, task_name = item.get("clip_uid"), item.get("task_id"), item.get("task_name")
+        scenario = item.get("registry_key") or (f"minute|{task_id}|{task_name}"
+                    if task_id and task_name else item.get("task_scenario"))
+        if (not isinstance(uid, str) or not uid or not isinstance(scenario, str) or not scenario
+                or not isinstance(item.get("accounts"), list)):
+            raise ValueError("Histórico de campanha sem identidade válida; preserve os arquivos para revisão.")
+        for account in item["accounts"]:
+            if (not isinstance(account, dict) or not isinstance(account.get("email"), str)
+                    or not account["email"] or any(key in account and type(account[key]) is not bool
+                                                  for key in ("ok", "skipped"))
+                    or "finalized" in account and account["finalized"] is not None
+                    and type(account["finalized"]) is not bool
+                    or account.get("session_id") is not None and not isinstance(account["session_id"], str)):
+                raise ValueError("Histórico de campanha sem recibo válido; preserve os arquivos para revisão.")
+            confirmed = (account.get("ok") is True and not account.get("skipped")
+                         and ("finalized" not in account or account["finalized"] is True))
+            deliveries.append((scenario, uid, account["email"], account.get("session_id"), confirmed))
+    return deliveries
+
+
+def _scoped_reset(scenario: str | None, history_names: Collection[str]) -> None:
+    if isinstance(history_names, (str, bytes)) or not isinstance(history_names, Collection):
+        raise ValueError("Selecione nomes de históricos válidos para limpar.")
+    selected = set()
+    root = config.DATA_DIR.resolve()
+    for name in history_names:
+        if (not isinstance(name, str) or Path(name).name != name or not name.startswith("campaign_")
+                or not name.endswith(".json") or ":" in name):
+            raise ValueError("Selecione nomes de históricos válidos para limpar.")
+        path = config.DATA_DIR / name
+        if (not path.is_file() or path.is_symlink() or path.resolve().parent != root
+                or getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400):
+            raise ValueError("Histórico selecionado ausente ou fora da instalação; preserve os arquivos.")
+        selected.add(name)
+    if not selected:
+        return
+    data = load(persist_seed=False)
+    resets = _reset_history()
+    old, retained, protected, session_entries, retained_sessions = set(), [], set(), {}, set()
+    targeted_keys = {scenario} if scenario is not None else set()
+    for path in sorted(config.DATA_DIR.glob("campaign_*.json")):
+        if (path.is_symlink() or path.resolve().parent != root
+                or getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400):
+            raise ValueError("Histórico de campanha fora da instalação; preserve os arquivos.")
+        for key, uid, email, sid, confirmed in _history_deliveries(path):
+            identity = _delivery_identity(key, uid, email)
+            in_scope = scenario is None or identity[0] == _delivery_identity(scenario, uid, email)[0]
+            targeted = path.name in selected and in_scope
+            already_reset = (path.name in resets.get("all", ())
+                             or path.name in resets.get("scenarios", {}).get(key, ()))
+            if sid:
+                session_entries.setdefault(sid, []).append((identity, targeted, confirmed))
+                if not targeted:
+                    retained_sessions.add(sid)
+            if targeted and confirmed:
+                old.add(identity)
+                targeted_keys.add(key)
+            elif not targeted and confirmed and not already_reset:
+                retained.append((key, uid, email))
+                protected.add(identity)
+            elif not confirmed:
+                protected.add(identity)
+    # Observe the installation's authoritative journals without migration,
+    # account discovery, archive generation or rewriting any pending record.
+    from . import upload
+    from .media_lifecycle import media_state_lease
+    from .upload_types import journal_delivery_confirmed
+    completed = set()
+    with media_state_lease(wait=True):
+        directory = config.DATA_DIR / "sidecars"
+        if (directory.is_symlink() or directory.exists() and
+                (directory.resolve().parent != root
+                 or getattr(directory.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400)):
+            raise ValueError("Registros de envio fora da instalação; preserve os arquivos.")
+        sessions = {}
+        for path in sorted(directory.iterdir()) if directory.is_dir() else ():
+            if path.suffix.lower() != ".json":
+                continue
+            if path.is_symlink() or getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
+                raise ValueError("Registro de envio inválido; preserve os arquivos.")
+            row = upload._read_sidecar_file(path)
+            if not isinstance(row, dict):
+                raise ValueError("Registro de envio inválido; preserve os arquivos.")
+            sessions.setdefault(row["session_id"], []).append(row)
+        for sid, rows in sessions.items():
+            expected = rows[0].get("expected_chunk_count", 1)
+            context = rows[0].get("campaign_context")
+            owner, task_id, org_key = (rows[0].get("account_email"), rows[0].get("task_id"),
+                                       rows[0].get("org_key"))
+            context_valid = (isinstance(context, dict)
+                             and all(isinstance(context.get(key), str) and context[key]
+                                     for key in ("registry_key", "clip_uid"))
+                             and isinstance(owner, str) and bool(owner)
+                             and (not context.get("task_id") or context["task_id"] == task_id))
+            identity = _delivery_identity(context["registry_key"], context["clip_uid"], owner) if context_valid else None
+            complete = (isinstance(org_key, str) and bool(org_key.strip())
+                        and type(expected) is int and expected > 0 and len(rows) == expected
+                        and all(type(row.get("chunk_index")) is int for row in rows)
+                        and {row["chunk_index"] for row in rows} == set(range(expected))
+                        and all(journal_delivery_confirmed(row) and row.get("account_email") == owner
+                                and row.get("org_key") == org_key
+                                and row.get("task_id") == task_id and row.get("campaign_context") == context
+                                and type(row.get("expected_chunk_count", 1)) is int
+                                and row.get("expected_chunk_count", 1) == expected for row in rows))
+            old_receipts = [entry for entry in session_entries.get(sid, ()) if entry[1] and entry[2]]
+            old_identities = {entry[0] for entry in old_receipts}
+            matches_old = len(old_identities) == 1 and all(entry[0][2] == owner
+                and (identity is None or entry[0] == identity)
+                and (not entry[0][0].startswith("minute|")
+                     or entry[0][0] == f"minute|{task_id}") for entry in old_receipts)
+            if complete and matches_old and sid not in retained_sessions:
+                completed.add(sid)
+            else:
+                # A pending/ambiguous group protects any known historic pair.
+                # Confirmed receipts outside the chosen histories remain sent,
+                # even if the persisted index was older than their campaign.
+                protected.update(entry[0] for entry in session_entries.get(sid, ()))
+                if identity is not None:
+                    protected.add(identity)
+                    if complete:
+                        retained.append((context["registry_key"], context["clip_uid"], owner))
+        removable = old - protected
+        for key in list(data):
+            for uid in list(data[key]):
+                data[key][uid] = [email for email in data[key][uid]
+                                  if _delivery_identity(key, uid, email) not in removable]
+                if not data[key][uid]:
+                    del data[key][uid]
+            if not data[key]:
+                del data[key]
+        for key, uid, email in retained:
+            entry = data.setdefault(key, {}).setdefault(uid, [])
+            if email not in entry:
+                entry.append(email)
+        resets["completed_sessions"] = sorted(set(resets.get("completed_sessions", ())) | completed)
+        if scenario is None:
+            resets["all"] = sorted(set(resets.get("all", ())) | selected)
+        else:
+            histories = resets.setdefault("scenarios", {})
+            for key in targeted_keys:
+                histories[key] = sorted(set(histories.get(key, ())) | selected)
+        save_json(config.DATA_DIR / "sent_reset_history.json", resets)
+        _save(data)
+
+
+def reset(scenario: str | None = None, *, history_names: Collection[str] | None = None) -> None:
+    """Limpa tudo/um cenário, ou só recibos das campanhas explicitamente escolhidas."""
     with _LOCK:
+        if history_names is not None:
+            _scoped_reset(scenario, history_names)
+            return
         data = load()
         if scenario is None:
             data = {}

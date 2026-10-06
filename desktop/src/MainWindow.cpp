@@ -2084,6 +2084,7 @@ QWidget* MainWindow::buildCampaignPage() {
   executionHead->addLayout(executionCopy, 1);
   _campaignStats = quietLabel(QStringLiteral("0 concluídos · 0 falhas"));
   _campaignStats->setObjectName(QStringLiteral("campaignStats"));
+  _campaignStats->setWordWrap(true);
   _campaignStats->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
   executionHead->addWidget(_campaignStats);
   executionLayout->addLayout(executionHead);
@@ -2093,6 +2094,33 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignProgress->setValue(0);
   _campaignProgress->setFormat(QStringLiteral("Nenhum envio iniciado"));
   executionLayout->addWidget(_campaignProgress);
+  _campaignPreviewPanel = new QWidget;
+  _campaignPreviewPanel->setObjectName(QStringLiteral("campaignPreviewPanel"));
+  auto* previewLayout = new QVBoxLayout(_campaignPreviewPanel);
+  previewLayout->setContentsMargins(0, 0, 0, 0);
+  previewLayout->setSpacing(6);
+  _campaignReceiptStats = quietLabel(QStringLiteral("Recibos atuais ainda não consultados."));
+  _campaignReceiptStats->setObjectName(QStringLiteral("campaignReceiptStats"));
+  _campaignReceiptStats->setWordWrap(true);
+  previewLayout->addWidget(_campaignReceiptStats);
+  _campaignPreviewStage = new QLabel(QStringLiteral("Prévias ainda não consultadas"));
+  _campaignPreviewStage->setObjectName(QStringLiteral("campaignPreviewStage"));
+  previewLayout->addWidget(_campaignPreviewStage);
+  _campaignPreviewStats = quietLabel(QString());
+  _campaignPreviewStats->setObjectName(QStringLiteral("campaignPreviewStats"));
+  _campaignPreviewStats->setWordWrap(true);
+  previewLayout->addWidget(_campaignPreviewStats);
+  _campaignPreviewProgress = new QProgressBar;
+  _campaignPreviewProgress->setObjectName(QStringLiteral("campaignPreviewProgress"));
+  _campaignPreviewProgress->setRange(0, 100);
+  _campaignPreviewProgress->setValue(0);
+  previewLayout->addWidget(_campaignPreviewProgress);
+  _campaignPreviewDetail = quietLabel(QString());
+  _campaignPreviewDetail->setObjectName(QStringLiteral("campaignPreviewDetail"));
+  _campaignPreviewDetail->setWordWrap(true);
+  previewLayout->addWidget(_campaignPreviewDetail);
+  _campaignPreviewPanel->hide();
+  executionLayout->addWidget(_campaignPreviewPanel);
   _campaignFeed = new QPlainTextEdit;
   _campaignFeed->setObjectName(QStringLiteral("campaignTimeline"));
   _campaignFeed->setReadOnly(true);
@@ -3564,14 +3592,14 @@ QWidget* MainWindow::buildHistoryPage() {
       QStringList lines;
       lines << _historyDetail->toPlainText()
             << QString()
-            << QStringLiteral("PROCESSAMENTO NO MINUTE")
-            << QStringLiteral("✓ %1 arquivo(s) pronto(s)  ·  %2 processando  ·  %3 indisponível(is)  ·  %4 erro(s)")
+            << QStringLiteral("PRÉVIAS NO MINUTE")
+            << QStringLiteral("✓ %1 prévia(s) disponível(is)  ·  %2 aguardando publicação  ·  %3 indisponível(is)  ·  %4 falha(s) de consulta")
                    .arg(ready).arg(pending).arg(unavailable).arg(errors);
       if (pending > 0)
-        lines << QStringLiteral("Os arquivos foram recebidos; o Minute ainda não publicou essas prévias.");
+        lines << QStringLiteral("A ausência de uma prévia publicada não confirma o recebimento. Confira os recibos desta execução separadamente.");
       lines << attention;
       _historyDetail->setPlainText(lines.join(QLatin1Char('\n')));
-      setStatus(QStringLiteral("Arquivos de prévia: %1 prontos, %2 processando, %3 indisponíveis.")
+      setStatus(QStringLiteral("Prévias: %1 disponíveis, %2 aguardando publicação, %3 indisponíveis.")
                     .arg(ready).arg(pending).arg(unavailable));
     });
   });
@@ -3866,7 +3894,7 @@ void MainWindow::applyStructuralStyle(bool dark) {
     #campaignTimeline { font-family: "Inter", "Segoe UI"; font-size: 12px; line-height: 1.35; padding: 12px; }
     QProgressBar { min-height: 7px; max-height: 7px; background: %8; border: none; border-radius: 3px; }
     QProgressBar::chunk { background: #7357ec; border-radius: 3px; }
-    #campaignProgress, #bulkRegisterProgress { min-height: 22px; max-height: 22px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 700; }
+    #campaignProgress, #campaignPreviewProgress, #bulkRegisterProgress { min-height: 22px; max-height: 22px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 700; }
     QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
     QScrollBar::handle:vertical { background: %6; min-height: 30px; border-radius: 4px; }
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -5271,6 +5299,7 @@ void MainWindow::submitOriginalCapture(QJsonObject body, QJsonObject reviewedSum
       _campaignActive = true;
       _campaignStop->setEnabled(true);
       _previewPoll.stop();_previewLogName.clear();_previewCheckActive = false;
+      resetCampaignPreviewDisplay();
       QSettings().remove(QStringLiteral("previewLogName"));
         if (!result.value(QStringLiteral("already_running")).toBool()) _campaignFeed->clear();
       _campaignStart->setText(QStringLiteral("Campanha em andamento"));
@@ -5425,6 +5454,16 @@ void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAcc
     const auto blockers = result.value(QStringLiteral("blockers")).toArray();
     QStringList blockerLines;
     for (const auto& value : blockers) blockerLines << QStringLiteral("• ") + value.toString();
+    if (CampaignReviewDialog::requestedSeconds(result, body) > 0
+        && result.value("accounts").toObject().value("validated").toInt() > 0
+        && result.value("account_issues").toArray().isEmpty() && !result.value("recovery_error").isObject()
+        && !CampaignReviewDialog::capacityAllowsStart(result, body)) {
+      setCampaignIndicator(QStringLiteral("Campanha não iniciada"),
+          QStringLiteral("O conteúdo novo não foi confirmado como suficiente para a meta. Revise a capacidade por conta."), QStringLiteral("error"));
+      CampaignReviewDialog review(result, reviewNames, this, body);
+      review.exec();
+      return;
+    }
     if (!result.value(QStringLiteral("ok")).toBool() || !blockerLines.isEmpty()) {
       setCampaignIndicator(QStringLiteral("Campanha não iniciada"),
                            QStringLiteral("Revise as pendências da verificação."), QStringLiteral("error"));
@@ -5467,12 +5506,18 @@ void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAcc
           for (int i = 0; i < requested.size(); ++i)
             if (!removed.contains(requested[i].toString())) included.append(selectedAccountNames.value(i));
           auto reviewed = result;
+          reviewed.insert("ok", true);
+          reviewed.insert("blockers", QJsonArray{});
+          reviewed.insert("account_errors", QJsonArray{});
+          reviewed.insert("account_issues", QJsonArray{});
           auto metrics = reviewed.value("accounts").toObject();
           const int validated = metrics.value("validated").toInt();
           metrics.insert("validated", included.size());
           reviewed.insert("accounts", metrics);
           reviewed.insert("account_workers", qMin(reviewed.value("account_workers").toInt(), int(included.size())));
-          if (validated > 0)
+          if (CampaignReviewDialog::validCapacity(reviewed, continuation))
+            reviewed.insert("estimated_sends", reviewed.value("capacity").toObject().value("estimated_sends"));
+          else if (validated > 0)
             reviewed.insert("estimated_sends", reviewed.value("estimated_sends").toInt() * int(included.size()) / validated);
           auto warnings = reviewed.value("warnings").toArray();
           warnings.append(QStringLiteral("Ao confirmar, %1 conta(s) com restrição serão removidas antes de iniciar. Voltar mantém os acessos cadastrados.").arg(removed.size()));
@@ -5605,6 +5650,7 @@ void MainWindow::submitCampaign(QJsonObject body) {
       _lastCampaignSeq = 0;
       _previewPoll.stop();
       _previewLogName.clear();
+      resetCampaignPreviewDisplay();
       _previewCheckActive = false;
       QSettings().remove(QStringLiteral("previewLogName"));
       _campaignFeed->clear();
@@ -5801,9 +5847,11 @@ void MainWindow::pollCampaign() {
     _campaignIndicatorProgress->setValue(percent);
     _campaignProgress->setValue(percent);
     _campaignProgress->setFormat(total > 0
-        ? QStringLiteral("%p%")
+        ? hoursGoal ? QStringLiteral("Meta: %1 de %2 h · %p%")
+            .arg(done / 3600., 0, 'f', 2).arg(total / 3600., 0, 'f', 2)
+            : QStringLiteral("Envios confirmados: %1 de %2 · %p%").arg(successful).arg(total)
         : QStringLiteral("Calculando os envios…"));
-    _campaignStats->setText(QStringLiteral("%1 sucesso · %2 ignorados · %3 falhas")
+    _campaignStats->setText(QStringLiteral("Envios nesta execução: %1 concluídos · %2 ignorados · %3 falhas")
         .arg(successful).arg(skipped).arg(failed));
     for (const auto eventValue : snap.value(QStringLiteral("events")).toArray()) {
       const auto event = eventValue.toObject();
@@ -5851,11 +5899,21 @@ void MainWindow::pollCampaign() {
   });
 }
 
+void MainWindow::resetCampaignPreviewDisplay() {
+  _campaignPreviewPanel->hide();
+  _campaignPreviewStage->setText(QStringLiteral("Prévias ainda não consultadas"));
+  _campaignPreviewDetail->clear();
+  _campaignPreviewStats->clear();
+  _campaignReceiptStats->setText(QStringLiteral("Recibos atuais ainda não consultados."));
+  _campaignPreviewProgress->setValue(0);
+}
+
 void MainWindow::pollCampaignPreviews() {
   if (_campaignActive || _campaignPreflightPending || _campaignStartPending || _previewLogName.isEmpty() || _previewCheckActive) return;
   const auto previewLog = _previewLogName;
   const auto revision = _campaignPollRevision;
   _previewCheckActive = true;
+  _campaignPreviewPanel->show();
   _api.post(QStringLiteral("/api/logs/") + encoded(_previewLogName)
                 + QStringLiteral("/status"), {},
             [this, previewLog, revision](bool ok, const QJsonDocument& doc, const QString& error) {
@@ -5867,14 +5925,14 @@ void MainWindow::pollCampaignPreviews() {
         _previewPoll.stop();
         _previewLogName.clear();
         QSettings().remove(QStringLiteral("previewLogName"));
-        _campaignStage->setText(QStringLiteral("Atenção no histórico"));
-        _campaignCurrent->setText(QStringLiteral(
+        _campaignPreviewStage->setText(QStringLiteral("Atenção no histórico"));
+        _campaignPreviewDetail->setText(QStringLiteral(
             "O registro salvo para acompanhar as prévias não foi encontrado."));
         setStatus(error);
         return;
       }
-      _campaignStage->setText(QStringLiteral("Aguardando o Minute"));
-      _campaignCurrent->setText(QStringLiteral(
+      _campaignPreviewStage->setText(QStringLiteral("Aguardando o Minute"));
+      _campaignPreviewDetail->setText(QStringLiteral(
           "Não foi possível consultar as prévias. A consulta será repetida automaticamente; confira os recibos no Histórico."));
       setStatus(QStringLiteral("Minute ainda não respondeu sobre as prévias: %1").arg(error));
       return;
@@ -5890,8 +5948,8 @@ void MainWindow::pollCampaignPreviews() {
     if (!validPreview || summary.value("transient_errors").toInt()>summary.value("errors").toInt()
         || qint64(summary.value("ready").toInt())+summary.value("pending").toInt()
             +summary.value("unavailable").toInt()+summary.value("errors").toInt()!=summary.value("total").toInt()) {
-      _campaignStage->setText(QStringLiteral("Consulta de prévias não confirmada"));
-      _campaignCurrent->setText(QStringLiteral("A resposta sobre as prévias está incompleta ou inválida. A consulta será repetida; os resultados de envio permanecem no Histórico."));
+      _campaignPreviewStage->setText(QStringLiteral("Consulta de prévias não confirmada"));
+      _campaignPreviewDetail->setText(QStringLiteral("A resposta sobre as prévias está incompleta ou inválida. A consulta será repetida; os resultados de envio permanecem no Histórico."));
       setStatus(QStringLiteral("Não foi possível validar o progresso das prévias."));
       return;
     }
@@ -5907,47 +5965,46 @@ void MainWindow::pollCampaignPreviews() {
             .arg(deliveries.value("confirmed").toInt()).arg(deliveries.value("pending").toInt())
             .arg(deliveries.value("review").toInt()).arg(deliveries.value("unknown").toInt())
         : QStringLiteral("Não foi possível validar os recibos atuais nesta consulta. Confira o Histórico.");
+    _campaignReceiptStats->setText(deliveryDetail);
     const int total = summary.value(QStringLiteral("total")).toInt();
     const int ready = summary.value(QStringLiteral("ready")).toInt();
     const int pending = summary.value(QStringLiteral("pending")).toInt();
     const int unavailable = summary.value(QStringLiteral("unavailable")).toInt();
     const int errors = summary.value(QStringLiteral("errors")).toInt();
     const int transientErrors = summary.value(QStringLiteral("transient_errors")).toInt();
-    const int terminalErrors = qMax(0, errors - transientErrors);
-    const int finished = ready + unavailable + terminalErrors;
-    const int percent = total > 0 ? qBound(0, int(qint64(finished) * 100 / total), 100) : 100;
-    _campaignProgress->setValue(percent);
-    _campaignProgress->setFormat(total > 0
-        ? QStringLiteral("%1 de %2 prévias prontas · %p%").arg(ready).arg(total)
+    const int percent = total > 0 ? qBound(0, int(qint64(ready) * 100 / total), 100) : 0;
+    _campaignPreviewProgress->setValue(percent);
+    _campaignPreviewProgress->setFormat(total > 0
+        ? QStringLiteral("Prévias disponíveis: %1 de %2 · %p%").arg(ready).arg(total)
         : QStringLiteral("Sem prévias para acompanhar"));
-    _campaignStats->setText(QStringLiteral(
-        "%1 prontas · %2 processando · %3 falhas")
-        .arg(ready).arg(pending).arg(unavailable + errors));
+    _campaignPreviewStats->setText(QStringLiteral(
+        "Prévias: %1 disponíveis · %2 aguardando publicação · %3 indisponíveis · %4 falhas de consulta")
+        .arg(ready).arg(pending).arg(unavailable).arg(errors));
 
     if (total <= 0) {
       _previewPoll.stop();
       _previewLogName.clear();
       QSettings().remove(QStringLiteral("previewLogName"));
-      _campaignStage->setText(QStringLiteral("Sem prévias para acompanhar"));
-      _campaignCurrent->setText(QStringLiteral(
+      _campaignPreviewStage->setText(QStringLiteral("Sem prévias para acompanhar"));
+      _campaignPreviewDetail->setText(QStringLiteral(
           "A consulta não identificou prévias para acompanhar. Confira os resultados de envio no Histórico.")
-          +QStringLiteral("\n")+deliveryDetail);
+          );
       setStatus(QStringLiteral("Não há prévias nesta consulta."));
       return;
     }
 
     if (pending > 0 || transientErrors > 0) {
-      _campaignStage->setText(transientErrors > 0
+      _campaignPreviewStage->setText(transientErrors > 0
           ? QStringLiteral("Confirmando no Minute")
-          : QStringLiteral("Processamento no Minute"));
-      _campaignCurrent->setText((transientErrors > 0
+          : QStringLiteral("Prévias aguardando publicação"));
+      _campaignPreviewDetail->setText((transientErrors > 0
           ? QStringLiteral(
                 "%1 de %2 prévias disponíveis. %3 consulta(s) falharam temporariamente e serão repetidas automaticamente.")
                 .arg(ready).arg(total).arg(transientErrors)
           : QStringLiteral(
-                "%1 de %2 prévias disponíveis. O Minute ainda está processando o restante.")
-                .arg(ready).arg(total))+QStringLiteral("\n")+deliveryDetail);
-      setStatus(QStringLiteral("Prévias no Minute: %1 prontas, %2 processando, %3 consultas pendentes.")
+                "%1 de %2 prévias disponíveis. As demais ainda não têm publicação confirmada; confira os recibos separadamente.")
+                .arg(ready).arg(total)));
+      setStatus(QStringLiteral("Prévias no Minute: %1 disponíveis, %2 aguardando publicação, %3 consultas pendentes.")
                     .arg(ready).arg(pending).arg(transientErrors));
       return;
     }
@@ -5956,21 +6013,19 @@ void MainWindow::pollCampaignPreviews() {
     _previewLogName.clear();
     QSettings().remove(QStringLiteral("previewLogName"));
     if (unavailable > 0 || errors > 0) {
-      _campaignStage->setText(QStringLiteral("Atenção nas prévias"));
-      _campaignCurrent->setText(QStringLiteral(
+      _campaignPreviewStage->setText(QStringLiteral("Atenção nas prévias"));
+      _campaignPreviewDetail->setText(QStringLiteral(
           "%1 prévia(s) pronta(s); %2 precisam de atenção. Veja os detalhes no Histórico.")
-          .arg(ready).arg(unavailable + errors)+QStringLiteral("\n")+deliveryDetail);
+          .arg(ready).arg(unavailable + errors));
       _campaignFeed->appendPlainText(QStringLiteral(
           "!   Minute concluiu a fila com %1 prévia(s) que precisam de atenção.")
           .arg(unavailable + errors));
     } else {
       const QString title=allConfirmed?QStringLiteral("Prévias prontas"):
           QStringLiteral("Prévias prontas · envios com pendências");
-      _campaignStage->setText(title);
-      _campaignCurrent->setText(QStringLiteral(
-          "Todas as %1 prévias desta consulta estão disponíveis no Minute.").arg(ready)
-          +QStringLiteral("\n")+deliveryDetail);
-      setCampaignIndicator(title, _campaignCurrent->text(), allConfirmed?QStringLiteral("done"):QStringLiteral("error"));
+      _campaignPreviewStage->setText(title);
+      _campaignPreviewDetail->setText(QStringLiteral(
+          "Todas as %1 prévias desta consulta estão disponíveis no Minute. A meta e os resultados da execução permanecem acima.").arg(ready));
       _campaignFeed->appendPlainText(QStringLiteral(
           "✓   Minute publicou todas as %1 prévias.").arg(ready));
       setStatus(title+QStringLiteral(". Confira o resultado da tentativa original e os recibos atuais no Histórico."));

@@ -45,6 +45,7 @@ public:
 #include "recovery_qa.inc"
 #include "prepared_library_qa.inc"
 #include "local_media_library_qa.inc"
+#include "campaign_capacity_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -521,6 +522,7 @@ public:
           if (flow->preflights < 3) result={{"loading",true},{"message","Conferindo acesso…"},{"elapsed_s",137}};
           else result={{"ok",true},{"preflight_id","fixture"},{"accounts",QJsonObject{{"validated",1}}},
                   {"tasks",QJsonObject{{"compatible",1}}},{"blockers",QJsonArray{}},{"warnings",QJsonArray{}}};
+          if (flow->preflights >= 3) result["capacity"] = capacityFixture(QJsonDocument::fromJson(input.mid(end+4)).object(), {"fixture@example.com"});
         } else if(input.startsWith("POST /api/campaigns ")) {
           ++flow->starts; flow->running=true; delay=200; result={{"ok",true},{"accounts",QJsonArray{"fixture@example.com"}}};
         } else if(input.startsWith("POST /api/campaigns/pause ")) {
@@ -1297,11 +1299,12 @@ public:
           if(requestBody.contains("preflight_id") || requestBody.contains("remove_restricted")) {qApp->exit(35);return;}
         }
         ++*requests;
-        const QJsonObject result{{"ok",false},{"can_remove_and_continue",true},{"preflight_id","fixture"},
+        QJsonObject result{{"ok",false},{"can_remove_and_continue",true},{"preflight_id","fixture"},
           {"blockers",QJsonArray{"blocked"}},{"account_errors",QJsonArray{"blocked"}},
           {"removable_accounts",QJsonArray{"blocked@example.com"}},
           {"account_issues",QJsonArray{QJsonObject{{"email","blocked@example.com"},{"restriction_confirmed",true}}}},
           {"accounts",QJsonObject{{"validated",2}}},{"account_workers",2},{"estimated_sends",2}};
+        result["capacity"] = capacityFixture(QJsonDocument::fromJson(input.mid(headerEnd+4)).object(), {"ok@example.com"});
         const auto body=QJsonDocument(result).toJson(QJsonDocument::Compact);
         socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(body.size())+"\r\n\r\n"+body);
         socket->disconnectFromHost();
@@ -1582,6 +1585,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--local-media-library-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::localMediaLibrarySmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--campaign-capacity-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignCapacitySmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--original-library-smoke")) {

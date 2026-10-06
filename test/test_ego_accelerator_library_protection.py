@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from moneymin import campaign, config, content_provenance, ego_accelerator, upload
+from moneymin import campaign, config, content_provenance, ego_accelerator, media_lifecycle, upload
 from moneymin.media_lifecycle import media_state_lease
 
 
@@ -193,8 +193,18 @@ class LibraryProtectionTests(unittest.TestCase):
                     attempted.append(exc)
 
             worker = threading.Thread(target=publish)
-            worker.start()
-            worker.join(4)
+            real_clock = media_lifecycle.time.monotonic
+            publisher_clock = iter((0.0, 30.1))
+
+            def clock():
+                # Preparation owns the real media barrier. Expire only this
+                # competing publisher's bounded wait, without releasing the
+                # barrier or delaying the fixture for 30 seconds.
+                return next(publisher_clock) if threading.current_thread() is worker else real_clock()
+
+            with patch.object(media_lifecycle.time, 'monotonic', side_effect=clock):
+                worker.start()
+                worker.join(4)
             self.assertFalse(worker.is_alive())
             self.assertEqual(len(attempted), 1)
             self.assertFalse(upload._sidecar_path('pending-fixture').exists())
