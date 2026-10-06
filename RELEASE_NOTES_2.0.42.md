@@ -7,4 +7,4 @@ A verificação da campanha passa a rodar em segundo plano. A tela mostra o prog
 - **Corrigir instalação** fica no topo da tela e em **Integrações**. O reparo baixa de novo o pacote oficial assinado, preserva contas, credenciais, campanhas e configurações, e pode reinstalar a mesma versão.
 - O aplicativo espera o encerramento seguro das operações antes de instalar.
 
-A origem da campanha continua com **Ego4D**, **Nymeria** e **Ambos**. O pacote Windows é gerado e assinado pelo CI ao publicar a tag `v2.0.42`.
+A origem da campanha continua com **Ego4D**, **Nymeria** e **Ambos**. Um clipe oficial exportado usa o início da janela como deslocamento do arquivo, para a mídia e a IMU ficarem no mesmo trecho. O pacote Windows é gerado e assinado pelo CI ao publicar a tag `v2.0.42`.

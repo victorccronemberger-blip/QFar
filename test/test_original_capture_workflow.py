@@ -77,9 +77,10 @@ def fixture_pair(root, index=0, *, sid=SID, change=None, count=None):
     media, sidecar = root / f'{log_id}.mp4', root / f'{log_id}.zip'
     media.write_bytes(b'DECLARED INERT NONDECODABLE MP4 SENTINEL ' + log_id.encode())
     with zipfile.ZipFile(sidecar, 'w', compression=zipfile.ZIP_STORED) as archive:
-        archive.writestr(f'{log_id}.metadata.json', json.dumps(metadata, indent=2))
+        # Mesma ordem do writer do APK: imu, frames, metadata. O membro extra fica depois.
         archive.writestr(f'{log_id}.imu.csv', imu)
         archive.writestr(f'{log_id}.frames.csv', frames)
+        archive.writestr(f'{log_id}.metadata.json', json.dumps(metadata, indent=2))
         archive.writestr('declared-extra.txt', b'Preserve this exact optional member and ZIP envelope.')
     return media, sidecar
 

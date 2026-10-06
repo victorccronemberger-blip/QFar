@@ -12,9 +12,9 @@ from test_validate_metadata_contract import FRAMES, IMU, LOG_ID, native_fixture
 def sidecar(raw):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(f"{LOG_ID}.metadata.json", raw)
         archive.writestr(f"{LOG_ID}.imu.csv", IMU)
         archive.writestr(f"{LOG_ID}.frames.csv", FRAMES)
+        archive.writestr(f"{LOG_ID}.metadata.json", raw)
     return output.getvalue()
 
 

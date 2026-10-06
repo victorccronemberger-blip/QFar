@@ -804,6 +804,20 @@ def _window_row_from_uid(
     }
 
 
+def _recorded_media_offset(row: dict[str, Any], window_start: float) -> float:
+    """Official exports omit the offset column; their file starts at the window.
+
+    A generated cut carries an explicit offset into the parent or exported file.
+    The historical placeholder 0 is not a measurement for an export that begins
+    later on the canonical timeline.
+    """
+    raw = row.get("media_time_offset_s")
+    needs_cut = bool(row.get("needs_cut"))
+    if raw in (None, "") and not needs_cut:
+        return float(window_start)
+    return float(raw or 0.0)
+
+
 def _clip_record(c: dict[str, Any], pv: dict[str, Any]) -> dict[str, Any]:
     """Monta o dict de resultado para um clipe a partir da linha CSV e vídeo pai."""
     s, e = clip_window_s(c)
@@ -828,7 +842,7 @@ def _clip_record(c: dict[str, Any], pv: dict[str, Any]) -> dict[str, Any]:
         "action_units": _action_units(action_text),
         "parent_video_uid": str(c.get("parent_video_uid") or ""),
         "media_uid": c.get("media_uid"),
-        "media_time_offset_s": float(c.get("media_time_offset_s") or 0.0),
+        "media_time_offset_s": _recorded_media_offset(c, s),
         "needs_cut": bool(c.get("needs_cut")),
     }
 
@@ -1614,8 +1628,13 @@ def _selection_candidate(clip: dict[str, Any]) -> dict[str, Any]:
     needs_cut = bool(clip.get("needs_cut"))
     # Exported MP4 begins at its canonical window start. Parent media begins
     # at zero unless a generated candidate explicitly selects an exported source.
+    # A stored 0 is the old catalog placeholder, not a measured parent-file origin.
     default_offset = window[0] if window is not None and not needs_cut else 0
-    offset = float(clip.get("media_time_offset_s", default_offset) or 0)
+    raw_offset = clip.get("media_time_offset_s", None)
+    if raw_offset is None or (not needs_cut and float(raw_offset or 0) == 0):
+        offset = float(default_offset)
+    else:
+        offset = float(raw_offset)
     if not math.isfinite(offset) or offset < 0:
         raise ValueError("Ego4D selection media offset invalid")
     parent = str(clip.get("parent_video_uid") or "")
