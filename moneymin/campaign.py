@@ -3942,8 +3942,13 @@ def _save_rank_cache(
     buckets: dict[str, tuple[dict[str, Any], ...]],
     path: Path | None = None,
     *,
-    narration_scan: bool = False,
+    narration_scan: bool | None = None,
 ) -> None:
+    # Quem grava o cache desta biblioteca narrada precisa poder relê-lo.
+    # narration_scan=False continua sendo o índice só portátil, recusado
+    # quando as narrações existem.
+    if narration_scan is None:
+        narration_scan = _local_narration_catalog()
     try:
         payload = json.dumps({"schema": 3, "narration_scan": narration_scan,
                               "stamp": _rank_cache_stamp(),
