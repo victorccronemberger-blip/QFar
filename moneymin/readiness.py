@@ -216,14 +216,26 @@ def campaign_readiness(
                 ))
 
     if selected in {"nymeria", "ambos"}:
-        from . import nymeria
+        from . import nymeria, nymeria_vrs
         root = nymeria.data_root()
-        sequences = nymeria.sequence_dirs(root)
+        try:
+            nymeria_vrs._bootstrap_projectaria()
+        except (ImportError, OSError, RuntimeError):
+            sdk_ok = False
+        else:
+            sdk_ok = True
+        checks.append(_check(
+            "SDK Nymeria", "ok" if sdk_ok else "error",
+            "Project Aria DEVICE_TIME disponível" if sdk_ok
+            else "SDK Project Aria indisponível; repare a instalação do QMoney",
+        ))
+        sequences = nymeria.list_sequences(root) if sdk_ok else []
+        usable = sum(sequence.get("selection_ready") is True for sequence in sequences)
         checks.append(_check(
             "Biblioteca Nymeria",
-            "ok" if sequences else "error",
-            f"{len(sequences)} sequência(s) em {root}" if sequences
-            else f"nenhuma sequência com metadata.json em {root}",
+            "ok" if usable else "error",
+            f"{usable} sequência(s) com narrações e RGB/IMU medidos em {root}" if usable
+            else f"nenhuma sequência com narrações e RGB/IMU medidos em {root}",
         ))
 
     if selected in {"ego4d", "ambos", "all"}:

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.0.46",
+    [string]$Version = "2.0.47",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [switch]$Staging
 )
@@ -48,6 +48,9 @@ New-Item -ItemType Directory -Force "$WorkDir\spec" | Out-Null
     --specpath "$WorkDir\spec" `
     --collect-data moneymin --collect-all curl_cffi `
     --collect-submodules playwright --collect-submodules boto3 --collect-submodules ego4d `
+    --collect-all projectaria_tools `
+    --hidden-import _core_pybinds --hidden-import _adt_pybinds `
+    --hidden-import _aea_pybinds --hidden-import _ase_pybinds `
     --add-data "$ProjectRoot\moneymin\samsung_uw_calibration.json;moneymin" `
     --add-data "$ProjectRoot\moneymin\resources;moneymin/resources" `
     --add-data "$ProjectRoot\reference;reference" `

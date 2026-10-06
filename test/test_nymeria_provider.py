@@ -23,10 +23,10 @@ class NymeriaProviderTests(unittest.TestCase):
         from moneymin import nymeria
         seqs = nymeria.list_sequences()
         self.assertGreaterEqual(len(seqs), 1)
-        wins = nymeria.list_windows(seqs[0], min_dur_s=60, max_dur_s=60)
-        self.assertTrue(wins)
-        self.assertTrue(wins[0]["clip_uid"].startswith("nymeria:"))
-        self.assertEqual(wins[0]["source"], "nymeria")
+        wins = nymeria.list_windows(seqs[0], task_name="Gardening", min_dur_s=60, max_dur_s=60)
+        for window in wins:
+            self.assertTrue(window["clip_uid"].startswith("nymeria:"))
+            self.assertEqual(window["source"], "nymeria")
 
     def test_imu_csv_500hz_and_span_pin(self):
         from moneymin import nymeria, nymeria_vrs
@@ -61,7 +61,9 @@ class NymeriaProviderTests(unittest.TestCase):
         # Avoid Ego4D refine requiring catalog
         with patch.object(campaign, "normalize_content_mode", return_value="dataset"):
             cands = campaign.automatic_candidates(cfg.tasks[0], cfg)
-        self.assertTrue(any(str(c.get("clip_uid", "")).startswith("nymeria:") for c in cands))
+        for candidate in cands:
+            self.assertTrue(str(candidate.get("clip_uid", "")).startswith("nymeria:"))
+            self.assertEqual(candidate["selection_evidence"]["task"]["name"], "Gardening")
 
 
 class NymeriaSelectionTests(unittest.TestCase):
@@ -85,7 +87,8 @@ class NymeriaSelectionTests(unittest.TestCase):
 class NymeriaReadinessTests(unittest.TestCase):
     def test_readiness_accepts_nymeria_and_reports_the_library(self):
         from moneymin import readiness
-        with patch("moneymin.nymeria.sequence_dirs", return_value=[Path("seq")]):
+        with patch("moneymin.nymeria.list_sequences", return_value=[{"selection_ready": True}]), \
+             patch("moneymin.nymeria_vrs._bootstrap_projectaria", return_value=None):
             result = readiness.campaign_readiness("nymeria")
         self.assertEqual(result["provider"], "nymeria")
         library = next(item for item in result["checks"]
@@ -95,7 +98,8 @@ class NymeriaReadinessTests(unittest.TestCase):
 
     def test_readiness_blocks_a_missing_nymeria_library(self):
         from moneymin import readiness
-        with patch("moneymin.nymeria.sequence_dirs", return_value=[]):
+        with patch("moneymin.nymeria.list_sequences", return_value=[]), \
+             patch("moneymin.nymeria_vrs._bootstrap_projectaria", return_value=None):
             result = readiness.campaign_readiness("nymeria")
         library = next(item for item in result["checks"]
                        if item["name"] == "Biblioteca Nymeria")

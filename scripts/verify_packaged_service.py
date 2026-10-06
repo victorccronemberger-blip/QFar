@@ -228,6 +228,11 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
         assert "fixture-private-token" not in json.dumps(accounts)
         assert get("/api/campaigns/current")["state"] == "idle"
         assert get("/api/recovery")["items"] == []
+        nymeria = get('/api/readiness?dataset=nymeria')
+        checks = {row['name']: row for row in nymeria['checks']}
+        assert checks['SDK Nymeria']['status'] == 'ok'
+        assert checks['Biblioteca Nymeria']['status'] == 'error'
+        assert nymeria['ready'] is False
         try:
             get('/api/library/ego4d', authenticated=False)
             raise AssertionError('Unauthenticated library request was accepted')
@@ -286,6 +291,10 @@ def main() -> None:
                                       'fixture-clip,fixture-original-1,10,310\n', encoding='utf-8')
         (ego / 'timed_narrations.jsonl').write_text(json.dumps({
             'video_uid': 'fixture-original-1', 'events': [[20, '#C stirs soup']]}), encoding='utf-8')
+        catalog_only = library / 'data/nymeria/catalog-only'
+        catalog_only.mkdir(parents=True)
+        (catalog_only / 'metadata.json').write_text(
+            json.dumps({'uid': 'catalog-only', 'head_duration_sec': 600}), encoding='utf-8')
         customer = root / "customer-a"
         probe(service, customer, library, [])
         credentials = customer / "secrets/token_fixture.json"
@@ -299,7 +308,8 @@ def main() -> None:
         "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started",
         "original_library_index_and_fts", "original_duration_and_unknown_sensor_state",
         "prepared_library_inventory", "prepared_library_authentication",
-        "general_local_media_inventory", "owned_process_tree_shutdown"]}, indent=2), encoding="utf-8")
+        "general_local_media_inventory", "owned_process_tree_shutdown",
+        "nymeria_sdk_core_device_time", "nymeria_metadata_only_not_ready"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 
 

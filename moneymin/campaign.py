@@ -293,6 +293,49 @@ def _native_container_args(tmp: Path) -> list[str]:
     ]
 
 
+def _measured_pts_container_args(tmp: Path) -> list[str]:
+    """Keep the existing container envelope without converting measured VFR."""
+    args = _native_container_args(tmp)
+    rate = args.index("-r")
+    del args[rate:rate + 2]
+    return [*args[:-1], "-fps_mode", "passthrough", "-enc_time_base", "1:1000000",
+            "-video_track_timescale", "1000000", args[-1]]
+
+
+def _measured_video_pts(path: Path) -> list[int]:
+    from .sidecar import _extract_frame_pts
+    frames = _extract_frame_pts(path)
+    if not frames or any(b[0] <= a[0] for a, b in zip(frames, frames[1:])):
+        raise UploadError("Vídeo sem PTS medidos válidos.", transient=False, phase="prepare")
+    return [frame[0] - frames[0][0] for frame in frames]
+
+
+def _require_same_video_pts(source: Path, output: Path, *, start_ns: int = 0,
+                            end_ns: int | None = None) -> int:
+    original = [ts for ts in _measured_video_pts(source)
+                if ts >= start_ns and (end_ns is None or ts < end_ns)]
+    measured = _measured_video_pts(output)
+    if (not original or len(original) != len(measured)
+            or any(abs((ts - original[0]) - actual) > 1000
+                   for ts, actual in zip(original, measured))):
+        raise UploadError("PTS alterados durante o recorte ou encode Nymeria.",
+                          transient=False, phase="prepare")
+    return original[0]
+
+
+def _measured_packet_tail_args(source: Path, *, start_ns: int = 0,
+                               end_ns: int | None = None) -> list[str]:
+    pts = [ts for ts in _measured_video_pts(source)
+           if ts >= start_ns and (end_ns is None or ts < end_ns)]
+    source_end = int(probe_video(source).get("duration_ms") or 0) * 1_000_000
+    end = source_end if end_ns is None else min(source_end, end_ns)
+    if not pts or end <= pts[-1]:
+        raise UploadError("Duração medida do último frame Nymeria inválida.",
+                          transient=False, phase="prepare")
+    tail_us = round((end - pts[-1]) / 1000)
+    return ["-bsf:v", f"setts=duration=if(eq(N\\,{len(pts) - 1})\\,{tail_us}\\,DURATION)"]
+
+
 @contextmanager
 def _cpu_slots(n: int) -> Iterator[None]:
     """Reserva `n` slots do semáforo de encode (normalize pega todos)."""
@@ -927,7 +970,7 @@ def prepare_nymeria_clip(
     allow_download: bool = True,
 ) -> dict[str, Any]:
     """Extrai RGB+IMU reais do Aria VRS e monta item Minute-ready."""
-    from . import nymeria_vrs
+    from . import content_provenance, nymeria_vrs
 
     _ = allow_download  # dados já locais na library Nymeria
     work_dir = Path(work_dir)
@@ -957,43 +1000,84 @@ def prepare_nymeria_clip(
     if not motion_vrs.is_file() or not data_vrs.is_file():
         raise RuntimeError(f"VRS Nymeria ausente em {seq_dir}")
 
+    # Fresh action/window/source proof is required before any heavy decode.
+    clip = nymeria.revalidate_candidate(clip)
+    inputs = {"source_video": content_provenance.fingerprint(data_vrs),
+              "source_imu": content_provenance.fingerprint(motion_vrs)}
     _progress("imu_lookup")
     t0_ns, t1_ns = nymeria.device_window_for_sequence(
         seq_dir, start_s=start_s, end_s=end_s)
     _progress("imu_preflight")
     samples = nymeria_vrs.read_imu_samples(
-        motion_vrs, t0_ns=t0_ns, t1_ns=t1_ns, label="imu-right")
+        motion_vrs, t0_ns=t0_ns, t1_ns=t1_ns, label="imu-right",
+        stats=(read_stats := {}))
     imu_diag: dict[str, Any] = {}
     # Validate continuity before expensive RGB extract
     _ = nymeria_vrs.build_imu_csv_from_samples(
-        samples, stats=None)
+        samples, t0_ns=t0_ns, duration_ms=int(round((t1_ns - t0_ns) / 1e6)))
     _progress("imu_ready", samples=len(samples))
 
     stem = "nymeria_" + clip_uid.replace(":", "_").replace(".", "_")
-    raw_mp4 = work_dir / f"{stem}_raw.mp4"
+    native = work_dir / f"{stem}_native.mp4"
+    rgb_diag: dict[str, Any] = {}
     _progress("video_lookup")
-    nymeria_vrs.extract_rgb_mp4(
-        data_vrs, raw_mp4, t0_ns=t0_ns, t1_ns=t1_ns)
-    _progress("video_ready", bytes=raw_mp4.stat().st_size)
-    _progress("encode")
-    native = _normalize_video(raw_mp4, work_dir, stem=stem)
-    _progress(
-        "encode_ready",
-        encoder="NVENC" if _use_nvenc(_ffmpeg_bin()) else "CPU",
-    )
+    # Encode once from measured VRS frames. The generic normalizer forces
+    # CFR30, so this path retains its envelope/codec and removes that rate.
+    container_args = _native_container_args(native)[:-1]
+    rate_index = container_args.index("-r")
+    del container_args[rate_index:rate_index + 2]
+    with _cpu_slots(ACCOUNT_ENCODE_WORKERS):
+        nymeria_vrs.extract_rgb_mp4(
+            data_vrs, native, t0_ns=t0_ns, t1_ns=t1_ns,
+            output_args=[*_native_video_codec_args(nvenc=False), *container_args],
+            stats=rgb_diag)
+    _progress("video_ready", bytes=native.stat().st_size)
+    _progress("encode_ready", encoder="CPU", measured_pts=True)
     probe = probe_video(native)
-    dur_ms = int(probe.get("duration_ms") or dur_ms)
+    dur_ms = int(probe.get("duration_ms") or 0)
     if not (MIN_DUR_MS <= dur_ms <= MAX_DUR_MS):
         raise RuntimeError(
             f"clipe {clip_uid} fora da janela de duração ({dur_ms}ms)")
     _progress("sidecar")
     imu_csv = nymeria_vrs.build_imu_csv_from_samples(
-        samples, stats=imu_diag)
-    n_samples = max(
-        1, int(dur_ms / 1000 * config.ANDROID_IMU_SAMPLE_RATE_HZ) + 1)
-    if imu_diag.get("sampleCount"):
-        n_samples = int(imu_diag["sampleCount"])
-    frames_csv = _frames_csv(dur_ms, fps=(probe.get("fps") or 30.0))
+        samples, t0_ns=int(rgb_diag["firstCaptureTimestampNs"]),
+        duration_ms=dur_ms,
+        source_dropped_timestamps_ns=read_stats["droppedRowTimestampsNs"],
+        stats=imu_diag)
+    n_samples = int(imu_diag["sampleCount"])
+    frames_csv = build_frames_csv_from_video(
+        native, duration_ms=dur_ms, require_measured_pts=True)
+    for binding in inputs.values():
+        content_provenance.verify_input(binding)
+    inputs["prepared_video"] = content_provenance.fingerprint(native)
+    diagnostics = {
+        "schema": 1, "kind": "local_derived_vrs_observation",
+        "source_clock": "aria_DEVICE_TIME_ns", "output_clock": "local_relative_csv_ns",
+        "physical_provenance_verified": False, "native_equivalence_verified": False,
+        "rgb": dict(rgb_diag), "imu": dict(imu_diag),
+        "output": {"sample_count": n_samples,
+                   "uniform_grid_step_ns": int(round(1e9 / config.ANDROID_IMU_SAMPLE_RATE_HZ)),
+                   **content_provenance.text_binding(imu_csv)},
+    }
+    lineage = {
+        "schema": 1, "dataset": "nymeria", "recording_origin": "third_party_dataset",
+        "physical_provenance_verified": False, "receiver_derived_data_support_verified": False,
+        "clip_uid": clip_uid, "parent_video_uid": clip.get("seq_id"),
+        "media_uid": clip.get("seq_id"), "window_s": [start_s, end_s],
+        "transform": {"kind": "measured_vrs_window_and_vfr_encoding",
+                      "presentation_rotation_degrees_clockwise": 90,
+                      "source_device_window_ns": [t0_ns, t1_ns],
+                      "first_rgb_capture_ns": rgb_diag["firstCaptureTimestampNs"],
+                      "imu": "measured_device_time_linear_resampling",
+                      "frames_at_prepare": "file_extracted_measured_pts"},
+        "assets": {**{role: content_provenance.public_binding(row)
+                       for role, row in inputs.items()},
+                   "imu_csv": content_provenance.text_binding(imu_csv),
+                   "prepared_frames_csv": content_provenance.text_binding(frames_csv)},
+        "selection_evidence": clip.get("selection_evidence"),
+        "derived_diagnostics": diagnostics,
+    }
+    lineage["lineage_sha256"] = content_provenance.canonical_digest(lineage)
     return {
         "clip_uid": clip_uid,
         "video_path": str(native),
@@ -1005,17 +1089,37 @@ def prepare_nymeria_clip(
         "frames_csv": frames_csv,
         "n_samples": n_samples,
         "imu_diagnostics": dict(imu_diag),
+        "rgb_diagnostics": dict(rgb_diag),
+        "selection_evidence": clip.get("selection_evidence"),
+        "task_name_authoritative": clip.get("task_name_authoritative"),
+        "task_id": clip.get("task_id"),
+        "registry_key": clip.get("registry_key"),
+        "content_provenance": lineage,
+        "derived_diagnostics": diagnostics,
+        "_content_inputs": inputs,
+        "_content_candidate": dict(clip),
+        "_nymeria_resample_inputs": {
+            "motion_vrs": inputs["source_imu"], "data_vrs": inputs["source_video"],
+            "source_device_window_ns": [t0_ns, t1_ns],
+            "origin_ns": int(rgb_diag["firstCaptureTimestampNs"]),
+            "duration_ms": dur_ms, "imu_label": "imu-right",
+            "sample_rate_hz": config.ANDROID_IMU_SAMPLE_RATE_HZ,
+        },
         "probe": probe,
         "source": "nymeria",
         "window_s": [start_s, end_s],
         "seq_id": clip.get("seq_id"),
         "source_provenance": {
+            **lineage,
             "dataset": "nymeria",
             "recording_origin": "third_party_dataset",
             "seq_id": clip.get("seq_id"),
             "window_s": [start_s, end_s],
+            "source_time_domain": "DEVICE_TIME",
+            "first_rgb_capture_ns": rgb_diag["firstCaptureTimestampNs"],
+            "source_device_window_ns": [t0_ns, t1_ns],
         },
-        "_cleanup_paths": [str(raw_mp4), str(native)],
+        "_cleanup_paths": [str(native)],
     }
 
 
@@ -1259,10 +1363,10 @@ _CHUNK_VIDEO_LOCKS_GUARD = threading.Lock()
 _chunk_video_locks: dict[str, threading.Lock] = {}
 
 
-def _chunk_video_signature(src: Path, start_s: float, dur_s: float) -> str:
+def _chunk_video_signature(src: Path, start_s: float, dur_s: float, *, preserve_pts: bool = False) -> str:
     stat = src.stat()
     value = (
-        f"v1|{src.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
+        f"{'vfr1' if preserve_pts else 'v1'}|{src.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
         f"{float(start_s):.3f}|{float(dur_s):.3f}"
     )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -1273,10 +1377,11 @@ def _chunk_video_path(
     chunk_index: int,
     start_ms: int,
     duration_ms: int,
+    *, preserve_pts: bool = False,
 ) -> Path:
     """Nome imutável: contas paralelas compartilham o mesmo corte pronto."""
     signature = _chunk_video_signature(
-        src, start_ms / 1000.0, duration_ms / 1000.0)
+        src, start_ms / 1000.0, duration_ms / 1000.0, preserve_pts=preserve_pts)
     return src.with_name(
         f"{src.stem}_ch{int(chunk_index)}_{signature[:12]}{src.suffix}")
 
@@ -1287,14 +1392,18 @@ def _chunk_video_lock(dest: Path) -> threading.Lock:
         return _chunk_video_locks.setdefault(key, threading.Lock())
 
 
-def _cut_video_chunk(src: Path, dest: Path, start_s: float, dur_s: float) -> Path:
+def _cut_video_chunk(src: Path, dest: Path, start_s: float, dur_s: float,
+                     *, preserve_pts: bool = False) -> Path:
     """Corta uma vez e publica atomicamente para todas as contas do lote."""
-    expected = _chunk_video_signature(src, start_s, dur_s)
+    expected = _chunk_video_signature(src, start_s, dur_s, preserve_pts=preserve_pts)
     ready = dest.with_name(dest.name + ".chunk.ok")
     with _chunk_video_lock(dest):
         try:
             if (dest.is_file() and dest.stat().st_size > 0 and ready.is_file()
                     and ready.read_text(encoding="utf-8").strip() == expected):
+                if preserve_pts:
+                    _require_same_video_pts(src, dest, start_ns=round(start_s * 1e9),
+                                            end_ns=round((start_s + dur_s) * 1e9))
                 return dest
         except OSError:
             pass
@@ -1303,6 +1412,29 @@ def _cut_video_chunk(src: Path, dest: Path, start_s: float, dur_s: float) -> Pat
         tmp = dest.with_name(dest.stem + ".tmp.mp4")
         if tmp.exists():
             tmp.unlink()
+        if preserve_pts:
+            container = _measured_pts_container_args(tmp)
+            filter_index = container.index("-vf") + 1
+            container[filter_index] += (
+                f",trim=start={start_s:.6f}:end={start_s + dur_s:.6f},setpts=PTS-STARTPTS")
+            container[-1:-1] = _measured_packet_tail_args(
+                src, start_ns=round(start_s * 1e9), end_ns=round((start_s + dur_s) * 1e9))
+            with _cpu_slots(1):
+                result = _ffmpeg_run([
+                    *_ffmpeg_head(ff), "-i", str(src),
+                    *_native_video_codec_args(nvenc=False), *container])
+            if result.returncode != 0:
+                tmp.unlink(missing_ok=True)
+                raise UploadError("Falha no recorte Nymeria com PTS medidos.",
+                                  transient=False, phase="prepare")
+            try:
+                _require_same_video_pts(src, tmp, start_ns=round(start_s * 1e9),
+                                        end_ns=round((start_s + dur_s) * 1e9))
+                tmp.replace(dest)
+                ready.write_text(expected, encoding="utf-8")
+                return dest
+            finally:
+                tmp.unlink(missing_ok=True)
         cmd = [
             *_ffmpeg_head(ff),
             "-ss", f"{max(0.0, float(start_s)):.3f}",
@@ -1399,7 +1531,7 @@ def _account_video_tmp_path(out: Path) -> Path:
     return out.with_name(f"{out.stem}.tmp.mp4")
 
 
-def _valid_account_video(out: Path, base: Path) -> bool:
+def _valid_account_video(out: Path, base: Path, *, preserve_pts: bool = False) -> bool:
     """Cache hit: arquivo completo, mais novo que o `_native.mp4`.
 
     O marcador `.ok` evita ffprobe em todo envio (abrir 500MB+ N vezes).
@@ -1414,14 +1546,16 @@ def _valid_account_video(out: Path, base: Path) -> bool:
         ok = _account_video_ok_path(out)
         if (not ok.exists() or ok.stat().st_mtime < st.st_mtime
                 or ok.read_text(encoding="utf-8").strip()
-                != _ACCOUNT_VIDEO_ENCODE_VERSION):
+                != _ACCOUNT_VIDEO_ENCODE_VERSION + ("-vfr1" if preserve_pts else "")):
             return False
+        if preserve_pts:
+            _require_same_video_pts(base, out)
         return bool(probe_video(out).get("duration_ms"))
     except Exception:  # noqa: BLE001 — probe/stat falhou: trata como miss
         return False
 
 
-def _per_account_video(base: Path, profile: DeviceProfile) -> Path:
+def _per_account_video(base: Path, profile: DeviceProfile, *, preserve_pts: bool = False) -> Path:
     """Vídeo POR APARELHO: re-encode com ABR/GOP do perfil, cacheado no disco.
 
     O MESMO MP4 byte-idêntico em N contas é a assinatura de colusão mais barata.
@@ -1436,11 +1570,11 @@ def _per_account_video(base: Path, profile: DeviceProfile) -> Path:
     out = _account_video_path(base, profile)
     lock = _lock_for_account_video(out)
     with lock:
-        if _valid_account_video(out, base):
+        if _valid_account_video(out, base, preserve_pts=preserve_pts):
             return out
         with _cpu_slots(1):
             # Pode ter ficado pronto enquanto esta conta aguardava o lock/slot.
-            if _valid_account_video(out, base):
+            if _valid_account_video(out, base, preserve_pts=preserve_pts):
                 return out
             ff = _ffmpeg_bin()
             mb = profile.video_bitrate_mbps
@@ -1451,7 +1585,10 @@ def _per_account_video(base: Path, profile: DeviceProfile) -> Path:
                 if leftover.exists():
                     leftover.unlink()
             input_args = [*_ffmpeg_head(ff), "-i", str(base)]
-            common_args = _native_container_args(tmp)
+            common_args = (_measured_pts_container_args(tmp) if preserve_pts
+                           else _native_container_args(tmp))
+            if preserve_pts:
+                common_args[-1:-1] = _measured_packet_tail_args(base)
             use_nvenc = _use_nvenc(ff)
             cmd = [
                 *input_args,
@@ -1486,9 +1623,14 @@ def _per_account_video(base: Path, profile: DeviceProfile) -> Path:
                     raise UploadError(
                         "re-encode por conta gerou vídeo sem duração "
                         f"(size={size})")
+                if preserve_pts:
+                    _require_same_video_pts(base, tmp)
+                    if abs(int(probed["duration_ms"]) - int(probe_video(base)["duration_ms"])) > 1:
+                        raise UploadError("Duração alterada durante encode Nymeria.",
+                                          transient=False, phase="prepare")
                 tmp.replace(out)
                 _account_video_ok_path(out).write_text(
-                    _ACCOUNT_VIDEO_ENCODE_VERSION, encoding="utf-8")
+                    _ACCOUNT_VIDEO_ENCODE_VERSION + ("-vfr1" if preserve_pts else ""), encoding="utf-8")
             finally:
                 if tmp.exists():
                     try:
@@ -2122,6 +2264,45 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
     return matched
 
 
+def _nymeria_resample_delivery(item: dict[str, Any], *, origin_ns: int | None = None,
+                               duration_ms: int | None = None) -> tuple[str, dict[str, Any]]:
+    """Measure one delivery interval from the original VRS sensor records."""
+    from . import content_provenance, nymeria_vrs
+    try:
+        source = item["_nymeria_resample_inputs"]
+        transform = item["content_provenance"]["transform"]
+        first_rgb = int(transform["first_rgb_capture_ns"])
+        if (source["motion_vrs"] != item["_content_inputs"]["source_imu"]
+                or source["data_vrs"] != item["_content_inputs"]["source_video"]
+                or source["source_device_window_ns"] != transform["source_device_window_ns"]
+                or type(source["origin_ns"]) is not int or source["origin_ns"] != first_rgb
+                or type(source["duration_ms"]) is not int or source["duration_ms"] != item["duration_ms"]
+                or source["imu_label"] != "imu-right"
+                or type(source["sample_rate_hz"]) is not int or source["sample_rate_hz"] != 500):
+            raise ValueError(content_provenance.INTEGRITY_ERROR)
+        origin = first_rgb if origin_ns is None else origin_ns
+        duration = item["duration_ms"] if duration_ms is None else duration_ms
+        if (type(origin) is not int or type(duration) is not int or duration <= 0
+                or origin < first_rgb
+                or origin + duration * 1_000_000 > first_rgb + item["duration_ms"] * 1_000_000 + 1000):
+            raise ValueError(content_provenance.INTEGRITY_ERROR)
+        read_stats, stats = {}, {}
+        read_start, read_end = ((source["source_device_window_ns"])
+                                if origin_ns is None and duration_ms is None
+                                else (origin, origin + duration * 1_000_000))
+        samples = nymeria_vrs.read_imu_samples(
+            Path(source["motion_vrs"]["path"]), t0_ns=read_start, t1_ns=read_end,
+            label=source["imu_label"], stats=read_stats)
+        output = nymeria_vrs.build_imu_csv_from_samples(
+            samples, t0_ns=origin, duration_ms=duration, sample_rate_hz=500,
+            source_dropped_timestamps_ns=read_stats["droppedRowTimestampsNs"], stats=stats)
+        content_provenance.verify_input(source["motion_vrs"])
+        return output, stats
+    except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
+        raise UploadError("Fonte ou diagnóstico IMU Nymeria divergente; novo preparo necessário.",
+                          transient=False, phase="prepare") from exc
+
+
 def upload_to_account(item: dict[str, Any], account: AccountSpec,
                       task_id: str, timeout_blob: int,
                       evaluate: bool, finalize: bool,
@@ -2145,10 +2326,29 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         return result
     try:
         if item.get("source") == "nymeria":
+            from . import content_provenance
             if not item.get("imu_csv") or not item.get("frames_csv"):
                 raise UploadError(
                     "Nymeria sem CSV medido completo; envio bloqueado sem substituição sintética.",
                     transient=False, phase="prepare")
+            try:
+                result["source_provenance"] = content_provenance.revalidate_content_provenance(item)
+                if (Path(item["video_path"]).resolve()
+                        != Path(item["_content_inputs"]["prepared_video"]["path"]).resolve()):
+                    raise ValueError(content_provenance.INTEGRITY_ERROR)
+                candidate = dict(item["_content_candidate"])
+                candidate["selection_evidence"] = item["content_provenance"]["selection_evidence"]
+                result["selection_evidence"] = nymeria.revalidate_candidate(
+                    candidate, task_name=item.get("task_name_authoritative"),
+                    task_id=task_id, registry_key=item.get("registry_key"))["selection_evidence"]
+                measured_csv, measured_stats = _nymeria_resample_delivery(item)
+                if (measured_csv != item["imu_csv"]
+                        or measured_stats != item.get("imu_diagnostics")
+                        or measured_stats["sampleCount"] != item.get("n_samples")):
+                    raise ValueError(content_provenance.INTEGRITY_ERROR)
+            except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
+                raise UploadError("Prova Nymeria ausente ou alterada; novo preparo necessário.",
+                                  transient=False, phase="prepare") from exc
         if item.get("source") == "ego4d":
             from . import content_provenance
             try:
@@ -2216,7 +2416,9 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         if unique_video:
             if on_progress:
                 on_progress("encode", "start", 1)
-            video_path = _per_account_video(base_video, profile)
+            video_path = (_per_account_video(base_video, profile, preserve_pts=True)
+                          if item.get("source") == "nymeria"
+                          else _per_account_video(base_video, profile))
             if on_progress:
                 on_progress("encode", "done", 1)
         else:
@@ -2300,9 +2502,13 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 part_imu, n_imu = imu_csv, int(item.get("n_samples") or 0)
                 part_frames = frames_csv
             else:
-                part = _chunk_video_path(video_path, index, start_ms, dur_ms)
-                _cut_video_chunk(
-                    video_path, part, start_ms / 1000.0, dur_ms / 1000.0)
+                if item.get("source") == "nymeria":
+                    part = _chunk_video_path(video_path, index, start_ms, dur_ms, preserve_pts=True)
+                    _cut_video_chunk(video_path, part, start_ms / 1000.0, dur_ms / 1000.0,
+                                     preserve_pts=True)
+                else:
+                    part = _chunk_video_path(video_path, index, start_ms, dur_ms)
+                    _cut_video_chunk(video_path, part, start_ms / 1000.0, dur_ms / 1000.0)
                 part_imu, n_imu = _slice_imu_csv(imu_csv, start_ms, dur_ms)
                 try:
                     part_frames = build_frames_csv_from_video(
@@ -2321,6 +2527,27 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                         transient=False, phase='prepare') from exc
             part_probe = probe_video(part) if len(plan) > 1 else video_probe
             chunk_item = dict(item)
+            if len(plan) > 1 and item.get("source") == "nymeria":
+                # A cut begins at its first captured RGB frame, which may be
+                # later than a policy boundary. Resample this part at that
+                # actual capture origin instead of shifting the whole CSV.
+                from bisect import bisect_left
+                source_pts = _measured_video_pts(video_path)
+                first_index = bisect_left(source_pts, start_ms * 1_000_000)
+                dur_ms = int(part_probe.get("duration_ms") or 0)
+                minimum = max(1000, int(policy_limits.get("min_duration_ms") or MIN_DUR_MS))
+                maximum = max(minimum, int(policy_limits.get("max_duration_ms") or MAX_DUR_MS))
+                if not minimum <= dur_ms <= maximum:
+                    raise UploadError("Duração medida do chunk Nymeria fora da política.",
+                                      transient=False, phase="prepare")
+                if first_index >= len(source_pts):
+                    raise UploadError("Chunk Nymeria sem primeiro frame medido.", transient=False, phase="prepare")
+                source_origin = item["_nymeria_resample_inputs"]["origin_ns"] + source_pts[first_index]
+                part_imu, part_stats = _nymeria_resample_delivery(
+                    item, origin_ns=source_origin, duration_ms=dur_ms)
+                n_imu = int(part_stats["sampleCount"])
+                chunk_item["imu_diagnostics"] = part_stats
+                chunk_item["n_samples"] = n_imu
             if len(plan) > 1:
                 chunk_item["n_samples"] = n_imu
                 if chunk_imu_diagnostics is not None:
@@ -2336,12 +2563,12 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 duration_ms=dur_ms))
             chunk_paths.append(part)
             chunk_recorded.append(rec_at)
-            if item.get("source") == "ego4d":
+            if item.get("source") in {"ego4d", "nymeria"}:
                 lineage_chunks.append({"index": index, "start_ms": start_ms, "duration_ms": dur_ms,
                     "video_path": str(part), "imu_csv": part_imu, "frames_csv": part_frames,
                     "sidecar_bytes": chunk_zips[-1], "recorded_at": rec_at})
         result["session_id"] = session_id
-        if item.get("source") == "ego4d":
+        if item.get("source") in {"ego4d", "nymeria"}:
             try:
                 result["source_provenance"] = content_provenance.bind_content_delivery(
                     item, session_id, task_id, account.org_key, lineage_chunks)
@@ -2364,11 +2591,11 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             campaign_context={"registry_key": item["registry_key"], "clip_uid": item["clip_uid"],
                               "task_id": task_id,
                               **({"content_provenance": result["source_provenance"]}
-                                 if item.get("source") == "ego4d" else {})}
+                                 if item.get("source") in {"ego4d", "nymeria"} else {})}
                               if item.get("registry_key") and item.get("clip_uid") else None,
             **({"expected_video_sha256": [row["video"]["sha256"]
                                            for row in result["source_provenance"]["chunks"]]}
-               if item.get("source") == "ego4d" else {}),
+               if item.get("source") in {"ego4d", "nymeria"} else {}),
         )
         result["session_id"] = res.session_id
         result["finalized"] = res.finalized
@@ -2519,11 +2746,12 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
     if dataset_provider in ("all", "ambos", "nymeria"):
         try:
             nymeria_clips = nymeria.automatic_candidates(
+                task_name=tsk.task_name, task_id=tsk.task_id,
+                registry_key=tsk.registry_key,
                 min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s)
         except Exception:
             nymeria_clips = []
-        # Nymeria is IMU-complete by construction — do not bury it behind Ego4D.
-        # Only Minute duration bounds + real VRS coverage limit the pool.
+        # Nymeria windows carry current action and measured VRS evidence.
         if dataset_provider == "nymeria":
             shorts = list(nymeria_clips)
         else:
@@ -2729,6 +2957,8 @@ def _run_campaign(
                         compatible = {
                             candidate["clip_uid"]: candidate
                             for candidate in nymeria.automatic_candidates(
+                                task_name=tsk.task_name, task_id=tsk.task_id,
+                                registry_key=tsk.registry_key,
                                 min_dur_s=tsk.min_dur_s,
                                 max_dur_s=tsk.max_dur_s,
                             )
@@ -3944,7 +4174,13 @@ def _prepare_queue_accepts(clip: dict[str, Any], task_name: str | None, *,
     """Trecho sem prova na biblioteca atual não entra na fila de preparo."""
     source = str(clip.get("source") or "")
     uid = str(clip.get("clip_uid") or "")
-    if source in {"holoassist", "nymeria"} or uid.startswith("nymeria:"):
+    if source == "nymeria" or uid.startswith("nymeria:"):
+        try:
+            nymeria.revalidate_candidate(clip, task_name=task_name, fresh=fresh)
+        except (OSError, ValueError, RuntimeError, ImportError):
+            return False
+        return True
+    if source == "holoassist":
         return True
     if not isinstance(clip.get("selection_evidence"), dict):
         return True
@@ -4213,14 +4449,18 @@ def _duration_ranked_pools(min_dur_s: float, max_dur_s: float):
 _duration_ranked_pools.cache_clear = _duration_ranked_snapshot.cache_clear
 
 
-@lru_cache(maxsize=8)
-def _nymeria_windows(min_dur_s: float, max_dur_s: float) -> tuple[dict[str, Any], ...]:
-    """Janelas Nymeria já filtradas pela duração do Minute."""
+def _nymeria_windows(task_name: str, min_dur_s: float,
+                     max_dur_s: float) -> tuple[dict[str, Any], ...]:
+    """Nymeria owns a cache bound to exact current roots/media/annotations."""
     try:
-        clips = nymeria.automatic_candidates(min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+        clips = nymeria.automatic_candidates(task_name=task_name,
+            min_dur_s=min_dur_s, max_dur_s=max_dur_s)
     except Exception:
         return ()
     return tuple(dict(clip) for clip in clips)
+
+
+_nymeria_windows.cache_clear = nymeria.clear_caches
 
 
 def _compatible_task_clips(
@@ -4255,7 +4495,7 @@ def _compatible_task_clips(
     if provider == "ego4d":
         return ego_clips
     if provider == "nymeria":
-        return _nymeria_windows(min_dur_s, max_dur_s)
+        return _nymeria_windows(task_name, min_dur_s, max_dur_s)
     holo_clips: tuple[dict[str, Any], ...] = ()
     if provider in ("all", "holoassist"):
         try:
@@ -4263,7 +4503,7 @@ def _compatible_task_clips(
                 task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
         except FileNotFoundError:
             holo_clips = ()
-    nymeria_clips = _nymeria_windows(min_dur_s, max_dur_s) if provider in ("all", "ambos") else ()
+    nymeria_clips = _nymeria_windows(task_name, min_dur_s, max_dur_s) if provider in ("all", "ambos") else ()
     if provider == "ambos":
         return (*nymeria_clips, *ego_clips)
     return (*holo_clips, *nymeria_clips, *ego_clips)

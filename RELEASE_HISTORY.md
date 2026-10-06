@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **112 releases públicas**, atualizado em **06/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **113 releases públicas**, atualizado em **06/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.46](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.46). Destaques: capacidade por conta antes da campanha, gravação de registros concorrentes e acompanhamento separado de envios, recibos e prévias.
+Versão atual: [v2.0.47](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.47). Destaques: Biblioteca Nymeria local, SDK Aria incluído no Windows, seleção por atividade comprovada e timestamps medidos no vídeo e na IMU de cada parte.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.47](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.47) | 06/10/2026 | Biblioteca Nymeria local com SDK Aria incluído. Seleção verifica tarefa e relógio das narrações; preparo e encodes preservam PTS reais. Cada parte recebe IMU e diagnóstico próprios; fontes ou vínculos alterados bloqueiam o envio. | [Desde v2.0.46](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.46...v2.0.47) |
 | [v2.0.46](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.46) | 06/10/2026 | Verifica capacidade e déficit por conta antes de aceitar a meta de horas. Checkpoints aguardam leituras concorrentes; falhas locais orientam a recuperação. Resultados da campanha, recibos e prévias permanecem separados. | [Desde v2.0.45](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.45...v2.0.46) |
 | [v2.0.45](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.45) | 06/10/2026 | Biblioteca com arquivos locais de todas as origens, busca, filtros, tamanhos e caminhos. Preparação com faixa de duração e espaço configuráveis; proteção de vídeos e sensores pendentes, seleção temporal Ego4D e diagnósticos IMU por parte. | [Desde v2.0.43](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.43...v2.0.45) |
 | [v2.0.43](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.43) | 05/10/2026 | Conta com restrição confirmada é arquivada em Banidas e deixa de bloquear a campanha. Rede, senha e tempo esgotado não removem a conta. | [Desde v2.0.42](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.42...v2.0.43) |
