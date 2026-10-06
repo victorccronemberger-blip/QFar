@@ -5148,7 +5148,7 @@ void MainWindow::updateCampaignActions() {
   _campaignStart->setEnabled(!busy && accounts && tasks && balancesReady
       && !_taskRequestPending && !_taskReload.isActive());
   _campaignReset->setEnabled(!campaignResetBlocked());
-  _historyVerifyPreviews->setEnabled(!_campaignResetPending && !_historyVerifyPending);
+  if (_historyVerifyPreviews) _historyVerifyPreviews->setEnabled(!_campaignResetPending && !_historyVerifyPending);
   if (_campaignOriginal) _campaignOriginal->setEnabled(!busy && !_closing && !_campaignClosePending
       && _backendReady && _campaignAccounts->count() > 0);
 }
