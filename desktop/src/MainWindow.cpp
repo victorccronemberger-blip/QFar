@@ -3689,7 +3689,9 @@ void MainWindow::startBackend() {
     // níveis acima; numa distribuição portátil eles podem ficar ao lado do EXE.
     workingDirectory = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
                        + QStringLiteral("/QMoney");
-    QString libraryRoot = workingDirectory;
+    // A pasta da conta não é biblioteca. Ela só entra se tiver as narrações;
+    // um catálogo parcial nessa pasta faz a campanha recusar todos os vídeos.
+    QString libraryRoot;
     QStringList libraryCandidates;
     const QString savedLibrary = QSettings().value(QStringLiteral("libraryRoot")).toString();
     if (!savedLibrary.isEmpty()) libraryCandidates << savedLibrary;
@@ -3703,6 +3705,8 @@ void MainWindow::startBackend() {
         break;
       }
     }
+    if (libraryRoot.isEmpty())
+      libraryRoot = workingDirectory;
     QDir().mkpath(workingDirectory);
     // Contas e segredos pertencem ao usuário Windows, nunca à biblioteca.
     for (const QString& key : environment.keys()) {

@@ -11,9 +11,12 @@ houver uma em andamento.
 from __future__ import annotations
 
 import math
+import shutil
+import tempfile
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from .. import campaign, ego_accelerator, holo_accelerator
@@ -21,6 +24,27 @@ from ..campaign import CampaignConfig, run_campaign
 from .operation_state import OperationState
 
 _MAX_EVENTS = 2000
+
+
+def _temporary_media_dir(cfg: CampaignConfig) -> Path | None:
+    """Vídeo baixado para envio não fica na biblioteca do catálogo.
+
+    A campanha apaga esses arquivos depois do upload. A pasta temporária
+    também sai no fim. Catálogo e narrações continuam na biblioteca real.
+    """
+    from .. import config
+    if not cfg.cleanup_after_upload or cfg.original_capture_plan is not None:
+        return None
+    try:
+        current = Path(cfg.work_dir).resolve()
+        catalog = (config.MEDIA_DATA_DIR / "ego4d").resolve()
+    except OSError:
+        return None
+    if current != catalog:
+        return None
+    temporary = Path(tempfile.mkdtemp(prefix="qmoney-campaign-"))
+    cfg.work_dir = temporary
+    return temporary
 
 
 def _fmt_wait(total_s: int) -> str:
@@ -60,6 +84,10 @@ def friendly_campaign_error(value: Any) -> str:
             "invalidaccesskeyid", "signaturedoesnotmatch", "expiredtoken",
             "credenciais ego4d inválidas", "credenciais aws ausentes")):
         return "As credenciais do Ego4D não foram aceitas. Atualize-as na aba Integrações."
+    if ("ego4d selection changed" in text or "lacks current task evidence" in text
+            or "narração" in text or "narracao" in text):
+        return ("A seleção deste trecho não confere com o catálogo do Ego4D. "
+                "O QMoney segue com outro vídeo.")
     if "acesso negado ao ego4d" in text or "accessdenied" in text:
         return "A licença Ego4D não autorizou este arquivo. O QMoney seguirá com outro vídeo."
     if any(term in text for term in ("disabled", "desativad", "blocked account")):
@@ -429,6 +457,7 @@ class CampaignRunner:
     # --- thread de fundo ----------------------------------------------------
     def _run(self, cfg: CampaignConfig) -> None:
         terminal: tuple[str, dict[str, Any]] | None = None
+        temporary_media = _temporary_media_dir(cfg)
 
         def on_progress(kind: str, payload: dict[str, Any]) -> None:
             nonlocal terminal
@@ -481,6 +510,9 @@ class CampaignRunner:
                     self.state = "stopped"
                     self.current = ""
                     self.stage = "Encerrada"
+        finally:
+            if temporary_media is not None:
+                shutil.rmtree(temporary_media, ignore_errors=True)
 
     def _restore_published_progress(self, log, cfg: CampaignConfig) -> None:
         """Restore counters from this attempt and current receipts, no events."""

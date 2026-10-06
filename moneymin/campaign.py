@@ -2497,7 +2497,8 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
                 ego.append(clip)
         ego = refine_candidates(ego, work_dir, tsk.min_dur_s, tsk.max_dur_s)
         shorts = [*ego, *other]
-    return shorts
+    task_name = tsk.task_name
+    return [clip for clip in shorts if _prepare_queue_accepts(clip, task_name)]
 
 
 def _candidate_sent_emails(registry_key: str, clip: dict) -> set[str]:
@@ -3807,6 +3808,60 @@ def _link_rank_history(
     return linked
 
 
+def _narration_file_present(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _local_narration_catalog() -> bool:
+    """A biblioteca ativa tem narração. O índice portátil não a substitui."""
+    return ego4d.has_timed_narrations() or _narration_file_present(
+        config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json")
+
+
+def _stamp_hides_present_narration(stamp) -> bool:
+    """Cache gravado com narração ausente não vale depois que o arquivo existe."""
+    present = {
+        "clip_narrations.json": _narration_file_present(
+            config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json"),
+        "timed_narrations.jsonl": _narration_file_present(ego4d.timed_narrations_path()),
+    }
+    for item in stamp:
+        if not item:
+            continue
+        name = str(item[0]).replace("\\", "/").rsplit("/", 1)[-1]
+        if not present.get(name):
+            continue
+        size = item[1] if len(item) > 1 else 0
+        digest = str(item[2]) if len(item) > 2 else ""
+        if size == 0 or digest == "missing":
+            return True
+    return False
+
+
+def _prepare_queue_accepts(clip: dict[str, Any], task_name: str | None) -> bool:
+    """Trecho sem prova na biblioteca atual não entra na fila de preparo."""
+    source = str(clip.get("source") or "")
+    uid = str(clip.get("clip_uid") or "")
+    if source in {"holoassist", "nymeria"} or uid.startswith("nymeria:"):
+        return True
+    if not isinstance(clip.get("selection_evidence"), dict):
+        return True
+    # Sem arquivo de narração o índice portátil segue na fila. Com narração,
+    # só fica o trecho que esta biblioteca prova.
+    if not (_narration_file_present(ego4d.timed_narrations_path())
+            or _narration_file_present(
+                config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json")):
+        return True
+    try:
+        ego4d.revalidate_selection_evidence(clip, task_name=task_name)
+    except ValueError:
+        return False
+    return True
+
+
 def _merge_rank_seed(
     buckets: dict[str, tuple[dict[str, Any], ...]],
     *,
@@ -3867,6 +3922,8 @@ def _load_rank_cache(
         stamp = tuple(tuple(item) for item in stamp)
     except Exception:  # noqa: BLE001 — cache corrompido = recompute
         return None
+    if _stamp_hides_present_narration(stamp):
+        return None
     if stamp != _rank_cache_stamp() or not isinstance(buckets, dict):
         return None
     if any(not isinstance(name, str) or not isinstance(items, list)
@@ -3903,11 +3960,22 @@ def _ranked_pools_snapshot(stamp) -> dict[str, tuple[dict[str, Any], ...]]:
     cached = _load_rank_cache()
     if cached is not None:
         return _rank_evidenced(_merge_rank_seed(cached))
+    if _local_narration_catalog():
+        spans = (ego4d.rank_all_task_spans(min_dur_s=60, max_dur_s=1800)
+                 if ego4d.has_timed_narrations() else {})
+        official = task_matching.rank_all_tasks(_task_candidates())
+        evidenced = (
+            ego4d.narration_evidence_clips(min_dur_s=60, max_dur_s=1800)
+            if ego4d.has_timed_narrations() else {})
+        buckets = _union_ranked_clips(
+            _union_ranked_clips(spans, official), evidenced)
+        result = _rank_evidenced(_merge_rank_seed(buckets))
+        _save_rank_cache(result)
+        return result
     seed = _load_rank_seed()
     if seed and any(seed.values()):
-        # The release already includes the verified full-range index. Rebuilding
-        # millions of annotations on a cold customer installation blocks every
-        # category query for minutes. Offline rebuilds belong to the seed tool.
+        # Sem narração local, o índice portátil é o piso. Com narração, ele
+        # só completa tarefas que a biblioteca não cobre.
         result = _rank_evidenced(_merge_rank_seed({}))
         _save_rank_cache(result)
         return result

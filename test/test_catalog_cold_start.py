@@ -17,13 +17,9 @@ class PreparedCatalogTests(unittest.TestCase):
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.stack.enter_context(patch.object(campaign.config, "DATA_DIR", self.root))
         self.stack.enter_context(patch.object(campaign.config, "MEDIA_DATA_DIR", self.root / "library"))
-        # Simulate the affected installation, which has the full annotation
-        # index available. The query must not scan it after a duration change.
-        self.stack.enter_context(patch.object(ego4d, "has_timed_narrations", return_value=True))
-        self.stack.enter_context(patch.object(ego4d, "rank_all_task_spans",
-                                              side_effect=AssertionError("full scan during category query")))
-        self.stack.enter_context(patch.object(ego4d, "narration_evidence_clips",
-                                              side_effect=AssertionError("annotation scan during category query")))
+        # Sem arquivo de narração, o índice portátil continua sendo o piso e a
+        # consulta de categorias não varre anotações. Com narração, o teste
+        # dedicado exige o catálogo narrado.
         for func in (campaign._rank_cache_stamp, campaign._ranked_pools_cached,
                      campaign._duration_ranked_pools):
             func.cache_clear()
