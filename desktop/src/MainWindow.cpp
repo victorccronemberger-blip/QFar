@@ -300,6 +300,8 @@ QString jsonId(const QJsonValue& value) {
 }
 
 QString bytesText(qint64 bytes) {
+  if (bytes < 1024) return QLocale().toString(bytes) + QStringLiteral(" B");
+  if (bytes < 1024 * 1024) return QLocale().toString(static_cast<double>(bytes) / 1024.0, 'f', 1) + QStringLiteral(" KiB");
   const double gib = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
   if (gib >= 1.0) return QLocale().toString(gib, 'f', gib >= 100.0 ? 0 : 1) + QStringLiteral(" GiB");
   const double mib = static_cast<double>(bytes) / (1024.0 * 1024.0);
@@ -2213,6 +2215,250 @@ QWidget* MainWindow::buildAcceleratorPage() {
   layout->setContentsMargins(0, 0, 0, 0);
   layout->setSpacing(14);
 
+  auto* library = new QWidget;
+  auto* libraryLayout = new QVBoxLayout(library);
+  libraryLayout->setContentsMargins(0, 0, 0, 0);
+  libraryLayout->setSpacing(12);
+  _libraryStorageSummary = quietLabel(QStringLiteral("Consultando espaço ocupado e livre…"));
+  _libraryStorageSummary->setObjectName(QStringLiteral("localLibraryStorageSummary"));
+  libraryLayout->addWidget(_libraryStorageSummary);
+  auto* base = new QHBoxLayout;
+  _libraryBase = quietLabel(QStringLiteral("Aguardando pasta da biblioteca"));
+  _libraryBase->setObjectName(QStringLiteral("localLibraryBase"));
+  _libraryBase->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  _libraryBase->setWordWrap(true);
+  base->addWidget(_libraryBase, 1);
+  _libraryOpenFolder = new QPushButton(QStringLiteral("Abrir pasta"));
+  _libraryOpenFolder->setObjectName(QStringLiteral("localLibraryOpenFolder"));
+  _libraryOpenFolder->setEnabled(false);
+  connect(_libraryOpenFolder, &QPushButton::clicked, this, [this] {
+    const QFileInfo root(_localMediaRoot);
+    const QString canonical = root.canonicalFilePath();
+    if (_localMediaVerified && root.isAbsolute() && root.isDir() && !canonical.isEmpty())
+      QDesktopServices::openUrl(QUrl::fromLocalFile(canonical));
+  });
+  base->addWidget(_libraryOpenFolder);
+  libraryLayout->addLayout(base);
+  _libraryTabs = new QTabWidget;
+  _libraryTabs->setObjectName(QStringLiteral("localLibraryTabs"));
+  _libraryTabs->setDocumentMode(true);
+  libraryLayout->addWidget(_libraryTabs);
+  auto* local = new QWidget;
+  auto* localLayout = new QVBoxLayout(local);
+  localLayout->setContentsMargins(0, 12, 0, 0);
+  localLayout->setSpacing(12);
+  _localMediaSummary = quietLabel(QStringLiteral("Vídeos de origem, recortes, sensores e arquivos de apoio neste computador."));
+  _localMediaSummary->setObjectName(QStringLiteral("localMediaSummary"));
+  localLayout->addWidget(_localMediaSummary);
+  auto* localSearch = new QHBoxLayout;
+  _localMediaQuery = new QLineEdit;
+  _localMediaQuery->setObjectName(QStringLiteral("localMediaQuery"));
+  _localMediaQuery->setPlaceholderText(QStringLiteral("Buscar nome ou caminho"));
+  _localMediaQuery->setMaxLength(200);
+  localSearch->addWidget(_localMediaQuery, 1);
+  _localMediaRefresh = new QPushButton(QStringLiteral("Verificar arquivos"));
+  _localMediaRefresh->setObjectName(QStringLiteral("localMediaRefresh"));
+  localSearch->addWidget(_localMediaRefresh);
+  localLayout->addLayout(localSearch);
+  auto* localFilters = new QHBoxLayout;
+  _localMediaProvider = new ComboBox;
+  _localMediaProvider->setObjectName(QStringLiteral("localMediaProvider"));
+  for (const auto& entry : QList<QPair<QString, QString>>{
+      {QStringLiteral("Todas as origens"), QStringLiteral("all")},
+      {QStringLiteral("Ego4D"), QStringLiteral("ego4d")},
+      {QStringLiteral("HoloAssist"), QStringLiteral("holoassist")},
+      {QStringLiteral("Nymeria"), QStringLiteral("nymeria")},
+      {QStringLiteral("Local"), QStringLiteral("local")}})
+    _localMediaProvider->addItem(entry.first, entry.second);
+  _localMediaKind = new ComboBox;
+  _localMediaKind->setObjectName(QStringLiteral("localMediaKind"));
+  for (const auto& entry : QList<QPair<QString, QString>>{
+      {QStringLiteral("Todos os tipos"), QStringLiteral("all")},
+      {QStringLiteral("Vídeos"), QStringLiteral("video")},
+      {QStringLiteral("Sensores / IMU"), QStringLiteral("sensor")},
+      {QStringLiteral("Arquivos de apoio"), QStringLiteral("sidecar")},
+      {QStringLiteral("Catálogos"), QStringLiteral("catalog")},
+      {QStringLiteral("Derivados"), QStringLiteral("derivative")}})
+    _localMediaKind->addItem(entry.first, entry.second);
+  localFilters->addWidget(_localMediaProvider);
+  localFilters->addWidget(_localMediaKind);
+  localFilters->addStretch();
+  localLayout->addLayout(localFilters);
+  _localMediaTable = new QTableWidget(0, 5);
+  _localMediaTable->setObjectName(QStringLiteral("localMediaTable"));
+  _localMediaTable->setHorizontalHeaderLabels({QStringLiteral("Nome"), QStringLiteral("Origem"),
+      QStringLiteral("Tipo / estágio"), QStringLiteral("Tamanho"), QStringLiteral("Proteção")});
+  _localMediaTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  _localMediaTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+  _localMediaTable->setSelectionMode(QAbstractItemView::SingleSelection);
+  _localMediaTable->setMinimumHeight(320);
+  _localMediaTable->setMaximumHeight(480);
+  _localMediaTable->setTextElideMode(Qt::ElideMiddle);
+  _localMediaTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+  for (int column = 1; column < 5; ++column)
+    _localMediaTable->horizontalHeader()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+  _localMediaTable->verticalHeader()->hide();
+  new TableEmptyState(_localMediaTable, QStringLiteral("Seus arquivos locais aparecem aqui"),
+      QStringLiteral("Consulte todas as origens ou use Preparar acervo para obter vídeos e sensores."));
+  localLayout->addWidget(_localMediaTable, 1);
+  _localMediaCount = quietLabel(QStringLiteral("Aguardando leitura dos arquivos"));
+  _localMediaCount->setObjectName(QStringLiteral("localMediaCount"));
+  localLayout->addWidget(_localMediaCount);
+  auto* localActions = new QHBoxLayout;
+  _localMediaPrevious = new QPushButton(QStringLiteral("Anterior"));
+  _localMediaNext = new QPushButton(QStringLiteral("Próxima"));
+  _localMediaCopy = new QPushButton(QStringLiteral("Copiar caminho"));
+  _localMediaOpen = new QPushButton(QStringLiteral("Abrir arquivo"));
+  _localMediaPrevious->setObjectName(QStringLiteral("localMediaPrevious"));
+  _localMediaNext->setObjectName(QStringLiteral("localMediaNext"));
+  _localMediaCopy->setObjectName(QStringLiteral("localMediaCopy"));
+  _localMediaOpen->setObjectName(QStringLiteral("localMediaOpen"));
+  for (auto* button : {_localMediaPrevious, _localMediaNext, _localMediaCopy, _localMediaOpen}) button->setEnabled(false);
+  localActions->addWidget(_localMediaPrevious);
+  localActions->addWidget(_localMediaNext);
+  localActions->addStretch();
+  localActions->addWidget(_localMediaCopy);
+  localActions->addWidget(_localMediaOpen);
+  localLayout->addLayout(localActions);
+  connect(_localMediaQuery, &QLineEdit::textChanged, this, &MainWindow::localMediaFiltersChanged);
+  connect(_localMediaQuery, &QLineEdit::returnPressed, this, [this] { loadLocalMediaLibrary(); });
+  connect(_localMediaProvider, qOverload<int>(&QComboBox::currentIndexChanged), this, &MainWindow::localMediaFiltersChanged);
+  connect(_localMediaKind, qOverload<int>(&QComboBox::currentIndexChanged), this, &MainWindow::localMediaFiltersChanged);
+  connect(_localMediaRefresh, &QPushButton::clicked, this, [this] { loadLocalMediaLibrary(true); });
+  connect(_localMediaPrevious, &QPushButton::clicked, this, [this] { _localMediaOffset = qMax(0, _localMediaOffset - 50); loadLocalMediaLibrary(); });
+  connect(_localMediaNext, &QPushButton::clicked, this, [this] { _localMediaOffset += 50; loadLocalMediaLibrary(); });
+  connect(_localMediaTable, &QTableWidget::itemSelectionChanged, this, &MainWindow::updateLocalMediaActions);
+  connect(_localMediaCopy, &QPushButton::clicked, this, [this] {
+    const QString path = localMediaPath();
+    if (!path.isEmpty()) QApplication::clipboard()->setText(path);
+  });
+  connect(_localMediaOpen, &QPushButton::clicked, this, [this] {
+    const QString path = localMediaPath(true);
+    if (!path.isEmpty()) QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+  });
+  _localMediaPoll.setInterval(1200);
+  connect(&_localMediaPoll, &QTimer::timeout, this, [this] { loadLocalMediaLibrary(); });
+  _libraryTabs->addTab(local, QStringLiteral("Arquivos locais"));
+
+  auto* inventory = new QWidget;
+  auto* inventoryLayout = new QVBoxLayout(inventory);
+  inventoryLayout->setContentsMargins(0, 0, 0, 0);
+  inventoryLayout->setSpacing(12);
+  _preparedSummary = quietLabel(QStringLiteral("Consulte os recortes e sensores preparados neste computador."));
+  _preparedSummary->setObjectName(QStringLiteral("preparedLibrarySummary"));
+  inventoryLayout->addWidget(_preparedSummary);
+  auto* filters = new QHBoxLayout;
+  _preparedQuery = new QLineEdit;
+  _preparedQuery->setObjectName(QStringLiteral("preparedLibraryQuery"));
+  _preparedQuery->setPlaceholderText(QStringLiteral("Buscar recorte ou arquivo"));
+  _preparedQuery->setMaxLength(200);
+  filters->addWidget(_preparedQuery, 1);
+  _preparedState = new ComboBox;
+  _preparedState->setObjectName(QStringLiteral("preparedLibraryState"));
+  for (const auto& entry : QList<QPair<QString, QString>>{
+      {QStringLiteral("Todos os estados"), QStringLiteral("all")},
+      {QStringLiteral("Mídia preparada"), QStringLiteral("ready")},
+      {QStringLiteral("Preparação incompleta"), QStringLiteral("partial")},
+      {QStringLiteral("Arquivo ausente"), QStringLiteral("missing")},
+      {QStringLiteral("Revisar"), QStringLiteral("stale")}})
+    _preparedState->addItem(entry.first, entry.second);
+  filters->addWidget(_preparedState);
+  inventoryLayout->addLayout(filters);
+  auto* durations = new QHBoxLayout;
+  durations->addWidget(quietLabel(QStringLiteral("Duração")));
+  _preparedMinimum = new QSpinBox;
+  _preparedMinimum->setObjectName(QStringLiteral("preparedLibraryMinimum"));
+  _preparedMinimum->setRange(0, 1440);
+  _preparedMinimum->setSuffix(QStringLiteral(" min"));
+  _preparedMinimum->setKeyboardTracking(false);
+  _preparedMinimum->setToolTip(QStringLiteral("Duração mínima do recorte preparado, em minutos"));
+  durations->addWidget(_preparedMinimum);
+  durations->addWidget(quietLabel(QStringLiteral("até")));
+  _preparedMaximum = new QSpinBox;
+  _preparedMaximum->setObjectName(QStringLiteral("preparedLibraryMaximum"));
+  _preparedMaximum->setRange(0, 1440);
+  _preparedMaximum->setSpecialValueText(QStringLiteral("Sem limite"));
+  _preparedMaximum->setSuffix(QStringLiteral(" min"));
+  _preparedMaximum->setKeyboardTracking(false);
+  _preparedMaximum->setToolTip(QStringLiteral("Duração máxima do recorte preparado, em minutos; 0 remove o limite"));
+  durations->addWidget(_preparedMaximum);
+  durations->addStretch();
+  _preparedRefresh = new QPushButton(QStringLiteral("Verificar acervo"));
+  _preparedRefresh->setObjectName(QStringLiteral("preparedLibraryRefresh"));
+  connect(_preparedRefresh, &QPushButton::clicked, this, [this] { loadPreparedLibrary(true); });
+  durations->addWidget(_preparedRefresh);
+  inventoryLayout->addLayout(durations);
+  _preparedTable = new QTableWidget(0, 4);
+  _preparedTable->setObjectName(QStringLiteral("preparedLibraryTable"));
+  _preparedTable->setHorizontalHeaderLabels({QStringLiteral("Estado"), QStringLiteral("Duração"),
+      QStringLiteral("Recorte"), QStringLiteral("Arquivos locais")});
+  _preparedTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  _preparedTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+  _preparedTable->setSelectionMode(QAbstractItemView::SingleSelection);
+  _preparedTable->setMinimumHeight(320);
+  _preparedTable->setMaximumHeight(480);
+  _preparedTable->setTextElideMode(Qt::ElideMiddle);
+  _preparedTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+  _preparedTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+  _preparedTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+  _preparedTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+  _preparedTable->verticalHeader()->hide();
+  new TableEmptyState(_preparedTable, QStringLiteral("Seu acervo preparado aparece aqui"),
+      QStringLiteral("Use Preparar acervo para guardar vídeos e sensores antes da campanha."));
+  inventoryLayout->addWidget(_preparedTable, 1);
+  _preparedCount = quietLabel(QStringLiteral("Aguardando leitura do acervo"));
+  _preparedCount->setObjectName(QStringLiteral("preparedLibraryCount"));
+  inventoryLayout->addWidget(_preparedCount);
+  auto* files = new QHBoxLayout;
+  _preparedPrevious = new QPushButton(QStringLiteral("Anterior"));
+  _preparedNext = new QPushButton(QStringLiteral("Próxima"));
+  _preparedPrevious->setObjectName(QStringLiteral("preparedLibraryPrevious"));
+  _preparedNext->setObjectName(QStringLiteral("preparedLibraryNext"));
+  files->addWidget(_preparedPrevious);
+  files->addWidget(_preparedNext);
+  files->addStretch();
+  _preparedCopy = new QPushButton(QStringLiteral("Copiar ID"));
+  _preparedOpenNative = new QPushButton(QStringLiteral("Abrir recorte"));
+  _preparedOpenSource = new QPushButton(QStringLiteral("Abrir origem"));
+  _preparedCopy->setObjectName(QStringLiteral("preparedLibraryCopy"));
+  _preparedOpenNative->setObjectName(QStringLiteral("preparedLibraryOpenNative"));
+  _preparedOpenSource->setObjectName(QStringLiteral("preparedLibraryOpenSource"));
+  for (auto* button : {_preparedPrevious, _preparedNext, _preparedCopy, _preparedOpenNative, _preparedOpenSource})
+    button->setEnabled(false);
+  files->addWidget(_preparedCopy);
+  files->addWidget(_preparedOpenNative);
+  files->addWidget(_preparedOpenSource);
+  inventoryLayout->addLayout(files);
+  connect(_preparedQuery, &QLineEdit::returnPressed, this, [this] { loadPreparedLibrary(); });
+  connect(_preparedQuery, &QLineEdit::textChanged, this, &MainWindow::preparedLibraryFiltersChanged);
+  connect(_preparedState, qOverload<int>(&QComboBox::currentIndexChanged), this, &MainWindow::preparedLibraryFiltersChanged);
+  connect(_preparedMinimum, qOverload<int>(&QSpinBox::valueChanged), this, &MainWindow::preparedLibraryFiltersChanged);
+  connect(_preparedMaximum, qOverload<int>(&QSpinBox::valueChanged), this, &MainWindow::preparedLibraryFiltersChanged);
+  connect(_preparedTable, &QTableWidget::itemSelectionChanged, this, &MainWindow::updatePreparedLibraryActions);
+  connect(_preparedPrevious, &QPushButton::clicked, this, [this] { _preparedOffset = qMax(0, _preparedOffset - 50); loadPreparedLibrary(); });
+  connect(_preparedNext, &QPushButton::clicked, this, [this] { _preparedOffset += 50; loadPreparedLibrary(); });
+  connect(_preparedCopy, &QPushButton::clicked, this, [this] {
+    const auto* item = _preparedTable->item(_preparedTable->currentRow(), 2);
+    if (_preparedVerified && item) QApplication::clipboard()->setText(item->data(Qt::UserRole).toJsonObject().value(QStringLiteral("clip_uid")).toString());
+  });
+  for (const auto& action : QList<QPair<QPushButton*, QString>>{
+      {_preparedOpenNative, QStringLiteral("native")}, {_preparedOpenSource, QStringLiteral("source")}})
+    connect(action.first, &QPushButton::clicked, this, [this, role = action.second] {
+      const QString path = preparedLibraryVideoPath(role);
+      if (!path.isEmpty()) QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+    });
+  _preparedPoll.setInterval(1200);
+  connect(&_preparedPoll, &QTimer::timeout, this, [this] { loadPreparedLibrary(); });
+  _libraryTabs->addTab(inventory, QStringLiteral("Recortes preparados Ego4D"));
+  connect(_libraryTabs, &QTabWidget::currentChanged, this, [this](int index) {
+    _localMediaPoll.stop();
+    _preparedPoll.stop();
+    if (_pages->currentIndex() != 4) return;
+    if (index == 0) loadLocalMediaLibrary(); else loadPreparedLibrary();
+  });
+  libraryLayout->addWidget(quietLabel(QStringLiteral(
+      "A presença de arquivos não aprova uma tarefa. O ZIP final é montado por conta na hora do envio.")));
+
   auto* hero = new QWidget;
   auto* heroLayout = new QVBoxLayout(hero);
   heroLayout->setContentsMargins(0, 0, 0, 0);
@@ -2229,14 +2475,11 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheLastRun = quietLabel(QStringLiteral("Última preparação: aguardando leitura."));
   _cacheLastRun->setWordWrap(true);
   heroLayout->addWidget(_cacheLastRun);
-  auto* libraryContext = card(QStringLiteral("MÍDIA PREPARADA"), hero);
+  auto* libraryContext = card(QStringLiteral("PREPARAÇÃO ANTECIPADA"), hero);
   libraryContext->setObjectName(QStringLiteral("libraryContext"));
   libraryContext->setMinimumWidth(280);
   _cacheState->setWordWrap(true);
-  heroLayout->addSpacing(24);
-  heroLayout->addWidget(quietLabel(QStringLiteral("Prepare uma vez, use nas campanhas")));
-  heroLayout->addWidget(quietLabel(QStringLiteral("Os vídeos e sensores ficam nesta biblioteca. A preparação respeita o espaço livre reservado no disco.")));
-  auto* explore = new QPushButton(QStringLiteral("Explorar catálogo Ego4D"));
+  auto* explore = new QPushButton(QStringLiteral("Catálogo de origem Ego4D"));
   explore->setObjectName(QStringLiteral("egoLibraryExplore"));
   connect(explore, &QPushButton::clicked, this, &MainWindow::openEgoLibrary);
   heroLayout->addWidget(explore);
@@ -2261,11 +2504,12 @@ QWidget* MainWindow::buildAcceleratorPage() {
     }
     if (_cacheBudget) form->setRowVisible(_cacheBudget, ego);
     if (_cacheBudgetHelp) form->setRowVisible(_cacheBudgetHelp, ego);
+    if (_cacheMinimum) form->setRowVisible(_cacheMinimum->parentWidget(), ego);
     if (_cacheProviderHelp) _cacheProviderHelp->setText(ego
         ? QStringLiteral("Ego4D: prepara vídeos e sensores antecipadamente. A campanha usa primeiro os arquivos prontos.")
         : QStringLiteral("HoloAssist: prepara os clipes da tarefa escolhida para uso posterior na campanha."));
     if (_cacheTaskHelp) _cacheTaskHelp->setText(ego
-        ? QStringLiteral("O cache alterna clipes entre categorias. A escolhida entra primeiro em cada rodada; o limite em GB é compartilhado.")
+        ? QStringLiteral("A categoria escolhida entra primeiro. O limite em GB é compartilhado entre categorias.")
         : QStringLiteral("Somente a tarefa escolhida entra nesta preparação."));
     if (_cacheDiskHelp) _cacheDiskHelp->setText(ego
         ? QStringLiteral("O QMoney preserva o espaço livre indicado e ajusta o limite ao disco disponível.")
@@ -2273,6 +2517,8 @@ QWidget* MainWindow::buildAcceleratorPage() {
     if (_cacheLimitHelp) _cacheLimitHelp->setText(ego
         ? QStringLiteral("Todos usa o espaço escolhido; um número menor limita somente esta execução.")
         : QStringLiteral("Todos prepara todos os clipes disponíveis da tarefa escolhida."));
+    _cacheProvider->setToolTip(_cacheProviderHelp->text());
+    _cacheLimit->setToolTip(_cacheLimitHelp->text());
     if (_cacheStart) {
       const bool off = ego && _cacheBudget && _cacheBudget->value() == 0;
       _cacheStart->setText(off ? QStringLiteral("Desativar pré-cache")
@@ -2285,6 +2531,8 @@ QWidget* MainWindow::buildAcceleratorPage() {
       "Ego4D: prepara vídeos e sensores antecipadamente. A campanha usa primeiro os arquivos prontos."));
   _cacheProviderHelp->setWordWrap(true);
   form->addRow(QString(), _cacheProviderHelp);
+  _cacheProvider->setToolTip(_cacheProviderHelp->text());
+  form->setRowVisible(_cacheProviderHelp, false);
   _cacheTask = new ComboBox;
   configureCombo(_cacheTask, 240);
   connect(_cacheTask, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
@@ -2293,7 +2541,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheTaskLabel = new QLabel(QStringLiteral("Priorizar categoria"));
   form->addRow(_cacheTaskLabel, _cacheTask);
   _cacheTaskHelp = quietLabel(QStringLiteral(
-      "O cache alterna clipes entre categorias. A escolhida entra primeiro em cada rodada; o limite em GB é compartilhado."));
+      "A categoria escolhida entra primeiro. O limite em GB é compartilhado entre categorias."));
   _cacheTaskHelp->setWordWrap(true);
   form->addRow(QString(), _cacheTaskHelp);
   _cacheBudgetLabel = new QLabel(QStringLiteral("Espaço para o cache"));
@@ -2316,7 +2564,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   });
   form->addRow(_cacheBudgetLabel, _cacheBudget);
   _cacheBudgetHelp = quietLabel(QStringLiteral(
-      "Limite total para arquivos Ego4D neste computador. 0 GB desativa a preparação antecipada; a campanha ainda pode buscar vídeos quando precisar."));
+      "0 GB desativa a preparação antecipada. A campanha ainda pode buscar vídeos quando precisar."));
   _cacheBudgetHelp->setWordWrap(true);
   form->addRow(QString(), _cacheBudgetHelp);
   const bool egoInitiallySelected = _cacheProvider->currentData().toString() == QStringLiteral("ego4d");
@@ -2335,6 +2583,26 @@ QWidget* MainWindow::buildAcceleratorPage() {
       "Todos usa o espaço escolhido; um número menor limita somente esta execução."));
   _cacheLimitHelp->setWordWrap(true);
   form->addRow(QString(), _cacheLimitHelp);
+  _cacheLimit->setToolTip(_cacheLimitHelp->text());
+  form->setRowVisible(_cacheLimitHelp, false);
+  auto* preparationDurations = new QWidget;
+  auto* preparationDurationLayout = new QHBoxLayout(preparationDurations);
+  preparationDurationLayout->setContentsMargins(0, 0, 0, 0);
+  _cacheMinimum = new QSpinBox;
+  _cacheMaximum = new QSpinBox;
+  _cacheMinimum->setObjectName(QStringLiteral("cacheMinimumDuration"));
+  _cacheMaximum->setObjectName(QStringLiteral("cacheMaximumDuration"));
+  for (auto* duration : {_cacheMinimum, _cacheMaximum}) {
+    duration->setRange(1, 30);
+    duration->setSuffix(QStringLiteral(" min"));
+    duration->setKeyboardTracking(false);
+    duration->setValue(duration == _cacheMinimum ? 1 : 30);
+    connect(duration, qOverload<int>(&QSpinBox::valueChanged), this, [this] { loadAccelerator(); });
+  }
+  preparationDurationLayout->addWidget(_cacheMinimum);
+  preparationDurationLayout->addWidget(quietLabel(QStringLiteral("até")));
+  preparationDurationLayout->addWidget(_cacheMaximum);
+  form->addRow(QStringLiteral("Duração dos recortes"), preparationDurations);
   _cacheReserve = new QSpinBox;
   _cacheReserve->setMaximumWidth(220);
   _cacheReserve->setRange(5, 1000);
@@ -2350,30 +2618,37 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheDiskHelp->setWordWrap(true);
   form->addRow(QString(), _cacheDiskHelp);
   auto* actions = new QWidget;
-  auto* actionLayout = new QHBoxLayout(actions);
+  auto* actionLayout = new QVBoxLayout(actions);
   actionLayout->setContentsMargins(0, 0, 0, 0);
+  auto* cleanupActions = new QHBoxLayout;
   auto* cleanupProvider = new ComboBox;
+  cleanupProvider->setObjectName(QStringLiteral("cacheCleanupProvider"));
   cleanupProvider->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
   cleanupProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
   cleanupProvider->addItem(QStringLiteral("Ambos"), QStringLiteral("all"));
   cleanupProvider->setToolTip(QStringLiteral("Escolha o cache a apagar"));
-  actionLayout->addWidget(cleanupProvider);
+  cleanupActions->addWidget(cleanupProvider);
   auto* cleanup = new QPushButton(QStringLiteral("Apagar cache"));
+  cleanup->setObjectName(QStringLiteral("cacheCleanupButton"));
   connect(cleanup, &QPushButton::clicked, this, [this, cleanupProvider] {
     const QString provider = cleanupProvider->currentData().toString();
     const QString name = cleanupProvider->currentText();
     if (QMessageBox::question(this, QStringLiteral("Limpar mídia"),
           QStringLiteral("Apagar o cache de %1? Catálogos, contas e histórico serão preservados.").arg(name))
         != QMessageBox::Yes) return;
-    _api.post(QStringLiteral("/api/storage/cleanup"), {{QStringLiteral("provider"), provider}}, [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    _api.post(QStringLiteral("/api/storage/cleanup"), {{QStringLiteral("provider"), provider}}, [this, provider](bool ok, const QJsonDocument& doc, const QString& error) {
       if (!ok) return showError(QStringLiteral("Falha na limpeza"), error);
       const auto result = doc.object();
       setStatus(QStringLiteral("%1 arquivo(s) removido(s).").arg(result.value(QStringLiteral("files")).toInt()));
+      invalidatePreparedLibrary();
+      loadLocalMediaLibrary(true);
       loadAccelerator();
     });
   });
-  actionLayout->addWidget(cleanup);
-  actionLayout->addStretch();
+  cleanupActions->addWidget(cleanup);
+  cleanupActions->addStretch();
+  actionLayout->addLayout(cleanupActions);
+  auto* preparationActions = new QHBoxLayout;
   _cacheStop = new QPushButton(QStringLiteral("Parar com segurança"));
   _cacheStop->setEnabled(false);
   connect(_cacheStop, &QPushButton::clicked, this, [this] {
@@ -2382,25 +2657,27 @@ QWidget* MainWindow::buildAcceleratorPage() {
       else setStatus(QStringLiteral("O acelerador parará depois do clipe atual."));
     });
   });
-  actionLayout->addWidget(_cacheStop);
+  preparationActions->addWidget(_cacheStop);
   _cacheStart = primaryButton(QStringLiteral("Preparar cache"));
   connect(_cacheStart, &QPushButton::clicked, this, &MainWindow::startAccelerator);
-  actionLayout->addWidget(_cacheStart);
+  preparationActions->addWidget(_cacheStart);
+  actionLayout->addLayout(preparationActions);
   auto* preparation = new QWidget;
   auto* preparationLayout = new QVBoxLayout(preparation);
   preparationLayout->setContentsMargins(0, 0, 0, 0);
   preparationLayout->setSpacing(20);
+  preparationLayout->addWidget(libraryContext);
   preparationLayout->addWidget(config);
   preparationLayout->addWidget(actions);
-  layout->addWidget(card(QStringLiteral("Preparar conteúdo"), preparation), 2);
-  layout->addWidget(libraryContext, 1);
+  layout->addWidget(card(QStringLiteral("Armazenamento local"), library), 2, Qt::AlignTop);
+  layout->addWidget(card(QStringLiteral("Preparar acervo"), preparation), 1);
   auto* scroll = new QScrollArea;
   scroll->setWidgetResizable(true);
   scroll->setFrameShape(QFrame::NoFrame);
   scroll->setWidget(body);
 
   return pageShell(QStringLiteral("Biblioteca"),
-                   QStringLiteral("Prepare seu conteúdo e acompanhe a mídia disponível para as campanhas."), scroll);
+                   QStringLiteral("Consulte os arquivos de todas as origens e prepare mídia para suas campanhas."), scroll);
 }
 
 QWidget* MainWindow::buildAccountsPage() {
@@ -3921,7 +4198,7 @@ void MainWindow::navigate(int index) {
   _pages->setCurrentIndex(index);
   if (index == 3 && _campaignStop->isEnabled()) _campaignPoll.start();
   else if (index != 3) _campaignPoll.stop();
-  if (index != 4) _cachePoll.stop();
+  if (index != 4) { _cachePoll.stop(); _preparedPoll.stop(); _localMediaPoll.stop(); }
   if (index != 6 && (!_walletMonitoring || !_walletMonitoring->isChecked())) _balancePoll.stop();
   if (index != 8) _bannedPoll.stop();
   if (_backendReady) refreshCurrentPage();
@@ -3934,7 +4211,9 @@ void MainWindow::refreshCurrentPage() {
     case 1: loadReadiness(); break;
     case 2: loadIntegrations(); break;
     case 3: loadCampaignData(); break;
-    case 4: loadAccelerator(); break;
+    case 4: loadAccelerator(); loadLocalMediaLibrary();
+      if (_libraryTabs->currentIndex() == 1) loadPreparedLibrary();
+      break;
     case 5:
       loadAccounts();
       beginRegistrationPolling();
@@ -5714,7 +5993,7 @@ void MainWindow::openEgoLibrary() {
   auto* dialog = new QDialog(this);
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   dialog->setObjectName(QStringLiteral("egoLibraryDialog"));
-  dialog->setWindowTitle(QStringLiteral("Catálogo original Ego4D"));
+  dialog->setWindowTitle(QStringLiteral("Catálogo de origem Ego4D"));
   dialog->resize(1000, 650);
   auto* layout = new QVBoxLayout(dialog);
   auto* summary = new QLabel(QStringLiteral("Consultando catálogo…"));
@@ -5932,11 +6211,404 @@ void MainWindow::openEgoLibrary() {
   dialog->show();
 }
 
+void MainWindow::localMediaFiltersChanged() {
+  _localMediaOffset = 0;
+  _localMediaRefreshNonce.clear();
+  _localMediaTable->setRowCount(0);
+  loadLocalMediaLibrary();
+}
+
+QString MainWindow::localMediaPath(bool videoOnly) const {
+  if (!_localMediaVerified || !_localMediaTable || _localMediaRoot.isEmpty()) return {};
+  const auto* selected = _localMediaTable->item(_localMediaTable->currentRow(), 0);
+  if (!selected) return {};
+  const auto item = selected->data(Qt::UserRole).toJsonObject();
+  const QFileInfo candidate(item.value(QStringLiteral("path")).toString());
+  const QString root = QFileInfo(_localMediaRoot).canonicalFilePath();
+  const QString actual = candidate.canonicalFilePath();
+  if (root.isEmpty() || actual.isEmpty() || !candidate.isAbsolute() || !candidate.isFile()) return {};
+  const QString relative = QDir(root).relativeFilePath(actual);
+  if (relative == QStringLiteral("..") || relative.startsWith(QStringLiteral("../")) || QDir::isAbsolutePath(relative)) return {};
+  const QSet<QString> videoSuffixes{QStringLiteral("mp4"), QStringLiteral("mkv"), QStringLiteral("mov"),
+      QStringLiteral("avi"), QStringLiteral("webm"), QStringLiteral("m4v")};
+  if (videoOnly && (item.value(QStringLiteral("kind")).toString() != QStringLiteral("video")
+      || !videoSuffixes.contains(candidate.suffix().toLower()))) return {};
+  return actual;
+}
+
+void MainWindow::updateLocalMediaActions() {
+  if (!_localMediaTable) return;
+  _localMediaCopy->setEnabled(!localMediaPath().isEmpty());
+  _localMediaOpen->setEnabled(!localMediaPath(true).isEmpty());
+  const QFileInfo root(_localMediaRoot);
+  _libraryOpenFolder->setEnabled(_localMediaVerified && root.isAbsolute() && root.isDir()
+      && !root.canonicalFilePath().isEmpty());
+}
+
+void MainWindow::loadLocalMediaLibrary(bool refresh) {
+  if (!_localMediaTable) return;
+  if (refresh) {
+    _localMediaRefreshNonce = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    _localMediaTable->setRowCount(0);
+  }
+  _localMediaVerified = false;
+  updateLocalMediaActions();
+  _localMediaPrevious->setEnabled(false);
+  _localMediaNext->setEnabled(false);
+  QUrlQuery params;
+  params.addQueryItem(QStringLiteral("async"), QStringLiteral("1"));
+  params.addQueryItem(QStringLiteral("q"), _localMediaQuery->text());
+  params.addQueryItem(QStringLiteral("provider"), _localMediaProvider->currentData().toString());
+  params.addQueryItem(QStringLiteral("kind"), _localMediaKind->currentData().toString());
+  params.addQueryItem(QStringLiteral("limit"), QStringLiteral("50"));
+  params.addQueryItem(QStringLiteral("offset"), QString::number(_localMediaOffset));
+  if (!_localMediaRefreshNonce.isEmpty()) params.addQueryItem(QStringLiteral("refresh"), _localMediaRefreshNonce);
+  const QString path = QStringLiteral("/api/storage/library/items?") + params.toString(QUrl::FullyEncoded);
+  if (_localMediaInFlightKey == path) return;
+  if (_localMediaRequestKey != path) { _localMediaRequestKey = path; ++_localMediaRequestId; }
+  const quint64 requestId = _localMediaRequestId;
+  const int requestedOffset = _localMediaOffset;
+  _localMediaInFlightKey = path;
+  _localMediaSummary->setText(refresh ? QStringLiteral("Verificando arquivos locais…") : QStringLiteral("Consultando arquivos locais…"));
+  _api.get(path, [this, requestId, requestedOffset, path](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (_localMediaInFlightKey == path) _localMediaInFlightKey.clear();
+    if (requestId != _localMediaRequestId) return;
+    const auto fail = [this](const QString& message) {
+      _localMediaPoll.stop();
+      _localMediaRefreshNonce.clear();
+      _localMediaVerified = false;
+      _localMediaTable->setRowCount(0);
+      _localMediaSummary->setText(message);
+      _localMediaCount->setText(QStringLiteral("Nenhum arquivo confirmado nesta consulta"));
+      updateLocalMediaActions();
+    };
+    if (!ok) { fail(error); return; }
+    const auto root = doc.object();
+    if (root.value(QStringLiteral("loading")).toBool() || root.value(QStringLiteral("refreshing")).toBool()
+        || root.value(QStringLiteral("state")).toString() == QStringLiteral("loading")) {
+      _localMediaSummary->setText(root.value(QStringLiteral("message")).toString(QStringLiteral("Verificando arquivos locais…")));
+      if (_pages->currentIndex() == 4 && _libraryTabs->currentIndex() == 0) _localMediaPoll.start();
+      return;
+    }
+    const auto integer = [](const QJsonValue& value) {
+      return value.isDouble() && std::isfinite(value.toDouble()) && value.toDouble() >= 0
+          && value.toDouble() <= 9007199254740991.0 && value.toDouble() == std::floor(value.toDouble());
+    };
+    const QHash<QString, QString> providers{{QStringLiteral("ego4d"), QStringLiteral("Ego4D")},
+        {QStringLiteral("holoassist"), QStringLiteral("HoloAssist")}, {QStringLiteral("nymeria"), QStringLiteral("Nymeria")},
+        {QStringLiteral("local"), QStringLiteral("Local")}};
+    const QHash<QString, QString> kinds{{QStringLiteral("video"), QStringLiteral("Vídeo")},
+        {QStringLiteral("sensor"), QStringLiteral("Sensores / IMU")}, {QStringLiteral("sidecar"), QStringLiteral("Apoio")},
+        {QStringLiteral("catalog"), QStringLiteral("Catálogo")}, {QStringLiteral("derivative"), QStringLiteral("Derivado")}};
+    const auto items = root.value(QStringLiteral("items")).toArray();
+    bool valid = root.value(QStringLiteral("schema")).toInt() == 1
+        && root.value(QStringLiteral("inventory_scope")).toString() == QStringLiteral("local_media_files")
+        && root.value(QStringLiteral("state")).toString() == QStringLiteral("ready")
+        && QFileInfo(root.value(QStringLiteral("library_root")).toString()).isAbsolute()
+        && root.value(QStringLiteral("items")).isArray() && integer(root.value(QStringLiteral("total")))
+        && integer(root.value(QStringLiteral("offset"))) && root.value(QStringLiteral("offset")).toInt(-1) == requestedOffset
+        && integer(root.value(QStringLiteral("file_count"))) && integer(root.value(QStringLiteral("total_bytes")))
+        && items.size() <= 50 && items.size() <= root.value(QStringLiteral("total")).toDouble()
+        && (items.isEmpty() || requestedOffset + items.size() <= root.value(QStringLiteral("total")).toDouble());
+    for (const auto& value : items) {
+      const auto item = value.toObject();
+      valid = valid && value.isObject() && !item.value(QStringLiteral("name")).toString().isEmpty()
+          && !item.value(QStringLiteral("relative_path")).toString().isEmpty()
+          && !item.value(QStringLiteral("path")).toString().isEmpty()
+          && providers.contains(item.value(QStringLiteral("provider")).toString())
+          && kinds.contains(item.value(QStringLiteral("kind")).toString())
+          && item.value(QStringLiteral("stage")).isString() && integer(item.value(QStringLiteral("size_bytes")))
+          && item.value(QStringLiteral("protected")).isBool() && item.value(QStringLiteral("protection_reasons")).isArray();
+    }
+    if (!valid) { fail(QStringLiteral("Resposta incompleta dos arquivos locais. Clique em Verificar arquivos para tentar novamente.")); return; }
+    _localMediaPoll.stop();
+    _localMediaRoot = root.value(QStringLiteral("library_root")).toString();
+    _libraryBase->setText(_localMediaRoot);
+    _localMediaTable->setRowCount(items.size());
+    for (int row = 0; row < items.size(); ++row) {
+      const auto item = items.at(row).toObject();
+      auto* name = new QTableWidgetItem(item.value(QStringLiteral("name")).toString());
+      name->setData(Qt::UserRole, item);
+      name->setToolTip(item.value(QStringLiteral("relative_path")).toString() + QLatin1Char('\n')
+          + item.value(QStringLiteral("path")).toString());
+      _localMediaTable->setItem(row, 0, name);
+      _localMediaTable->setItem(row, 1, new QTableWidgetItem(providers.value(item.value(QStringLiteral("provider")).toString())));
+      _localMediaTable->setItem(row, 2, new QTableWidgetItem(QStringLiteral("%1 · %2")
+          .arg(kinds.value(item.value(QStringLiteral("kind")).toString()), item.value(QStringLiteral("stage")).toString())));
+      const qint64 size = static_cast<qint64>(item.value(QStringLiteral("size_bytes")).toDouble());
+      auto* sizeCell = new QTableWidgetItem(bytesText(size));
+      sizeCell->setToolTip(QStringLiteral("%1 bytes").arg(size));
+      _localMediaTable->setItem(row, 3, sizeCell);
+      QStringList reasons;
+      for (const auto& reason : item.value(QStringLiteral("protection_reasons")).toArray()) reasons << reason.toString();
+      const bool unknown = reasons.contains(QStringLiteral("protection_state_unknown"))
+          || reasons.contains(QStringLiteral("digest_protection_unverified"));
+      auto* protection = new QTableWidgetItem(item.value(QStringLiteral("protected")).toBool()
+          ? unknown ? QStringLiteral("Preservado") : QStringLiteral("Em uso") : QStringLiteral("—"));
+      protection->setToolTip(reasons.join(QLatin1Char('\n')));
+      _localMediaTable->setItem(row, 4, protection);
+    }
+    _localMediaVerified = true;
+    _localMediaRefreshNonce.clear();
+    const auto free = root.value(QStringLiteral("disk_free_bytes"));
+    _libraryStorageSummary->setText(QStringLiteral("%1 arquivos · %2 ocupados · %3 livres no disco")
+        .arg(root.value(QStringLiteral("file_count")).toInt())
+        .arg(bytesText(static_cast<qint64>(root.value(QStringLiteral("total_bytes")).toDouble())))
+        .arg(integer(free) ? bytesText(static_cast<qint64>(free.toDouble())) : QStringLiteral("espaço indisponível")));
+    _localMediaSummary->setText(QStringLiteral("Arquivos locais de todas as origens. O estágio indica a presença física; os recortes são conferidos na outra aba."));
+    if (root.value(QStringLiteral("scan_complete")).isBool() && !root.value(QStringLiteral("scan_complete")).toBool())
+      _localMediaSummary->setText(QStringLiteral("Leitura incompleta: %1 falha(s) ao acessar arquivos ou pastas. Os totais incluem somente os arquivos encontrados.")
+          .arg(root.value(QStringLiteral("scan_errors")).toInt()));
+    const int total = root.value(QStringLiteral("total")).toInt();
+    _localMediaCount->setText(items.isEmpty() ? QStringLiteral("Nenhum arquivo encontrado nesta consulta")
+        : QStringLiteral("%1–%2 de %3 arquivos nesta consulta").arg(requestedOffset + 1).arg(requestedOffset + items.size()).arg(total));
+    _localMediaPrevious->setEnabled(requestedOffset > 0);
+    _localMediaNext->setEnabled(requestedOffset + items.size() < total);
+    updateLocalMediaActions();
+  });
+}
+
+void MainWindow::preparedLibraryFiltersChanged() {
+  _preparedOffset = 0;
+  _preparedRefreshNonce.clear();
+  _preparedVerified = false;
+  _preparedTable->setRowCount(0);
+  updatePreparedLibraryActions();
+  loadPreparedLibrary();
+}
+
+QString MainWindow::preparedLibraryVideoPath(const QString& role) const {
+  if (!_preparedVerified || !_preparedTable || _preparedLibraryRoot.isEmpty()) return {};
+  const auto* selected = _preparedTable->item(_preparedTable->currentRow(), 2);
+  if (!selected) return {};
+  const auto file = selected->data(Qt::UserRole).value<QJsonObject>().value(role).toObject();
+  if (!file.value(QStringLiteral("present")).toBool()) return {};
+  const QFileInfo candidate(file.value(QStringLiteral("path")).toString());
+  const QString root = QFileInfo(_preparedLibraryRoot).canonicalFilePath();
+  const QString actual = candidate.canonicalFilePath();
+  if (root.isEmpty() || actual.isEmpty() || !candidate.isAbsolute() || !candidate.isFile()
+      || candidate.suffix().compare(QStringLiteral("mp4"), Qt::CaseInsensitive) != 0) return {};
+  const QString relative = QDir(root).relativeFilePath(actual);
+  if (relative == QStringLiteral("..") || relative.startsWith(QStringLiteral("../"))
+      || QDir::isAbsolutePath(relative)) return {};
+  return actual;
+}
+
+void MainWindow::updatePreparedLibraryActions() {
+  if (!_preparedTable) return;
+  _preparedCopy->setEnabled(_preparedVerified && _preparedTable->currentRow() >= 0);
+  _preparedOpenNative->setEnabled(!preparedLibraryVideoPath(QStringLiteral("native")).isEmpty());
+  _preparedOpenSource->setEnabled(!preparedLibraryVideoPath(QStringLiteral("source")).isEmpty());
+}
+
+void MainWindow::invalidatePreparedLibrary() {
+  _preparedPoll.stop();
+  ++_preparedRequestId;
+  _preparedRequestKey.clear();
+  _preparedInFlightKey.clear();
+  _preparedRefreshNonce.clear();
+  _preparedVerified = false;
+  _preparedRefreshPending = true;
+  _preparedTable->setRowCount(0);
+  _preparedPrevious->setEnabled(false);
+  _preparedNext->setEnabled(false);
+  _preparedSummary->setText(QStringLiteral("O acervo mudou. Abra esta aba para verificar os recortes preparados."));
+  updatePreparedLibraryActions();
+  if (_pages->currentIndex() == 4 && _libraryTabs->currentIndex() == 1) loadPreparedLibrary();
+}
+
+void MainWindow::loadPreparedLibrary(bool refresh) {
+  if (!_preparedTable) return;
+  refresh = refresh || _preparedRefreshPending;
+  _preparedRefreshPending = false;
+  if (refresh) {
+    _preparedRefreshNonce = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    _preparedTable->setRowCount(0);
+  }
+  _preparedVerified = false;
+  updatePreparedLibraryActions();
+  _preparedPrevious->setEnabled(false);
+  _preparedNext->setEnabled(false);
+  const int minimum = _preparedMinimum->value() * 60;
+  const int maximum = _preparedMaximum->value() * 60;
+  if (maximum > 0 && maximum < minimum) {
+    ++_preparedRequestId;
+    _preparedRequestKey.clear();
+    _preparedPoll.stop();
+    _preparedTable->setRowCount(0);
+    _preparedSummary->setText(QStringLiteral("A duração máxima deve ser igual ou maior que a mínima."));
+    return;
+  }
+  QUrlQuery params;
+  params.addQueryItem(QStringLiteral("async"), QStringLiteral("1"));
+  params.addQueryItem(QStringLiteral("q"), _preparedQuery->text());
+  params.addQueryItem(QStringLiteral("state"), _preparedState->currentData().toString());
+  params.addQueryItem(QStringLiteral("min_s"), QString::number(minimum));
+  if (maximum > 0) params.addQueryItem(QStringLiteral("max_s"), QString::number(maximum));
+  params.addQueryItem(QStringLiteral("limit"), QStringLiteral("50"));
+  params.addQueryItem(QStringLiteral("offset"), QString::number(_preparedOffset));
+  if (!_preparedRefreshNonce.isEmpty()) params.addQueryItem(QStringLiteral("refresh"), _preparedRefreshNonce);
+  const QString path = QStringLiteral("/api/library/ego4d/prepared?") + params.toString(QUrl::FullyEncoded);
+  if (_preparedInFlightKey == path) return;
+  if (_preparedRequestKey != path) {
+    _preparedRequestKey = path;
+    ++_preparedRequestId;
+  }
+  const quint64 requestId = _preparedRequestId;
+  const int requestedOffset = _preparedOffset;
+  _preparedInFlightKey = path;
+  _preparedSummary->setText(refresh ? QStringLiteral("Verificando arquivos locais…") : QStringLiteral("Consultando acervo preparado…"));
+  _api.get(path, [this, requestId, requestedOffset, path](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (_preparedInFlightKey == path) _preparedInFlightKey.clear();
+    if (requestId != _preparedRequestId) return;
+    const auto fail = [this](const QString& message) {
+      _preparedPoll.stop();
+      _preparedRefreshNonce.clear();
+      _preparedVerified = false;
+      _preparedTable->setRowCount(0);
+      _preparedSummary->setText(message);
+      _preparedCount->setText(QStringLiteral("Nenhum arquivo confirmado nesta consulta"));
+      updatePreparedLibraryActions();
+    };
+    if (!ok) { fail(error); return; }
+    const auto root = doc.object();
+    if (root.value(QStringLiteral("loading")).toBool() || root.value(QStringLiteral("refreshing")).toBool()
+        || root.value(QStringLiteral("state")).toString() == QStringLiteral("loading")) {
+      _preparedSummary->setText(root.value(QStringLiteral("message")).toString(QStringLiteral("Verificando arquivos locais…")));
+      if (_pages->currentIndex() == 4 && _libraryTabs->currentIndex() == 1) _preparedPoll.start();
+      return;
+    }
+    if (root.value(QStringLiteral("schema")).toInt() != 1
+        || root.value(QStringLiteral("provider")).toString() != QStringLiteral("ego4d")
+        || root.value(QStringLiteral("inventory_scope")).toString() != QStringLiteral("local_prepared_media")) {
+      fail(QStringLiteral("Resposta incompleta do acervo. Clique em Verificar acervo para tentar novamente."));
+      return;
+    }
+    _preparedPoll.stop();
+    const auto integer = [](const QJsonValue& value) {
+      return value.isDouble() && std::isfinite(value.toDouble()) && value.toDouble() >= 0
+          && value.toDouble() == std::floor(value.toDouble());
+    };
+    const auto counts = root.value(QStringLiteral("counts")).toObject();
+    bool valid = root.value(QStringLiteral("state")).toString() == QStringLiteral("ready")
+        && root.value(QStringLiteral("items")).isArray() && integer(root.value(QStringLiteral("total")))
+        && integer(root.value(QStringLiteral("offset"))) && root.value(QStringLiteral("offset")).toInt(-1) == requestedOffset
+        && !root.value(QStringLiteral("library_root")).toString().isEmpty();
+    for (const auto* key : {"ready", "partial", "missing", "stale", "protected"})
+      valid = valid && integer(counts.value(QLatin1String(key)));
+    const auto items = root.value(QStringLiteral("items")).toArray();
+    valid = valid && items.size() <= 50 && items.size() <= root.value(QStringLiteral("total")).toDouble();
+    const QHash<QString, QString> stateLabels{
+        {QStringLiteral("ready"), QStringLiteral("Mídia preparada")},
+        {QStringLiteral("partial"), QStringLiteral("Preparação incompleta")},
+        {QStringLiteral("missing"), QStringLiteral("Arquivo ausente")},
+        {QStringLiteral("stale"), QStringLiteral("Revisar")}};
+    for (const auto& value : items) {
+      const auto item = value.toObject();
+      const auto duration = item.value(QStringLiteral("duration_ms"));
+      valid = valid && value.isObject() && !item.value(QStringLiteral("clip_uid")).toString().isEmpty()
+          && stateLabels.contains(item.value(QStringLiteral("cache_state")).toString())
+          && item.value(QStringLiteral("protected")).isBool() && item.value(QStringLiteral("reasons")).isArray()
+          && (duration.isNull() || integer(duration));
+      if (item.value(QStringLiteral("cache_state")).toString() == QStringLiteral("ready"))
+        valid = valid && duration.isDouble() && duration.toDouble() > 0;
+      for (const auto* key : {"source", "native", "imu"}) {
+        const auto fileValue = item.value(QLatin1String(key));
+        if (fileValue.isNull()) {
+          valid = valid && item.value(QStringLiteral("cache_state")).toString() != QStringLiteral("ready");
+          continue;
+        }
+        const auto file = fileValue.toObject();
+        valid = valid && fileValue.isObject()
+            && file.value(QStringLiteral("present")).isBool() && integer(file.value(QStringLiteral("bytes")));
+        if (file.value(QStringLiteral("present")).toBool())
+          valid = valid && !file.value(QStringLiteral("path")).toString().isEmpty();
+        if (item.value(QStringLiteral("cache_state")).toString() == QStringLiteral("ready"))
+          valid = valid && file.value(QStringLiteral("present")).toBool() && file.value(QStringLiteral("bytes")).toDouble() > 0;
+      }
+    }
+    if (!valid) {
+      fail(root.value(QStringLiteral("error")).toString(QStringLiteral("Dados incompletos do acervo. Clique em Verificar acervo para tentar novamente.")));
+      return;
+    }
+    _preparedLibraryRoot = root.value(QStringLiteral("library_root")).toString();
+    _preparedTable->setRowCount(items.size());
+    for (int row = 0; row < items.size(); ++row) {
+      const auto item = items.at(row).toObject();
+      QString status = stateLabels.value(item.value(QStringLiteral("cache_state")).toString());
+      QStringList reasons;
+      for (const auto reason : item.value(QStringLiteral("reasons")).toArray()) reasons << reason.toString();
+      for (const auto reason : item.value(QStringLiteral("protection_reasons")).toArray()) reasons << reason.toString();
+      const bool protectionUnconfirmed = root.value(QStringLiteral("protection_status")).toString() == QStringLiteral("unknown")
+          || reasons.contains(QStringLiteral("protection_state_unknown")) || reasons.contains(QStringLiteral("digest_protection_unverified"));
+      if (item.value(QStringLiteral("protected")).toBool())
+        status += protectionUnconfirmed ? QStringLiteral(" · Preservado") : QStringLiteral(" · Em uso");
+      if (protectionUnconfirmed) reasons << QStringLiteral("Proteção a confirmar; o arquivo é preservado nesta operação.");
+      auto* state = new QTableWidgetItem(status);
+      state->setToolTip(reasons.join(QLatin1Char('\n')));
+      _preparedTable->setItem(row, 0, state);
+      const int milliseconds = item.value(QStringLiteral("duration_ms")).toInt();
+      const int seconds = milliseconds / 1000;
+      auto* duration = new QTableWidgetItem(milliseconds > 0
+          ? QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0')) : QStringLiteral("—"));
+      duration->setToolTip(QStringLiteral("Duração do recorte: %1 ms").arg(milliseconds));
+      _preparedTable->setItem(row, 1, duration);
+      auto* clip = new QTableWidgetItem(item.value(QStringLiteral("clip_uid")).toString());
+      clip->setData(Qt::UserRole, item);
+      const auto window = item.value(QStringLiteral("window_s")).toArray();
+      clip->setToolTip(QStringLiteral("%1\nVídeo de origem: %2\nJanela: %3–%4 s\nTarefa escolhida na campanha")
+          .arg(clip->text(), item.value(QStringLiteral("parent_video_uid")).toString())
+          .arg(window.size() > 0 ? window.at(0).toDouble() : 0, 0, 'f', 3)
+          .arg(window.size() > 1 ? window.at(1).toDouble() : 0, 0, 'f', 3));
+      _preparedTable->setItem(row, 2, clip);
+      QStringList fileNames, paths;
+      for (const auto& entry : QList<QPair<QString, QString>>{
+          {QStringLiteral("native"), QStringLiteral("Recorte")},
+          {QStringLiteral("source"), QStringLiteral("Origem")},
+          {QStringLiteral("imu"), QStringLiteral("Sensores")}}) {
+        const auto file = item.value(entry.first).toObject();
+        if (file.value(QStringLiteral("present")).toBool()) fileNames << entry.second;
+        paths << QStringLiteral("%1: %2").arg(entry.second,
+            file.value(QStringLiteral("present")).toBool() ? file.value(QStringLiteral("path")).toString() : QStringLiteral("ausente"));
+      }
+      auto* local = new QTableWidgetItem(QStringLiteral("%1 de 3").arg(fileNames.size()));
+      local->setToolTip(paths.join(QLatin1Char('\n')));
+      _preparedTable->setItem(row, 3, local);
+    }
+    _preparedVerified = true;
+    _preparedRefreshNonce.clear();
+    _preparedSummary->setText(QStringLiteral("%1 com mídia preparada · %2 incompletos · %3 ausentes · %4 para revisar · %5 preservados")
+        .arg(counts.value(QStringLiteral("ready")).toInt()).arg(counts.value(QStringLiteral("partial")).toInt())
+        .arg(counts.value(QStringLiteral("missing")).toInt()).arg(counts.value(QStringLiteral("stale")).toInt())
+        .arg(counts.value(QStringLiteral("protected")).toInt()));
+    if (root.value(QStringLiteral("protection_status")).toString() == QStringLiteral("unknown"))
+      _preparedSummary->setText(_preparedSummary->text() + QStringLiteral("\nA proteção de arquivos em uso não pôde ser confirmada nesta leitura."));
+    const double timestamp = root.value(QStringLiteral("verified_at")).toDouble();
+    const QString checked = timestamp > 0 ? QDateTime::fromSecsSinceEpoch(static_cast<qint64>(timestamp)).toLocalTime()
+        .toString(QStringLiteral("dd/MM HH:mm")) : QStringLiteral("horário indisponível");
+    const int total = root.value(QStringLiteral("total")).toInt();
+    _preparedCount->setText(items.isEmpty() ? QStringLiteral("Nenhum recorte encontrado · verificado em %1").arg(checked)
+        : QStringLiteral("%1–%2 de %3 recortes · verificado em %4").arg(requestedOffset + 1).arg(requestedOffset + items.size()).arg(total).arg(checked));
+    _preparedPrevious->setEnabled(requestedOffset > 0);
+    _preparedNext->setEnabled(requestedOffset + items.size() < total);
+    updatePreparedLibraryActions();
+  });
+}
+
 void MainWindow::loadAccelerator() {
   const QString provider = _cacheProvider && !_cacheProvider->currentData().toString().isEmpty()
       ? _cacheProvider->currentData().toString() : QStringLiteral("holoassist");
   const QString requestedTask = _cacheTask->count() ? _cacheTask->currentText() : QString();
+  if (provider == QStringLiteral("ego4d") && _cacheMinimum->value() > _cacheMaximum->value()) {
+    ++_cacheRequestId;
+    _cacheRequestKey.clear();
+    _cacheStart->setEnabled(false);
+    _cacheState->setText(QStringLiteral("A duração máxima deve ser igual ou maior que a mínima."));
+    return;
+  }
   QString path = QStringLiteral("/api/holo-cache?async=1&provider=%1").arg(encoded(provider));
+  if (provider == QStringLiteral("ego4d"))
+    path += QStringLiteral("&min_dur_s=%1&max_dur_s=%2").arg(_cacheMinimum->value() * 60).arg(_cacheMaximum->value() * 60);
   if (!requestedTask.isEmpty()) {
     path += QStringLiteral("&task=%1&limit=%2").arg(encoded(requestedTask)).arg(_cacheLimit->value());
   }
@@ -5947,6 +6619,9 @@ void MainWindow::loadAccelerator() {
   }
   const bool live = !_cacheCatalogPending && _cachePoll.isActive()
       && _cacheCatalogSnapshot.value(QStringLiteral("provider")).toString() == provider
+      && (provider != QStringLiteral("ego4d")
+          || (_cacheCatalogSnapshot.value(QStringLiteral("min_dur_s")).toInt(-1) == _cacheMinimum->value() * 60
+              && _cacheCatalogSnapshot.value(QStringLiteral("max_dur_s")).toInt(-1) == _cacheMaximum->value() * 60))
       && (requestedTask.isEmpty()
           || _cacheCatalogSnapshot.value(QStringLiteral("task")).toString() == requestedTask);
   if (live) path += QStringLiteral("&live=1");
@@ -5974,6 +6649,8 @@ void MainWindow::loadAccelerator() {
       // Refresh disk counts once the live run ends; the pre-run snapshot is stale.
       _cachePoll.stop();
       _cacheCatalogPending = false;
+      invalidatePreparedLibrary();
+      loadLocalMediaLibrary(true);
       loadAccelerator();
       return;
     }
@@ -6012,6 +6689,10 @@ void MainWindow::loadAccelerator() {
     } else {
       cache = root.value(QStringLiteral("cache")).toObject();
       cache.insert(QStringLiteral("provider"), provider);
+      if (provider == QStringLiteral("ego4d")) {
+        cache.insert(QStringLiteral("min_dur_s"), _cacheMinimum->value() * 60);
+        cache.insert(QStringLiteral("max_dur_s"), _cacheMaximum->value() * 60);
+      }
       _cacheCatalogSnapshot = cache;
     }
     if (!live && provider == QStringLiteral("ego4d") && cache.contains(QStringLiteral("max_budget_gb"))) {
@@ -6048,7 +6729,8 @@ void MainWindow::loadAccelerator() {
     const int runTotal = runner.value(QStringLiteral("total")).toInt();
     const int runReady = runner.value(QStringLiteral("ready")).toInt();
     const int runFailed = runner.value(QStringLiteral("failed")).toInt();
-    const int processed = qMin(runTotal, runReady + runFailed);
+    const int runProtected = runner.value(QStringLiteral("protected")).toInt();
+    const int processed = qMin(runTotal, runReady + runFailed + runProtected);
     if (runningHere)
       _cacheState->setText(state == QStringLiteral("stopping")
           ? QStringLiteral("Parando após o clipe atual…")
@@ -6086,6 +6768,8 @@ void MainWindow::loadAccelerator() {
           .arg(processed).arg(runTotal));
       _cacheNumbers->setText(QStringLiteral("%1 pronto(s) · %2 falha(s) · clipe %3 de %4")
           .arg(runReady).arg(runFailed).arg(runner.value(QStringLiteral("index")).toInt()).arg(runTotal));
+      if (runProtected > 0)
+        _cacheNumbers->setText(_cacheNumbers->text() + QStringLiteral(" · %1 preservado(s)").arg(runProtected));
     } else {
       _cacheProgress->setRange(0, 100);
       _cacheProgress->setValue(total > 0 ? ready * 100 / total : 0);
@@ -6126,6 +6810,10 @@ void MainWindow::loadAccelerator() {
                QString::number(lastRun.value(QStringLiteral("ready")).toInt()),
                QString::number(lastRun.value(QStringLiteral("total")).toInt()),
                QString::number(lastRun.value(QStringLiteral("failed")).toInt()), when));
+      const int lastProtected = lastRun.value(QStringLiteral("protected")).toInt();
+      if (lastProtected > 0)
+        _cacheLastRun->setText(_cacheLastRun->text()
+            + QStringLiteral("\n%1 clipe(s) preservado(s).").arg(lastProtected));
       const int reclaimedFiles = lastRun.value(QStringLiteral("reclaimed_files")).toInt();
       if (reclaimedFiles > 0)
         _cacheLastRun->setText(_cacheLastRun->text()
@@ -6156,6 +6844,10 @@ void MainWindow::startAccelerator() {
   if (_cacheTask->currentText().isEmpty()) return;
   const QString provider = _cacheProvider && !_cacheProvider->currentData().toString().isEmpty()
       ? _cacheProvider->currentData().toString() : QStringLiteral("holoassist");
+  if (provider == QStringLiteral("ego4d") && _cacheMinimum->value() > _cacheMaximum->value()) {
+    _cacheState->setText(QStringLiteral("A duração máxima deve ser igual ou maior que a mínima."));
+    return;
+  }
   QJsonObject body{{QStringLiteral("provider"), provider},
                    {QStringLiteral("task"), _cacheTask->currentText()},
                    {QStringLiteral("min_free_gb"), _cacheReserve->value()}};
@@ -6163,6 +6855,10 @@ void MainWindow::startAccelerator() {
   else body.insert(QStringLiteral("limit"), QJsonValue::Null);
   if (provider == QStringLiteral("ego4d") && _cacheBudget)
     body.insert(QStringLiteral("budget_gb"), _cacheBudget->value());
+  if (provider == QStringLiteral("ego4d")) {
+    body.insert(QStringLiteral("min_dur_s"), _cacheMinimum->value() * 60);
+    body.insert(QStringLiteral("max_dur_s"), _cacheMaximum->value() * 60);
+  }
   _cacheStartPending = true;
   ++_cacheRequestId;
   _cacheStart->setEnabled(false);

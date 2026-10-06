@@ -113,7 +113,13 @@ class Ego4dCampaignMeasuredFrameTests(unittest.TestCase):
             from moneymin import content_provenance
             sensor = self.root / 'declared-canonical-imu.csv'
             sensor.write_text('canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z\n'
-                f'0,4,5,6,1,2,3\n{duration_ms},4,5,6,1,2,3\n', encoding='utf-8')
+                + ''.join(f'{timestamp},4,5,6,1,2,3\n'
+                          for timestamp in range(0, duration_ms + 1, 10)), encoding='utf-8')
+            diagnostics = {}
+            item['imu_csv'] = campaign.ego4d.build_imu_csv(
+                sensor, (0, duration_ms / 1000), duration_ms=duration_ms, stats=diagnostics)
+            item['n_samples'] = diagnostics['sampleCount']
+            item['imu_diagnostics'] = diagnostics
             item.update(content_provenance.prepare_content_provenance(
                 self.media, sensor, self.media, item['imu_csv'], 'i,ptsNs,dtNs,tNs,key\n',
                 clip_uid='declared-clip', parent_video_uid='declared-parent', media_uid='declared-media',

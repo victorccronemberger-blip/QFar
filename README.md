@@ -48,9 +48,20 @@ são validados antes de salvar, e os valores ficam criptografados pelo DPAPI do
 Windows em `%LOCALAPPDATA%\QMoney\secrets\integrations.dat`, acessível somente
 ao mesmo usuário do Windows.
 
-## Acelerador Ego4D
+## Biblioteca local
 
-Na aba **Acelerador**, a barra mostra clipes processados durante a preparação e
+Na aba **Biblioteca**, **Arquivos locais** mostra vídeos originais, normalizados,
+sensores e arquivos de apoio de todas as origens. Use a busca e os filtros por
+origem e tipo para localizar arquivos, conferir o tamanho, copiar o caminho ou
+abrir a pasta. O resumo mostra o espaço ocupado pelo acervo e o espaço livre no
+disco. A consulta não depende de uma conta ou de um lote de campanha.
+
+**Recortes preparados Ego4D** mantém a conferência dos recortes numa visão
+separada. A preparação antecipada permite escolher a faixa de duração, o
+orçamento de cache e a reserva de disco; operações pendentes protegem vídeos e
+sensores contra limpeza e substituição.
+
+A barra mostra clipes processados durante a preparação e
 clipes prontos quando a operação está parada. O espaço ocupado e o limite de
 cache aparecem separadamente: atingir 400 GB não é o critério de conclusão.
 A tela mostra a fase do clipe atual, falhas e o último resultado salvo com horário.

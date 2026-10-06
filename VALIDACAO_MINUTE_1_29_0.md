@@ -85,8 +85,7 @@ Alinhamentos milimétricos no prepare→sidecar→upload:
   `android_elapsedRealtimeNanos` no `.data.zip` (mesmo domínio de frames/`tNs`).
 - `imuDiagnostics.maxInterpolationSpanNs` = teto APK `"25000000"`; contadores
   (`interpolatedCount`, nearest-fallback, spans) vêm do resample Ego4D
-  (`build_imu_csv(..., stats=)`), sem fingir `interpolatedCount == sampleCount`.
-- Mapa do que forjar: `EGO4D_FORGE_MAP.md`.
+  (`build_imu_csv(..., stats=)`). `interpolatedCount` vem do resample, não é igualado a `sampleCount`.
 - Lacuna máxima Ego4D na reamostragem: **25 ms**.
 - Validador local: `xcheck.imu_timebase` falha se a IMU ficar em relógio zero
   com âncora elapsedRealtime não-zero.

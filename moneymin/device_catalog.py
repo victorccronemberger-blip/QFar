@@ -62,7 +62,7 @@ def pick_model(rng: random.Random) -> dict[str, Any]:
 
 
 def pick_os(model: dict[str, Any], rng: random.Random) -> tuple[str, int]:
-    releases = [str(r) for r in (model.get("osReleases") or ["14"])]
+    releases = [str(r) for r in (model.get("osReleases") or ["16"])]
     release = releases[rng.randrange(len(releases))]
     return release, api_level_for_release(release)
 

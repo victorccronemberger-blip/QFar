@@ -1,0 +1,2224 @@
+{
+  "89193e37-1ed4-4a65-996b-6883f2e1cf61": {
+    "window_s": [
+      3357.047,
+      3543.747
+    ],
+    "events": [
+      [
+        3357.047,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3357.26,
+        "#c c places the cloth on the table"
+      ],
+      [
+        3358.393,
+        "#c c folds the cloth"
+      ],
+      [
+        3358.477,
+        "#c c folds the material"
+      ],
+      [
+        3361.224,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3365.586,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3373.727,
+        "#C C moves the piece of cloth"
+      ],
+      [
+        3374.287,
+        "#C C moves the scissors"
+      ],
+      [
+        3374.356,
+        "#c c moves the scissors on the table"
+      ],
+      [
+        3374.902,
+        "#c c moves the scissor on the table"
+      ],
+      [
+        3375.547,
+        "#c c continues to fold the material"
+      ],
+      [
+        3376.227,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3376.831,
+        "#c c folds the cloth"
+      ],
+      [
+        3381.347,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3384.227,
+        "#c c removes a tape measure from the tin"
+      ],
+      [
+        3384.259,
+        "#C C picks a tape measure"
+      ],
+      [
+        3385.38,
+        "#c c take a tape measure"
+      ],
+      [
+        3385.997,
+        "#c c put the tape measure on the table"
+      ],
+      [
+        3386.346,
+        "#C C picks the set"
+      ],
+      [
+        3386.719,
+        "#c c touches the round metal on the table"
+      ],
+      [
+        3387.161,
+        "#c c take a set of the equipment"
+      ],
+      [
+        3387.577,
+        "#c c picks the small box from the table"
+      ],
+      [
+        3388.55,
+        "#c c laces the small box on the table"
+      ],
+      [
+        3388.766,
+        "#c c opens the set"
+      ],
+      [
+        3388.789,
+        "#C C opens the set"
+      ],
+      [
+        3389.456,
+        "#c c opens the small box on the table"
+      ],
+      [
+        3389.898,
+        "#c c takes a pin from the set"
+      ],
+      [
+        3389.917,
+        "#C C picks a pin from the set"
+      ],
+      [
+        3390.645,
+        "#C C picks a tape measure"
+      ],
+      [
+        3390.704,
+        "#c c take a tape measure from the table"
+      ],
+      [
+        3390.973,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3391.458,
+        "#C C pulls the tape measure"
+      ],
+      [
+        3392.088,
+        "#c c measures the material"
+      ],
+      [
+        3392.121,
+        "#c c pulls the tape measure"
+      ],
+      [
+        3392.365,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3392.783,
+        "#c c measures the cloth with the tape measure"
+      ],
+      [
+        3394.584,
+        "#C C pulls the tape measure"
+      ],
+      [
+        3395.466,
+        "#c c places the tape measure on the table"
+      ],
+      [
+        3396.069,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3396.976,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3397.132,
+        "#c c measures the cloth with the tape measure"
+      ],
+      [
+        3403.974,
+        "#c c places the tape measure on the table"
+      ],
+      [
+        3404.052,
+        "#C C puts the tape measure on the table"
+      ],
+      [
+        3404.801,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3405.008,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3406.973,
+        "#c c take a pin"
+      ],
+      [
+        3407.01,
+        "#C C picks a pin"
+      ],
+      [
+        3407.346,
+        "#c c picks the pin from the small box"
+      ],
+      [
+        3409.1,
+        "#c c stick the pin on the material"
+      ],
+      [
+        3409.145,
+        "#C C holds the piece of cloth with a pin"
+      ],
+      [
+        3410.579,
+        "#c c inserts the pin on the cloth"
+      ],
+      [
+        3417.061,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3417.694,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3422.881,
+        "#c c take a tape measure"
+      ],
+      [
+        3423.11,
+        "#C C picks a tape measure"
+      ],
+      [
+        3423.215,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3423.645,
+        "#c c measures the cloth with the tape measure"
+      ],
+      [
+        3423.712,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3423.954,
+        "#c c measures the material"
+      ],
+      [
+        3427.955,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3429.087,
+        "#C C puts the tape measure on the table"
+      ],
+      [
+        3429.151,
+        "#c c put the tape measure on the table"
+      ],
+      [
+        3429.575,
+        "#c c places the tape measure on the table"
+      ],
+      [
+        3429.851,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3430.355,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3442.422,
+        "#c c take a pin"
+      ],
+      [
+        3442.58,
+        "#C C picks a pin from the set"
+      ],
+      [
+        3442.674,
+        "#c c picks the pin from the small box"
+      ],
+      [
+        3443.664,
+        "#C C holds the piece of cloth with a pin"
+      ],
+      [
+        3443.992,
+        "#c c stick the pin on the material"
+      ],
+      [
+        3444.01,
+        "#c c inserts the pin on the cloth"
+      ],
+      [
+        3446.851,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3447.325,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3448.073,
+        "#C C moves the piece of cloth"
+      ],
+      [
+        3448.658,
+        "#c c moves the cloth on the table"
+      ],
+      [
+        3449.359,
+        "#C C picks a tape measure"
+      ],
+      [
+        3449.478,
+        "#c c take a tape measure"
+      ],
+      [
+        3449.796,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3450.239,
+        "#C C pulls the tape measure"
+      ],
+      [
+        3450.422,
+        "#c c measures the material"
+      ],
+      [
+        3450.698,
+        "#c c measures the cloth with the tape measure"
+      ],
+      [
+        3450.725,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3451.7,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3453.973,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3457.195,
+        "#c c put the tape measure on the table"
+      ],
+      [
+        3457.301,
+        "#C C puts the tape measure on the table"
+      ],
+      [
+        3458.156,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3458.282,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3460.759,
+        "#c c take a pin"
+      ],
+      [
+        3461.029,
+        "#C C picks a pin"
+      ],
+      [
+        3461.503,
+        "#c c picks the pin from the table"
+      ],
+      [
+        3461.59,
+        "#C C holds the piece of cloth with a pin"
+      ],
+      [
+        3461.734,
+        "#c c stick the pin on the material"
+      ],
+      [
+        3461.754,
+        "#c c inserts the pin on the cloth"
+      ],
+      [
+        3465.493,
+        "#C C moves the tape measure"
+      ],
+      [
+        3465.789,
+        "#cc moves the tape measure on the table"
+      ],
+      [
+        3466.279,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3466.952,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3471.791,
+        "#C C looks at the safety pin"
+      ],
+      [
+        3472.976,
+        "#c c pushes the pin on the cloth"
+      ],
+      [
+        3474.139,
+        "#C C looks at the small finger"
+      ],
+      [
+        3474.579,
+        "#c c looks at the finger"
+      ],
+      [
+        3475.403,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3475.81,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3478.946,
+        "#C C moves the piece of cloth"
+      ],
+      [
+        3480.694,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3483.845,
+        "#c c take a pin"
+      ],
+      [
+        3483.916,
+        "#C C picks a pin"
+      ],
+      [
+        3484.229,
+        "#c c picks the pin from the small box"
+      ],
+      [
+        3486.14,
+        "#c c inserts the pin on the cloth"
+      ],
+      [
+        3486.183,
+        "#c c stick the pin on the material"
+      ],
+      [
+        3486.473,
+        "#C C holds the piece of cloth with a pin"
+      ],
+      [
+        3490.743,
+        "#c c take a tape measure"
+      ],
+      [
+        3490.849,
+        "#C C picks the tape measure"
+      ],
+      [
+        3491.067,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3491.245,
+        "#c c puts the tape measure on the material"
+      ],
+      [
+        3491.428,
+        "#C C puts the tape measure on the piece of cloth"
+      ],
+      [
+        3492.18,
+        "#c c places the tape measure on the table"
+      ],
+      [
+        3492.413,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3494.139,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3494.972,
+        "#c c take a tape measure"
+      ],
+      [
+        3494.996,
+        "#C C picks the tape measure"
+      ],
+      [
+        3495.474,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3495.662,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3495.987,
+        "#c c measures the material"
+      ],
+      [
+        3496.45,
+        "#c c measures the cloth with the tape measure"
+      ],
+      [
+        3499.172,
+        "#c c puts the tape measure on the table"
+      ],
+      [
+        3499.325,
+        "#C C puts the tape measure on the piece of cloth"
+      ],
+      [
+        3499.437,
+        "#c c places the tape measure on the table"
+      ],
+      [
+        3500.005,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3500.884,
+        "#c c folds the material with hands"
+      ],
+      [
+        3500.884,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3501.771,
+        "#c c folds the edge of the cloth"
+      ],
+      [
+        3502.134,
+        "#c c folds the edge of  the white cloth"
+      ],
+      [
+        3513.721,
+        "#c c take a tape measure on the table"
+      ],
+      [
+        3513.928,
+        "#C C picks the tape measure"
+      ],
+      [
+        3513.948,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3513.976,
+        "#C C picks the tape measure"
+      ],
+      [
+        3514.068,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3514.098,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3514.482,
+        "#C C measures the piece of cloth with the tape measure"
+      ],
+      [
+        3514.586,
+        "#c c measures the material"
+      ],
+      [
+        3514.875,
+        "#c c measures the white cloth on the table"
+      ],
+      [
+        3515.223,
+        "#c c measures the cloth with the tape measure"
+      ],
+      [
+        3516.592,
+        "#C C puts the tape measure on the piece of cloth"
+      ],
+      [
+        3516.878,
+        "#c c put the tape measure on the"
+      ],
+      [
+        3516.955,
+        "#C C puts the tape measure on the piece of cloth"
+      ],
+      [
+        3517.058,
+        "#c c places the tape measure on the table"
+      ],
+      [
+        3517.347,
+        "#c c places the tape measure on the table"
+      ],
+      [
+        3517.393,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3517.603,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3517.835,
+        "#c c folds the edge of  the white cloth"
+      ],
+      [
+        3518.099,
+        "#c c take pin from the cushion pin"
+      ],
+      [
+        3518.111,
+        "#C C picks a pin"
+      ],
+      [
+        3518.17,
+        "#c c takes a pin"
+      ],
+      [
+        3518.284,
+        "#C C picks a pin"
+      ],
+      [
+        3518.938,
+        "#c c picks the pin from the small box"
+      ],
+      [
+        3518.979,
+        "#c c picks the pin from the small box on the table"
+      ],
+      [
+        3520.64,
+        "#c c put the pin in the material"
+      ],
+      [
+        3520.652,
+        "#C C holds the fabric together using a pin"
+      ],
+      [
+        3520.789,
+        "#c c stick the pin on the material"
+      ],
+      [
+        3520.805,
+        "#C C holds the piece of cloth with a pin"
+      ],
+      [
+        3521.161,
+        "#c c inserts the pin on the cloth"
+      ],
+      [
+        3521.495,
+        "#c c inserts the pin on the white cloth"
+      ],
+      [
+        3523.094,
+        "#C C puts the other things back in the set"
+      ],
+      [
+        3523.126,
+        "#C C puts the other things in the set"
+      ],
+      [
+        3523.218,
+        "#c c take pin from the cushion pin"
+      ],
+      [
+        3524.188,
+        "#c c returns the items to the small box"
+      ],
+      [
+        3525.154,
+        "#c c places the items in the small box"
+      ],
+      [
+        3527.421,
+        "#C C holds the piece of cloth with a pin"
+      ],
+      [
+        3527.456,
+        "#C C holds the fabric together using a pin"
+      ],
+      [
+        3527.738,
+        "#c c picks the pin from the table"
+      ],
+      [
+        3527.762,
+        "#c c put the pin in the material"
+      ],
+      [
+        3527.811,
+        "#c c picks the pin from the small box"
+      ],
+      [
+        3528.58,
+        "#c c inserts the pin on the white cloth"
+      ],
+      [
+        3529.526,
+        "#c c inserts the pin on the cloth"
+      ],
+      [
+        3531.556,
+        "#c c take pin from the cushion pin"
+      ],
+      [
+        3531.712,
+        "#C C picks  a pin"
+      ],
+      [
+        3531.718,
+        "#C C picks a pin"
+      ],
+      [
+        3532.485,
+        "#c c picks the pin from the small box"
+      ],
+      [
+        3532.824,
+        "#c c picks the pin from the small box on the table"
+      ],
+      [
+        3533.16,
+        "#C C holds the fabric together using a pin"
+      ],
+      [
+        3533.166,
+        "#C C holds the piece of cloth with a pin"
+      ],
+      [
+        3533.22,
+        "#c c put the pin in the material"
+      ],
+      [
+        3533.714,
+        "#c c inserts the pin on the cloth"
+      ],
+      [
+        3533.86,
+        "#c c inserts the pin on the white cloth"
+      ],
+      [
+        3538.16,
+        "#C C moves the set aside"
+      ],
+      [
+        3538.337,
+        "#C C moves the set aside"
+      ],
+      [
+        3538.496,
+        "#c c moves the set on the table"
+      ],
+      [
+        3538.939,
+        "#c c moves the small box on the table"
+      ],
+      [
+        3539.731,
+        "#c c moves the small box on the table"
+      ],
+      [
+        3539.796,
+        "#summaru c was in a room stitched the material used embroidery hoop"
+      ],
+      [
+        3539.894,
+        "#C C picks the tape measure"
+      ],
+      [
+        3540.387,
+        "#c c picks the tape measure from the table"
+      ],
+      [
+        3540.801,
+        "#C C puts the tape measure in the container"
+      ],
+      [
+        3540.948,
+        "#c c places the tape measure on the tin"
+      ],
+      [
+        3541.847,
+        "#C C folds the piece of cloth"
+      ],
+      [
+        3541.852,
+        "#c c folds the material"
+      ],
+      [
+        3542.723,
+        "#c c raises the cloth on the table"
+      ],
+      [
+        3543.747,
+        "#c c folds the cloth on the table"
+      ]
+    ],
+    "scenarios": [
+      "Crafting/knitting/sewing/drawing/painting"
+    ]
+  },
+  "cc81ee49-a724-4adb-8834-87d411e0fea3": {
+    "window_s": [
+      299.129,
+      911.035
+    ],
+    "events": [
+      [
+        299.241,
+        "#C C turns the trouser inside out"
+      ],
+      [
+        300.656,
+        "#C C straightens the trouser"
+      ],
+      [
+        307.04,
+        "#C C folds the edge of the cloth with her hands."
+      ],
+      [
+        307.628,
+        "#C C folds the trouser lining"
+      ],
+      [
+        310.421,
+        "#C C picks the needle"
+      ],
+      [
+        310.525,
+        "#C C picks another needle with her right hand from the sewing machine table. #Unsure"
+      ],
+      [
+        311.396,
+        "#C C inserts the needle into the edge of the cloth with her right hand. #Unsure"
+      ],
+      [
+        312.453,
+        "#C C pierces the trouser"
+      ],
+      [
+        316.836,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        317.54,
+        "#C C straightens the trouser"
+      ],
+      [
+        320.964,
+        "#C C folds the edge of the cloth with her hands."
+      ],
+      [
+        321.5,
+        "#C C holds the trouser lining"
+      ],
+      [
+        329.088,
+        "#C C picks the needle"
+      ],
+      [
+        329.321,
+        "#C C picks another needle with her right hand from the sewing machine table. #Unsure"
+      ],
+      [
+        330.677,
+        "#C C inserts the needle into the edge of the cloth with her right hand. #Unsure"
+      ],
+      [
+        331.233,
+        "#C C pierces the trouser"
+      ],
+      [
+        334.06,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        334.58,
+        "#C C straightens the trouser"
+      ],
+      [
+        338.153,
+        "#C C holds the trouser lining"
+      ],
+      [
+        339.539,
+        "#C C folds the trouser lining"
+      ],
+      [
+        342.174,
+        "#C C picks the needle"
+      ],
+      [
+        342.241,
+        "#C C picks another needle with her right hand from the sewing machine table. #Unsure"
+      ],
+      [
+        343.483,
+        "#C C raises her right hand towards her face. #Unsure"
+      ],
+      [
+        343.55,
+        "#C C lifts his hand"
+      ],
+      [
+        345.158,
+        "#C C lifts his hand"
+      ],
+      [
+        345.306,
+        "#C C inserts the needle into the edge of the cloth with her right hand. #Unsure"
+      ],
+      [
+        345.79,
+        "#C C pierces the trouser"
+      ],
+      [
+        350.164,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        350.462,
+        "#C C holds the trouser lining"
+      ],
+      [
+        351.958,
+        "#C C lifts the trouser"
+      ],
+      [
+        352.728,
+        "#C C puts down the trouser"
+      ],
+      [
+        356.43,
+        "#C C folds the edge of the cloth with her hands."
+      ],
+      [
+        359.535,
+        "#C C folds the trouser lining"
+      ],
+      [
+        362.767,
+        "#C C straightens the trouser"
+      ],
+      [
+        364.554,
+        "#C C folds the trouser lining"
+      ],
+      [
+        365.913,
+        "#C C straightens the trouser"
+      ],
+      [
+        367.106,
+        "#C C folds the trouser lining"
+      ],
+      [
+        367.346,
+        "#C C raises her right hand towards her face. #Unsure"
+      ],
+      [
+        367.747,
+        "#C C lifts his hand"
+      ],
+      [
+        368.385,
+        "#C C inserts the needle into the edge of the cloth with her right hand. #Unsure"
+      ],
+      [
+        368.651,
+        "#C C puts down his hand"
+      ],
+      [
+        370.059,
+        "#C C pierces the trouser"
+      ],
+      [
+        371.823,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        372.412,
+        "#C C lifts the trouser"
+      ],
+      [
+        372.755,
+        "#C C straightens the trouser"
+      ],
+      [
+        372.893,
+        "#C C puts down the trouser"
+      ],
+      [
+        376.334,
+        "#C C rubs his finger on the trouser lining"
+      ],
+      [
+        377.691,
+        "#C C folds the edge of the cloth with her hands."
+      ],
+      [
+        377.912,
+        "#C C folds the trouser lining"
+      ],
+      [
+        381.848,
+        "#C C lifts the trouser"
+      ],
+      [
+        382.991,
+        "#C C places the cloth around the mouth of the sewing machine with her hands."
+      ],
+      [
+        383.113,
+        "#C C puts down the trouser on the sewing machine"
+      ],
+      [
+        383.71,
+        "#C C adjusts the sewing machine with her hands. #Unsure"
+      ],
+      [
+        385.673,
+        "#C C holds the ripper"
+      ],
+      [
+        386.577,
+        "#C C puts down the ripper"
+      ],
+      [
+        388.488,
+        "#C C dials the stitch selection area"
+      ],
+      [
+        390.129,
+        "#C C places the cloth at the mouth of the sewing machine with her hands."
+      ],
+      [
+        390.417,
+        "#C C puts the trouser on the sewing machine"
+      ],
+      [
+        392.616,
+        "#C C moves the presser foot"
+      ],
+      [
+        393.784,
+        "#C C straightens the trouser"
+      ],
+      [
+        397.808,
+        "#C C holds the trouser lining"
+      ],
+      [
+        399.974,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        403.739,
+        "#C C sews the trouser lining"
+      ],
+      [
+        408.605,
+        "#C C straightens the trouser"
+      ],
+      [
+        410.941,
+        "#C C holds down the trouser lining"
+      ],
+      [
+        416.38,
+        "#C C sews the trouser lining"
+      ],
+      [
+        418.812,
+        "#C C holds the trouser"
+      ],
+      [
+        424.653,
+        "#C C holds down the trouser lining"
+      ],
+      [
+        426.822,
+        "#C C rubs his finger on the trouser lining"
+      ],
+      [
+        428.776,
+        "#C C sews the trouser lining"
+      ],
+      [
+        431.76,
+        "#C C holds the trouser"
+      ],
+      [
+        432.696,
+        "#C C removes a needle"
+      ],
+      [
+        434.065,
+        "#C C puts the needle beside the sewing machine"
+      ],
+      [
+        434.938,
+        "#C C holds the trouser"
+      ],
+      [
+        435.538,
+        "#C C holds down the trouser"
+      ],
+      [
+        439.757,
+        "#C C removes the needle"
+      ],
+      [
+        439.796,
+        "#C C picks another needle from the cloth with her left hand."
+      ],
+      [
+        440.005,
+        "#C C raises her left hand towards her mouth. #Unsure"
+      ],
+      [
+        440.015,
+        "#C C lifts his hand"
+      ],
+      [
+        440.349,
+        "#C C lowers her left hand."
+      ],
+      [
+        440.557,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        440.711,
+        "#C C puts down his hand"
+      ],
+      [
+        446.519,
+        "#C C sews the trouser lining"
+      ],
+      [
+        449.495,
+        "#C C holds down the trouser"
+      ],
+      [
+        450.632,
+        "#C C holds down the trouser"
+      ],
+      [
+        454.489,
+        "#C C sews the trouser lining"
+      ],
+      [
+        456.873,
+        "#C C holds down the trouser"
+      ],
+      [
+        458.48,
+        "#C C raises her left hand towards her mouth. #Unsure"
+      ],
+      [
+        458.913,
+        "#C C lifts his hand"
+      ],
+      [
+        459.08,
+        "#C C lowers her left hand."
+      ],
+      [
+        459.753,
+        "#C C puts down his hand"
+      ],
+      [
+        459.773,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        462.674,
+        "#C C sews the trouser lining"
+      ],
+      [
+        468.217,
+        "#C C raises her right hand towards her mouth. #Unsure"
+      ],
+      [
+        468.595,
+        "#C C lifts his hand"
+      ],
+      [
+        469.166,
+        "#C C stretches her right hand towards the sewing machine table. #Unsure"
+      ],
+      [
+        469.194,
+        "#C C puts the needle on the other side"
+      ],
+      [
+        469.842,
+        "#C C straightens the trouser"
+      ],
+      [
+        470.402,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        471.12,
+        "#C C lifts the trouser"
+      ],
+      [
+        472.16,
+        "#C C holds the trouser with the other hand"
+      ],
+      [
+        473.135,
+        "#C C removes the needle"
+      ],
+      [
+        473.471,
+        "#C C lifts his hand"
+      ],
+      [
+        474.119,
+        "#C C puts down his hand"
+      ],
+      [
+        475.919,
+        "#C C sews the trouser lining"
+      ],
+      [
+        479.303,
+        "#C C raises her right hand towards her mouth. #Unsure"
+      ],
+      [
+        479.572,
+        "#C C lifts his hand"
+      ],
+      [
+        480.848,
+        "#C C holds the trouser"
+      ],
+      [
+        481.863,
+        "#C C puts the needle on the other side"
+      ],
+      [
+        481.974,
+        "#C C places the needle on the sewing machine table with her right hand.."
+      ],
+      [
+        482.463,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        483,
+        "#C C straightens the trouser"
+      ],
+      [
+        485.956,
+        "#C C lifts the trouser"
+      ],
+      [
+        486.497,
+        "#C C puts down the trouser"
+      ],
+      [
+        486.649,
+        "#C C raises her left hand towards her mouth. #Unsure"
+      ],
+      [
+        486.726,
+        "#C C lifts his hand"
+      ],
+      [
+        486.998,
+        "#C C lowers her left hand."
+      ],
+      [
+        487.206,
+        "#C C puts down his hand"
+      ],
+      [
+        490.166,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        491.214,
+        "#C C sews the trouser lining"
+      ],
+      [
+        494.749,
+        "#C C raises her right hand towards her mouth. #Unsure"
+      ],
+      [
+        494.823,
+        "#C C lifts his hand"
+      ],
+      [
+        495.751,
+        "#C C puts the needle on the other side"
+      ],
+      [
+        495.806,
+        "#C C places the needle on the sewing machine table with her right hand.."
+      ],
+      [
+        496.742,
+        "#C C removes the needle"
+      ],
+      [
+        496.807,
+        "#C C removes needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        497.486,
+        "#C C puts the needle on the other side"
+      ],
+      [
+        497.5,
+        "#C C places the needle on the sewing machine table with her right hand.."
+      ],
+      [
+        499.799,
+        "#C C removes the needle"
+      ],
+      [
+        501.155,
+        "#C C removes needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        502.077,
+        "#C C passes the needle to the other hand"
+      ],
+      [
+        502.444,
+        "#C C places the needle on the sewing machine table with her right hand.."
+      ],
+      [
+        502.558,
+        "#C C puts the needle on the other side"
+      ],
+      [
+        503.415,
+        "#C C holds down the trouser"
+      ],
+      [
+        506.615,
+        "#C C sews the trouser lining"
+      ],
+      [
+        508.875,
+        "#C C moves the trouser"
+      ],
+      [
+        511.332,
+        "#C C sews the trouser lining"
+      ],
+      [
+        516.591,
+        "#C C moves her right hand around the sewing machine."
+      ],
+      [
+        517.099,
+        "#C C stops the hand wheel"
+      ],
+      [
+        518.139,
+        "#C C picks the scissor"
+      ],
+      [
+        518.162,
+        "#C C picks scissors with her right hand from the sewing machine table."
+      ],
+      [
+        519.413,
+        "#C C trims the cloth with the scissors in her right hand."
+      ],
+      [
+        519.539,
+        "#C C cuts the thread"
+      ],
+      [
+        522.647,
+        "#C C removes the cloth from the sewing machine with her left hand."
+      ],
+      [
+        523.011,
+        "#C C lifts the thread"
+      ],
+      [
+        525.241,
+        "#C C trims the cloth with the scissors in her right hand."
+      ],
+      [
+        525.324,
+        "#C C cuts the loose thread"
+      ],
+      [
+        528.215,
+        "#C C puts down the scissor"
+      ],
+      [
+        528.244,
+        "#C C places the scissors on a compartment of  the sewing machine with her right hand."
+      ],
+      [
+        529.469,
+        "#C C removes needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        529.919,
+        "#C C removes the needle"
+      ],
+      [
+        530.451,
+        "#C C places the needle on the sewing machine table with her right hand.."
+      ],
+      [
+        530.544,
+        "#C C puts the needle on the other side"
+      ],
+      [
+        531.298,
+        "#C C puts down the trouser"
+      ],
+      [
+        531.611,
+        "#C C picks the cloth with her right hand."
+      ],
+      [
+        532.209,
+        "#C C lifts the trouser"
+      ],
+      [
+        532.828,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        534.707,
+        "#C C puts down the trouser"
+      ],
+      [
+        536.681,
+        "#C C lifts the trouser"
+      ],
+      [
+        537.489,
+        "#C C puts down the trouser"
+      ],
+      [
+        540.132,
+        "#C C folds a piece of cloth with her hands."
+      ],
+      [
+        540.272,
+        "#C C holds the trouser"
+      ],
+      [
+        541.097,
+        "#C C looks at the trouser"
+      ],
+      [
+        541.66,
+        "#C C looks at the trouser"
+      ],
+      [
+        542.145,
+        "#C C lifts the trouser"
+      ],
+      [
+        542.522,
+        "#C C puts down the trouser"
+      ],
+      [
+        542.995,
+        "#C C lifts the trouser"
+      ],
+      [
+        543.411,
+        "#C C puts down the trouser"
+      ],
+      [
+        544.151,
+        "#C C folds another edge of the cloth with her hands."
+      ],
+      [
+        544.341,
+        "#C C folds the trouser"
+      ],
+      [
+        544.827,
+        "#C C looks at the trouser lining"
+      ],
+      [
+        548,
+        "#C C folds the trouser lining"
+      ],
+      [
+        553.876,
+        "#C C picks up a pin"
+      ],
+      [
+        553.879,
+        "#C C picks the needle"
+      ],
+      [
+        554.17,
+        "#C C picks a needle from the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        554.297,
+        "#C C picks another needle with her right hand from the sewing machine table. #Unsure"
+      ],
+      [
+        554.77,
+        "#C C inserts the needle into the cloth with her right hand."
+      ],
+      [
+        555.169,
+        "#C C inserts the needle into the edge of the cloth with her right hand. #Unsure"
+      ],
+      [
+        555.425,
+        "#C C pierces the trouser"
+      ],
+      [
+        555.62,
+        "#C C inserts the pin in the trouser"
+      ],
+      [
+        561.195,
+        "#C C picks up a pin"
+      ],
+      [
+        561.328,
+        "#C C picks the needle"
+      ],
+      [
+        561.648,
+        "#C C picks another needle with her right hand from the sewing machine table. #Unsure"
+      ],
+      [
+        561.884,
+        "#C C picks another  needle from the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        562.756,
+        "#C C inserts the needle into the cloth with her right hand."
+      ],
+      [
+        562.857,
+        "#C C inserts the needle into the edge of the cloth with her right hand. #Unsure"
+      ],
+      [
+        562.947,
+        "#C C inserts pin in the trouser"
+      ],
+      [
+        563.364,
+        "#C C pierces the trouser"
+      ],
+      [
+        565.23,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        565.419,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        565.445,
+        "#C C straightens the trouser"
+      ],
+      [
+        566.101,
+        "#C C holds the trouser"
+      ],
+      [
+        567.037,
+        "#C C puts down the trouser"
+      ],
+      [
+        572.635,
+        "# C C folds the trouser"
+      ],
+      [
+        583.725,
+        "#C C folds another part of the cloth with her hands."
+      ],
+      [
+        587.981,
+        "#C C inserts the needle into the cloth with her right hand."
+      ],
+      [
+        588.347,
+        "#C C inserts pin in the trouser"
+      ],
+      [
+        591.635,
+        "#C C folds trouser"
+      ],
+      [
+        593.686,
+        "#C C folds another part of the cloth with her hands."
+      ],
+      [
+        599.462,
+        "#C C picks up pin"
+      ],
+      [
+        600.043,
+        "#C C picks another needle from the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        600.756,
+        "#C C inserts the needle into the cloth with her right hand."
+      ],
+      [
+        601.013,
+        "#C C inserts pin in trouser"
+      ],
+      [
+        605.17,
+        "#C C removes needle from the cloth with her right hand."
+      ],
+      [
+        606.08,
+        "#C C places the needle on the sewing machine table with her right hand."
+      ],
+      [
+        607.306,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        607.638,
+        "#C C folds trouser"
+      ],
+      [
+        611.035,
+        "#C C folds another part of the cloth with her hands."
+      ],
+      [
+        615.613,
+        "#C C removes another needle from the cloth with her right hand."
+      ],
+      [
+        616.345,
+        "#C C inserts the needle into the cloth with her right hand."
+      ],
+      [
+        616.701,
+        "#C C inserts pin in trouser"
+      ],
+      [
+        620.46,
+        "#C C places the cloth in the mouth of the sewing machine with her hands. #Unsure"
+      ],
+      [
+        621.229,
+        "#C C sews trouser with sewing machine"
+      ],
+      [
+        629.212,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        649.808,
+        "#C C removes another needle from the cloth with her right hand."
+      ],
+      [
+        650.341,
+        "#C C places the needle on the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        651.16,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        659.242,
+        "#C C removes pin from the trouser"
+      ],
+      [
+        659.247,
+        "#C C removes another needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        659.987,
+        "#C C puts the pin down"
+      ],
+      [
+        660.151,
+        "#C C places the needle on the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        661.371,
+        "#C C sews the trouser"
+      ],
+      [
+        664.909,
+        "#C C raises her right hand towards her face. #Unsure"
+      ],
+      [
+        669.923,
+        "#C C removes pin from the trouser"
+      ],
+      [
+        673.05,
+        "#C C sews the trouser"
+      ],
+      [
+        678.203,
+        "#C C removes pin from the trouser"
+      ],
+      [
+        678.552,
+        "#C C removes another needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        679.122,
+        "#C C places the needle on the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        679.298,
+        "#C C puts the pin down"
+      ],
+      [
+        680.321,
+        "#C C sews the fabric"
+      ],
+      [
+        698.808,
+        "#C C removes pin from the trouser"
+      ],
+      [
+        701.049,
+        "#C C sews the trouser"
+      ],
+      [
+        703.418,
+        "#C C adjusts the ring in her right hand."
+      ],
+      [
+        706.801,
+        "#C C removes pin from the trouser"
+      ],
+      [
+        707.245,
+        "#C C raises her left hand towards her face. #Unsure"
+      ],
+      [
+        707.708,
+        "#C C lowers her left hand. #Unsure"
+      ],
+      [
+        708.016,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        709.743,
+        "#C C sews the trouser"
+      ],
+      [
+        716.485,
+        "#C C raises her right hand towards her face. #Unsure"
+      ],
+      [
+        717.02,
+        "#C C lowers her right hand. #Unsure"
+      ],
+      [
+        717.288,
+        "#C C removes pin from the trouser"
+      ],
+      [
+        718.262,
+        "#C C removes another needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        718.929,
+        "#C C puts the pin down"
+      ],
+      [
+        719.163,
+        "#C C places the needle on the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        719.834,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        722.994,
+        "#C C removes another needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        723.16,
+        "#C C removes pin from the trouser"
+      ],
+      [
+        723.984,
+        "#C C puts the pin down"
+      ],
+      [
+        724.126,
+        "#C C places the needle on the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        724.681,
+        "#C C sews the cloth with the sewing machine."
+      ],
+      [
+        725.187,
+        "#C C sews the trouser"
+      ],
+      [
+        739.214,
+        "#C C picks the scissors from the sewing machine with her right hand."
+      ],
+      [
+        739.962,
+        "#C C cuts thread with the scissors"
+      ],
+      [
+        740.015,
+        "#C C cuts the thread with the scissors."
+      ],
+      [
+        740.622,
+        "#C C removes the cloth from the sewing machine mouth with her left hand. #Unsure"
+      ],
+      [
+        743.499,
+        "#C C trims a part of the cloth with the scissors in her right hand."
+      ],
+      [
+        755.161,
+        "#C C places the scissors on the sewing machine with her right hand."
+      ],
+      [
+        756.47,
+        "#C C puts down the scissors"
+      ],
+      [
+        757.33,
+        "#C C folds the cloth with her hands."
+      ],
+      [
+        757.95,
+        "#C C holds up the trouser"
+      ],
+      [
+        762.478,
+        "#C C folds the trouser"
+      ],
+      [
+        768.652,
+        "#C C removes another needle from the cloth with her right hand. #Unsure"
+      ],
+      [
+        769.223,
+        "#C C places the needle on the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        769.885,
+        "#C C adjusts the cloth with her hands."
+      ],
+      [
+        771.208,
+        "#C C looks at the trouser"
+      ],
+      [
+        777.485,
+        "#C C picks up scissors"
+      ],
+      [
+        777.749,
+        "#C C picks scissors from the sewing machine with her right hand."
+      ],
+      [
+        778.505,
+        "#C C trims another part of the cloth with the scissors in her right hand."
+      ],
+      [
+        778.542,
+        "#C C cuts thread from the trouser with scissors"
+      ],
+      [
+        780.565,
+        "#C C puts down scissors"
+      ],
+      [
+        780.833,
+        "#C C places the scissors on the sewing machine with her right hand."
+      ],
+      [
+        781.723,
+        "#C C folds the cloth with her hands."
+      ],
+      [
+        784.617,
+        "#C C folds the trouser"
+      ],
+      [
+        791.442,
+        "#C C  puts the trouser on the chair"
+      ],
+      [
+        791.442,
+        "#C C places the cloth on the chair with her left hand."
+      ],
+      [
+        791.75,
+        "#C C picks up the paper bag"
+      ],
+      [
+        792.187,
+        "#C C picks a nylon bag with her left hand from the wooden chair handle."
+      ],
+      [
+        794.578,
+        "#C C removes a fabric from the paper bag"
+      ],
+      [
+        795.128,
+        "#C C brings out a white cloth from the nylon bag with her right hand."
+      ],
+      [
+        796.287,
+        "#C C hangs the nylon bag to the handle of the chair with her left hand."
+      ],
+      [
+        796.513,
+        "#C C hangs the paper bag on the chair"
+      ],
+      [
+        798.291,
+        "#C C adjusts the white cloth with her hands."
+      ],
+      [
+        800.025,
+        "#C C unfolds the fabric"
+      ],
+      [
+        810,
+        "#C C picks a needle with her right hand."
+      ],
+      [
+        810,
+        "#C C holds a piece of clothe"
+      ],
+      [
+        810.294,
+        "#C C picks up a needle"
+      ],
+      [
+        811.554,
+        "#C C picks another needle from the sewing machine table with her right hand. #Unsure"
+      ],
+      [
+        812.591,
+        "#C C picks the needle from the table"
+      ],
+      [
+        812.887,
+        "#C C looks at the needle"
+      ],
+      [
+        814.267,
+        "#C C picks a bobbins with her right hand."
+      ],
+      [
+        814.694,
+        "#C C takes out a button of thread from the sewing machine with her right hand. #Unsure"
+      ],
+      [
+        815.055,
+        "#C C picks up thread"
+      ],
+      [
+        815.371,
+        "#C C drops the bobbins in her right hand."
+      ],
+      [
+        815.39,
+        "#C C returns the button of thread back to the sewing machine with her right hand. #Unsure"
+      ],
+      [
+        815.538,
+        "#C C pick the bobbin"
+      ],
+      [
+        816.366,
+        "#C C picks a bobbins with her right hand."
+      ],
+      [
+        816.848,
+        "#C C takes out another button of thread from the sewing machine with her right hand. #Unsure"
+      ],
+      [
+        817.468,
+        "#C C holds the bobbins with both hands."
+      ],
+      [
+        817.54,
+        "#C C pulls thread from the button of thread with her left hand. #Unsure"
+      ],
+      [
+        817.866,
+        "#C C pulls a thread with her left hand."
+      ],
+      [
+        818.596,
+        "#C C pulls the thread from the bobbin"
+      ],
+      [
+        818.792,
+        "#C C raises the button of thread towards her mouth. #Unsure"
+      ],
+      [
+        820.202,
+        "#C C returns the button of thread back to the sewing machine with her right hand."
+      ],
+      [
+        820.381,
+        "#C C places the bobbins on a sewing machine with her right hand."
+      ],
+      [
+        820.891,
+        "#C C drops the bobbin on the sewing machine"
+      ],
+      [
+        821.249,
+        "#C C passes the needle from her right hand to her left hand."
+      ],
+      [
+        821.365,
+        "#C C passes the needle to her left hand."
+      ],
+      [
+        821.936,
+        "#C C raises her right hand towards her mouth. #Unsure"
+      ],
+      [
+        823.35,
+        "#C C picks the needle from the mouth"
+      ],
+      [
+        823.979,
+        "#C C inserts thread into the needle with her right hand. #Unsure"
+      ],
+      [
+        824.308,
+        "#C C inserts a thread in the needle with her right hand."
+      ],
+      [
+        825.078,
+        "#C C puts the thread in the needle"
+      ],
+      [
+        825.214,
+        "#C C puts thread in the needle"
+      ],
+      [
+        833.042,
+        "#C C picks a needle with her right hand."
+      ],
+      [
+        833.183,
+        "#C C stretches her right hand towards the sewing machine table. #Unsure"
+      ],
+      [
+        835.31,
+        "#C C inserts thread into the needle with her right hand. #Unsure"
+      ],
+      [
+        835.615,
+        "#C C inserts a thread in the needle with her right hand."
+      ],
+      [
+        841.355,
+        "#C C twists the thread with her right hand."
+      ],
+      [
+        844.075,
+        "#C C pulls the thread with her right hand."
+      ],
+      [
+        845.022,
+        "#C C pulls the thread with her left hand."
+      ],
+      [
+        845.874,
+        "#C C pulls the thread"
+      ],
+      [
+        847.47,
+        "#C C picks a cloth with both hands."
+      ],
+      [
+        848.189,
+        "#C C folds a cloth with both hands."
+      ],
+      [
+        848.505,
+        "#C C pulls up the clothe"
+      ],
+      [
+        849.837,
+        "#C C adjusts the cloth with her right hand."
+      ],
+      [
+        850.231,
+        "#C C aligns the clothe"
+      ],
+      [
+        852.606,
+        "#C C sews the cloth with a needle in her right hand."
+      ],
+      [
+        854.017,
+        "#C C sews the clothe with the needle"
+      ],
+      [
+        857.352,
+        "#C C adjusts the cloth with her right hand."
+      ],
+      [
+        861.378,
+        "#C C aligns the clothe"
+      ],
+      [
+        862.5,
+        "#C C sews the cloth with the needle in her right hand."
+      ],
+      [
+        863.737,
+        "#C C sews the clothe with a needle"
+      ],
+      [
+        871.077,
+        "#C C adjusts the cloth with her right hand."
+      ],
+      [
+        872.007,
+        "#C C pulls the thread with her right hand."
+      ],
+      [
+        875.63,
+        "#C C sews the cloth with the needle in her right hand."
+      ],
+      [
+        878.666,
+        "#CC shifts her left hand."
+      ],
+      [
+        879.935,
+        "#C C adjusts the cloth with both hands."
+      ],
+      [
+        880.417,
+        "#C C aligns the clothe"
+      ],
+      [
+        886.647,
+        "#C C sews the cloth with the needle in her right hand."
+      ],
+      [
+        887.018,
+        "#C C sews the clothe with the needle"
+      ],
+      [
+        891.895,
+        "#C C adjusts the thread with her right hand."
+      ],
+      [
+        893.733,
+        "#C C adjusts the thread with her right hand."
+      ],
+      [
+        894.092,
+        "#C C pulls the thread with her right hand."
+      ],
+      [
+        896.713,
+        "#C C adjusts the thread with both hands."
+      ],
+      [
+        897.924,
+        "#C C aligns the clothe"
+      ],
+      [
+        902.227,
+        "#C C sews the cloth with the needle in her right hand."
+      ],
+      [
+        903.084,
+        "#C C sews the clothe with a needle"
+      ],
+      [
+        905.944,
+        "#C C adjusts the thread with both hands."
+      ],
+      [
+        908.215,
+        "#C C sews the cloth with the needle in her right hand."
+      ],
+      [
+        910.359,
+        "#C C passes the needle from her right hand to her left hand."
+      ]
+    ],
+    "scenarios": [
+      "Crafting/knitting/sewing/drawing/painting"
+    ]
+  }
+}

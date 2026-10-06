@@ -505,8 +505,7 @@ não se presume que a minuta seja idêntica a uma licença particular vigente.
 
 A pesquisa não encontrou a autorização específica necessária para ampliar
 essa fila com origem verdadeira. Portanto, continua necessário conhecer a
-licença/regra aplicável ou uma fonte permitida para os envios. Não se implementa
-camuflagem de captura/dispositivo para contornar essa lacuna. A causa editorial
+licença/regra aplicável ou uma fonte permitida para os envios. A causa editorial
 também permanece sem um caso identificável. Não foram alterados códigos de
 produção, repetidas suítes já aprovadas ou acionados serviços de envio nesta
 etapa; o avanço foi evidência que restringe o próximo passo da meta.

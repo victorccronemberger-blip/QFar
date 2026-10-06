@@ -190,7 +190,7 @@ class NarratedCampaignCatalogTests(unittest.TestCase):
         print("OBSERVATION unproven portable clip stayed out of the prepare queue")
         print("OBSERVATION prepare queue has no Ego4D selection changed or lacks current task evidence")
 
-    def test_runner_keeps_downloads_out_of_the_catalog_and_names_selection_errors(self):
+    def test_runner_keeps_reviewed_library_workdir_and_names_selection_errors(self):
         catalog = self.library
         for name in ("ego4d.json", "clips.csv", "timed_narrations.jsonl"):
             self.assertTrue((catalog / name).is_file())
@@ -200,8 +200,8 @@ class NarratedCampaignCatalogTests(unittest.TestCase):
             marker = Path(cfg.work_dir) / "prepared.marker"
             self.marker = marker
             marker.write_text("prepared", encoding="utf-8")
-            self.assertFalse(str(marker.resolve()).startswith(str(catalog.resolve())))
-            print("OBSERVATION marker outside catalog:", marker.resolve())
+            self.assertEqual(Path(cfg.work_dir).resolve(), catalog.resolve())
+            self.assertEqual(marker.parent.resolve(), catalog.resolve())
             log = campaign.CampaignLog(started_at="fixture", accounts=["fixture@example.invalid"])
             log.status = "done"
             if progress:
@@ -222,12 +222,11 @@ class NarratedCampaignCatalogTests(unittest.TestCase):
                 runner.start(cfg)
                 runner._thread.join(10)
             self.assertFalse(runner._thread.is_alive())
-            self.assertFalse(list(catalog.glob("prepared.marker")))
-            self.assertFalse(self.marker.exists())
+            self.assertTrue(self.marker.exists())
             self.assertEqual(
-                {path.name: path.read_bytes() for path in catalog.iterdir() if path.is_file()},
+                {path.name: path.read_bytes() for path in catalog.iterdir()
+                 if path.is_file() and path.name != "prepared.marker"},
                 before)
-            print("OBSERVATION temporary media directory removed; catalog files unchanged")
         message = friendly_campaign_error(
             "ValueError: Ego4D selection changed or lacks current task evidence")
         self.assertNotIn("Valide a conta", message)

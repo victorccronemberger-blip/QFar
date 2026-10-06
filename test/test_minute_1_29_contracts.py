@@ -34,7 +34,9 @@ class Minute129DefaultsTests(unittest.TestCase):
         profile = DeviceProfile(email="fixture@example.com", device_id="dev-fixture")
         self.assertEqual(profile.device_model, "SM-S901E")
         self.assertEqual(profile.sidecar_model, "SM-S901E")
-        self.assertEqual(profile.sidecar_platform_meta(), {"os": "android", "version": 34})
+        self.assertEqual(profile.os_version, "16")
+        self.assertEqual(profile.sidecar_device_meta()["systemVersion"], "16")
+        self.assertEqual(profile.sidecar_platform_meta(), {"os": "android", "version": 36})
         self.assertEqual(profile.upload_platform_meta(), {"os": "android"})
         self.assertEqual(profile.upload_device_meta(), {"model": "SM-S901E"})
 

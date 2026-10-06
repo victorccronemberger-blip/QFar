@@ -11,8 +11,6 @@ houver uma em andamento.
 from __future__ import annotations
 
 import math
-import shutil
-import tempfile
 import threading
 import time
 from collections import deque
@@ -24,27 +22,6 @@ from ..campaign import CampaignConfig, run_campaign
 from .operation_state import OperationState
 
 _MAX_EVENTS = 2000
-
-
-def _temporary_media_dir(cfg: CampaignConfig) -> Path | None:
-    """Vídeo baixado para envio não fica na biblioteca do catálogo.
-
-    A campanha apaga esses arquivos depois do upload. A pasta temporária
-    também sai no fim. Catálogo e narrações continuam na biblioteca real.
-    """
-    from .. import config
-    if not cfg.cleanup_after_upload or cfg.original_capture_plan is not None:
-        return None
-    try:
-        current = Path(cfg.work_dir).resolve()
-        catalog = (config.MEDIA_DATA_DIR / "ego4d").resolve()
-    except OSError:
-        return None
-    if current != catalog:
-        return None
-    temporary = Path(tempfile.mkdtemp(prefix="qmoney-campaign-"))
-    cfg.work_dir = temporary
-    return temporary
 
 
 def _fmt_wait(total_s: int) -> str:
@@ -457,7 +434,9 @@ class CampaignRunner:
     # --- thread de fundo ----------------------------------------------------
     def _run(self, cfg: CampaignConfig) -> None:
         terminal: tuple[str, dict[str, Any]] | None = None
-        temporary_media = _temporary_media_dir(cfg)
+        # Keep the reviewed library/cache and persisted recovery paths stable.
+        # The campaign engine removes only delivered items after checking
+        # pending journals, publication and the next item's protected paths.
 
         def on_progress(kind: str, payload: dict[str, Any]) -> None:
             nonlocal terminal
@@ -510,10 +489,6 @@ class CampaignRunner:
                     self.state = "stopped"
                     self.current = ""
                     self.stage = "Encerrada"
-        finally:
-            if temporary_media is not None:
-                shutil.rmtree(temporary_media, ignore_errors=True)
-
     def _restore_published_progress(self, log, cfg: CampaignConfig) -> None:
         """Restore counters from this attempt and current receipts, no events."""
         if not isinstance(log, campaign.CampaignLog):
@@ -947,6 +922,7 @@ class HoloCacheRunner:
         self.total = 0
         self.ready = 0
         self.failed = 0
+        self.protected = 0
         self.error: str | None = None
         self.result: dict[str, Any] | None = None
         self.provider = "holoassist"
@@ -980,6 +956,7 @@ class HoloCacheRunner:
             self.total = 0
             self.ready = 0
             self.failed = 0
+            self.protected = 0
             self.error = None
             self.result = None
             kwargs = {
@@ -1049,6 +1026,7 @@ class HoloCacheRunner:
             self.total = int(result.get("total") or self.total)
             self.ready = int(result.get("ready") or 0)
             self.failed = int(result.get("failed") or 0)
+            self.protected = int(result.get("protected") or 0)
             self.current = ""
             self.phase = ""
 
@@ -1097,6 +1075,10 @@ class HoloCacheRunner:
                 self.failed += 1
                 self.phase = "failed"
                 self.current = f"falhou: {name} — {payload.get('error', '')}"
+            elif kind == "protected":
+                self.protected += 1
+                self.phase = "protected"
+                self.current = f"preservado por operação pendente: {name}"
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -1110,6 +1092,7 @@ class HoloCacheRunner:
                 "total": self.total,
                 "ready": self.ready,
                 "failed": self.failed,
+                "protected": self.protected,
                 "error": self.error,
                 "result": self.result,
             }

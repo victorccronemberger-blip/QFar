@@ -48,13 +48,13 @@ def _device_pool_from_catalog() -> list[tuple[str, str, int, tuple[tuple[str, in
     for model in device_catalog.catalog_models():
         releases = tuple(
             (str(rel), device_catalog.api_level_for_release(str(rel)))
-            for rel in (model.get("osReleases") or ["14"])
+            for rel in (model.get("osReleases") or ["16"])
         )
         pool.append((
             str(model.get("commercial") or model["buildModel"]),
             str(model["buildModel"]),
             max(1, int(model.get("weight") or 1)),
-            releases or (("14", 34),),
+            releases or (("16", 36),),
         ))
     return pool
 
@@ -363,9 +363,9 @@ class DeviceProfile:
     device_id: str
     device_model: str = "SM-S901E"          # Build.MODEL âncora S22 1.29 (short e sidecar)
     sidecar_model: str = "SM-S901E"         # Build.MODEL completo (metadata.json)
-    os_version: str = "14"                  # release do Android (UA, app/opened)
-    sdk_int: int = 34                       # Build.VERSION.SDK_INT (metadata.json)
-    sidecar_system_version: str = "14"      # systemVersion = Build.VERSION.RELEASE
+    os_version: str = "16"                  # release do Android (UA, app/opened)
+    sdk_int: int = 36                       # Build.VERSION.SDK_INT (metadata.json)
+    sidecar_system_version: str = "16"      # systemVersion = Build.VERSION.RELEASE
     logical_camera_id: str = "4"            # id da câmera (camera_logical_X)
     boot_wall_ms: int = 0                   # último boot (epoch ms)
     created_wall_ms: int = 0                # 1ª vez que a conta usou a réplica

@@ -61,6 +61,7 @@ scripts/*
 !scripts/build_release.ps1
 !scripts/browser_parts.ps1
 !scripts/run_tests.py
+!scripts/verify_release_local.ps1
 !scripts/verify_packaged_service.py
 !scripts/audit_ego4d_catalog.py
 !scripts/index_ego4d_library.py
@@ -73,6 +74,7 @@ scripts/*
 !scripts/forensic_resend.py
 !scripts/registrar_conta.py
 *.bat
+!VERIFICAR_RELEASE_LOCAL.bat
 HowUseMe.md
 PARA_RODAR_NO_DESTINO.md
 README_QMONEY.md

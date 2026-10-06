@@ -314,8 +314,9 @@ class EgoBudgetTests(unittest.TestCase):
             prepare.assert_not_called()
 
     def test_catalog_scenario_clips_do_not_require_cache(self):
-        clip = {"clip_uid": "g", "dur_s": 90, "source": "ego4d"}
+        clip = {"clip_uid": "g", "dur_s": 90, "source": "ego4d", "selection_evidence": {"fixture": True}}
         with patch.object(ego_accelerator, "scenario_buckets", return_value={"Gardening": [clip]}), \
+             patch.object(ego4d, "revalidate_selection_evidence", return_value=clip["selection_evidence"]), \
              patch.object(campaign, "ego_clip_cache_state", return_value="pending"):
             self.assertEqual(
                 ego_accelerator.ready_scenario_clips("Gardening", require_cached=False),
@@ -327,10 +328,11 @@ class EgoBudgetTests(unittest.TestCase):
             self.assertEqual(ego_accelerator.ready_scenario_clips("Gardening"), [])
 
     def test_cache_only_can_use_ready_scenario_when_preparation_is_disabled(self):
-        clip = {"clip_uid": "g", "dur_s": 90}
+        clip = {"clip_uid": "g", "dur_s": 90, "selection_evidence": {"fixture": True}}
         with patch.object(ego_accelerator, "configured_budget_gb", return_value=0), \
              patch.object(ego_accelerator, "catalog_installed", return_value=True), \
              patch.object(ego_accelerator, "scenario_buckets", return_value={"Gardening": [clip]}), \
+             patch.object(ego4d, "revalidate_selection_evidence", return_value=clip["selection_evidence"]), \
              patch.object(campaign, "ego_clip_cache_state", return_value="ready"):
             self.assertEqual(ego_accelerator.ready_scenario_clips(
                 "Gardening", allow_disabled=True), [clip])

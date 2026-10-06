@@ -65,6 +65,7 @@ from .campaign_types import (
 from .device_profile import DeviceProfile
 from .content_selection import diverse_order, diversity_summary, parent_key
 from .minute_api import AuthError, Session, validate_task_catalog
+from .media_lifecycle import cleanup_operation
 from .sidecar import (
     build_frames_csv,
     build_frames_csv_from_video,
@@ -1620,11 +1621,13 @@ def _warm_account_videos(base: Path, emails: list[str]) -> ThreadPoolExecutor | 
     return pool
 
 
+@cleanup_operation
 def _enforce_account_video_cache(work_dir: Path) -> tuple[int, int]:
     """Apaga variantes `_acc*.mp4` mais antigas se o cache passar do teto.
 
     Não mexe no `_native.mp4` (fonte do re-encode) nem no original Ego4D.
-    Arquivos recém-gerados têm mtime novo e saem por último.
+    Arquivos recém-gerados têm mtime novo e saem por último. Journals e
+    reservas pendentes protegem as variantes mesmo acima do teto do cache.
     """
     if not work_dir.exists():
         return 0, 0
@@ -1646,24 +1649,24 @@ def _enforce_account_video_cache(work_dir: Path) -> tuple[int, int]:
         total += st.st_size
     if total <= budget:
         return 0, 0
+    from .recovery import media_cleanup_protection
+    protection = media_cleanup_protection()
     files.sort()  # mais antigo primeiro
     removed = freed = 0
     for _mtime, size, path in files:
         if total <= budget:
             break
-        try:
-            path.unlink()
-        except OSError:
-            continue
-        ok = _account_video_ok_path(path)
-        try:
-            if ok.exists():
-                ok.unlink()
-        except OSError:
-            pass
-        total -= size
-        removed += 1
-        freed += size
+        with _lock_for_account_video(path):
+            cleanup = _delete_media_files([path], allowed_roots=(work_dir,), protection=protection)
+            if cleanup["files"] != 1:
+                continue
+            # Keep the companion while a protected variant survives. The
+            # enclosing lifecycle lease also covers this second deletion.
+            _delete_media_files([_account_video_ok_path(path)], allowed_roots=(work_dir,),
+                                protection=protection)
+            total -= size
+            removed += 1
+            freed += size
     return removed, freed
 
 
@@ -1673,9 +1676,6 @@ def _within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
-
-
-from .media_lifecycle import cleanup_operation
 
 
 @cleanup_operation
@@ -2047,14 +2047,39 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
         # Keep all rows of a session, including malformed or foreign chunks.
         # A filtered subset must not become evidence of a complete receipt.
         groups.setdefault(sid, []).append(row)
+    # Validate every owned session before any registry/ACK mutation. A later
+    # corrupt session must not consume earlier valid receipts, and journals
+    # for another clip must receive the same integrity check as this item.
+    contexts: dict[str, Any] = {}
+    lineages: dict[str, dict[str, Any]] = {}
+    for sid, chunks in groups.items():
+        first = next((row for row in chunks if owned(row)), None)
+        if first is None or sent_registry.recovery_was_reset(sid, ""):
+            continue
+        context = first.get("campaign_context") or _legacy_upload_context(sid, account.email)
+        contexts[sid] = context
+        lineage = context.get("content_provenance") if isinstance(context, dict) else None
+        if lineage is not None:
+            from .content_provenance import canonical_digest
+            try:
+                if (not isinstance(lineage, dict) or lineage.get("session_id") != sid
+                        or lineage.get("task_id") != first.get("task_id")
+                        or lineage.get("org_key") != account.org_key
+                        or lineage.get("delivery_binding_sha256") != canonical_digest({
+                            key: value for key, value in lineage.items()
+                            if key != "delivery_binding_sha256"})):
+                    raise ValueError
+                lineages[sid] = json.loads(json.dumps(lineage, allow_nan=False))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise UploadError(
+                    "Vínculo de conteúdo da retomada inválido; preserve os registros.",
+                    transient=False, phase="recovery", review_required=True) from exc
     matched = None
     for sid, chunks in groups.items():
         first = next((row for row in chunks if owned(row)), None)
-        if first is None:
+        if first is None or sid not in contexts:
             continue
-        if sent_registry.recovery_was_reset(sid, ""):
-            continue
-        context = first.get("campaign_context") or _legacy_upload_context(sid, account.email)
+        context = contexts[sid]
         if (not isinstance(context, dict)
                 or any(not isinstance(context.get(key), str) or not context[key]
                        for key in ("registry_key", "clip_uid"))):
@@ -2088,18 +2113,11 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
                        "org_key": account.org_key,
                        "session_id": sid, "recovered": complete,
                        "error": None if complete else "Envio anterior ainda pendente; nova sessão não criada."}
-            if context.get('content_provenance') is not None:
-                from .content_provenance import canonical_digest
-                lineage=context['content_provenance']
-                if (not isinstance(lineage,dict) or lineage.get('session_id')!=sid
-                        or lineage.get('task_id')!=first.get('task_id') or lineage.get('org_key')!=account.org_key
-                        or lineage.get('delivery_binding_sha256') != canonical_digest({
-                            k:v for k,v in lineage.items() if k!='delivery_binding_sha256'})):
-                    raise ValueError('Vínculo de conteúdo da retomada inválido; preserve os registros.')
+            if sid in lineages:
                 # Keep the immutable planning descriptor and expose receipt
                 # confirmation separately. Updating its flag would invalidate
                 # its original digest or turn a plan into evidence of delivery.
-                matched['content_provenance']=json.loads(json.dumps(lineage,allow_nan=False))
+                matched['content_provenance'] = lineages[sid]
                 matched['content_receipt_confirmed']=complete
     return matched
 
@@ -2246,6 +2264,27 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 'Vídeo sem PTS medidos; preparo interrompido.',
                 transient=False, phase='prepare') from exc
         plan = _chunk_plan(int(item["duration_ms"]), limits=policy_limits)
+        chunk_imu_diagnostics: list[dict[str, Any]] | None = None
+        if len(plan) > 1 and item.get("source") == "ego4d":
+            # Classify the same source resampling events on each half-open
+            # output interval. Resampling a chunk in isolation changes edge
+            # holds/interpolation; copying the full item's counters repeats
+            # events that do not belong to this ZIP.
+            try:
+                source_imu = item["_content_inputs"]["source_imu"]
+                measured: dict[str, Any] = {}
+                measured_csv = ego4d.build_imu_csv(
+                    source_imu["path"], tuple(item["content_provenance"]["window_s"]),
+                    duration_ms=int(item["duration_ms"]), stats=measured,
+                    stats_windows_ms=[(start, start + duration) for start, duration in plan])
+                content_provenance.verify_input(source_imu)
+                if measured_csv != imu_csv:
+                    raise ValueError(content_provenance.INTEGRITY_ERROR)
+                chunk_imu_diagnostics = measured["windows"]
+            except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
+                raise UploadError(
+                    "IMU ou diagnóstico do chunk divergente; novo preparo necessário.",
+                    transient=False, phase="prepare") from exc
         chunk_paths: list[Path] = []
         chunk_zips: list[bytes] = []
         chunk_recorded: list[str] = []
@@ -2284,6 +2323,12 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             chunk_item = dict(item)
             if len(plan) > 1:
                 chunk_item["n_samples"] = n_imu
+                if chunk_imu_diagnostics is not None:
+                    if chunk_imu_diagnostics[index]["sampleCount"] != n_imu:
+                        raise UploadError(
+                            "Diagnóstico IMU diverge das amostras do chunk; novo preparo necessário.",
+                            transient=False, phase="prepare")
+                    chunk_item["imu_diagnostics"] = chunk_imu_diagnostics[index]
             chunk_zips.append(_build_sidecar(
                 chunk_item, session_id, log_id, rec_at, profile=profile,
                 video_probe=part_probe, imu_csv=part_imu,
@@ -2429,6 +2474,7 @@ def run_campaign(
         prefetch.shutdown()
 
 
+@ego4d.selection_boundary
 def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str, Any]]:
     """Resolve the candidate pool once; a reviewed pool is reused verbatim."""
     if config.candidate_plan is not None:
@@ -2498,7 +2544,7 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
         ego = refine_candidates(ego, work_dir, tsk.min_dur_s, tsk.max_dur_s)
         shorts = [*ego, *other]
     task_name = tsk.task_name
-    return [clip for clip in shorts if _prepare_queue_accepts(clip, task_name)]
+    return [clip for clip in shorts if _prepare_queue_accepts(clip, task_name, fresh=False)]
 
 
 def _candidate_sent_emails(registry_key: str, clip: dict) -> set[str]:
@@ -2509,6 +2555,20 @@ def _candidate_sent_emails(registry_key: str, clip: dict) -> set[str]:
 def _candidate_reserved_emails(config: CampaignConfig, clip: dict) -> set[str]:
     return set().union(*(set(config.recovery_exclusions.get(uid, []))
                          for uid in [clip["clip_uid"], *clip.get("dedup_clip_uids", [])]))
+
+
+def _batch_footage_overlaps(previous: dict, candidate: dict) -> bool:
+    """Match original footage, independently of category and encoded variants."""
+    if str(previous.get("source") or "ego4d") != str(candidate.get("source") or "ego4d"):
+        return False
+    if (previous.get("parent_video_uid") and candidate.get("parent_video_uid")
+            and _clip_window(previous) is not None and _clip_window(candidate) is not None):
+        # Distinct cuts can share an old catalog alias. Canonical source
+        # windows distinguish them and tolerate small shared boundary padding.
+        return _same_action_already_covered([previous], candidate)
+    old_ids = {previous.get("clip_uid"), *previous.get("dedup_clip_uids", [])} - {None, ""}
+    new_ids = {candidate.get("clip_uid"), *candidate.get("dedup_clip_uids", [])} - {None, ""}
+    return bool(old_ids & new_ids)
 
 
 def _run_campaign(
@@ -2597,6 +2657,19 @@ def _run_campaign(
     banned: set[str] = set()
     rejected_imu: set[str] = set()
     account_seconds: dict[str, float] = {}
+    batch_footage: dict[str, list[dict[str, Any]]] = {}
+
+    def _batch_reserved_emails(candidate: dict) -> set[str]:
+        return {email for email, previous in batch_footage.items()
+                if any(_batch_footage_overlaps(clip, candidate) for clip in previous)}
+
+    def _reserve_batch_footage(email: str, candidate: dict) -> dict:
+        reservation = {key: candidate[key] for key in (
+            "clip_uid", "source", "parent_video_uid", "window_s", "dedup_clip_uids")
+            if key in candidate}
+        batch_footage.setdefault(email, []).append(reservation)
+        return reservation
+
     quota_s = max(0.0, float(config.target_hours_per_account or 0) * 3600.0)
     n_tasks = max(1, len(config.tasks))
     per_task_cap_s = (quota_s / n_tasks) * 1.3 if quota_s else 0.0
@@ -2731,7 +2804,8 @@ def _run_campaign(
                 for candidate in all_clips:
                     if candidate["clip_uid"] in rejected_imu:
                         continue
-                    reserved_for = _candidate_reserved_emails(config, candidate)
+                    reserved_for = (_candidate_reserved_emails(config, candidate)
+                                    | _batch_reserved_emails(candidate))
                     unavailable = _candidate_sent_emails(registry_key, candidate) | reserved_for
                     if sent_registry.is_sent_to_all(registry_key, candidate["clip_uid"], emails) or all(email in unavailable for email in emails):
                         used_parents.add(parent_key(candidate))
@@ -2806,7 +2880,8 @@ def _run_campaign(
             # clipe (seleção explícita do wizard ou corrida entre campanhas),
             # pula ANTES do intervalo e de baixar/reencodar.
             sent_to = _candidate_sent_emails(registry_key, clip_info)
-            reserved = _candidate_reserved_emails(config, clip_info)
+            batch_reserved = _batch_reserved_emails(clip_info)
+            reserved = _candidate_reserved_emails(config, clip_info) | batch_reserved
             if all(a.email in sent_to | reserved for a in config.accounts):
                 _log(f"  clipe {clip_info['clip_uid'][:12]} já enviado ou reservado por pendência "
                      f"em todas as contas — pulando (sem baixar/reencodar)")
@@ -2815,7 +2890,8 @@ def _run_campaign(
                 for account in config.accounts:
                     _emit("account_done", clip_uid=clip_info["clip_uid"],
                           task=tsk.scenario, email=account.email, ok=account.email not in reserved,
-                          skipped=True, reason="pending_recovery" if account.email in reserved else "already_sent")
+                          skipped=True, reason=("source_reserved_in_campaign" if account.email in batch_reserved
+                                               else "pending_recovery" if account.email in reserved else "already_sent"))
                 continue
             if content_mode == "cache" and not _clip_is_cached(clip_info, work_dir):
                 _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
@@ -2945,6 +3021,11 @@ def _run_campaign(
                           task_name=display_name, ok=False,
                           error="carve fora da duração")
                     continue
+            # IMU carving can produce a different proven source interval.
+            # Account eligibility follows the footage that will actually go out.
+            batch_reserved = _batch_reserved_emails(clip_info)
+            reserved = _candidate_reserved_emails(config, clip_info) | batch_reserved
+            sent_to = _candidate_sent_emails(registry_key, clip_info)
             _emit("clip_ready", clip_uid=clip_info["clip_uid"],
                   duration_ms=item["duration_ms"], imu_real=item["imu_real"],
                   source_provenance=item.get("source_provenance"))
@@ -3038,6 +3119,12 @@ def _run_campaign(
                               task=tsk.scenario, email=account.email, ok=True,
                               skipped=True, error=skip_res["error"])
                         continue
+                if account.email in batch_reserved:
+                    account_results[account.email] = {"email": account.email, "org_key": account.org_key,
+                        "ok": False, "skipped": True, "reason": "source_reserved_in_campaign"}
+                    _emit("account_done", clip_uid=clip_info["clip_uid"], task=tsk.scenario,
+                          email=account.email, ok=False, skipped=True, reason="source_reserved_in_campaign")
+                    continue
                 if account.email in reserved:
                     _log(f"      -> {account.email} (clipe reservado por envio anterior pendente)")
                     account_results[account.email] = {"email": account.email, "org_key": account.org_key,
@@ -3205,6 +3292,15 @@ def _run_campaign(
                     acc_res = {**acc_res, "ok": False,
                                "error": acc_res.get("error") or
                                "Finalização não confirmada; envio preservado para revisão."}
+                # Known pre-effect failures/skips have not consumed this
+                # footage. A receipt or an uncertain remote result stays
+                # reserved across the remaining tasks in this batch.
+                if (acc_res.get("skipped") or (not acc_res.get("ok")
+                        and "retryable" in acc_res and not acc_res.get("session_id")
+                        and not acc_res.get("uploads"))):
+                    reservation = batch_reservations.pop(account.email, None)
+                    if reservation is not None:
+                        batch_footage[account.email].remove(reservation)
                 results[account.email] = acc_res
                 # Persiste antes de atualizar o índice de deduplicação. Uma falha
                 # no índice não deve apagar do histórico um envio concluído.
@@ -3247,6 +3343,7 @@ def _run_campaign(
                     raise record_error
 
             batch_started_at = time.monotonic() if pending_accounts else None
+            batch_reservations: dict[str, dict] = {}
             # Reserva TODAS as contas no mesmo instante, antes de disputar
             # vagas de upload. O fim anterior de cada conta continua valendo.
             # A fila ordenada permite enviar contas livres mesmo se outra tem
@@ -3325,6 +3422,7 @@ def _run_campaign(
                                 accepting = False
                                 break
                             _ready_at, idx, account, recorded_at = queued.pop(0)
+                            batch_reservations[account.email] = _reserve_batch_footage(account.email, clip_info)
                             future = pool.submit(
                                 _send_account_with_recovery, idx, account, recorded_at)
                             futures[future] = account
@@ -3628,9 +3726,8 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
             relative = path.name
         source = ego4d._selection_source(path)
         stamp.append((relative, source[1], source[2]))
-    # v8 descarta caches de duração cujo carimbo já tinha o hash das narrações,
-    # mas os buckets ainda eram só o índice portátil.
-    stamp.append(("ranked-union", 8, "narration-catalog-selection"))
+    # Duration caches must contain current, resegmented task evidence.
+    stamp.append(("ranked-union", 11, "garment-laundry-selection"))
     return tuple(stamp)
 
 
@@ -3842,7 +3939,8 @@ def _stamp_hides_present_narration(stamp) -> bool:
     return False
 
 
-def _prepare_queue_accepts(clip: dict[str, Any], task_name: str | None) -> bool:
+def _prepare_queue_accepts(clip: dict[str, Any], task_name: str | None, *,
+                           fresh: bool = True) -> bool:
     """Trecho sem prova na biblioteca atual não entra na fila de preparo."""
     source = str(clip.get("source") or "")
     uid = str(clip.get("clip_uid") or "")
@@ -3857,7 +3955,7 @@ def _prepare_queue_accepts(clip: dict[str, Any], task_name: str | None) -> bool:
                 config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json")):
         return True
     try:
-        ego4d.revalidate_selection_evidence(clip, task_name=task_name)
+        ego4d.revalidate_selection_evidence(clip, task_name=task_name, fresh=fresh)
     except ValueError:
         return False
     return True
@@ -4047,7 +4145,7 @@ def _ranked_pools() -> dict[str, tuple[dict[str, Any], ...]]:
 
 @lru_cache(maxsize=8)
 def _duration_ranked_snapshot(stamp, min_dur_s: float, max_dur_s: float):
-    """Filter the prepared index; a duration change must not rebuild Ego4D."""
+    """Recheck indexed source windows once per content-bound duration range."""
     cache_key = hashlib.sha256(
         f"{float(min_dur_s):.6f}|{float(max_dur_s):.6f}".encode("ascii")
     ).hexdigest()[:16]
@@ -4056,14 +4154,55 @@ def _duration_ranked_snapshot(stamp, min_dur_s: float, max_dur_s: float):
     if cached is not None:
         return _rank_evidenced(_merge_rank_seed(
             cached, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
+    full = _ranked_pools_cached()
     result = {
         name: tuple(clip for clip in rows
                     if min_dur_s <= float(clip.get("dur_s") or 0) <= max_dur_s)
-        for name, rows in _ranked_pools_cached().items()
+        for name, rows in full.items()
     }
+    if ego4d.has_timed_narrations():
+        windows = _duration_window_candidates(full)
+        if windows:
+            recuts = ego4d.revalidate_task_windows(
+                windows, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+            result = _union_ranked_clips(
+                result, recuts, min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+            result = _link_rank_history(result, full)
     result = _rank_evidenced(result)
     _save_rank_cache(result, path, narration_scan=_local_narration_catalog())
     return result
+
+
+def _duration_window_candidates(buckets) -> dict[str, list[dict[str, Any]]]:
+    """Union indexed footage before requesting new verified segmentation.
+
+    Adjacent five-minute scene windows can support a longer requested take.
+    Every union is revalidated against current annotations and sensor coverage;
+    a gap in the original source windows remains a gap here.
+    """
+    ranges: dict[tuple[str, str], list[tuple[float, float]]] = {}
+    for name, clips in buckets.items():
+        name = task_matching.canonical_task_name(name)
+        for clip in clips:
+            parent = str(clip.get("parent_video_uid") or "")
+            window = _clip_window(clip)
+            if parent and window is not None:
+                ranges.setdefault((name, parent), []).append(window)
+    candidates: dict[str, list[dict[str, Any]]] = {}
+    for (name, parent), windows in ranges.items():
+        merged: list[tuple[float, float]] = []
+        for start, end in sorted(windows):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        for start, end in merged:
+            for relative_start, relative_end in ego4d.split_parent_windows(end - start):
+                candidates.setdefault(name, []).append({
+                    "parent_video_uid": parent,
+                    "window_s": (start + relative_start, start + relative_end),
+                })
+    return candidates
 
 
 @ego4d.selection_boundary
@@ -4225,6 +4364,15 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
     tasks = validate_task_catalog(tasks)
     mode = normalize_content_mode(content_mode)
     ready_by_uid: dict[str, bool] = {}
+    eligibility: dict[tuple[str, str], bool] = {}
+
+    def queue_accepts(clip: dict[str, Any], name: str) -> bool:
+        # Both duration pools share the request's immutable parser inputs.
+        # Include the whole candidate/evidence and task, never only its UID.
+        key = (task_matching.canonical_task_name(name), ego4d._selection_digest(clip))
+        if key not in eligibility:
+            eligibility[key] = _prepare_queue_accepts(clip, name, fresh=False)
+        return eligibility[key]
 
     def cache_ready(clip: dict[str, Any]) -> bool:
         uid = str(clip.get("clip_uid") or "")
@@ -4262,6 +4410,8 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
         if mode == "cache":
             all_clips = [clip for clip in all_clips if cache_ready(clip)]
             clips = [clip for clip in clips if cache_ready(clip)]
+        all_clips = [clip for clip in all_clips if queue_accepts(clip, name)]
+        clips = [clip for clip in clips if queue_accepts(clip, name)]
         if clips or include_unavailable:
             source_counts: dict[str, int] = {}
             for clip in clips:

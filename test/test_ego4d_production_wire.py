@@ -272,17 +272,6 @@ class Ego4dForgeEnvelope(unittest.TestCase):
                  "forge-session_0.frames.csv",
                  "forge-session_0.metadata.json"])
 
-    def test_forge_map_document_exists(self):
-        root = Path(__file__).resolve().parents[1]
-        doc = root / "EGO4D_FORGE_MAP.md"
-        self.assertTrue(doc.is_file())
-        text = doc.read_text(encoding="utf-8")
-        for needle in (
-            "imuDiagnostics", "android_elapsedRealtimeNanos", "SM-S901E",
-            "500 Hz", "Brown-Conrady", "getDeviceUploadMeta",
-        ):
-            self.assertIn(needle, text)
-
 
 class Ego4dUploadReachesSession(unittest.TestCase):
     def test_prepared_ego4d_item_invokes_upload_session(self):

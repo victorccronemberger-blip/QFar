@@ -55,7 +55,9 @@ class LocalApiSessionBoundaryTests(unittest.TestCase):
         operations = _product_operations()
         registered = {(rule.rule, method) for rule in application.url_map.iter_rules()
                       for method in rule.methods - {"HEAD", "OPTIONS"}}
-        self.assertEqual(len(operations), 78)
+        self.assertEqual(len(operations), 80)
+        self.assertIn(("/api/library/ego4d/prepared", "GET"), operations)
+        self.assertIn(("/api/storage/library/items", "GET"), operations)
         self.assertIn(("/api/accounts/proxies", "GET"), operations)
         self.assertIn(("/api/accounts/proxies/import", "POST"), operations)
         self.assertIn(("/api/accounts/bulk-register/stop", "POST"), operations)

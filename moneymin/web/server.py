@@ -84,7 +84,7 @@ from flask import Flask, g, jsonify, request
 from .. import banned_store
 from .. import (
     campaign, config, crowtado, ego4d, ego4d_library, ego_accelerator, fx, holo_accelerator, holoassist,
-    hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store,
+    hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store, prepared_library,
 )
 from ..atomic_io import JsonStateError, decode_json_state, load_json, load_json_state, save_json
 from ..jsonl_history import decode_jsonl_history
@@ -2395,6 +2395,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
     accelerator_catalog = CatalogLoader()
     recovery_catalog = CatalogLoader(ttl_s=2)
     original_library_index = CatalogLoader(max_pending=1, timeout_s=180)
+    prepared_library_inventory = CatalogLoader(ttl_s=300, max_pending=1, timeout_s=7200,
+        timeout_message="A conferência dos arquivos locais demorou demais. Tente verificar o acervo novamente.")
+    local_media_inventory = CatalogLoader(ttl_s=3, max_pending=1, timeout_s=300)
 
     @app.before_request
     def authenticate_local_client():
@@ -3593,9 +3596,91 @@ def create_app(*, for_testing: bool = False) -> Flask:
     def get_storage_library():
         return jsonify(_storage_snapshot(include_path=True))
 
+    @app.get("/api/storage/library/items")
+    def browse_local_media_library():
+        root = config.MEDIA_DATA_DIR
+        try:
+            query = request.args.get("q", "")
+            provider = request.args.get("provider", "all")
+            kind = request.args.get("kind", "all")
+            limit = int(request.args.get("limit", 50))
+            offset = int(request.args.get("offset", 0))
+            refresh = request.args.get("refresh", "")
+            if (len(query) > 200 or provider not in {"all", "ego4d", "holoassist", "nymeria", "local"}
+                    or kind not in {"all", "video", "sensor", "sidecar", "catalog", "derivative"}
+                    or not 1 <= limit <= 100 or not 0 <= offset <= 100000 or len(refresh) > 80):
+                raise ValueError
+        except (ValueError, TypeError, OverflowError):
+            return jsonify({"error": "Filtros inválidos para os arquivos da Biblioteca."}), 400
+
+        def read_local_files(progress):
+            progress("Lendo os arquivos da Biblioteca local…")
+            try:
+                result = prepared_library.list_local_media(
+                    root, query, provider=provider, kind=kind, limit=limit, offset=offset)
+                disk_path = Path(root)
+                while not disk_path.exists() and disk_path != disk_path.parent:
+                    disk_path = disk_path.parent
+                result["disk_free_bytes"] = shutil.disk_usage(disk_path).free
+                return result, 200
+            except (OSError, ValueError, RuntimeError):
+                return {"error": "Não foi possível ler os arquivos da Biblioteca. Tente atualizar a lista."}, 503
+
+        if request.args.get("async") != "1":
+            result, status = read_local_files(lambda message: None)
+        else:
+            # File enumeration belongs to the worker, including with a cold
+            # library. A nonce is idempotent while the request is being polled.
+            result, status = local_media_inventory.get(
+                (str(root), query, provider, kind, limit, offset, refresh),
+                read_local_files, scope="local-media-library")
+        return jsonify(result), status
+
     def original_library_paths():
         root = config.MEDIA_DATA_DIR / "ego4d"
         return root, root / "library.sqlite3"
+
+    @app.get("/api/library/ego4d/prepared")
+    def browse_prepared_library():
+        root, _ = original_library_paths()
+        try:
+            query = request.args.get("q", "")
+            state = request.args.get("state", "all")
+            minimum = float(request.args.get("min_s", 0))
+            raw_maximum = request.args.get("max_s")
+            maximum = float(raw_maximum) if raw_maximum else None
+            limit = int(request.args.get("limit", 50))
+            offset = int(request.args.get("offset", 0))
+            refresh = request.args.get("refresh", "")
+            if (len(query) > 200 or state not in {"all", "ready", "partial", "missing", "stale"}
+                    or not math.isfinite(minimum) or minimum < 0
+                    or maximum is not None and (not math.isfinite(maximum) or maximum < minimum)
+                    or not 1 <= limit <= 100 or not 0 <= offset <= 100000 or len(refresh) > 80):
+                raise ValueError
+        except (ValueError, TypeError, OverflowError):
+            return jsonify({"error": "Filtros inválidos para os recortes locais."}), 400
+
+        def read_inventory(progress):
+            progress("Conferindo os recortes e arquivos locais…")
+            try:
+                result = prepared_library.list_prepared_clips(
+                    root, query, state=state, minimum_s=minimum, maximum_s=maximum,
+                    limit=limit, offset=offset, force_refresh=bool(refresh))
+                return result, 200
+            except (OSError, ValueError, RuntimeError):
+                return {"error": "Não foi possível conferir os recortes locais. Atualize a Biblioteca."}, 503
+
+        if request.args.get("async") != "1":
+            result, status = read_inventory(lambda message: None)
+        else:
+            try:
+                signature = prepared_library.inventory_signature(root)
+            except (OSError, ValueError, RuntimeError):
+                return jsonify({"error": "Não foi possível ler a Biblioteca local."}), 503
+            result, status = prepared_library_inventory.get(
+                (str(root), signature, query, state, minimum, maximum, limit, offset, refresh),
+                read_inventory, scope="prepared-library")
+        return jsonify(result), status
 
     @app.get("/api/library/ego4d")
     def get_original_library_summary():
@@ -3749,6 +3834,17 @@ def create_app(*, for_testing: bool = False) -> Flask:
             raise ValueError
         return budget_gb
 
+    def _accelerator_durations(values) -> tuple[float, float]:
+        raw_minimum = values.get("min_dur_s", 60)
+        raw_maximum = values.get("max_dur_s", 1800)
+        if isinstance(raw_minimum, bool) or isinstance(raw_maximum, bool):
+            raise ValueError
+        minimum, maximum = float(raw_minimum), float(raw_maximum)
+        if (not math.isfinite(minimum) or not math.isfinite(maximum)
+                or not 60 <= minimum <= maximum <= MAX_DUR_S):
+            raise ValueError
+        return minimum, maximum
+
     @app.get("/api/holo-cache")
     def holo_cache_status():
         provider = _accelerator_provider(request.args.get("provider"))
@@ -3770,9 +3866,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
             min_free_gb = float(request.args.get("min_free_gb", 50))
             if not math.isfinite(min_free_gb) or not 5 <= min_free_gb <= 1000:
                 raise ValueError
+            min_dur_s, max_dur_s = _accelerator_durations(request.args)
         except (TypeError, ValueError):
             return jsonify({
-                "error": "use cache em GB inteiros (0 para desativar), limite de 1 a 1000 e reserva de 5 a 1000 GiB",
+                "error": "use cache em GB inteiros (0 para desativar), limite de 1 a 1000, reserva de 5 a 1000 GiB e duração entre 60 e 1800 s",
             }), 400
         if request.args.get("live") == "1":
             # O plano completo percorre o catálogo e verifica cada arquivo.
@@ -3787,10 +3884,12 @@ def create_app(*, for_testing: bool = False) -> Flask:
             progress("Conferindo conteúdo e arquivos preparados…")
             try:
                 if provider == "ego4d":
-                    cache = module.cache_status(task, limit=limit, budget_gb=budget_gb,
+                    cache = module.cache_status(task, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                                                limit=limit, budget_gb=budget_gb,
                                                 min_free_gb=min_free_gb)
                 else:
-                    cache = module.cache_status(task, limit=limit)
+                    cache = module.cache_status(task, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                                                limit=limit)
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 cache = {
                     "provider": provider,
@@ -3819,7 +3918,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         runner = HOLO_CACHE_RUNNER.snapshot()
         if request.args.get("async") == "1":
             result, status = accelerator_catalog.get(
-                (provider, task, limit, budget_gb, min_free_gb,
+                (provider, task, min_dur_s, max_dur_s, limit, budget_gb, min_free_gb,
                  runner.get("run_id", 0), runner.get("state")), read_cache,
                 scope="accelerator")
         else:
@@ -3855,9 +3954,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 raise ValueError
             budget_gb = _accelerator_budget_gb(
                 provider, body.get("budget_gb"), default=ego_accelerator.DEFAULT_BUDGET_GB)
+            min_dur_s, max_dur_s = _accelerator_durations(body)
         except (TypeError, ValueError):
             return jsonify({
-                "error": "use limite entre 1 e 1000, reserva entre 5 e 1000 GiB e cache em GB inteiros (0 para desativar)",
+                "error": "use limite entre 1 e 1000, reserva entre 5 e 1000 GiB, cache em GB inteiros (0 para desativar) e duração entre 60 e 1800 s",
             }), 400
 
         if provider == "ego4d" and budget_gb == 0:
@@ -3891,7 +3991,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     if budget_gb == 0:
                         return jsonify({"error": "não há espaço disponível para cache acima da reserva de disco"}), 400
                 HOLO_CACHE_RUNNER.start(
-                    provider=provider, task=task, limit=limit,
+                    provider=provider, task=task, min_dur_s=min_dur_s, max_dur_s=max_dur_s, limit=limit,
                     budget_gb=budget_gb, min_free_gb=min_free_gb)
             except (OSError, ValueError) as exc:
                 return jsonify({"error": str(exc)}), 400

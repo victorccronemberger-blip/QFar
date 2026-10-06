@@ -152,6 +152,41 @@ def continuous_intervals_for_imu(
         return ()
 
 
+def _evidenced_subwindows(clip: dict, candidate: dict, min_s: float, max_s: float) -> list[dict]:
+    """Restrict a sensor cut to current task proof before replacing its carrier."""
+    if clip.get("selection_evidence") is None:
+        return [candidate]
+    try:
+        previous = ego4d.revalidate_selection_evidence(clip, fresh=False)
+        task = previous["task"]
+        name = task["name"]
+        start, end = map(float, candidate["window_s"])
+        checked = ego4d.revalidate_task_windows(
+            {name: [candidate]}, min_dur_s=min_s, max_dur_s=max_s).get(name, ())
+    except (OSError, ValueError, TypeError, KeyError):
+        return []
+    result = []
+    for record in checked:
+        try:
+            proof_start, proof_end = map(float, record["window_s"])
+            if (proof_start < start or proof_end > end
+                    or record.get("parent_video_uid") != candidate.get("parent_video_uid")
+                    or not min_s <= proof_end - proof_start <= max_s):
+                continue
+            proved = {**candidate, **record}
+            proved.pop("selection_evidence", None)
+            proved = ego4d.attach_selection_evidence(
+                proved, name, task_id=task.get("id"), registry_key=task.get("registry_key"))
+            proved["selection_evidence"] = ego4d.revalidate_selection_evidence(
+                proved, task_name=name, task_id=task.get("id"), registry_key=task.get("registry_key"),
+                fresh=False)
+            result.append(proved)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    return result
+
+
+@ego4d.selection_boundary
 def carve_continuous_window(
     clip: dict, work_dir: Path, *, min_s: float, max_s: float,
 ) -> dict | None:
@@ -182,41 +217,33 @@ def carve_continuous_window(
     if not candidates:
         return None
     candidates.sort(reverse=True)
-    _, start, end = candidates[0]
-    uid = f"{parent}_{start:.3f}_{end:.3f}"
     aliases = {clip.get("clip_uid"), *(clip.get("dedup_clip_uids") or [])}
     aliases.discard(None)
-    # Prefer catalog resolution when the local index is already warm; never
-    # block carve on S3/network — synthesize a parent cut instead.
-    row = video = None
-    try:
-        row, video = ego4d.find_clip(uid)
-    except Exception:  # noqa: BLE001 — offline / missing AWS profile
+    proved = []
+    for _, start, end in candidates:
+        uid = f"{parent}_{start:.3f}_{end:.3f}"
+        # Prefer catalog resolution when the local index is already warm.
         row = video = None
-    if row is not None and video is not None:
-        return {
-            **clip, **ego4d._clip_record(row, video), "source": "ego4d",
-            "exported_clip_uid": uid, "parent_start_sec": str(start),
-            "parent_end_sec": str(end),
-            "media_uid": row.get("media_uid", parent),
-            "media_time_offset_s": row.get("media_time_offset_s", 0.0),
+        try:
+            row, video = ego4d.find_clip(uid)
+        except Exception:  # noqa: BLE001 — offline / missing AWS profile
+            row = video = None
+        candidate = {
+            **clip, "clip_uid": uid, "exported_clip_uid": uid,
+            "window_s": (start, end), "dur_s": end - start, "needs_cut": True,
+            "parent_start_sec": str(start), "parent_end_sec": str(end),
             "imu_carved_from": clip.get("clip_uid"),
             "dedup_clip_uids": sorted(str(a) for a in aliases),
         }
-    return {
-        **clip,
-        "clip_uid": uid,
-        "exported_clip_uid": uid,
-        "window_s": (start, end),
-        "dur_s": end - start,
-        "needs_cut": True,
-        "parent_start_sec": str(start),
-        "parent_end_sec": str(end),
-        "imu_carved_from": clip.get("clip_uid"),
-        "dedup_clip_uids": sorted(str(a) for a in aliases),
-    }
+        if row is not None and video is not None:
+            candidate.update(ego4d._clip_record(row, video))
+        proved.extend(_evidenced_subwindows(clip, candidate, min_s, max_s))
+        if clip.get("selection_evidence") is None:
+            break
+    return max(proved, key=lambda row: row["window_s"][1] - row["window_s"][0]) if proved else None
 
 
+@ego4d.selection_boundary
 def refine_candidates(candidates: list[dict], work_dir: Path, min_s: float, max_s: float) -> list[dict]:
     result = []
     seen = {}
@@ -263,6 +290,12 @@ def refine_candidates(candidates: list[dict], work_dir: Path, min_s: float, max_
                        "media_uid": row.get("media_uid", parent),
                        "media_time_offset_s": row.get("media_time_offset_s", 0.0),
                        "imu_refined_from": clip["clip_uid"], "dedup_clip_uids": sorted(aliases)}
-            result.append(refined)
-            seen[uid] = refined
+            for proved in _evidenced_subwindows(clip, refined, min_s, max_s):
+                proved_uid = proved["clip_uid"]
+                if proved_uid in seen:
+                    seen[proved_uid]["dedup_clip_uids"] = sorted(
+                        set(seen[proved_uid]["dedup_clip_uids"]) | aliases)
+                    continue
+                result.append(proved)
+                seen[proved_uid] = proved
     return result

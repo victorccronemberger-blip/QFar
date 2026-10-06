@@ -16,6 +16,7 @@ from typing import Any
 
 from . import config, ego4d, task_matching
 from .atomic_io import JsonStateError, load_json, load_json_state, save_json
+from .media_lifecycle import cleanup_operation, media_state_lease
 
 DEFAULT_TASK = "Furniture Assembly"
 MAX_BUDGET_GB = 2_147_483_647
@@ -135,15 +136,21 @@ def used_bytes(work_dir: Path | None = None) -> int:
     return total
 
 
+@cleanup_operation
 def reclaim_stale_native(work_dir: Path | None = None) -> dict[str, int]:
     """Remove somente nativos Ego4D cujo marcador não vale mais para a fonte."""
     from .campaign import (_ego_clip_inputs, _ego_prepare_plan,
-                           _native_cache_guard, _native_cache_marker_matches)
+                           _native_cache_guard, _native_cache_marker_matches,
+                           _delete_media_files)
+    from .recovery import media_cleanup_protection
 
     work = Path(work_dir or data_dir())
     result = {"files": 0, "bytes": 0}
     if not work.is_dir() or not catalog_installed():
         return result
+    # Read authoritative journals while publication and cleanup are excluded.
+    # An unreadable store must stop reclamation before any derivative is erased.
+    protection = media_cleanup_protection()
     for native in work.glob("*_native.mp4"):
         if native.name.startswith("holoassist_") or not native.is_file():
             continue
@@ -164,13 +171,16 @@ def reclaim_stale_native(work_dir: Path | None = None) -> dict[str, int]:
                 if _native_cache_marker_matches(
                         saved, source, native, plan["norm_start"], plan["dur_s"]):
                     continue
-                size = native.stat().st_size
-                native.unlink()
-                marker.unlink(missing_ok=True)
+                removed = _delete_media_files(
+                    [native], allowed_roots=(work,), protection=protection)
+                if removed["files"] != 1:
+                    continue
+                result["files"] += 1
+                result["bytes"] += removed["bytes"]
+                _delete_media_files(
+                    [marker], allowed_roots=(work,), protection=protection)
         except (OSError, RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             continue
-        result["files"] += 1
-        result["bytes"] += size
     return result
 
 
@@ -223,6 +233,7 @@ def scenario_buckets() -> dict[str, list[dict[str, Any]]]:
     return _scenario_cache
 
 
+@ego4d.selection_boundary
 def ready_scenario_clips(
     task: str,
     *,
@@ -232,11 +243,11 @@ def ready_scenario_clips(
     allow_disabled: bool = False,
     require_cached: bool = True,
 ) -> list[dict[str, Any]]:
-    """Clipes cujo cenário cabe na tarefa e que passaram na higiene.
+    """Clipes com cenário compatível e evidência atual aceita para a tarefa.
 
-    Com `require_cached`, só devolve o que já está normalizado. Sem isso, o
-    catálogo inteiro desse cenário entra na campanha e o download fica para
-    o preparo. Sem orçamento e sem `allow_disabled`, o modo cache continua vazio.
+    Com `require_cached`, só devolve o que já está normalizado. Sem isso,
+    a prova da tarefa continua obrigatória e o download fica para o preparo.
+    Sem orçamento e sem `allow_disabled`, o modo cache continua vazio.
     """
     if require_cached and not allow_disabled and configured_budget_gb() < 1:
         return []
@@ -254,7 +265,14 @@ def ready_scenario_clips(
             from .campaign import ego_clip_cache_state
             if ego_clip_cache_state(clip, work) != "ready":
                 continue
-        selected.append(clip)
+        try:
+            candidate = dict(clip)
+            if not isinstance(candidate.get("selection_evidence"), dict):
+                candidate = ego4d.attach_selection_evidence(candidate, canonical)
+            evidence = ego4d.revalidate_selection_evidence(candidate, task_name=canonical, fresh=False)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        selected.append({**candidate, "selection_evidence": evidence})
     return selected
 
 
@@ -408,6 +426,27 @@ def request_stop() -> Path:
     return path
 
 
+def _protected_preparation_path(
+    row: dict[str, Any], work: Path, protection: dict[str, Any],
+) -> Path | None:
+    """Any source, sensor or derivative that this preparation could replace."""
+    from .campaign import (_ego_prepare_plan, _expected_prefetch_paths,
+                           _native_cache_fingerprint)
+
+    plan = _ego_prepare_plan(row)
+    candidates = _expected_prefetch_paths(row, work)
+    candidates.extend(work / plan[key] for key in ("source_name", "native_name", "imu_name"))
+    keys = {os.path.normcase(str(Path(path).resolve())) for path in protection["paths"]}
+    hashes = protection["sha256"]
+    for path in candidates:
+        resolved = path.resolve()
+        if os.path.normcase(str(resolved)) in keys:
+            return path
+        if hashes and path.is_file() and _native_cache_fingerprint(path, allow_empty=True)[1] in hashes:
+            return path
+    return None
+
+
 def warm_cache(
     task: str = DEFAULT_TASK,
     *,
@@ -422,6 +461,7 @@ def warm_cache(
 ) -> dict[str, Any]:
     """Baixa e normaliza clipes elegíveis; cache pronto é pulado."""
     from .campaign import ego_clip_cache_state, prepare_clip, _ego_clip_inputs
+    from .recovery import media_cleanup_protection
 
     work = Path(work_dir or data_dir())
     work.mkdir(parents=True, exist_ok=True)
@@ -435,6 +475,7 @@ def warm_cache(
             "total": 0,
             "ready": 0,
             "skipped": 0,
+            "protected": 0,
             "failed": 0,
             "errors": [],
         }
@@ -443,7 +484,8 @@ def warm_cache(
         budget_gb = storage["budget_gb"]
         if budget_gb == 0:
             return {"status": "disk_limit", "provider": "ego4d", **storage,
-                    "total": 0, "ready": 0, "failed": 0, "skipped": 0, "errors": []}
+                    "total": 0, "ready": 0, "failed": 0, "skipped": 0,
+                    "protected": 0, "errors": []}
     budget = budget_bytes(budget_gb) if budget_gb is not None else None
     if budget_gb is not None:
         remember_budget(budget_gb)
@@ -469,6 +511,7 @@ def warm_cache(
         "total": len(clips),
         "ready": 0,
         "skipped": 0,
+        "protected": 0,
         "failed": 0,
         "current": None,
         "started_at": started,
@@ -544,7 +587,20 @@ def warm_cache(
                         phase_current=phase_current, phase_total=phase_total,
                         **phase_data)
 
-                prepare_clip(row, video, work, progress=preparation_progress)
+                # A journal can be published after reclamation or catalog work.
+                # Re-read protection under the same lease as the entire write;
+                # incomplete/read-invalid recovery state never permits prepare.
+                with media_state_lease(wait=True):
+                    protection = media_cleanup_protection()
+                    protected = _protected_preparation_path(row, work, protection)
+                    if protected is not None:
+                        state["protected"] += 1
+                        state["skipped"] += 1
+                        emit("protected", index=index, total=len(clips),
+                             video_name=name, reason="pending_recovery")
+                        persist()
+                        continue
+                    prepare_clip(row, video, work, progress=preparation_progress)
             except Exception as exc:  # noqa: BLE001 — registra e avança
                 state["failed"] += 1
                 state["errors"] = [

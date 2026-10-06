@@ -211,7 +211,7 @@ NATIVE_PLATFORM_OS = os.environ.get("MINUTE_NATIVE_PLATFORM_OS", "android")
 # Formato COMPLETO do device dentro do sidecar (Build.MODEL + Android release).
 NATIVE_SIDECAR_MODEL = os.environ.get("MINUTE_NATIVE_SIDECAR_MODEL", "SM-S901E")
 NATIVE_SIDECAR_SYSTEM_NAME = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_NAME", "Android")
-NATIVE_SIDECAR_SYSTEM_VERSION = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_VERSION", "14")
+NATIVE_SIDECAR_SYSTEM_VERSION = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_VERSION", "16")
 
 # IMU pipeline ego: CSV `t,ax,ay,az,wx,wy,wz` (K0$b.smali / Y.smali header).
 # Taxa 500 Hz confirmada no contrato 1.28 e mantida no 1.29 (smali l2.1).

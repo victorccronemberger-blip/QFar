@@ -1219,8 +1219,7 @@ def list_task_spans(
             continue
         activity_rules = [
             (name, candidate) for name, candidate in task_matching.TASK_RULES.items()
-            if (task_matching.score_narrated_scenarios(name, candidate, scenarios) is not None
-                and task_matching.span_evidence_possible(candidate, search_text))
+            if task_matching.span_evidence_possible(candidate, search_text)
         ]
         prepared = task_matching.prepare_span_events(events)
         event_labels = task_matching.label_span_events(prepared, activity_rules)
@@ -1440,7 +1439,12 @@ def rank_all_task_spans(
         eligible_rules = list(dict(possible_rules + exact_long_rules).items())
         if not eligible_rules:
             continue
-        activity_rules = possible_rules
+        # A parent scene controls candidate eligibility, not the classification
+        # of contradictory actions that must terminate a candidate window.
+        activity_rules = [
+            (name, candidate) for name, candidate in named_rules
+            if task_matching.span_evidence_possible(candidate, search_text)
+        ]
         prepared = task_matching.prepare_span_events(events)
         event_labels = task_matching.label_span_events(prepared, activity_rules)
         possible_names = {name for name, _rule in possible_rules}
@@ -1525,6 +1529,7 @@ def rank_all_task_spans(
 @_selection_rank_boundary
 def revalidate_task_windows(
     candidates: dict[str, list[dict[str, Any]] | tuple[dict[str, Any], ...]],
+    *, min_dur_s: float = WINDOW_MIN_S, max_dur_s: float = WINDOW_TARGET_S,
 ) -> dict[str, list[dict[str, Any]]]:
     """Recover duration variants using today's evidence, never old approvals.
 
@@ -1533,6 +1538,12 @@ def revalidate_task_windows(
     not lost just because the segmentation changed.
     """
     from . import task_matching
+    if (not math.isfinite(min_dur_s) or not math.isfinite(max_dur_s)
+            or min_dur_s < WINDOW_MIN_S or max_dur_s > WINDOW_TARGET_S
+            or max_dur_s < min_dur_s):
+        raise ValueError("Intervalo de duração inválido")
+    if not any(candidates.values()):
+        return {}
     index = load_timed_narrations()
     videos = _cat().videos
     by_parent: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
@@ -1550,8 +1561,7 @@ def revalidate_task_windows(
         scenarios = scenario_values(video)
         search = task_matching.span_search_text(events)
         rules = [(name, rule) for name, rule in task_matching.TASK_RULES.items()
-                 if (task_matching.score_narrated_scenarios(name, rule, scenarios) is not None
-                     and task_matching.span_evidence_possible(rule, search))]
+                 if task_matching.span_evidence_possible(rule, search)]
         prepared = task_matching.prepare_span_events(events)
         labels = task_matching.label_span_events(prepared, rules)
         times = tuple(row[0] for row in prepared)
@@ -1574,17 +1584,20 @@ def revalidate_task_windows(
             local_labels = labels[first:last]
             rivals = task_matching.competing_span_names(name, rules)
             spans = []
-            base_min = max(60.0, rule.min_span_s or 0)
+            base_min = max(min_dur_s, rule.min_span_s or 0)
+            maximum = min(max_dur_s, end - start)
+            if maximum < base_min:
+                continue
             minimums = [base_min] + [minimum for minimum in (
                 task_matching.LONG_ACTIVITY_MIN_S, task_matching.LONG_ACTIVITY_CONTEXT_MIN_S)
-                if base_min < minimum <= end - start]
+                if base_min < minimum <= maximum]
             for minimum in minimums:
                 spans.extend(task_matching.extract_spans(
-                    rule, (), min_s=minimum, max_s=end - start, pad_s=0,
+                    rule, (), min_s=minimum, max_s=maximum, pad_s=0,
                     video_duration_s=end, prepared_events=local, activity_mode=True,
                     task_name=name, event_task_names=local_labels,
                     competing_task_names=rivals, allowed_intervals=[(start, end)]))
-            if (end - start >= task_matching.SCENARIO_ACTIVITY_MIN_S
+            if (maximum >= task_matching.SCENARIO_ACTIVITY_MIN_S
                     and task_matching.scenario_is_sufficient(rule, scenarios)):
                 spans.extend(task_matching.scenario_activity_spans(
                     [(*row[:3], name in tags,
@@ -1593,7 +1606,7 @@ def revalidate_task_windows(
                       or (name not in tags and bool(tags & rivals)))
                      for row, tags in zip(local, local_labels)],
                     min_s=max(base_min, task_matching.SCENARIO_ACTIVITY_MIN_S),
-                    max_s=end - start, video_duration_s=end,
+                    max_s=maximum, video_duration_s=end,
                     allowed_intervals=[(start, end)]))
             for span in spans:
                 record = _span_record(video, span)
@@ -1686,7 +1699,8 @@ def attach_selection_evidence(clip: dict[str, Any], task_name: str, *,
 
 
 def revalidate_selection_evidence(clip: dict[str, Any], *, task_name: str | None = None,
-                                  task_id: str | None = None, registry_key: str | None = None) -> dict[str, Any]:
+                                  task_id: str | None = None, registry_key: str | None = None,
+                                  fresh: bool = True) -> dict[str, Any]:
     """Fresh before-effects gate: verify identity and actual current task evidence."""
     from . import task_matching
     error = "Ego4D selection changed or lacks current task evidence"
@@ -1708,7 +1722,9 @@ def revalidate_selection_evidence(clip: dict[str, Any], *, task_name: str | None
         candidate = _selection_candidate(clip)
         if candidate != saved["candidate"] or candidate["window_s"] is None:
             raise ValueError(error)
-        with selection_operation(fresh=True):
+        # Read-only catalog requests can share their immutable input snapshot;
+        # preparation and upload retain a fresh before-effects read by default.
+        with selection_operation(fresh=fresh):
             current = attach_selection_evidence(clip, name)["selection_evidence"]
             if (saved.get("algorithm_version") != current["algorithm_version"]
                     or saved["bindings"] != current["bindings"]
@@ -2053,7 +2069,7 @@ def _valid_imu_cache(path: Path) -> bool:
 
 
 def _clip_s3_candidates(clip: dict[str, Any]) -> list[tuple[str, str]]:
-    """Primary s3 path plus known Ego4D mirrors for the same clip UID."""
+    """Primary source plus mirrors of the actual exported MP4 identity."""
     primary = str(clip.get("s3_path") or "").replace("s3://", "").strip()
     out: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -2067,7 +2083,12 @@ def _clip_s3_candidates(clip: dict[str, Any]) -> list[tuple[str, str]]:
     if primary:
         bucket, _, key = primary.partition("/")
         _add(bucket, key)
-    uid = str(clip.get("exported_clip_uid") or clip.get("clip_uid") or "").strip()
+    media_uid = str(clip.get("media_uid") or "").strip()
+    parent_uid = str(clip.get("parent_video_uid") or "").strip()
+    if media_uid and media_uid == parent_uid:
+        # Full parent videos do not live in the exported-clip mirror folders.
+        return out
+    uid = media_uid or str(clip.get("exported_clip_uid") or clip.get("clip_uid") or "").strip()
     if uid:
         for bucket, prefix in (
             ("ego4d-speac", "public/v2/clips"),
@@ -2150,6 +2171,7 @@ def build_imu_csv(
     seed: str | None = None,
     validate_only: bool = False,
     stats: dict[str, Any] | None = None,
+    stats_windows_ms: list[tuple[int, int]] | None = None,
 ) -> str:
     """Converte e valida a IMU oficial antes de gerar o sidecar ANDROID.
 
@@ -2163,6 +2185,10 @@ def build_imu_csv(
     Se ``stats`` for um dict, preenche contadores no formato do
     ``imuDiagnostics`` do Minute 1.29 (sampleCount, interpolatedCount, …)
     para o metadata forjado refletir o resample — não zeros inventados.
+    ``stats_windows_ms`` mede esses mesmos eventos em janelas relativas
+    half-open [start_ms, end_ms), sem mudar o sinal ou reamostrar cada chunk.
+    max/p95 de alinhamento medem o deslocamento observado da linha canônica
+    ao bucket local; não são prova de relógios físicos do aparelho original.
     """
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz deve ser positivo")
@@ -2183,6 +2209,32 @@ def build_imu_csv(
     step_ns = int(round(1_000_000_000 / sample_rate_hz))
     n = max(1, int(duration_ms / 1000 * sample_rate_hz) + 1)
     sensor_end_ms = start_ms + duration_ms
+    measured_windows: list[dict[str, Any]] = []
+    window_starts_ns: list[int] = []
+    if stats_windows_ms is not None:
+        if stats is None or not isinstance(stats_windows_ms, list):
+            raise ValueError("stats_windows_ms exige stats e uma lista de janelas")
+        previous_end = 0
+        for window in stats_windows_ms:
+            if (not isinstance(window, (list, tuple)) or len(window) != 2
+                    or any(type(value) is not int for value in window)
+                    or not 0 <= window[0] < window[1] <= duration_ms
+                    or window[0] < previous_end):
+                raise ValueError("janela de diagnóstico IMU inválida")
+            previous_end = window[1]
+            window_starts_ns.append(window[0] * 1_000_000)
+            measured_windows.append({"start_ms": window[0], "end_ms": window[1],
+                                     "sample_count": 0, "interpolated_count": 0,
+                                     "fallback_count": 0, "max_span_ns": 0,
+                                     "alignment_deltas": array("Q")})
+    alignment_deltas = array("Q")
+
+    def _window_at(timestamp_ns: int) -> dict[str, Any] | None:
+        from bisect import bisect_right
+        index = bisect_right(window_starts_ns, timestamp_ns) - 1
+        if index >= 0 and timestamp_ns < measured_windows[index]["end_ms"] * 1_000_000:
+            return measured_windows[index]
+        return None
 
     # Keep the compatibility parameter, but never alter measured signals by
     # account identity. Resampling uses the source's canonical timestamps.
@@ -2234,6 +2286,12 @@ def build_imu_csv(
                 for col, value in enumerate(values, start=offset):
                     sums[col][idx] += value
                 counts[component][idx] += 1
+                if stats is not None:
+                    delta_ns = int(round(abs(cms - start_ms - idx * step_ms) * 1_000_000))
+                    alignment_deltas.append(delta_ns)
+                    measured_window = _window_at(idx * step_ns)
+                    if measured_window is not None:
+                        measured_window["alignment_deltas"].append(delta_ns)
 
     def _continuity(component_counts: array) -> tuple[int, int, int, int]:
         first: int | None = None
@@ -2319,21 +2377,28 @@ def build_imu_csv(
 
     interpolated_count = 0
     nearest_fallback_count = 0
-    max_interp_span_samples = 0
-    run = 0
+    max_interp_span_ns = 0
     for idx in range(n):
         gyro_missing = not counts[0][idx]
         accel_missing = not counts[1][idx]
         if gyro_missing or accel_missing:
             interpolated_count += 1
-            run += 1
-            max_interp_span_samples = max(max_interp_span_samples, run)
-        else:
-            run = 0
+        row_fallbacks = 0
+        row_span_ns = 0
         # Conta hold de borda antes de atualizar left/right em _component_values.
         for component, missing in ((0, gyro_missing), (1, accel_missing)):
             if missing and (left[component] is None or right[component] is None):
                 nearest_fallback_count += 1
+                row_fallbacks += 1
+            elif missing:
+                row_span_ns = max(row_span_ns, (right[component] - left[component]) * step_ns)
+        max_interp_span_ns = max(max_interp_span_ns, row_span_ns)
+        measured_window = _window_at(idx * step_ns)
+        if measured_window is not None:
+            measured_window["sample_count"] += 1
+            measured_window["interpolated_count"] += int(gyro_missing or accel_missing)
+            measured_window["fallback_count"] += row_fallbacks
+            measured_window["max_span_ns"] = max(measured_window["max_span_ns"], row_span_ns)
         gyro = _component_values(0, idx)
         accel = _component_values(1, idx)
         # Android: grava o sensor COMO LIDO (sem negar o eixo z — convenção
@@ -2344,24 +2409,26 @@ def build_imu_csv(
             f"{gyro[0]:.6f}", f"{gyro[1]:.6f}", f"{gyro[2]:.6f}",
         ])
     if stats is not None:
-        step_ns_i = int(round(step_ms * 1_000_000))
-        span_ns = max_interp_span_samples * step_ns_i
-        # APK config ceiling (0x17d7840); measured span never exceeds the gate.
-        span_ns = min(span_ns, int(IMU_MAX_INTERPOLATION_GAP_MS * 1_000_000))
-        half_step = str(max(0, step_ns_i // 2))
+        def _diagnostics(sample_count, interpolated, fallbacks, span_ns, deltas):
+            ordered = sorted(deltas)
+            p95 = ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)] if ordered else 0
+            return {
+                "droppedRowCount": 0, "interpolatedCount": int(interpolated),
+                "maxAlignmentDeltaNs": str(max(ordered) if ordered else 0),
+                # Native configuration stays distinct from the observed source span.
+                "maxInterpolationSpanNs": "25000000",
+                "measuredMaxInterpolationSpanNs": str(span_ns),
+                "nearestFallbackCount": int(fallbacks),
+                "nearestFallbackToleranceNs": "1000000", "p95AlignmentDeltaNs": str(p95),
+                "sampleCount": int(sample_count), "strategy": "gyro_anchored_v1",
+            }
         stats.clear()
-        stats.update({
-            "droppedRowCount": 0,
-            "interpolatedCount": int(interpolated_count),
-            "maxAlignmentDeltaNs": half_step,
-            # Wire field is always APK ceiling; measured span is provenance-only.
-            "maxInterpolationSpanNs": "25000000",
-            "measuredMaxInterpolationSpanNs": str(
-                span_ns if span_ns > 0 else step_ns_i),
-            "nearestFallbackCount": int(nearest_fallback_count),
-            "nearestFallbackToleranceNs": "1000000",
-            "p95AlignmentDeltaNs": half_step,
-            "sampleCount": int(n),
-            "strategy": "gyro_anchored_v1",
-        })
+        stats.update(_diagnostics(n, interpolated_count, nearest_fallback_count,
+                                  max_interp_span_ns, alignment_deltas))
+        if stats_windows_ms is not None:
+            stats["windows"] = [
+                {"start_ms": window["start_ms"], "end_ms": window["end_ms"],
+                 **_diagnostics(window["sample_count"], window["interpolated_count"],
+                                window["fallback_count"], window["max_span_ns"],
+                                window["alignment_deltas"])} for window in measured_windows]
     return out.getvalue()

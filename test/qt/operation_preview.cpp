@@ -29,17 +29,22 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTableWidget>
+#include <QTabWidget>
 #include <QSpinBox>
 #include <QCheckBox>
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QScrollBar>
+#include <QUrlQuery>
+#include <QFileInfo>
 
 class OperationPreview {
 public:
 #include "operation_qa.inc"
 #include "accounts_qa.inc"
 #include "recovery_qa.inc"
+#include "prepared_library_qa.inc"
+#include "local_media_library_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -599,25 +604,41 @@ public:
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(90); return; }
     auto started = std::make_shared<bool>(false);
     auto liveSeen = std::make_shared<bool>(false);
-    QObject::connect(server, &QTcpServer::newConnection, server, [server, started, liveSeen] {
+    auto preparedRefreshed = std::make_shared<bool>(false);
+    auto localRefreshed = std::make_shared<bool>(false);
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, started, liveSeen, preparedRefreshed, localRefreshed] {
       auto* socket = server->nextPendingConnection();
-      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, started, liveSeen] {
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, started, liveSeen, preparedRefreshed, localRefreshed] {
         auto input = socket->property("input").toByteArray() + socket->readAll();
         socket->setProperty("input", input);
         if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
         socket->setProperty("answered", true);
         QJsonObject payload;
-        if (input.startsWith("POST /api/holo-cache/start")) {
+        if (input.startsWith("GET /api/library/ego4d/prepared?")) {
+          *preparedRefreshed = input.contains("refresh=");
+          payload = {{"schema", 1}, {"provider", "ego4d"}, {"inventory_scope", "local_prepared_media"},
+              {"state", "ready"}, {"library_root", "C:/inert-library-fixture"}, {"verified_at", 1791241200},
+              {"total", 0}, {"offset", 0}, {"items", QJsonArray{}}, {"protection_status", "verified"},
+              {"counts", QJsonObject{{"ready", 0}, {"partial", 0}, {"missing", 0}, {"stale", 0}, {"protected", 0}}}};
+        } else if (input.startsWith("GET /api/storage/library/items?")) {
+          *localRefreshed = input.contains("refresh=");
+          payload = {{"schema", 1}, {"inventory_scope", "local_media_files"}, {"state", "ready"},
+              {"library_root", "C:/inert-library-fixture"}, {"file_count", 0}, {"total_bytes", 0},
+              {"total", 0}, {"offset", 0}, {"items", QJsonArray{}}};
+        } else if (input.startsWith("GET /api/storage/library ")) {
+          payload = {{"free_bytes", 53687091200.0}};
+        } else if (input.startsWith("POST /api/holo-cache/start")) {
           *started = true;
           payload = {{"ok", true}, {"runner", QJsonObject{{"state", "running"}}}};
         } else if (input.contains("live=1")) {
-          *liveSeen = true;
-          payload = {{"live", true}, {"runner", QJsonObject{{"state", "done"}, {"provider", "ego4d"}}}};
+          const bool selectedHolo = input.contains("provider=holoassist");
+          if (selectedHolo) *liveSeen = true;
+          payload = {{"live", true}, {"runner", QJsonObject{{"state", selectedHolo ? "done" : "running"}, {"provider", "ego4d"}}}};
         } else {
           payload = {{"tasks", QJsonArray{"Furniture Assembly"}}, {"default_task", "Furniture Assembly"},
             {"cache", QJsonObject{{"task", "Furniture Assembly"}, {"total", 2}, {"ready", *started ? 2 : 0},
               {"pending", *started ? 0 : 2}, {"last_run", QJsonObject{{"status", *started ? "complete" : "stopped"}}}}},
-            {"runner", QJsonObject{{"state", *started ? "done" : "idle"}, {"provider", "ego4d"}}}};
+            {"runner", QJsonObject{{"state", *liveSeen ? "done" : *started ? "running" : "idle"}, {"provider", "ego4d"}}}};
         }
         const auto body = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -629,11 +650,17 @@ public:
     window._pages->setCurrentIndex(4);
     auto phase = std::make_shared<int>(0);
     auto* poll = new QTimer(&window);
-    QObject::connect(poll, &QTimer::timeout, &window, [&window, phase, liveSeen] {
+    QObject::connect(poll, &QTimer::timeout, &window, [&window, phase, liveSeen, preparedRefreshed, localRefreshed] {
       if (*phase == 0 && window._cacheTask->count() && window._cacheStart->isEnabled()) {
         *phase = 1;
         window._cacheStart->click();
-      } else if (*phase == 1 && *liveSeen && window._cacheStart->isEnabled() && !window._cachePoll.isActive()) {
+      } else if (*phase == 1 && !window._cacheStartPending && window._cachePoll.isActive() && !window._cacheStart->isEnabled()) {
+        *phase = 2;
+        window._cacheProvider->setCurrentIndex(1); // Ego warm continues after switching the visible provider.
+      } else if (*phase == 2 && *liveSeen && *localRefreshed && window._cacheStart->isEnabled() && !window._cachePoll.isActive()) {
+        if (*preparedRefreshed || !window._preparedRefreshPending) { qApp->exit(93); return; }
+        *phase = 3; window._libraryTabs->setCurrentIndex(1);
+      } else if (*phase == 3 && *preparedRefreshed && window._preparedVerified) {
         qApp->exit(window._cacheProgress->value() == 100 && !QApplication::activeModalWidget() ? 0 : 91);
       }
     });
@@ -1547,6 +1574,14 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--accelerator-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::acceleratorSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--prepared-library-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::preparedLibrarySmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--local-media-library-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::localMediaLibrarySmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--original-library-smoke")) {

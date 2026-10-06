@@ -57,6 +57,10 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
             raise AssertionError("Unauthenticated account request was accepted")
         except urllib.error.HTTPError as error:
             assert error.code == 401
+        local_files = get('/api/storage/library/items')
+        assert local_files['schema'] == 1 and local_files['inventory_scope'] == 'local_media_files'
+        assert local_files['file_count'] > 0
+        assert all('path' in item and 'size_bytes' in item for item in local_files['items'])
         accounts = get("/api/accounts")["accounts"]
         assert sorted(account["email"] for account in accounts) == sorted(expected)
         assert "fixture-private-token" not in json.dumps(accounts)
@@ -83,6 +87,15 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
         assert results['items'][0]['duration_s'] == 600.123
         assert results['items'][0]['has_imu'] is None
         assert results['items'][0]['imu_local'] is False
+        prepared = get('/api/library/ego4d/prepared')
+        assert prepared['schema'] == 1 and prepared['inventory_scope'] == 'local_prepared_media'
+        assert prepared['physical_clip_count'] == 0 and prepared['items'] == []
+        assert prepared['counts']['ready'] == 0
+        try:
+            get('/api/library/ego4d/prepared', authenticated=False)
+            raise AssertionError('Unauthenticated prepared inventory request was accepted')
+        except urllib.error.HTTPError as error:
+            assert error.code == 401
     finally:
         # Target only the process tree created above, including the onefile child.
         if process.poll() is None:
@@ -127,7 +140,9 @@ def main() -> None:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"passed": True, "checks": ["fresh_installation", "restart_preserves_credentials",
         "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started",
-        "original_library_index_and_fts", "original_duration_and_unknown_sensor_state"]}, indent=2), encoding="utf-8")
+        "original_library_index_and_fts", "original_duration_and_unknown_sensor_state",
+        "prepared_library_inventory", "prepared_library_authentication",
+        "general_local_media_inventory"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 
 

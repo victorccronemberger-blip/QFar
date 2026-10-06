@@ -258,10 +258,10 @@ TASK_RULES: dict[str, TaskRule] = {
     ),
     "Hanging clothes on hangers": _r(
         "Cleaning / laundry",
-        ("hanger", "hangs", "wardrobe", "closet", "clothes rack"),
-        ("clothes", "cloth", "garment", "shirt", "dress", "jacket", "trouser"),
-        ("hang ", "hangs ", "hanging ", "puts on hanger", "places on hanger",
-         "arranges on the rod"),
+        ("hanger",),
+        ("clothes", "garment", "shirt", "dress", "jacket", "trouser", "laundry", "towel", "pants"),
+        ("hang ", "hangs ", "hanging ", "put", "place"),
+        action_excluded=("sew", "sewing machine"),
     ),
     "Change Sheets & Make Bed": _r(
         "Cleaning / laundry",
@@ -448,10 +448,10 @@ TASK_RULES.update({
                          "pruning", "pruner", "shear", "cuts the plant", "cuts plants")),
     "Folding Clothes or Putting Them on Hangers": _r(
         "Cleaning / laundry",
-        ("clothes", "cloth", "garment", "shirt", "dress", "jacket", "trouser",
+        ("clothes", "garment", "shirt", "dress", "jacket", "trouser",
          "laundry", "towel", "pants"),
-        ("fold", "hanger", "hangs", "hanging", "wardrobe", "closet"),
-        action_excluded=("washing machine", "scrub", "wring")),
+        ("fold", "hanger"),
+        action_excluded=("washing machine", "scrub", "wring", "sew", "sewing machine")),
     "Using the Laundry Machine": _r(
         "Cleaning / laundry", ("washer", "washing machine", "dryer"),
         ("clothes", "cloth", "laundry", "garment", "shirt", "trouser", "linen"),

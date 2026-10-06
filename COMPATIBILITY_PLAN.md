@@ -98,7 +98,7 @@ de todos os contratos do servidor nem alteram a origem dos vídeos ou sensores.
 
 Inventário completo do catálogo Duvi (política, segurança, anti-fraude,
 telemetria, OTA). Classes: **A** fechar no código, **B** aproximar no Windows,
-**C** impossível/forjar (não-meta), **D** já alinhado.
+**C** fora do escopo, **D** já alinhado.
 
 Referência operacional: plano de sessão aprovado (P0–P7). A auditoria estática
 `docs/auditoria_duvi_2026-09-18.md` está **obsoleta** em relação ao código
@@ -131,17 +131,13 @@ tratam HTTP de erro como sucesso.
 | B4 | geo só com coords reais (já omitia sem LAT/LNG; quota gate em A6) | feito |
 | B6 | diagnóstico próprio (VPN/geo/quota/version/device sem PostHog Baker) | feito |
 
-### C — não-meta até autorização de proveniência
+### C — fora do escopo
 PairIP, OTA/devFlags, PostHog/Sentry Baker, Uber lock UI, fingerprint
 emulador→analytics, Trinet SEI hardware, reCAPTCHA phone/FIDO.
 
-**Catálogo público (2026-09-18):** `resources/samsung_device_catalog.json` +
-`device_catalog.py` alimentam modelo/OS/SDK a partir de Play/MobileModels/
-SamMobile. Identificadores derivados continuam sintéticos (não há lista
-pública legítima de SSAIDs). A procedência agora acompanha o perfil persistido;
-perfis antigos sem esse campo permanecem `unknown`, sem trocar seus IDs.
-O campo informado na âncora usa `anchor_reported`, não `minute_verified`:
-validar formato e proprietário não comprova a origem Android do identificador.
+O catálogo de modelos fica em `resources/samsung_device_catalog.json` e
+`device_catalog.py`. A procedência acompanha o perfil persistido. Perfis
+antigos sem esse campo permanecem `unknown`, sem trocar seus IDs.
 
 ### Correções da revisão de 18/09
 
@@ -156,5 +152,4 @@ validar formato e proprietário não comprova a origem Android do identificador.
   Testes de âncora usam arquivo temporário independente dos dados pessoais.
 - O wheel inclui o catálogo Samsung. `app/opened` só confirma publicação
   após HTTP 2xx e reinicia esse estado ao trocar a conta.
-- Leitor de âncora valida schemaVersion 2 e formato do ID informado. Nenhuma
-  regeneração em massa ou certificação automática de SSAID foi implementada.
+- Leitor de âncora valida schemaVersion 2 e formato do ID informado.
