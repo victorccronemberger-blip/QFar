@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from moneymin import campaign, config, ego4d
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
+from moneymin.web import runner as campaign_runner
 from moneymin.web.runner import CampaignRunner, friendly_campaign_error
 
 PARENT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -132,19 +133,32 @@ class NarratedCampaignCatalogTests(unittest.TestCase):
         self.assertIn(PARENT, parents(dataset))
         self.assertIn(PARENT, parents(both))
         self.assertNotIn(PARENT, parents(cached))
+        again = self.narrated_clip("dataset")
+        first_ids = sorted(row["clip_uid"] for row in dataset if row.get("parent_video_uid") == PARENT)
+        second_ids = sorted(row["clip_uid"] for row in again if row.get("parent_video_uid") == PARENT)
+        self.assertEqual(first_ids, second_ids)
+        self.assertTrue(first_ids)
         chosen = next(row for row in dataset if row.get("parent_video_uid") == PARENT)
         self.assertFalse(any(self.library.glob("*.mp4")))
         self.assertNotIn(UNPROVEN, {row.get("clip_uid") for row in dataset})
         self.assertNotIn(UNPROVEN, {row.get("clip_uid") for row in both})
+        print("OBSERVATION narrated clip in both dataset selections:", first_ids)
+        print("OBSERVATION dataset keeps clip with no mp4 on disk")
+        print("OBSERVATION both keeps narrated parent:", PARENT in parents(both))
+        print("OBSERVATION cache discards narrated parent:", PARENT not in parents(cached))
 
     def test_selected_narration_revalidates_and_unproven_seed_stays_out(self):
         dataset = self.narrated_clip("dataset")
         chosen = next(row for row in dataset if row.get("parent_video_uid") == PARENT)
-        ego4d.revalidate_selection_evidence(chosen, task_name=TASK)
+        accepted = ego4d.revalidate_selection_evidence(chosen, task_name=TASK)
+        self.assertEqual(accepted["candidate"]["parent_video_uid"], PARENT)
         self.assertNotIn(UNPROVEN, {row.get("clip_uid") for row in dataset})
         self.assertFalse(any(
             "Ego4D selection changed or lacks current task evidence" in str(row)
             for row in dataset))
+        print("OBSERVATION revalidate accepted narrated clip", chosen["clip_uid"])
+        print("OBSERVATION unproven portable clip stayed out of the prepare queue")
+        print("OBSERVATION prepare queue has no Ego4D selection changed or lacks current task evidence")
 
     def test_runner_keeps_downloads_out_of_the_catalog_and_names_selection_errors(self):
         catalog = self.library
@@ -154,8 +168,10 @@ class NarratedCampaignCatalogTests(unittest.TestCase):
 
         def observe(cfg, progress=None, should_stop=None):
             marker = Path(cfg.work_dir) / "prepared.marker"
+            self.marker = marker
             marker.write_text("prepared", encoding="utf-8")
             self.assertFalse(str(marker.resolve()).startswith(str(catalog.resolve())))
+            print("OBSERVATION marker outside catalog:", marker.resolve())
             log = campaign.CampaignLog(started_at="fixture", accounts=["fixture@example.invalid"])
             log.status = "done"
             if progress:
@@ -172,17 +188,21 @@ class NarratedCampaignCatalogTests(unittest.TestCase):
                 dataset_provider="ego4d",
                 content_mode="dataset",
             )
-            with patch.object(campaign, "run_campaign", side_effect=observe):
+            with patch.object(campaign_runner, "run_campaign", side_effect=observe):
                 runner.start(cfg)
                 runner._thread.join(10)
             self.assertFalse(runner._thread.is_alive())
             self.assertFalse(list(catalog.glob("prepared.marker")))
+            self.assertFalse(self.marker.exists())
             self.assertEqual(
                 {path.name: path.read_bytes() for path in catalog.iterdir() if path.is_file()},
                 before)
+            print("OBSERVATION temporary media directory removed; catalog files unchanged")
         message = friendly_campaign_error(
             "ValueError: Ego4D selection changed or lacks current task evidence")
         self.assertNotIn("Valide a conta", message)
         self.assertTrue("seleção" in message.casefold() or "catálogo" in message.casefold())
         account = friendly_campaign_error("AuthError: http 401")
         self.assertIn("acesso", account.casefold())
+        print("OBSERVATION selection message:", message)
+        print("OBSERVATION account message still mentions acesso:", account)
