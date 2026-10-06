@@ -5,10 +5,11 @@ import copy
 import csv
 import hashlib
 import io
+import importlib
+from importlib import metadata as importlib_metadata
 import json
 import math
 import os
-import sys
 from bisect import bisect_left
 from collections import OrderedDict
 from pathlib import Path
@@ -19,6 +20,13 @@ from . import config, nymeria_vrs, task_matching
 _ALGORITHM = "nymeria-atomic-device-v1"
 _SNAPSHOTS: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 _WINDOWS: OrderedDict[tuple, tuple[dict[str, Any], ...]] = OrderedDict()
+_SDK_DIGESTS: OrderedDict[tuple, tuple[int, str]] = OrderedDict()
+_SDK_WRAPPERS = (
+    "__init__.py", "core/__init__.py", "core/calibration.py",
+    "core/data_provider.py", "core/image.py", "core/sensor_data.py",
+    "core/sophus.py", "core/stream_id.py", "core/vrs.py",
+    "core/vrs_health_check.py",
+)
 _ANNOTATIONS = ("atomic_action.csv", "activity_summarization.csv", "motion_narration.csv")
 
 
@@ -53,13 +61,13 @@ def _stat(path: Path) -> tuple:
             stat.st_ctime_ns, stat.st_dev, stat.st_ino)
 
 
-def _signature(seq_dir: Path) -> tuple:
+def _signature(seq_dir: Path, *, fresh_sdk: bool = False) -> tuple:
     files = [seq_dir / "metadata.json", seq_dir / "recording_head/data/data.vrs",
              seq_dir / "recording_head/data/motion.vrs",
              *(seq_dir / "narration" / name for name in _ANNOTATIONS)]
     return (_ALGORITHM, str(seq_dir.resolve()), tuple(_stat(path) for path in files),
             _stat(Path(nymeria_vrs.__file__)), _stat(Path(task_matching.__file__)),
-            os.environ.get("NYMERIA_VENV", ""), _sdk_signature(), _rules_digest())
+            os.environ.get("NYMERIA_VENV", ""), _sdk_signature(fresh=fresh_sdk), _rules_digest())
 
 
 def _rules_digest() -> str:
@@ -69,15 +77,46 @@ def _rules_digest() -> str:
     return hashlib.sha256(value.encode("utf8")).hexdigest()
 
 
-def _sdk_signature() -> tuple:
+def _sdk_content_digest(path: Path, *, fresh: bool = False) -> tuple[int, str]:
+    marker = _stat(path)
+    if not fresh and marker in _SDK_DIGESTS:
+        return _SDK_DIGESTS[marker]
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            size += len(block)
+            digest.update(block)
+    if _stat(path) != marker:
+        raise ValueError("SDK Nymeria mudou durante a leitura")
+    return _remember(_SDK_DIGESTS, marker, (size, digest.hexdigest()))
+
+
+def _sdk_signature(*, fresh: bool = False) -> tuple:
     try:
         nymeria_vrs._bootstrap_projectaria()
     except (ImportError, OSError, RuntimeError):
         return (("unavailable", ()),)
-    return tuple(sorted(
-        (name, _stat(Path(module.__file__)))
-        for name, module in list(sys.modules.items())
-        if name.startswith("projectaria_tools") and getattr(module, "__file__", None)))
+    package = importlib.import_module("projectaria_tools")
+    core = importlib.import_module("_core_pybinds")
+    base = Path(package.__file__).resolve().parent
+    native = Path(core.__file__).resolve()
+    try:
+        version = importlib_metadata.version("projectaria-tools")
+    except importlib_metadata.PackageNotFoundError:
+        version = "unknown"
+    # PyInstaller extracts identical SDK bytes into a different _MEI directory
+    # on each start. Persist content identity, keeping physical stats only in
+    # the bounded digest cache. The fixed list also excludes incidental imports.
+    files = [(f"projectaria_tools/{name}", base / name) for name in _SDK_WRAPPERS]
+    files.append(("_core_pybinds", native))
+    for prefix, folder in (("projectaria_tools", base),
+                           ("projectaria_tools.libs", native.parent / "projectaria_tools.libs")):
+        if folder.is_dir():
+            files.extend((f"{prefix}/{path.relative_to(folder).as_posix()}", path)
+                         for path in sorted(folder.rglob("*.dll")))
+    return (("projectaria-tools.version", (version,)), *tuple(sorted(
+        (name, _sdk_content_digest(path, fresh=fresh)) for name, path in files)))
 
 
 def inventory_signature(root: Path | None = None) -> tuple:
@@ -196,7 +235,7 @@ def _annotation_rows(seq_dir: Path) -> tuple[list[tuple[float, float, str]], dic
 
 def _snapshot(seq_dir: Path, *, fresh: bool = False) -> dict[str, Any]:
     seq_dir = Path(seq_dir).resolve()
-    signature = _signature(seq_dir)
+    signature = _signature(seq_dir, fresh_sdk=fresh)
     if not fresh and signature in _SNAPSHOTS:
         return _SNAPSHOTS[signature]
     metadata_bytes = (seq_dir / "metadata.json").read_bytes()

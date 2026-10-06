@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,6 +73,67 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
     def candidates(self, name=FOLD, **kwargs):
         return nymeria.automatic_candidates(task_name=name, task_id="task-fold",
             registry_key="minute|task-fold|Fold", min_dur_s=60, max_dur_s=240, **kwargs)
+
+    def sdk_fixture(self, extraction):
+        base = self.root / extraction / "projectaria_tools"
+        for name in nymeria._SDK_WRAPPERS:
+            path = base / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"SDK wrapper {name}\n".encode())
+        native = base.parent / "_core_pybinds.pyd"
+        native.write_bytes(b"native-sdk-v1")
+        dll = base / "vendor/clock.dll"
+        dll.parent.mkdir()
+        dll.write_bytes(b"clock-sdk-v1")
+        modules = {"projectaria_tools": SimpleNamespace(__file__=str(base / "__init__.py")),
+                   "_core_pybinds": SimpleNamespace(__file__=str(native))}
+        return modules, native, dll
+
+    def test_sdk_evidence_survives_identical_mei_relocation(self):
+        first, _native, _dll = self.sdk_fixture("_MEI_first_start")
+        second, _native, _dll = self.sdk_fixture("_MEI_second_start")
+        with patch.object(nymeria_vrs, "_bootstrap_projectaria", return_value=None), \
+             patch.object(nymeria.importlib_metadata, "version", return_value="1.7.1"):
+            with patch.dict(sys.modules, first):
+                clip = json.loads(json.dumps(self.candidates()[0]))
+                self.assertEqual(nymeria.revalidate_candidate(clip), clip)
+            self.assertNotIn("_MEI", json.dumps(clip["selection_evidence"]["sdk_signature"]))
+            nymeria.clear_caches()
+            with patch.dict(sys.modules, second):
+                self.assertEqual(nymeria.revalidate_candidate(clip), clip)
+
+    def test_sdk_byte_changes_reject_saved_evidence_even_with_preserved_stats(self):
+        modules, native, dll = self.sdk_fixture("_MEI_sdk_change")
+        with patch.object(nymeria_vrs, "_bootstrap_projectaria", return_value=None), \
+             patch.object(nymeria.importlib_metadata, "version", return_value="1.7.1"), \
+             patch.dict(sys.modules, modules):
+            for path in (native, dll):
+                with self.subTest(binary=path.name):
+                    clip = self.candidates()[0]
+                    original = path.read_bytes()
+                    marker = nymeria._stat(path)
+                    stat_function = nymeria._stat
+                    path.write_bytes(original.replace(b"v1", b"v2"))
+                    # Fresh validation must verify the SDK's bytes even when
+                    # every physical cache marker appears unchanged.
+                    with patch.object(nymeria, "_stat", side_effect=lambda candidate:
+                            marker if candidate == path else stat_function(candidate)), \
+                         self.assertRaises(ValueError):
+                        nymeria.revalidate_candidate(clip)
+                    path.write_bytes(original)
+                    nymeria.clear_caches()
+
+    def test_irrelevant_sdk_module_import_does_not_change_evidence(self):
+        modules, _native, _dll = self.sdk_fixture("_MEI_extra_import")
+        extra = self.root / "unrelated-sdk-module.py"
+        extra.write_bytes(b"unrelated SDK module")
+        with patch.object(nymeria_vrs, "_bootstrap_projectaria", return_value=None), \
+             patch.object(nymeria.importlib_metadata, "version", return_value="1.7.1"), \
+             patch.dict(sys.modules, modules):
+            clip = self.candidates()[0]
+            with patch.dict(sys.modules, {"projectaria_tools.unrelated":
+                    SimpleNamespace(__file__=str(extra))}):
+                self.assertEqual(nymeria.revalidate_candidate(clip), clip)
 
     def test_measured_atomic_actions_match_only_the_requested_task(self):
         clips = self.candidates()
