@@ -279,7 +279,12 @@ class PreparedLibraryTests(unittest.TestCase):
         self.assertEqual(result['counts']['ready'], 2)
         self.assertEqual(result['counts']['protected'], 2)
         self.assertTrue(all('pending_journal' in item['protection_reasons'] for item in result['items']))
-        self.assertEqual(sum(call.args[0] == self.sensor for call in fingerprint.call_args_list), 1)
+        # The inventory resolves its root, while Windows temporary directories
+        # can retain an 8.3 alias. Count the physical sensor, not path spelling.
+        for sensor_path in (self.sensor, self.sensor.parent / '..' / self.sensor.parent.name / self.sensor.name):
+            with self.subTest(sensor_path=sensor_path):
+                self.assertEqual(sum(Path(call.args[0]).samefile(sensor_path)
+                                     for call in fingerprint.call_args_list), 1)
 
     def test_digest_reservation_keeps_ambiguous_source_conservatively_protected(self):
         self.make_native('manual-unknown', self.source, 0.0, 180.0)
