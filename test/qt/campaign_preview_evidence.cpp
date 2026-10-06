@@ -28,7 +28,7 @@ struct InertApi {
 class MainWindow {
 public:
   InertApi _api;
-  bool _campaignActive=false, _campaignPreflightPending=false, _campaignStartPending=false, _previewCheckActive=false;
+  bool _campaignActive=false, _campaignPreflightPending=false, _campaignStartPending=false, _previewCheckActive=false, _campaignResetPending=false;
   int _campaignPollRevision=0;
   QString _previewLogName="campaign_fixture.json";
   QTimer _previewPoll;

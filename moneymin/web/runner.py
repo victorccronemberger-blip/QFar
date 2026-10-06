@@ -421,6 +421,31 @@ class CampaignRunner:
         if requested:
             self._record("campaign_stopping")
 
+    def reset_idle(self) -> None:
+        """Forget the completed campaign, including its counters and receipts."""
+        with self._lock:
+            if self.running:
+                raise RuntimeError("Aguarde a campanha terminar antes do reset.")
+            self._thread = None
+            self._stop.clear()
+            self._resume.set()
+            self.pause_requested = False
+            self.state = "idle"
+            self.events.clear()
+            self._seq = 0
+            self.error = None
+            self.log_path = None
+            self.target_seconds_per_account = 0.0
+            self.account_seconds.clear()
+            self.credited_deliveries.clear()
+            self._reported_outcomes.clear()
+            self.total_sends = self.done_sends = self.ok_sends = 0
+            self.failed_sends = self.skipped_sends = 0
+            self.current = ""
+            self.stage = "Aguardando"
+            self.operation = OperationState()
+            self.start_request_id = None
+
     def pause(self) -> None:
         with self._lock:
             if self.state != "running":

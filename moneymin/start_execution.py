@@ -1,5 +1,6 @@
 """Conservative UUID/history correlation; admission is not delivery evidence."""
 from . import config, recovery
+from .campaign_history import is_campaign_history_name
 from .atomic_io import load_json_state
 from .upload_types import journal_delivery_confirmed
 
@@ -11,6 +12,8 @@ def execution_evidence(row, *, running_id=None, thread_running=False):
     try:
         matches=[]
         for path in sorted(config.DATA_DIR.glob('campaign_*.json')):
+            if not is_campaign_history_name(path.name):
+                continue
             if path.is_symlink() or path.resolve().parent != config.DATA_DIR.resolve():
                 return result
             data=load_json_state(path,None)

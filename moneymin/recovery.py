@@ -9,12 +9,14 @@ from .atomic_io import save_json
 from .recovery_errors import RecoveryReadError
 from .media_lifecycle import media_state_lease
 from .operation_lease import OperationLeaseError
+from .campaign_state import campaign_state_operation
 from .upload_types import (is_pending_finalization, journal_delivery_confirmed,
                            journal_evaluation_confirmed, journal_flags_valid)
 
 _UNREAD_PUBLICATION = object()
 
 
+@campaign_state_operation
 def media_cleanup_protection() -> dict:
     """Read every authoritative journal, including hidden/acknowledged rows.
 
@@ -210,6 +212,7 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
     }
 
 
+@campaign_state_operation
 def snapshot() -> dict:
     # Enumeration and reads share the writers/cleanup barrier. A disappearing
     # journal must not be mistaken for a corrupt store during local cleanup.
@@ -245,6 +248,7 @@ def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
     return {uid: sorted(emails) for uid, emails in excluded.items()}
 
 
+@campaign_state_operation
 def reconcile_confirmed() -> dict:
     directory = upload.sidecars_dir()
     groups = _groups(directory, include_reconciled=True)
@@ -280,6 +284,7 @@ def reconcile_confirmed() -> dict:
         for rows in confirmed], **snapshot()}
 
 
+@campaign_state_operation
 def resume_account(email: str, resolve_org) -> dict:
     """Resume only reviewed, existing sessions of one authenticated account."""
     selected = []
@@ -313,6 +318,15 @@ class RecoveryRunner:
     def snapshot(self):
         with self._lock:
             return dict(self._state)
+
+    def reset_idle(self):
+        """Forget terminal UI state only after the owned thread has exited."""
+        with self._lock:
+            if (self._state["state"] == "running"
+                    or (self._thread is not None and self._thread.is_alive())):
+                raise RuntimeError("Aguarde a recuperação terminar antes de limpar a operação.")
+            self._state = {"state": "idle", "email": None, "error": None}
+            self._thread = None
 
     def start(self, email: str, resolve_org):
         with self._lock:

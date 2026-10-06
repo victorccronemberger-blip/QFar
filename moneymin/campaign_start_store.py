@@ -13,6 +13,7 @@ from . import config
 from .atomic_io import load_json_state, save_json, decode_json_state
 from .operation_lease import operation_lease
 from .media_lifecycle import media_state_lease
+from .campaign_state import campaign_state_operation
 
 _ID = re.compile(r'[A-Za-z0-9_-]{1,160}\Z')
 _HASH = re.compile(r'[0-9a-f]{64}\Z')
@@ -86,6 +87,7 @@ def _validate_request(uid,kind,receipt_id,body,row=None):
         raise StartConflictError('O identificador de início já pertence a outra operação.')
     return digest
 
+@campaign_state_operation
 def lookup(uid, *, kind=None, receipt_id=None, body=None):
     if not isinstance(uid,str) or not _ID.fullmatch(uid):
         raise StartStoreError('Identidade de início inválida.')
@@ -95,6 +97,7 @@ def lookup(uid, *, kind=None, receipt_id=None, body=None):
             _validate_request(uid,kind,receipt_id,body,row)
         return deepcopy(row)
 
+@campaign_state_operation
 def claim(uid, *, kind, receipt_id, body, bindings, protected_assets=None):
     with media_state_lease(wait=True), operation_lease(_path().with_suffix('.lock')):
         store=_read();prior=store['requests'].get(uid)
@@ -116,6 +119,7 @@ def claim(uid, *, kind, receipt_id, body, bindings, protected_assets=None):
         _read()
         return True,deepcopy(row)
 
+@campaign_state_operation
 def acknowledge(uid, reply):
     with operation_lease(_path().with_suffix('.lock')):
         store=_read();row=store['requests'].get(uid)
@@ -130,10 +134,12 @@ def acknowledge(uid, reply):
         _read(store)
         save_json(_path(),store)
 
+@campaign_state_operation
 def protected_paths():
     with operation_lease(_path().with_suffix('.lock')):
         return [asset['path'] for row in _read()['requests'].values() for asset in row['protected_assets']]
 
+@campaign_state_operation
 def public_status(uid):
     row=lookup(uid)
     if row is None:

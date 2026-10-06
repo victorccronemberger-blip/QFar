@@ -66,6 +66,8 @@ from .device_profile import DeviceProfile
 from .content_selection import diverse_order, diversity_summary, parent_key
 from .minute_api import AuthError, Session, validate_task_catalog
 from .media_lifecycle import cleanup_operation
+from .campaign_state import campaign_state_operation
+from .campaign_history import is_campaign_history_name
 from .sidecar import (
     build_frames_csv,
     build_frames_csv_from_video,
@@ -2128,9 +2130,9 @@ def _legacy_upload_contexts(wanted: set[tuple[str, str]], journals: list[dict] |
         name = str(row.get("local_video_path") or "").replace("\\", "/").rsplit("/", 1)[-1]
         if identity in wanted and name and row.get("task_id"):
             journal_media.setdefault((name, row["task_id"], identity[1]), set()).add(identity)
-    paths = set(config.DATA_DIR.glob("campaign_*.json"))
+    paths = {p for p in config.DATA_DIR.glob("campaign_*.json") if is_campaign_history_name(p.name)}
     # Older installations kept campaign history beside the media library.
-    paths.update(config.MEDIA_DATA_DIR.glob("campaign_*.json"))
+    paths.update(p for p in config.MEDIA_DATA_DIR.glob("campaign_*.json") if is_campaign_history_name(p.name))
     for path in sorted(paths):
         try:
             history = json.loads(path.read_text(encoding="utf-8"))
@@ -2303,6 +2305,7 @@ def _nymeria_resample_delivery(item: dict[str, Any], *, origin_ns: int | None = 
                           transient=False, phase="prepare") from exc
 
 
+@campaign_state_operation
 def upload_to_account(item: dict[str, Any], account: AccountSpec,
                       task_id: str, timeout_blob: int,
                       evaluate: bool, finalize: bool,
@@ -2649,13 +2652,13 @@ def list_campaign_logs(data_dir: Path | None = None) -> list[Path]:
     paths: list[Path] = []
     if data_dir.exists():
         for p in data_dir.iterdir():
-            if (p.name.startswith("campaign_") and p.name.endswith(".json")
-                    and p.name != "campaign.example.json"):
+            if is_campaign_history_name(p.name):
                 paths.append(p)
     paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return paths
 
 
+@campaign_state_operation
 def run_campaign(
     config: CampaignConfig,
     log: CampaignLog | None = None,
@@ -4570,6 +4573,7 @@ def _prefer_cached_clips(
     return ready + later if prioritize else in_original_order
 
 
+@campaign_state_operation
 def warm_task_catalog() -> None:
     """Load the prepared catalog before the first category request."""
     _ranked_pools()

@@ -109,10 +109,11 @@ class CampaignCapacityTests(unittest.TestCase):
         self.assertEqual(response.get_json()['error_code'], 'campaign_capacity_insufficient')
         self.assertEqual(response.get_json()['capacity']['accounts'][0]['recorded_clips'], 1)
         self.assertFalse((case.root / sent_registry.FILE_NAME).exists())
-        # The pre-existing integrity lookup takes a lease, whose empty lock
-        # file is not a start reservation or a persisted delivery.
+        # Integrity lookup and reset exclusion take neutral leases. Their
+        # empty lock files contain no start reservation or delivery history.
+        self.assertEqual((case.root / '.campaign-state.lock').read_bytes(), b'')
         after = {path: path.read_bytes() for path in case.root.rglob('*')
-                 if path.is_file() and path.name != 'start_requests.lock'}
+                 if path.is_file() and path.name not in {'start_requests.lock', '.campaign-state.lock'}}
         self.assertEqual(before, after)
         case.runner.start.assert_not_called()
 

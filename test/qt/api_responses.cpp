@@ -8,7 +8,8 @@
 #include <QTimer>
 #include <iostream>
 
-bool checkResponse(const QByteArray& body, int status, bool expected) {
+bool checkResponse(const QByteArray& body, int status, bool expected,
+                   bool post=false, const QString& path=QStringLiteral("/api/test")) {
   QTcpServer server;
   if (!server.listen(QHostAddress::LocalHost, 0)) return false;
   QObject::connect(&server, &QTcpServer::newConnection, &server, [&] {
@@ -29,10 +30,11 @@ bool checkResponse(const QByteArray& body, int status, bool expected) {
   api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
   QEventLoop loop;
   bool passed = false;
-  api.get(QStringLiteral("/api/test"), [&](bool ok, const QJsonDocument& doc, const QString& error) {
+  const auto callback = [&](bool ok, const QJsonDocument& doc, const QString& error) {
     passed = ok == expected && (expected ? doc.isObject() && error.isEmpty() : !error.isEmpty());
     loop.quit();
-  });
+  };
+  if (post) api.post(path, {}, callback); else api.get(path, callback);
   QTimer::singleShot(5000, &loop, &QEventLoop::quit);
   loop.exec();
   return passed;
@@ -48,6 +50,38 @@ int main(int argc, char** argv) {
   }
   if (!checkResponse("{\"ok\":true}", 200, true) ||
       !checkResponse("{\"error\":\"test failure\"}", 400, false)) return 1;
+  for (const auto& body : {QByteArray("{}"), QByteArray("{\"ok\":false}"), QByteArray("{\"ok\":1}"), QByteArray("{\"ok\":\"true\"}")})
+    if (!checkResponse(body,200,false,true,QStringLiteral("/api/campaign/reset"))) return 2;
+  if (!checkResponse("{\"ok\":true}",200,true,true,QStringLiteral("/api/campaign/reset"))
+      || !checkResponse("{\"error\":\"Campanha ativa\"}",409,false,true,QStringLiteral("/api/campaign/reset"))) return 2;
+  {
+    QTcpServer replies;
+    if (!replies.listen(QHostAddress::LocalHost)) return 3;
+    QObject::connect(&replies,&QTcpServer::newConnection,&replies,[&] {
+      auto* socket=replies.nextPendingConnection();
+      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket] {
+        socket->readAll();
+        if(socket->property("answered").toBool()) return;
+        socket->setProperty("answered",true);
+        QTimer::singleShot(60,socket,[socket] {
+          socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+          socket->disconnectFromHost();
+        });
+      });
+      QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+    });
+    ApiClient scoped;
+    scoped.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(replies.serverPort()));
+    int stale=0,accounts=0,current=0;
+    for(const auto& path : {QStringLiteral("/api/campaigns/current"),QStringLiteral("/api/logs"),QStringLiteral("/api/recovery?async=1"),QStringLiteral("/api/tasks?async=1")})
+      scoped.get(path,[&](bool,const QJsonDocument&,const QString&) {++stale;});
+    scoped.get(QStringLiteral("/api/accounts"),[&](bool ok,const QJsonDocument&,const QString&) {accounts+=ok;});
+    scoped.invalidateCampaignRequests();
+    scoped.get(QStringLiteral("/api/logs"),[&](bool ok,const QJsonDocument&,const QString&) {current+=ok;});
+    QEventLoop pending;
+    QTimer::singleShot(350,&pending,&QEventLoop::quit);pending.exec();
+    if(stale || accounts!=1 || current!=1) return 3;
+  }
   // Accept the connection but never answer: the real GET timeout must invoke
   // the callback, allowing MainWindow to clear its in-flight polling flag.
   QTcpServer stalled;

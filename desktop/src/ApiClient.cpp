@@ -57,6 +57,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   else if (method == "POST" && path.startsWith(QStringLiteral("/api/campaigns/preflight?")))
     req.setTransferTimeout(15000);
   else if (method == "POST" && (path.startsWith(QStringLiteral("/api/campaigns/"))
+                               || path == QStringLiteral("/api/campaign/reset")
                                || path == QStringLiteral("/api/sent/reset")))
     req.setTransferTimeout(60000);
 
@@ -67,7 +68,18 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   else if (method == "PUT") reply = _network.put(req, payload);
   else reply = _network.sendCustomRequest(req, method, payload);
 
-  connect(reply, &QNetworkReply::finished, this, [reply, method, path, startsRegistration, callback = std::move(callback)]() {
+  const QString route = path.section(QLatin1Char('?'), 0, 0);
+  const bool campaignRequest = route == QStringLiteral("/api/tasks")
+      || route == QStringLiteral("/api/logs") || route.startsWith(QStringLiteral("/api/logs/"))
+      || route == QStringLiteral("/api/recovery") || route.startsWith(QStringLiteral("/api/recovery/"))
+      || route == QStringLiteral("/api/campaigns") || route.startsWith(QStringLiteral("/api/campaigns/"))
+      || route == QStringLiteral("/api/campaign/reset") || route == QStringLiteral("/api/sent/reset");
+  const quint64 campaignEpoch = _campaignRequestEpoch;
+  connect(reply, &QNetworkReply::finished, this, [this, reply, method, path, startsRegistration, campaignRequest, campaignEpoch, callback = std::move(callback)]() {
+    if (campaignRequest && campaignEpoch != _campaignRequestEpoch) {
+      reply->deleteLater();
+      return;
+    }
     const QByteArray bytes = reply->readAll();
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
@@ -91,6 +103,10 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       error = QStringLiteral("O serviço retornou uma resposta JSON inválida ou incompleta.");
       if (method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration))
         doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
+    } else if (method == "POST" && path == QStringLiteral("/api/campaign/reset")
+               && doc.object().value(QStringLiteral("ok")) != QJsonValue(true)) {
+      error = doc.object().value(QStringLiteral("error")).toString(
+          QStringLiteral("O serviço não confirmou o reset completo. Os dados exibidos foram preservados."));
     } else if (method == "POST" && path == QStringLiteral("/api/campaigns")
                && !doc.object().value(QStringLiteral("ok")).toBool()) {
       error = doc.object().value(QStringLiteral("error")).toString(

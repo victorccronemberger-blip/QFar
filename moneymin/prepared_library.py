@@ -27,6 +27,7 @@ import uuid
 
 from . import config
 from .atomic_io import decode_json_state
+from .campaign_history import is_campaign_history_name
 
 _TTL_S = 300.0
 _STATES = {'ready', 'partial', 'missing', 'stale'}
@@ -81,7 +82,7 @@ def _protection_files():
         'campaign_start_requests.json')]
     for base in {config.DATA_DIR, config.MEDIA_DATA_DIR}:
         if base.is_dir():
-            paths.extend(base.glob('campaign_*.json'))
+            paths.extend(p for p in base.glob('campaign_*.json') if is_campaign_history_name(p.name))
     for base in {config.DATA_DIR / 'sidecars', config.MEDIA_DATA_DIR / 'sidecars'}:
         if base.is_dir() and _confined(base, base.parent.resolve()):
             paths.extend(base.glob('*.json'))

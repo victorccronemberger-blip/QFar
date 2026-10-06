@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable
 
 from .capture_import import CaptureDescriptor, CaptureImportError, CaptureLimits, inspect_original_capture
+from .campaign_state import campaign_state_lease, campaign_state_operation
 
 _ID = re.compile(r'[A-Za-z0-9_-]{1,160}\Z')
 _HASH = re.compile(r'[0-9a-f]{64}\Z')
@@ -516,6 +517,7 @@ def _check_reservation(plan, store, mode):
                 _fail('existing_review')
 
 
+@campaign_state_operation
 def _persist_reservation(plan, store, phase):
     from . import config
     from .atomic_io import save_json
@@ -533,7 +535,7 @@ def _exclusive_operation():
     from . import config
     from .operation_lease import operation_lease, OperationLeaseError
     try:
-        with operation_lease(config.DATA_DIR / '.original_capture.lock'):
+        with campaign_state_lease(), operation_lease(config.DATA_DIR / '.original_capture.lock'):
             yield
     except OperationLeaseError:
         _fail('busy')
@@ -573,6 +575,7 @@ def validate_original_capture_session_policy(plan: OriginalCapturePlan, session)
                'duration_ms': plan.durations_ms[index], 'recorded_at': plan.recorded_at[index], 'meta': meta})
 
 
+@campaign_state_operation
 def run_original_capture_campaign(cfg, log=None, *, progress=None, should_stop=None):
     """Use the normal campaign event contract and drain an active upload on Stop."""
     from . import campaign, config, sent_registry, upload

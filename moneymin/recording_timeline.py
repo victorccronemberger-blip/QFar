@@ -10,6 +10,7 @@ from pathlib import Path
 from . import config
 from .atomic_io import JsonStateError, load_json_state, save_json
 from .device_profile import format_recorded_at
+from .campaign_state import campaign_state_operation
 
 _LOCK = threading.Lock()
 
@@ -29,6 +30,7 @@ def timeline_path() -> Path:
     return config.DATA_DIR / "recording_timeline.json"
 
 
+@campaign_state_operation
 def reserve(email: str, duration_s: float, *, now: float | None = None) -> RecordingSlot:
     """Reserva um intervalo sem sobreposição; a primeira gravação começa agora."""
     duration = max(1.0, float(duration_s))

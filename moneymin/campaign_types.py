@@ -10,6 +10,7 @@ from typing import Any
 
 from . import config
 from .atomic_io import save_json
+from .campaign_state import campaign_state_operation
 
 DEFAULT_TIMEOUT_BLOB = 1200
 DEFAULT_ACCOUNT_STAGGER_S = 0.0
@@ -128,6 +129,7 @@ class CampaignLog:
             result['start_request_id'] = self.start_request_id
         return result
 
+    @campaign_state_operation
     def save(self, path: Path | None = None) -> Path:
         destination = path or self._path
         if destination is None:

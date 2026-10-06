@@ -5,6 +5,7 @@ from typing import Any
 
 from . import config, recovery
 from .atomic_io import load_json_state
+from .campaign_history import is_campaign_history_name
 from .upload_types import journal_delivery_confirmed, journal_evaluation_confirmed
 
 
@@ -18,7 +19,7 @@ def publication_index() -> dict[str, list[tuple[dict, dict, str]]] | None:
     try:
         for root in {config.DATA_DIR.resolve(), config.MEDIA_DATA_DIR.resolve()}:
             if root.exists():
-                paths.update(root.glob('campaign_*.json'))
+                paths.update(p for p in root.glob('campaign_*.json') if is_campaign_history_name(p.name))
         result: dict[str, list[tuple[dict, dict, str]]] = {}
         for path in sorted(paths):
             history = load_json_state(path, None)

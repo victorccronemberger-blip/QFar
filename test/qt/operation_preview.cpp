@@ -46,6 +46,7 @@ public:
 #include "prepared_library_qa.inc"
 #include "local_media_library_qa.inc"
 #include "campaign_capacity_qa.inc"
+#include "campaign_reset_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -1589,6 +1590,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--campaign-capacity-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignCapacitySmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--campaign-reset-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignResetSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--original-library-smoke")) {

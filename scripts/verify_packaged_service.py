@@ -263,6 +263,43 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
             raise AssertionError('Unauthenticated prepared inventory request was accepted')
         except urllib.error.HTTPError as error:
             assert error.code == 401
+        # Exercise the shipped reset, including its legacy import source. These
+        # deliberately damaged receipts exist only in this temporary fixture.
+        reset_files = []
+        for directory in (user_root / 'data', library / 'data'):
+            for name in ('campaign_package_fixture.json', 'sent_videos.json', 'sent_reset_history.json',
+                         'start_requests.json', 'recording_timeline.json',
+                         'original_capture_reservations.json', 'sidecars/fixture-session.json',
+                         'sidecars/fixture-session.data.zip'):
+                path = directory / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'{damaged-reset-fixture')
+                reset_files.append(path)
+        protected = [path for directory in (user_root / 'secrets', library / 'secrets', library / 'data/ego4d')
+                     for path in directory.rglob('*') if path.is_file()]
+        before = {path: path.read_bytes() for path in protected}
+        try:
+            get('/api/campaign/reset', authenticated=False, method='POST')
+            raise AssertionError('Unauthenticated full reset was accepted')
+        except urllib.error.HTTPError as error:
+            assert error.code == 401
+        reset_deadline = time.monotonic() + 45
+        while True:
+            try:
+                cleared = get('/api/campaign/reset', method='POST')
+                break
+            except urllib.error.HTTPError as error:
+                response = json.load(error)
+                if error.code != 409 or response.get('error_code') != 'campaign_reset_busy' or time.monotonic() >= reset_deadline:
+                    raise AssertionError('Packaged full reset did not finish') from None
+                time.sleep(.2)
+        assert cleared['ok'] is True and cleared['state'] == 'idle'
+        assert all(not path.exists() for path in reset_files)
+        assert {path: path.read_bytes() for path in protected} == before
+        assert get('/api/logs')['logs'] == [] and get('/api/sent')['sent'] == []
+        assert get('/api/recovery')['items'] == []
+        current = get('/api/campaigns/current')
+        assert current['state'] == 'idle' and current['events'] == [] and current['totals']['total_sends'] == 0
     finally:
         process.close()
 
@@ -309,7 +346,8 @@ def main() -> None:
         "original_library_index_and_fts", "original_duration_and_unknown_sensor_state",
         "prepared_library_inventory", "prepared_library_authentication",
         "general_local_media_inventory", "owned_process_tree_shutdown",
-        "nymeria_sdk_core_device_time", "nymeria_metadata_only_not_ready"]}, indent=2), encoding="utf-8")
+        "nymeria_sdk_core_device_time", "nymeria_metadata_only_not_ready",
+        "full_campaign_reset_preserves_credentials_and_library"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 
 

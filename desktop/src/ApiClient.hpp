@@ -19,6 +19,8 @@ public:
   void post(const QString& path, const QJsonObject& body, Callback callback);
   void put(const QString& path, const QJsonObject& body, Callback callback);
   void remove(const QString& path, Callback callback);
+  // Discard replies belonging to local campaign state from before a reset.
+  void invalidateCampaignRequests() { ++_campaignRequestEpoch; }
 
 private:
   void request(const QByteArray& method, const QString& path,
@@ -26,5 +28,6 @@ private:
 
   QNetworkAccessManager _network;
   QByteArray _sessionToken;
+  quint64 _campaignRequestEpoch{};
   QString _baseUrl{QStringLiteral("http://127.0.0.1:8876")};
 };

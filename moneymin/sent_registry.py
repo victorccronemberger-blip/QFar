@@ -27,6 +27,8 @@ from typing import Any
 
 from . import config
 from .atomic_io import JsonStateError, load_json_state, save_json
+from .campaign_state import campaign_state_operation
+from .campaign_history import is_campaign_history_name
 
 FILE_NAME = "sent_videos.json"
 _LOCK = threading.RLock()
@@ -45,7 +47,7 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
     if not data_dir.exists():
         return data
     for p in data_dir.iterdir():
-        if not (p.name.startswith("campaign_") and p.name.endswith(".json")):
+        if not is_campaign_history_name(p.name):
             continue
         # A damaged historical receipt cannot prove that no clip was sent.
         log = load_json_state(p, {})
@@ -77,6 +79,7 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
     return data
 
 
+@campaign_state_operation
 def load(*, persist_seed: bool = True) -> dict[str, dict[str, list[str]]]:
     """Carrega o registro, semeando dos logs na 1ª vez.
 
@@ -141,6 +144,7 @@ def _reset_history() -> dict[str, Any]:
     return result
 
 
+@campaign_state_operation
 def recovery_was_reset(session_id: str, scenario: str, history_name: str = "") -> bool:
     with _LOCK:
         resets = _reset_history()
@@ -149,6 +153,7 @@ def recovery_was_reset(session_id: str, scenario: str, history_name: str = "") -
                     or history_name in resets.get("scenarios", {}).get(scenario, [])))
 
 
+@campaign_state_operation
 def recovery_reset_checker():
     """One validated reset snapshot for a read-only recovery listing."""
     with _LOCK:
@@ -165,6 +170,7 @@ def recovery_reset_checker():
             history in histories or history in scenarios.get(scenario, set())))
 
 
+@campaign_state_operation
 def mark_sent_many(deliveries: list[tuple[str, str, str]]) -> None:
     """Persist a validated reconciliation batch before acknowledging journals."""
     if not deliveries:
@@ -181,6 +187,7 @@ def mark_sent_many(deliveries: list[tuple[str, str, str]]) -> None:
             _save(data)
 
 
+@campaign_state_operation
 def mark_sent(scenario: str, clip_uid: str, email: str) -> None:
     """Registra que `clip_uid` foi enviado com sucesso para `email`."""
     with _LOCK:
@@ -285,6 +292,8 @@ def _scoped_reset(scenario: str | None, history_names: Collection[str]) -> None:
     old, retained, protected, session_entries, retained_sessions = set(), [], set(), {}, set()
     targeted_keys = {scenario} if scenario is not None else set()
     for path in sorted(config.DATA_DIR.glob("campaign_*.json")):
+        if not is_campaign_history_name(path.name):
+            continue
         if (path.is_symlink() or path.resolve().parent != root
                 or getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400):
             raise ValueError("Histórico de campanha fora da instalação; preserve os arquivos.")
@@ -389,6 +398,7 @@ def _scoped_reset(scenario: str | None, history_names: Collection[str]) -> None:
         _save(data)
 
 
+@campaign_state_operation
 def reset(scenario: str | None = None, *, history_names: Collection[str] | None = None) -> None:
     """Limpa tudo/um cenário, ou só recibos das campanhas explicitamente escolhidas."""
     with _LOCK:
@@ -419,7 +429,7 @@ def reset(scenario: str | None = None, *, history_names: Collection[str] | None 
                             for row in rows)):
                 completed.add(sid)
         resets["completed_sessions"] = sorted(set(resets.get("completed_sessions", [])) | completed)
-        histories = {p.name for p in config.DATA_DIR.glob("campaign_*.json")}
+        histories = {p.name for p in config.DATA_DIR.glob("campaign_*.json") if is_campaign_history_name(p.name)}
         if scenario is None:
             resets["all"] = sorted(set(resets.get("all", [])) | histories)
         else:

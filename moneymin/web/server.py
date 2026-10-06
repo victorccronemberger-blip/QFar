@@ -114,6 +114,8 @@ _BULK_REGISTER_LOCK = threading.Lock()
 _BULK_REGISTER_STATE: dict[str, Any] = {"state": "idle"}
 _HEAVY_RUNNER_LOCK = threading.Lock()
 from .. import recovery, campaign_start_store
+from .. import campaign_reset
+from ..campaign_state import campaign_state_lease, CampaignStateLeaseError
 from ..operation_lease import OperationLeaseError
 RECOVERY = recovery.RecoveryRunner()
 _WITHDRAW_LOCK = threading.Lock()
@@ -2422,6 +2424,35 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 return campaign_closing_response()
             campaign_drain["requests"] += 1
             g.campaign_request_admitted = True
+
+    @app.before_request
+    def guard_campaign_state():
+        scoped = any(request.path == prefix or request.path.startswith(prefix + "/")
+                     for prefix in ("/api/campaigns", "/api/recovery", "/api/logs",
+                                    "/api/sent", "/api/tasks", "/api/holo-cache", "/api/storage",
+                                    "/api/library"))
+        if not scoped or request.path == "/api/campaigns/drain":
+            return
+        lease = campaign_state_lease()
+        try:
+            lease.__enter__()
+        except CampaignStateLeaseError as exc:
+            code = getattr(exc, "code", "campaign_reset_busy")
+            return jsonify({"error_code": code,
+                            "error": ("A limpeza local foi interrompida. Use Reset completo novamente antes de iniciar envios."
+                                      if code == "campaign_reset_incomplete" else
+                                      "A limpeza local está em andamento. Aguarde terminar.")}), 409
+        g.campaign_state_lease = lease
+        if campaign_reset.pending() and (request.path.startswith("/api/campaigns")
+                                        or request.path.startswith("/api/recovery")):
+            return jsonify({"error_code": "campaign_reset_incomplete",
+                            "error": "A limpeza local foi interrompida. Use Reset completo novamente antes de iniciar envios."}), 409
+
+    @app.teardown_request
+    def release_campaign_state(_exc):
+        lease = g.pop("campaign_state_lease", None)
+        if lease is not None:
+            lease.__exit__(None, None, None)
 
     @app.teardown_request
     def release_campaign_request(_exc):
@@ -5676,12 +5707,51 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 return jsonify({"error": str(exc)}), 409
             return jsonify({"ok": True, "sent": sent_registry.summary()})
 
+    @app.post("/api/campaign/reset")
+    def reset_campaign_state():
+        body = request.get_json(silent=True) or {}
+        if body:
+            return jsonify({"error": "Reset completo não aceita filtros ou caminhos."}), 400
+        try:
+            with campaign_state_lease(exclusive=True), _HEAVY_RUNNER_LOCK:
+                workers = (RUNNER, RECOVERY, HOLO_CACHE_RUNNER)
+                catalogs = (task_catalog, campaign_verifications, accelerator_catalog,
+                            recovery_catalog, original_library_index, prepared_library_inventory,
+                            local_media_inventory)
+                if (campaign_drain["requested"] or campaign_drain["requests"]
+                        or any(worker.running or (getattr(worker, "_thread", None) is not None
+                                   and worker._thread.is_alive()) for worker in workers)
+                        or any(catalog.busy for catalog in catalogs)):
+                    return jsonify({"error_code": "campaign_reset_busy",
+                                    "error": "Pare a campanha ou recuperação e aguarde as operações e consultas terminarem antes do Reset completo."}), 409
+                result = campaign_reset.erase_local_campaigns()
+                RUNNER.reset_idle()
+                RECOVERY.reset_idle()
+                with preflight_lock:
+                    preflights.clear()
+                    original_preflights.clear()
+                    original_starts.clear()
+                for catalog in catalogs:
+                    catalog.clear_idle()
+                # Invalidate derived selection results; raw media and evidence
+                # in the Library stay intact and are re-read on demand.
+                campaign._ranked_pools_cached.cache_clear()
+                campaign._duration_ranked_pools.cache_clear()
+                campaign._nymeria_windows.cache_clear()
+        except CampaignStateLeaseError:
+            return jsonify({"error_code": "campaign_reset_busy",
+                            "error": "Aguarde as operações locais terminarem antes do Reset completo."}), 409
+        except campaign_reset.CampaignResetError as exc:
+            return jsonify({"ok": False, "error_code": exc.code,
+                            "error": str(exc), "partial": exc.partial}), 409
+        return jsonify({"ok": True, "state": "idle", **result})
+
     return app
 
 
 def _log_path(name: str) -> Path | None:
     """Resolve um nome de log de forma segura (sem path traversal)."""
-    if not (name.startswith("campaign_") and name.endswith(".json")) or "/" in name \
+    if not campaign.is_campaign_history_name(name) or "/" in name \
             or "\\" in name or name == "campaign.example.json":
         return None
     path = config.DATA_DIR / name

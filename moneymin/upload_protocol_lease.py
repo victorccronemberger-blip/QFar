@@ -6,6 +6,7 @@ import inspect
 
 from . import config
 from .operation_lease import operation_lease, OperationLeaseError
+from .campaign_state import campaign_state_lease
 
 def _path(sid):
     return config.DATA_DIR / 'upload-session-leases' / (hashlib.sha256(sid.encode('utf8')).hexdigest()+'.lock')
@@ -23,7 +24,7 @@ def session_protocol(fn):
             bound.arguments['session_id']=sid
         _sidecar_filename(sid)
         try:
-            with operation_lease(_path(sid)):
+            with campaign_state_lease(), operation_lease(_path(sid)):
                 return fn(*bound.args,**bound.kwargs)
         except OperationLeaseError:
             raise UploadError('A sessão já possui uma operação local em andamento.',transient=True,phase='preflight') from None
@@ -41,13 +42,13 @@ def pending_protocol(fn):
         if owner is not None and (not isinstance(owner,str) or not owner.strip()):
             raise UploadError('Conta de retomada inválida.',phase='preflight')
         org=arguments.get('required_org_key');selected=arguments.get('session_ids')
-        rows=list_sidecars()
-        sids=sorted({row['session_id'] for row in rows
-            if (owner is None or (isinstance(row.get('account_email'),str) and row['account_email'].strip().casefold()==owner.strip().casefold()))
-            and (org is None or row.get('org_key')==org)
-            and (selected is None or row.get('session_id') in selected)})
         try:
-            with ExitStack() as stack:
+            with campaign_state_lease(), ExitStack() as stack:
+                rows=list_sidecars()
+                sids=sorted({row['session_id'] for row in rows
+                    if (owner is None or (isinstance(row.get('account_email'),str) and row['account_email'].strip().casefold()==owner.strip().casefold()))
+                    and (org is None or row.get('org_key')==org)
+                    and (selected is None or row.get('session_id') in selected)})
                 for sid in sids:
                     if not isinstance(sid,str):
                         raise UploadError('Identidade de retomada inválida.',phase='preflight')

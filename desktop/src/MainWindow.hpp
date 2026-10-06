@@ -127,6 +127,10 @@ private:
   void loadTasks();
   void startCampaign();
   void updateCampaignActions();
+  bool campaignResetBlocked() const;
+  void resetCampaigns();
+  void invalidateCampaignUiRequests();
+  bool clearCampaignUiAfterReset();
   void pollCampaign();
   bool rememberCampaignStart(const QString& identity);
   void clearCampaignStart();
@@ -415,6 +419,9 @@ private:
   QString _campaignRequestedPreflight;
   bool _campaignPollInFlight{};
   int _campaignPollRevision{};
+  quint64 _campaignUiEpoch{};
+  bool _recoveryCommandPending{};
+  bool _campaignResetRunnerBusy{};
 
   QComboBox* _cacheProvider{};
   quint64 _cacheRequestId{};
@@ -544,6 +551,8 @@ private:
   int _walletRequestEpoch{};
 
   QTableWidget* _historyTable{};
+  QPushButton* _historyVerifyPreviews{};
+  bool _historyVerifyPending{};
   QPlainTextEdit* _historyDetail{};
   QTableWidget* _historyEvidence{};
 };

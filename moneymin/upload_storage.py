@@ -11,6 +11,7 @@ from pathlib import Path
 from . import config, token_store
 from .atomic_io import load_json_state, save_json
 from .recovery_errors import RecoveryReadError
+from .campaign_state import campaign_state_operation
 
 _LOCK = threading.RLock()
 
@@ -57,6 +58,7 @@ def _save_migrated_journal_without_overwrite(target: Path, row: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@campaign_state_operation
 def journal_directory() -> Path:
     destination = config.DATA_DIR / "sidecars"
     destination.mkdir(parents=True, exist_ok=True)

@@ -19,6 +19,18 @@ class CatalogLoader:
             "A preparação das categorias excedeu o tempo esperado. "
             "O cálculo continua no serviço. Tente recarregar em instantes.")
 
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return any("finished" not in row for row in self._jobs.values())
+
+    def clear_idle(self) -> None:
+        """Discard cached operational results only after every worker returns."""
+        with self._lock:
+            if any("finished" not in row for row in self._jobs.values()):
+                raise RuntimeError("Aguarde a consulta terminar antes do reset.")
+            self._jobs.clear()
+
     def get(self, key: tuple, work: Callable, *, scope: str | None = None, refresh: bool = False) -> tuple[dict, int]:
         with self._lock:
             now = time.monotonic()
@@ -68,7 +80,11 @@ class CatalogLoader:
                     return
                 row["state"] = "running"
             try:
-                result = work(progress)
+                # Operational catalog reads can migrate journals or retain a
+                # campaign preview. Reset must wait for their actual lifetime.
+                from ..campaign_state import campaign_state_lease
+                with campaign_state_lease():
+                    result = work(progress)
             except Exception:
                 # Never leave polling stuck forever, or expose credentials in
                 # an unexpected exception. Expected errors are mapped by work.

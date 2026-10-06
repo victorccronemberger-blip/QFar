@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config, transport
+from .campaign_state import campaign_state_operation
 from .atomic_io import JsonStateError, decode_json_state, load_json_state, save_bytes, save_json
 from .capture_import import CaptureDescriptor, CaptureImportError, inspect_original_capture
 from .device_profile import (
@@ -898,6 +899,7 @@ def _sidecar_archive_path(session_id: str, chunk_index: int = 0) -> Path:
     return _sidecar_path(session_id, chunk_index).with_suffix(".data.zip")
 
 
+@campaign_state_operation
 def _remove_sidecar_archive(session_id: str, chunk_index: int = 0) -> None:
     """Remove somente o ZIP temporário depois da entrega confirmada."""
     try:
@@ -947,6 +949,7 @@ def _sidecar_resume_payload(item: dict[str, Any]) -> bytes:
     return payload
 
 
+@campaign_state_operation
 def save_sidecar(sidecar: dict[str, Any]) -> Path:
     """Persiste o estado de um upload em `data/sidecars/<session_id>.json`."""
     if not isinstance(sidecar, dict):
@@ -1019,12 +1022,14 @@ def _load_sidecar_from_path(path: Path, session_id: str,
     return data
 
 
+@campaign_state_operation
 def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None:
     """Lê um recibo; somente a ausência real retorna None."""
     return _load_sidecar_from_path(_sidecar_path(session_id, chunk_index),
                                   session_id, chunk_index)
 
 
+@campaign_state_operation
 def list_sidecars(state: str | None = None) -> list[dict[str, Any]]:
     """Valida todos os journals antes de retornar o filtro de estado."""
     from .media_lifecycle import media_state_lease
