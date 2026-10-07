@@ -117,11 +117,19 @@ def capacity(review: list[dict], emails: list[str], *, target_seconds: float = 0
 
 
 def capacity_error(summary: dict) -> str:
+    accounts = summary.get('accounts', [])
+    history = max((row.get('recorded_clips', 0) for row in accounts), default=0)
+    pending = max((row.get('pending_clips', 0) for row in accounts), default=0)
+    diagnosis = (f"Histórico: até {history} recorte(s) já enviado(s) por conta; "
+                 f"pendências: até {pending} recorte(s) reservado(s) por conta. "
+                 if history or pending else
+                 "Nenhum recorte desta seleção foi excluído pelo histórico ou por pendências; "
+                 "o Reset não aumentará essas horas. ")
     return (f"Conteúdo novo insuficiente para a meta em {summary['shortfall_account_count']} conta(s): "
             f"a seleção oferece até {summary['available_seconds_min'] / 3600:.2f}–"
             f"{summary['available_seconds_max'] / 3600:.2f} h por conta, para uma meta de "
             f"{summary['target_seconds_per_account'] / 3600:g} h. "
-            "Selecione mais categorias, reveja a faixa de duração ou reduza a meta. "
+            + diagnosis + "Selecione mais categorias, reveja a faixa de duração ou reduza a meta. "
             "Vídeos já enviados e envios pendentes não contam como conteúdo novo.")
 
 

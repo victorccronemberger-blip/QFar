@@ -43,6 +43,10 @@ def friendly_campaign_error(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return "O QMoney não conseguiu concluir esta etapa. Tente novamente."
+    if "mídia reservada para envio anterior" in text or "limpeza incompleta" in text:
+        return ("Os envios confirmados foram preservados. A campanha parou porque "
+                "há mídia protegida por registros anteriores ou uma falha na limpeza. "
+                "Confira Recuperação de envios e o diagnóstico no Histórico.")
     if any(term in text for term in (
             "registro de envio já está em uso", "sessão selecionada está em uso",
             "registros estão em uso")):
@@ -59,7 +63,7 @@ def friendly_campaign_error(value: Any) -> str:
     if "origem da câmera" in text and "metadados" in text:
         return "Os metadados do envio não informam uma origem de câmera válida. O envio foi bloqueado antes do registro."
     if "memoryerror" in text or "cannot allocate memory" in text or "not enough memory" in text:
-        return "Este computador ficou sem memória durante a preparação. O QMoney liberou a etapa e seguirá com outro vídeo."
+        return "A preparação foi interrompida por falta de memória neste computador. Confira o andamento da campanha."
     if "cobertura imu insuficiente" in text or "sem amostras válidas de imu" in text:
         sensor = "acelerômetro" if "acelerômetro" in text else (
             "giroscópio" if "giroscópio" in text else "sensor")
@@ -73,9 +77,9 @@ def friendly_campaign_error(value: Any) -> str:
     if ("ego4d selection changed" in text or "lacks current task evidence" in text
             or "narração" in text or "narracao" in text):
         return ("A seleção deste trecho não confere com o catálogo do Ego4D. "
-                "O QMoney segue com outro vídeo.")
+                "O trecho foi recusado antes do envio.")
     if "acesso negado ao ego4d" in text or "accessdenied" in text:
-        return "A licença Ego4D não autorizou este arquivo. O QMoney seguirá com outro vídeo."
+        return "A licença Ego4D não autorizou este arquivo. O trecho foi recusado antes do envio."
     if any(term in text for term in ("disabled", "desativad", "blocked account")):
         return "O serviço recusou a operação. Confira o diagnóstico em Contas; uma mensagem de envio isolada não comprova desativação. Não remova a conta por este erro."
     if any(term in text for term in (
@@ -99,7 +103,7 @@ def friendly_campaign_error(value: Any) -> str:
     if any(term in text for term in (
             "clip", "video", "vídeo", "manifest", "duração", "duration",
             "ffmpeg", "ffprobe")):
-        return "Não foi possível preparar este vídeo. O QMoney o preservou e seguirá para o próximo."
+        return "Não foi possível preparar este vídeo. Os arquivos foram preservados; confira o diagnóstico no Histórico."
     return ("O envio não foi concluído. Confira o diagnóstico no Histórico e o recibo "
             "em Recuperação de envios antes de tentar novamente.")
 
@@ -247,6 +251,12 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             "detail": f"A campanha retomará dentro da janela {hours[0]}h–{hours[1]}h.",
         }
     if kind == "item_incomplete":
+        if payload.get('reason') == 'media_retained_for_recovery':
+            gib = float(payload.get('retained_bytes') or 0) / 1024 ** 3
+            return {'level': 'error', 'stage': 'Organização', 'title': 'Limpeza pendente',
+                'detail': (f"Envios confirmados; {int(payload.get('retained_managed') or 0)} arquivo(s) "
+                           f"gerenciado(s) preservado(s), {gib:.2f} GiB. A campanha parou antes de baixar "
+                           "outro vídeo. Confira Recuperação de envios e o Histórico.")}
         return {
             "level": "error", "stage": "Envio", "title": "Lote incompleto",
             "detail": "Uma ou mais contas não concluíram o envio; o vídeo foi preservado.",
@@ -254,6 +264,13 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if kind == "storage_cleanup":
         files = int(payload.get("files") or 0)
         mib = float(payload.get("bytes") or 0) / (1024 ** 2)
+        retained = int(payload.get('retained_managed') or 0)
+        if retained or payload.get('errors'):
+            gib = float(payload.get('retained_bytes') or 0) / 1024 ** 3
+            return {'level': 'warning', 'stage': 'Organização', 'title': 'Limpeza incompleta',
+                'detail': (f"{files} arquivo(s) removido(s) · {mib:.1f} MB liberados. "
+                           f"{retained} arquivo(s) gerenciado(s) preservado(s) · {gib:.2f} GiB. "
+                           "Confira o diagnóstico antes de continuar.")}
         return {
             "level": "info", "stage": "Organização", "title": "Espaço liberado",
             "detail": f"{files} arquivo(s) temporário(s) removido(s) · {mib:.1f} MB",

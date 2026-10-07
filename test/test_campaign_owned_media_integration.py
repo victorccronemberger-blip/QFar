@@ -54,7 +54,8 @@ class OwnedMediaCampaignIntegrationTests(unittest.TestCase):
             self.assertFalse(any(path.exists() for path in self.created['one']),
                              'The next dataset download began while first-item bytes remained')
             first = [rows for rows in recovery._groups(include_reconciled=True)
-                     if rows[0]['campaign_context']['clip_uid'] == 'one']
+                     if rows[0]['campaign_context']['clip_uid'] == 'one'
+                     and rows[0]['account_email'] in {account.email for account in self.cfg.accounts}]
             self.assertEqual(len(first), len(self.cfg.accounts))
             self.assertTrue(all(publication_registered(rows, publication_index()) for rows in first))
         self.events.append(('acquire', uid))
@@ -127,6 +128,37 @@ class OwnedMediaCampaignIntegrationTests(unittest.TestCase):
                        if rows[0]['account_email'] == self.fail_account)
         self.assertFalse(journal_delivery_confirmed(pending[0]))
         self.assertIn(Path(pending[0]['video_path']), recovery.media_cleanup_protection()['paths'])
+
+    def test_old_confirmed_orphan_sharing_source_is_repaired_before_next_download(self):
+        original_prepare = self.prepare_item
+        def prepare_with_old_receipt(clip, *args, **kwargs):
+            item = original_prepare(clip, *args, **kwargs)
+            if clip['clip_uid'] == 'one':
+                from moneymin.content_provenance import canonical_digest
+                binding = {'content': {'assets': {str(index): {
+                    'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                    for index, path in enumerate(self.created['one'][:3])}}}
+                binding['delivery_binding_sha256'] = canonical_digest(binding)
+                upload.save_sidecar({'session_id': 'old-confirmed-orphan',
+                    'account_email': 'previous@example.invalid', 'org_key': 'offline-org',
+                    'task_id': self.task.task_id, 'chunk_index': 0, 'expected_chunk_count': 1,
+                    'state': 'done', 'phase': 'done', 'create_attempted': True,
+                    'upload_id': 'old-confirmed-upload', 'finalized': True,
+                    'evaluation_required': False, 'campaign_reconciled': True,
+                    'campaign_context': {'registry_key': self.task.registry_key,
+                        'clip_uid': 'one', 'task_id': self.task.task_id,
+                        'content_provenance': binding}})
+                self.assertTrue(recovery.media_cleanup_protection()['sha256'])
+            return item
+        self.prepare.side_effect = prepare_with_old_receipt
+        log = campaign.run_campaign(self.cfg)
+        self.assertEqual(log.status, 'done')
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(len([event for event in self.events if event[0] == 'receipt']), 4)
+        self.assertFalse(any(path.exists() for values in self.created.values() for path in values))
+        old = next(rows for rows in recovery._groups(include_reconciled=True)
+                   if rows[0]['session_id'] == 'old-confirmed-orphan')
+        self.assertTrue(publication_registered(old, publication_index()))
         self.assertTrue(self.manual.exists())
 
     def test_confirmed_account_keeps_shared_variant_chunks_until_other_account_publishes(self):

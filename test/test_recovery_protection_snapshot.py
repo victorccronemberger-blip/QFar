@@ -75,6 +75,43 @@ class RecoveryProtectionSnapshotTests(unittest.TestCase):
                 self.assertEqual(result["paths"], {value for media, _, archive in self.paths.values()
                                                   for value in (media.resolve(), archive)})
 
+    def test_cleanup_resolves_the_store_once_even_for_many_pending_receipts(self):
+        for index in range(21, 71):
+            self.persist(index, confirmed=False)
+        with patch.object(upload, 'sidecars_dir', return_value=self.journals) as directory:
+            result = recovery.media_cleanup_protection()
+        directory.assert_called_once()
+        self.assertEqual(len(result['sha256']), 51)
+
+    def test_confirmed_orphan_is_republished_once_without_rewriting_receipts(self):
+        path = self.journals / 'fixture-session-0.json'
+        row = json.loads(path.read_text('utf8'))
+        del row['campaign_context']['history_name']
+        path.write_text(json.dumps(row), 'utf8')
+        (self.root / 'campaign_fixture_0.json').unlink()
+        before = path.read_bytes()
+        media, digest, _ = self.paths[0]
+        self.assertIn(digest, recovery.media_cleanup_protection()['sha256'])
+        result = recovery.reconcile_confirmed()
+        self.assertEqual(result['publication_pending'], 0)
+        self.assertNotIn(digest, recovery.media_cleanup_protection()['sha256'])
+        self.assertEqual(path.read_bytes(), before)
+        histories = set(self.root.glob('campaign_*.json'))
+        recovery.reconcile_confirmed()
+        self.assertEqual(set(self.root.glob('campaign_*.json')), histories)
+        self.assertTrue(media.exists())
+
+    def test_missing_named_attempt_pending_receipt_and_bad_history_remain_protected(self):
+        (self.root / 'campaign_fixture_0.json').unlink()
+        recovery.reconcile_confirmed(refresh=False)
+        result = recovery.media_cleanup_protection()
+        self.assertIn(self.paths[0][1], result['sha256'])
+        self.assertIn(self.paths[20][1], result['sha256'])
+        (self.root / 'campaign_bad.json').write_text('{bad', 'utf8')
+        histories = set(self.root.glob('campaign_*.json'))
+        recovery.reconcile_confirmed(refresh=False)
+        self.assertEqual(set(self.root.glob('campaign_*.json')), histories)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,8 @@ def media_cleanup_protection() -> dict:
     store is an error, never an empty protection list. No journal is rewritten.
     """
     from . import campaign_start_store, original_capture
-    groups = _groups(include_reconciled=True)
+    directory = upload.sidecars_dir()
+    groups = _groups(directory, include_reconciled=True)
     paths, hashes = set(), set()
     publications = _UNREAD_PUBLICATION
     for rows in groups:
@@ -63,7 +64,11 @@ def media_cleanup_protection() -> dict:
                         if not isinstance(value,str) or not value or not Path(value).is_absolute():
                             raise ValueError('Vínculo de mídia inválido impede a limpeza segura.')
                         paths.add(Path(value).resolve())
-                archive = upload._sidecar_archive_path(row['session_id'], row.get('chunk_index',0))
+                # Resolve/migrate the authoritative store once for this snapshot.
+                # Re-entering sidecars_dir for every pending row rescans legacy
+                # journals and credentials, turning cleanup into quadratic I/O.
+                archive = (directory / upload._sidecar_filename(
+                    row['session_id'], row.get('chunk_index', 0))).with_suffix('.data.zip')
                 paths.add(archive.resolve())
     reservations = original_capture._read_reservations()
     for row in reservations['bindings'].values():
@@ -271,29 +276,85 @@ def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
 
 
 @campaign_state_operation
-def reconcile_confirmed() -> dict:
+def reconcile_confirmed(*, refresh=True) -> dict:
     directory = upload.sidecars_dir()
     groups = _groups(directory, include_reconciled=True)
     publications = _read_required_publications(groups)
     groups = _visible_groups(groups, publications)
+    reset_checker = sent_registry.recovery_reset_checker()
     missing = {(rows[0]["session_id"], rows[0]["account_email"]) for rows in groups
                if not rows[0].get("campaign_context")}
     contexts = campaign._legacy_upload_contexts(missing, [row for rows in groups for row in rows]) if missing else {}
     confirmed = []
     deliveries = []
+    orphaned = []
     for rows in groups:
-        item = _describe(rows, contexts, publication_index=publications)
+        item = _describe(rows, contexts, reset_checker, publications)
         if item is None or item["status"] != "confirmed":
             continue
         first = rows[0]
         context = first.get("campaign_context") or contexts[(item["session_id"], item["email"])]
+        lineage = context.get('content_provenance')
+        if lineage is not None:
+            from .content_provenance import canonical_digest
+            if (not isinstance(lineage, dict) or lineage.get('delivery_binding_sha256') !=
+                    canonical_digest({k: v for k, v in lineage.items() if k != 'delivery_binding_sha256'})):
+                raise ValueError('Vínculo de conteúdo inválido impede a reconciliação segura.')
+        # Some legacy completed receipts have no remaining attempt history.
+        # Publish their existing receipt locally before cleanup may release the
+        # source. Ambiguous/corrupt history and named attempts stay protected.
+        if (publications is not None and not publications.get(first['session_id'])
+                and not context.get('history_name')
+                and all(row.get('campaign_reconciled') is True for row in rows)):
+            reference = {'clip_uid': context['clip_uid'], 'task_id': first['task_id'],
+                'registry_key': context['registry_key'], 'recovered_from_journals': True,
+                'accounts': [{'email': first['account_email'], 'org_key': first['org_key'],
+                    'session_id': first['session_id'], 'ok': True, 'finalized': True,
+                    'recovered': True}]}
+            durations = [row.get('duration_ms') for row in rows]
+            if all(type(duration) is int and duration > 0 for duration in durations):
+                reference['duration_ms'] = sum(durations)
+            from .campaign_evidence import current_result
+            if current_result(reference, reference['accounts'][0], None,
+                              {first['session_id']: rows})['status'] == 'confirmed':
+                orphaned.append(reference)
         deliveries.extend((context["registry_key"], uid, item["email"])
                           for uid in item["delivery_clip_uids"])
         if any(row.get('campaign_reconciled') is not True for row in rows):
             confirmed.append(rows)
+    if orphaned:
+        from datetime import datetime, timezone
+        restored = campaign.CampaignLog(started_at=datetime.now(timezone.utc).isoformat(),
+            accounts=sorted({item['accounts'][0]['email'] for item in orphaned}),
+            items=orphaned, status='done')
+        # Campaign reset is excluded by the shared state lease. Serialize
+        # read/publish with journal checkpoints and recheck before creating a
+        # history so concurrent reconciliation cannot duplicate a SID.
+        from .campaign_evidence import publication_index
+        with media_state_lease(wait=True, timeout_s=30):
+            latest = publication_index()
+            if latest is not None:
+                restored.items = [item for item in orphaned
+                                  if not latest.get(item['accounts'][0]['session_id'])]
+                selected = {item['accounts'][0]['session_id'] for item in restored.items}
+                import json
+                for rows in groups:
+                    if rows[0]['session_id'] not in selected:
+                        continue
+                    for row in rows:
+                        path = directory / upload._sidecar_filename(row['session_id'], row['chunk_index'])
+                        actual = upload._read_sidecar_file(path)
+                        if actual is None:
+                            raise RecoveryReadError('journal_unreadable', path)
+                        actual = {**actual, 'chunk_index': actual.get('chunk_index', 0)}
+                        if json.dumps(actual, sort_keys=True) != json.dumps(row, sort_keys=True):
+                            raise ValueError('O recibo mudou durante a reconciliação; tente novamente.')
+                if restored.items:
+                    restored.save()
     # Commit the complete sent index first. An interrupted acknowledgment can
     # safely repeat; it never forgets a completed delivery or starts an upload.
-    sent_registry.mark_sent_many(deliveries)
+    if deliveries:
+        sent_registry.mark_sent_many(deliveries)
     for rows in confirmed:
         for row in rows:
             if row.get("campaign_reconciled") is True:
@@ -304,7 +365,7 @@ def reconcile_confirmed() -> dict:
         {"email": rows[0]["account_email"], "session_id": rows[0]["session_id"],
          "clip_uid": (rows[0].get("campaign_context") or contexts[
              (rows[0]["session_id"], rows[0]["account_email"])])["clip_uid"]}
-        for rows in confirmed], **snapshot()}
+        for rows in confirmed], **(snapshot() if refresh else {})}
 
 
 @campaign_state_operation

@@ -178,13 +178,15 @@ class _ProbeProcess:
             self._job = None
 
 
-def probe(service: Path, user_root: Path, library: Path, expected: list[str]) -> None:
+def probe(service: Path, user_root: Path, library: Path, expected: list[str], *, test_manifest=False) -> None:
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     token = uuid.uuid4().hex
     environment = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("QMONEY_", "MINUTE_", "AWS_", "HOSTINGER_", "EGO4D_", "CROWTADO_"))}
+                   if not key.startswith(("QMONEY_", "MINUTE_", "AWS_", "HOSTINGER_", "EGO4D_", "CROWTADO_", "NYMERIA_"))
+                   and key not in {'PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE'}}
+    environment['PYTHONNOUSERSITE'] = '1'
     environment.update(QMONEY_USER_ROOT=str(user_root), QMONEY_LIBRARY_ROOT=str(library),
                        QMONEY_RUNTIME_ROOT=str(service.parent), QMONEY_LOCAL_API_TOKEN=token,
                        QMONEY_APP_VERSION=os.environ.get("QMONEY_VERSION", "2.0.27").lstrip("v"), MINUTE_VPN_ENFORCE="0",
@@ -196,9 +198,11 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
                              "--parent-pid", str(os.getpid())], cwd=user_root, env=environment)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def get(route, authenticated=True, method='GET'):
+    def get(route, authenticated=True, method='GET', body=None):
         request = urllib.request.Request(f"http://127.0.0.1:{port}{route}",
-                    headers={"X-QMoney-Session": token} if authenticated else {}, method=method)
+                    headers={**({"X-QMoney-Session": token} if authenticated else {}),
+                             'Content-Type': 'application/json'}, method=method,
+                    data=json.dumps(body).encode() if body is not None else None)
         with opener.open(request, timeout=3) as response:
             return json.load(response)
 
@@ -312,6 +316,25 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
         assert get('/api/recovery')['items'] == []
         current = get('/api/campaigns/current')
         assert current['state'] == 'idle' and current['events'] == [] and current['totals']['total_sends'] == 0
+        if test_manifest:
+            groups = ('metadata_json', 'narration', 'timesync_and_imu', 'recording_head_data_data_vrs')
+            manifest = user_root / 'fixture-download-urls.json'
+            manifest.write_text(json.dumps({'sequences': {'portable_sequence': {
+                name: {'filename': name + '.zip', 'sha1sum': 'a' * 40, 'file_size_bytes': 100,
+                       'download_url': 'https://fixture.fbcdn.net/' + name + '.zip'}
+                for name in groups}}}), encoding='utf8')
+            assert get('/api/library/nymeria/import', method='POST', body={'path':str(manifest)})['ok'] is True
+            deadline = time.monotonic() + 15
+            while True:
+                operation = get('/api/library/nymeria/operation')
+                if not operation['running']:
+                    assert operation['state'] == 'done'
+                    break
+                if time.monotonic() > deadline:
+                    raise RuntimeError('Portable manifest import did not finish')
+                time.sleep(.1)
+            assert get('/api/library/nymeria/sequences')['total'] == 1
+            assert get('/api/campaigns/current')['state'] == 'idle'
     finally:
         process.close()
 
@@ -351,7 +374,7 @@ def main() -> None:
         credentials.write_bytes(original)
         probe(service, customer, library, ["fixture@example.invalid"])
         assert credentials.read_bytes() == original
-        probe(service, root / "customer-b", library, [])
+        probe(service, root / "customer-b", library, [], test_manifest=True)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"passed": True, "checks": ["fresh_installation", "restart_preserves_credentials",
         "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started",
@@ -360,6 +383,7 @@ def main() -> None:
         "general_local_media_inventory", "owned_process_tree_shutdown",
         "nymeria_sdk_core_device_time", "nymeria_metadata_only_not_ready",
         "nymeria_source_catalog_and_packaged_current_tasks", "nymeria_source_catalog_authentication",
+        "nymeria_manifest_import_without_external_python_or_sdk",
         "full_campaign_reset_preserves_credentials_and_library"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 

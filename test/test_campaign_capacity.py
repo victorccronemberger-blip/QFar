@@ -9,6 +9,17 @@ import test_preflight_continuation as continuation
 
 
 class CampaignCapacityTests(unittest.TestCase):
+    def test_insufficient_goal_explains_when_reset_cannot_add_content(self):
+        review = [self.row('one', [0, 300])]
+        summary = campaign_plan.capacity(review, ['fixture@example.invalid'], target_seconds=28800)
+        self.assertFalse(summary['can_reach_goal'])
+        self.assertIn('Reset não aumentará', campaign_plan.capacity_error(summary))
+        review[0].update(recorded_accounts=['fixture@example.invalid'], eligible_accounts=[])
+        summary = campaign_plan.capacity(review, ['fixture@example.invalid'], target_seconds=28800)
+        message = campaign_plan.capacity_error(summary)
+        self.assertIn('Histórico: até 1', message)
+        self.assertNotIn('Nenhum recorte', message)
+
     def row(self, uid, window, *, parent='parent', task='task', email='fixture@example.invalid'):
         return {'clip_uid': uid, 'task_id': task, 'source': 'ego4d',
                 'parent_video_uid': parent, 'window_s': window,

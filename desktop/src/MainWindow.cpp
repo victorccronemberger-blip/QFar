@@ -10,6 +10,7 @@
 #include "CampaignReviewDialog.hpp"
 #include "OriginalCaptureDialog.hpp"
 #include "OwnedServiceProcesses.hpp"
+#include "LibraryRootSelection.hpp"
 #include <QMenu>
 #include <QWidgetAction>
 #include <QPointer>
@@ -4003,24 +4004,10 @@ void MainWindow::startBackend() {
     // níveis acima; numa distribuição portátil eles podem ficar ao lado do EXE.
     workingDirectory = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
                        + QStringLiteral("/QMoney");
-    // A pasta da conta não é biblioteca. Ela só entra se tiver as narrações;
-    // um catálogo parcial nessa pasta faz a campanha recusar todos os vídeos.
-    QString libraryRoot;
-    QStringList libraryCandidates;
+    // A escolha explícita da biblioteca também vale antes de sincronizar
+    // seu catálogo. Fontes portáteis são procuradas só na ausência dessa escolha.
     const QString savedLibrary = QSettings().value(QStringLiteral("libraryRoot")).toString();
-    if (!savedLibrary.isEmpty()) libraryCandidates << savedLibrary;
-    libraryCandidates << appDir << QDir(appDir).absoluteFilePath(QStringLiteral("../.."));
-    for (const QString& candidate : libraryCandidates) {
-      const QString data = QDir::cleanPath(candidate + QStringLiteral("/data/ego4d"));
-      if (QFileInfo::exists(data + QStringLiteral("/timed_narrations.jsonl")) ||
-          QFileInfo::exists(data + QStringLiteral("/clip_narrations.json")) ||
-          QFileInfo::exists(QDir::cleanPath(candidate + QStringLiteral("/data/holoassist")))) {
-        libraryRoot = QDir::cleanPath(candidate);
-        break;
-      }
-    }
-    if (libraryRoot.isEmpty())
-      libraryRoot = workingDirectory;
+    const QString libraryRoot = selectLibraryRoot(savedLibrary, appDir, workingDirectory);
     QDir().mkpath(workingDirectory);
     // Contas e segredos pertencem ao usuário Windows, nunca à biblioteca.
     for (const QString& key : environment.keys()) {

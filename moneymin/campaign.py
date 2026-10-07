@@ -2088,7 +2088,10 @@ def _cleanup_uploaded_item(
         seq_dir = Path(candidate["path"])
         if seq_dir.is_absolute():
             roots.append(seq_dir.parent)
-    result["retained_managed"] = len(managed_media_paths(candidates, allowed_roots=tuple(roots)))
+    retained = managed_media_paths(candidates, allowed_roots=tuple(roots))
+    result["retained_managed"] = len(retained)
+    result["retained_bytes"] = sum(path.stat().st_size for path in retained)
+    result["retained_names"] = [path.name for path in retained]
     result["protected"] = protected_count
     return result
 
@@ -2728,6 +2731,8 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             on_progress=on_progress,
             campaign_context={"registry_key": item["registry_key"], "clip_uid": item["clip_uid"],
                               "task_id": task_id,
+                              **({"history_name": item['_history_name']}
+                                 if item.get('_history_name') else {}),
                               **({"content_provenance": result["source_provenance"]}
                                  if item.get("source") in {"ego4d", "nymeria"} else {})}
                               if item.get("registry_key") and item.get("clip_uid") else None,
@@ -3502,6 +3507,7 @@ def _run_campaign(
             item["task_scenario"] = tsk.scenario
             item["registry_key"] = registry_key
             item["dedup_clip_uids"] = list(clip_info.get("dedup_clip_uids") or [])
+            item['_history_name'] = log._path.name if log._path is not None else None
             item["accounts"] = []
             pending_accounts: list[AccountSpec] = []
             account_results: dict[str, dict[str, Any]] = {}
@@ -3513,7 +3519,7 @@ def _run_campaign(
                                     if a.email in account_results]
                 if persisted_item is None:
                     persisted_item = {k: v for k, v in item.items()
-                                      if k not in ("imu_csv", "frames_csv", "probe", "_cleanup_paths")}
+                                      if k not in ("imu_csv", "frames_csv", "probe", "_cleanup_paths", "_history_name")}
                     log.add_item(persisted_item)
                 else:
                     persisted_item["accounts"] = item["accounts"]
@@ -3972,6 +3978,8 @@ def _run_campaign(
                 if reserved and not config.cleanup_after_upload:
                     _log("  armazenamento: mídia preservada para a recuperação do envio anterior")
                 elif config.cleanup_after_upload and all_pending_succeeded:
+                    from . import recovery
+                    recovery.reconcile_confirmed(refresh=False)
                     cleanup = _cleanup_uploaded_item(
                         item,
                         work_dir,
@@ -3984,6 +3992,8 @@ def _run_campaign(
                         bytes=cleanup["bytes"],
                         errors=cleanup["errors"],
                         protected=cleanup["protected"],
+                        retained_managed=cleanup.get("retained_managed", 0),
+                        retained_bytes=cleanup.get("retained_bytes", 0),
                     )
                     _log(
                         "  armazenamento: removeu "
@@ -3996,7 +4006,9 @@ def _run_campaign(
                     )
                     if cleanup["errors"] or cleanup.get("retained_managed", 0):
                         _emit("item_incomplete", clip_uid=clip_info["clip_uid"],
-                              task=tsk.scenario, reason="media_retained_for_recovery")
+                              task=tsk.scenario, reason="media_retained_for_recovery",
+                              retained_managed=cleanup.get("retained_managed", 0),
+                              retained_bytes=cleanup.get("retained_bytes", 0))
                         raise RuntimeError(
                             "Mídia reservada para envio anterior ou limpeza incompleta; "
                             "a campanha não adquiriu outro vídeo. Resolva a pendência e retome.")
