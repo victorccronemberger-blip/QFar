@@ -5276,7 +5276,7 @@ void MainWindow::loadTasks() {
     _campaignStart->setEnabled(false);
     return;
   }
-  {
+  if (!automaticPoll) {
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
     auto* loading = new QListWidgetItem(QStringLiteral("Carregando categorias…"), _campaignTasks);
@@ -5296,9 +5296,12 @@ void MainWindow::loadTasks() {
   }
   if (selectionChanged || !automaticPoll || !_taskCatalogPollTimer.isValid()) {
     _taskCatalogPollCount = 0;
+    _taskCatalogIdlePollCount = 0;
+    _taskCatalogProgress.clear();
     _taskCatalogTimeoutPollCount = 0;
     _taskCatalogTimedOut = false;
     _taskCatalogPollTimer.restart();
+    _taskCatalogIdleTimer.restart();
     _taskCatalogTimeoutTimer.invalidate();
   }
   if (!_taskCatalogJobId.isEmpty()) path += QStringLiteral("&job_id=%1").arg(encoded(_taskCatalogJobId));
@@ -5341,6 +5344,13 @@ void MainWindow::loadTasks() {
       }
       QString message = body.value(QStringLiteral("message")).toString(
           QStringLiteral("Preparando categorias…"));
+      const QString progress = body.value(QStringLiteral("phase")).toString()
+          + QLatin1Char('\n') + message;
+      if (progress != _taskCatalogProgress) {
+        _taskCatalogProgress = progress;
+        _taskCatalogIdlePollCount = 0;
+        _taskCatalogIdleTimer.restart();
+      }
       const int elapsed = body.value(QStringLiteral("elapsed_s")).toInt();
       if (elapsed > 0) message += QStringLiteral(" (%1 s)").arg(elapsed);
       if (liveTimeout) {
@@ -5351,10 +5361,12 @@ void MainWindow::loadTasks() {
         message = error + QStringLiteral(" · ") + message;
       }
       ++_taskCatalogPollCount;
+      ++_taskCatalogIdlePollCount;
       if (_taskCatalogTimedOut) ++_taskCatalogTimeoutPollCount;
       const bool paused = _taskCatalogTimedOut
           ? _taskCatalogTimeoutPollCount >= 30 || _taskCatalogTimeoutTimer.elapsed() >= 60000
-          : _taskCatalogPollCount >= 250 || _taskCatalogPollTimer.elapsed() >= 300000;
+          : _taskCatalogPollCount >= 1500 || _taskCatalogPollTimer.elapsed() >= 1800000
+              || _taskCatalogIdlePollCount >= 250 || _taskCatalogIdleTimer.elapsed() >= 300000;
       if (paused) message += QStringLiteral(
           " · Acompanhamento pausado. O cálculo continua no serviço; use Recarregar categorias para consultar esta mesma consulta.");
       auto* item = new QListWidgetItem(message, _campaignTasks);

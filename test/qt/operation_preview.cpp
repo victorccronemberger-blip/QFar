@@ -52,6 +52,7 @@ public:
 #include "campaign_all_compatible_qa.inc"
 #include "campaign_on_demand_qa.inc"
 #include "catalog_timeout_qa.inc"
+#include "catalog_progress_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -1664,6 +1665,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--catalog-timeout-recovery-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::catalogTimeoutRecoverySmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--catalog-progress-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::catalogProgressSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--mail-cleanup-smoke")) {

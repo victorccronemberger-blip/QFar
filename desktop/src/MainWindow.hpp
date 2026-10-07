@@ -427,8 +427,11 @@ private:
   bool _taskCatalogForceRefresh{};
   bool _taskCatalogTimedOut{};
   int _taskCatalogPollCount{};
+  int _taskCatalogIdlePollCount{};
   int _taskCatalogTimeoutPollCount{};
+  QString _taskCatalogProgress;
   QElapsedTimer _taskCatalogPollTimer;
+  QElapsedTimer _taskCatalogIdleTimer;
   QElapsedTimer _taskCatalogTimeoutTimer;
   bool _cacheCatalogPending{};
   bool _cacheStartPending{};
