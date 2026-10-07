@@ -50,7 +50,7 @@ class NymeriaLibraryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name) / "library"
+        self.root = (Path(self.temporary.name) / "library").resolve()
         self.manifest = Path(self.temporary.name) / "manifest.json"
         self.payloads = {}
         self.catalog = {"sequences": {}}
