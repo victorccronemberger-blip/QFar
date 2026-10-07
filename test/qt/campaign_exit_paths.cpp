@@ -2,6 +2,7 @@
 #include <QCloseEvent>
 #include <QDir>
 #include <QEventLoop>
+#include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -93,6 +94,12 @@ static void spin(int ms) {
   loop.exec();
 }
 
+static void waitFor(const std::function<bool()>& completed) {
+  QElapsedTimer deadline;
+  deadline.start();
+  while (!completed() && deadline.elapsed() < 2000) spin(10);
+}
+
 int main(int argc, char** argv) {
   QApplication app(argc, argv);
   app.setQuitOnLastWindowClosed(false);
@@ -129,7 +136,14 @@ int main(int argc, char** argv) {
     window.pollCampaignClose(); window._api.reply(busy); spin(5);
     check("restart-busy-held", window.backendStops == 0 && window.isVisible());
     if (mode == "restart-close") window.close();
-    window.pollCampaignClose(); window._api.reply(ready); spin(420);
+    window.pollCampaignClose(); window._api.reply(ready);
+    // Wait for the actual transition: a 350 ms restart timer is not a
+    // guarantee that its callback ran within a fixed 420 ms on a busy runner.
+    if (mode == "restart") waitFor([&] { return window.backendStarts == 1; });
+    else {
+      waitFor([&] { return window.backendStops == 1 && !window.isVisible(); });
+      spin(420); // The cancelled restart must still not run afterwards.
+    }
     if (mode == "restart-close") {
       check("close-cancels-library-commit", QSettings().value("libraryRoot") == "original-library");
       check("close-cancels-restart-timer", window.backendStarts == 0 && window.backendStops == 1 && !window.isVisible());
@@ -153,7 +167,11 @@ int main(int argc, char** argv) {
     window.pollCampaignClose(); window._api.reply(busy); spin(5);
     check("update-busy-held", InertProcess::launches == 0 && window.backendStops == 0);
     if (mode == "update-close-failure") window.close();
-    window.pollCampaignClose(); window._api.reply(ready); spin(420);
+    window.pollCampaignClose(); window._api.reply(ready);
+    waitFor([&] {
+      return mode == "update-failure" ? window.backendStarts == 1
+                                     : window.backendStops == 1 && !window.isVisible();
+    });
     check("updater-one-launch-after-ready", InertProcess::launches == 1);
     const auto args = InertProcess::launchArguments;
     check("updater-original-package-and-digest", args.value(1) == "inert-package.zip" && args.value(3) == QString(64, 'a'));
@@ -172,7 +190,8 @@ int main(int argc, char** argv) {
     InertFileDialog::duringSelection = [&] { window.restartBackend(); };
     window.chooseLibrary();
     check("reentrant-library-no-late-pending-root", window._pendingLibraryRoot.isEmpty());
-    window._api.reply(ready); spin(420);
+    window._api.reply(ready);
+    waitFor([&] { return window.backendStarts == 1; });
     check("reentrant-library-no-stale-commit", QSettings().value("libraryRoot") == "original-library");
     check("reentrant-restart-once", window.backendStarts == 1 && window.backendStops == 1);
   } else if (mode == "quit") {
