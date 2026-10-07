@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.0.70",
+    [string]$Version = "2.0.71",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [switch]$Staging
 )
@@ -46,7 +46,7 @@ New-Item -ItemType Directory -Force "$WorkDir\spec" | Out-Null
     --paths $ProjectRoot --icon "$ProjectRoot\desktop\resources\qmoney.ico" `
     --distpath "$WorkDir\pyinstaller" --workpath "$WorkDir\pyinstaller-build" `
     --specpath "$WorkDir\spec" `
-    --collect-data moneymin --collect-all curl_cffi `
+    --collect-data moneymin --collect-all curl_cffi --collect-all ijson `
     --collect-submodules playwright --collect-submodules boto3 --collect-submodules ego4d `
     --collect-all projectaria_tools `
     --hidden-import _core_pybinds --hidden-import _adt_pybinds `

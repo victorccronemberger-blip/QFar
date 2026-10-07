@@ -4648,6 +4648,7 @@ def _refresh_rank_inputs() -> None:
 def _ranked_pools() -> dict[str, tuple[dict[str, Any], ...]]:
     """Todas as tasks de uma vez. Cache em disco para o GET /api/tasks não congelar a UI."""
     with _RANK_LOCK:
+        ego4d.ensure_task_annotations()
         _refresh_rank_inputs()
         return _ranked_pools_cached()
 
@@ -4754,6 +4755,7 @@ def _compatible_task_clips(
     ego_clips: tuple[dict[str, Any], ...] = ()
     task_name = task_matching.canonical_task_name(task_name)
     if provider in ("all", "ambos", "ego4d"):
+        ego4d.ensure_task_annotations()
         if ((min_dur_s, max_dur_s) != (60, 1800)
                 and ego4d.has_timed_narrations()):
             with _RANK_LOCK:

@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **123 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **124 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.70](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.70). Destaques: Campanhas sem meta obrigatória de horas, que continuam até esgotar o conteúdo elegível ou o usuário parar.
+Versão atual: [v2.0.71](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.71). Destaques: Instalações novas obtêm as anotações Ego4D antes de selecionar e preparar recortes; mantém campanhas sem meta de horas.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.71](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.71) | 07/10/2026 | Obtém as anotações temporizadas oficiais antes de gerar a seleção em uma biblioteca Ego4D nova. Leitura por fluxo guarda apenas o índice compacto, preserva arquivos existentes e remove temporários após falha. Inclui o leitor no executável e amplia o tempo da consulta inicial acompanhada em segundo plano. Mantém campanhas sem meta de horas. | [Desde v2.0.70](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.70...v2.0.71) |
 | [v2.0.70](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.70) | 07/10/2026 | Remove meta obrigatória de horas e limite de um recorte por categoria. Prévia informa disponibilidade sem bloquear por déficit, acompanhamento mostra envios confirmados e o motor continua até esgotar os recortes elegíveis ou o usuário parar. Preserva proteção de pendências, deduplicação e limpeza após confirmação. | [Desde v2.0.68](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.68...v2.0.70) |
 | [v2.0.68](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.68) | 07/10/2026 | Importa o catálogo privado portátil pela Biblioteca existente e sincroniza apenas metadados e anotações. Preserva configurações anteriores, informa falhas sem bloquear o serviço e evita caminhos Nymeria herdados do Windows. SDK incluído e verificação do catálogo disponível sem adquirir VRS ou IMU. | [Desde v2.0.65](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.65...v2.0.68) |
 | [v2.0.65](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.65) | 07/10/2026 | Reconstrói localmente o histórico de recibos confirmados sem tentativa correspondente, preservando registros pendentes e históricos ambíguos. Limpeza resolve o armazenamento uma vez, informa bytes retidos e não promete continuação após parada. Corrige a escolha de bibliotecas vazias ou somente Nymeria e amplia a verificação do pacote em instalação isolada. | [Desde v2.0.63](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.63...v2.0.65) |

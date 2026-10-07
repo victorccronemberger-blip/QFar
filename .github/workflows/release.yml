@@ -101,7 +101,7 @@ jobs:
             --name QMoneyService --paths $root `
             --icon "$root/desktop/resources/qmoney.ico" `
             --distpath dist/work/pyinstaller --workpath dist/work/pyinstaller-build `
-            --specpath dist/work/spec --collect-data moneymin --collect-all curl_cffi `
+            --specpath dist/work/spec --collect-data moneymin --collect-all curl_cffi --collect-all ijson `
             --collect-submodules playwright --collect-submodules boto3 `
             --collect-submodules ego4d `
             --collect-all projectaria_tools `

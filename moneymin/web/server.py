@@ -2432,7 +2432,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
     # Nenhum frontend web e publicado ou usado como fallback.
     app = Flask(__name__, static_folder=None)
     app.config["QMONEY_LOCAL_API_AUTHENTICATED"] = bool(local_api_token)
-    task_catalog = CatalogLoader()
+    task_catalog = CatalogLoader(timeout_s=1800)
     campaign_verifications = CatalogLoader(ttl_s=30, max_pending=1, timeout_s=900,
         timeout_message="A verificação demorou mais que o esperado. Nenhum envio foi iniciado. "
                         "Confira a conexão e tente verificar novamente em instantes.")

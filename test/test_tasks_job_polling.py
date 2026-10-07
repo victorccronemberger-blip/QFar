@@ -106,6 +106,10 @@ class TasksJobPollingTests(unittest.TestCase):
     def test_timeout_keeps_live_job_and_poll_returns_unobserved_completion(self):
         job = self.start_job()
         self.clock += 301
+        preparing = self.poll(job)
+        self.assertEqual(preparing.status_code, 202, preparing.get_json())
+        self.assertEqual(preparing.json['job_id'], job)
+        self.clock += 1500
         for _ in range(3):
             response = self.poll(job)
             self.assertEqual(response.status_code, 504, response.get_json())

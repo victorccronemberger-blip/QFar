@@ -39,6 +39,7 @@ import os
 import random
 import re
 import shutil
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -53,12 +54,14 @@ from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 from . import config, tls
-from .background_work import report_progress
+from .background_work import checkpoint, report_progress
 
 EGO4D_DIR = config.MEDIA_DATA_DIR / "ego4d"
 MANIFEST_BUCKET = "ego4d-consortium-sharing"
 METADATA_KEY = "public/v2/ego4d.json"
 CLIPS_MANIFEST_KEY = "public/v2/clips/manifest.csv"
+NARRATIONS_KEY = "public/v2/annotations/all_narrations_redacted.json"
+_TASK_CATALOG_LOCK = threading.RLock()
 def timed_narrations_path() -> Path:
     return Path(config.MEDIA_DATA_DIR) / "ego4d" / "timed_narrations.jsonl"
 
@@ -512,6 +515,77 @@ def sync_meta(force: bool = False) -> tuple[Path, Path]:
             MANIFEST_BUCKET, CLIPS_MANIFEST_KEY, clips_path,
             _valid_clips_manifest)
     return meta_path, clips_path
+
+
+def sync_task_annotations() -> Path:
+    """Acquire real timed task evidence, streaming rather than storing the archive.
+
+    The portable ranking seed is a suggestion. It cannot replace the annotations
+    required by the preparation gate on a new computer.
+    """
+    import ijson
+    with _TASK_CATALOG_LOCK:
+        target = timed_narrations_path()
+        if has_timed_narrations():
+            return target
+        sync_meta()
+        with selection_operation(fresh=True):
+            videos = _catalog(str(EGO4D_DIR / "ego4d.json"),
+                              str(EGO4D_DIR / "clips.csv")).videos
+        parents = {uid for uid, video in videos.items() if video.get("has_imu") is True}
+        staging = target.with_name(f".{target.name}.{uuid.uuid4().hex}.refresh")
+        body = None
+        try:
+            report_progress("Baixando as anotações reais do Ego4D; vídeos ainda não serão baixados…",
+                            phase="ego4d_annotations")
+            body = _s3().meta.client.get_object(Bucket=MANIFEST_BUCKET, Key=NARRATIONS_KEY)["Body"]
+            count = 0
+            with staging.open("w", encoding="utf-8", newline="\n") as output:
+                for uid, record in ijson.kvitems(body, "videos", use_float=True):
+                    checkpoint()
+                    if uid not in parents or not isinstance(record, dict):
+                        continue
+                    events = []
+                    for row in record.get("narrations", ()):
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            when, text = float(row["time"]), str(row["text"]).strip()
+                        except (KeyError, TypeError, ValueError, OverflowError):
+                            continue
+                        if math.isfinite(when) and when >= 0 and text:
+                            events.append([when, text])
+                    if events:
+                        output.write(json.dumps({"video_uid": uid, "events": events},
+                                                ensure_ascii=False, separators=(",", ":")) + "\n")
+                        count += 1
+                        report_progress(f"Anotações reais do Ego4D: {count} vídeos com IMU indexados",
+                                        phase="ego4d_annotations")
+                output.flush()
+                os.fsync(output.fileno())
+            if not count:
+                raise ValueError("Ego4D sem anotações temporizadas válidas para vídeos com IMU")
+            staging.replace(target)
+            return target
+        except ijson.JSONError as exc:
+            raise ValueError("Anotações Ego4D incompletas ou inválidas; catálogo anterior preservado") from exc
+        finally:
+            if body is not None:
+                body.close()
+            staging.unlink(missing_ok=True)
+
+
+def ensure_task_annotations() -> None:
+    """Bootstrap licensed real catalogs before binding any selection evidence."""
+    if has_timed_narrations():
+        return
+    try:
+        _aws_creds()
+    except RuntimeError:
+        return  # The portable catalog remains browseable before configuration.
+    meta, _ = sync_meta()
+    if _valid_metadata(meta):
+        sync_task_annotations()
 
 
 def diagnostics(*, check_access: bool = False) -> dict[str, Any]:

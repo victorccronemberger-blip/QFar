@@ -4,6 +4,7 @@ flask>=3
 playwright>=1.52
 boto3>=1.34
 ego4d>=1.7.3
+ijson>=3.3,<4
 projectaria-tools==1.7.1
 curl_cffi>=0.11
 certifi>=2025.8.3
