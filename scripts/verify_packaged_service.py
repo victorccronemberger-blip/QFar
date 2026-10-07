@@ -264,7 +264,8 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str], *,
         nymeria = get('/api/readiness?dataset=nymeria')
         checks = {row['name']: row for row in nymeria['checks']}
         assert checks['SDK Nymeria']['status'] == 'ok'
-        assert checks['Biblioteca Nymeria']['status'] == 'error'
+        if not portable_setup:
+            assert checks['Biblioteca Nymeria']['status'] == 'error'
         assert nymeria['ready'] is False
         source_catalog = get('/api/library/nymeria/sequences')
         assert source_catalog['total'] == (1 if portable_setup else 0)
@@ -284,6 +285,9 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str], *,
             assert source_catalog['worker']['state'] == 'done'
             assert source_catalog['worker']['result']['sync']['errors'] == {}
             assert source_catalog['summary']['by_state']['downloaded'] == 0
+            ready_catalog = get('/api/readiness?dataset=nymeria')
+            assert next(row for row in ready_catalog['checks']
+                        if row['name'] == 'Biblioteca Nymeria')['status'] == 'ok'
             assert not (library / 'data/nymeria/native_setup/recording_head/data/data.vrs').exists()
             assert not (library / 'data/nymeria/native_setup/recording_head/data/motion.vrs').exists()
         else:
