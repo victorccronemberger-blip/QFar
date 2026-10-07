@@ -28,6 +28,10 @@ jobs:
           }
           $version = $version.TrimStart('v')
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versão inválida: $version" }
+          if ($env:GITHUB_REF.StartsWith('refs/tags/') -and
+              -not (Test-Path -LiteralPath "RELEASE_NOTES_$version.md")) {
+            throw "Notas da release ausentes: RELEASE_NOTES_$version.md"
+          }
           "QMONEY_VERSION=$version" >> $env:GITHUB_ENV
 
       - uses: actions/setup-python@v5
