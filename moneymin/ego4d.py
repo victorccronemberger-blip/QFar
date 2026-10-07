@@ -53,6 +53,7 @@ from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 from . import config, tls
+from .background_work import report_progress
 
 EGO4D_DIR = config.MEDIA_DATA_DIR / "ego4d"
 MANIFEST_BUCKET = "ego4d-consortium-sharing"
@@ -1436,7 +1437,10 @@ def narration_evidence_clips(
     if not narrations:
         return buckets
     rules = list(task_matching.TASK_RULES.items())
-    for video in _cat().videos.values():
+    videos = _cat().videos
+    for video_index, video in enumerate(videos.values()):
+        report_progress(f"Conferindo evidências Ego4D: {video_index}/{len(videos)} vídeos concluídos",
+                        phase="ego4d_evidence")
         if video.get("has_imu") is not True or not video.get("s3_path"):
             continue
         uid = str(video.get("video_uid") or "")
@@ -1474,7 +1478,9 @@ def rank_all_task_spans(
     videos = _cat().videos
     named_rules = list(task_matching.TASK_RULES.items())
     seen_by_task: dict[str, set[str]] = defaultdict(set)
-    for uid, events in index.items():
+    for video_index, (uid, events) in enumerate(index.items()):
+        report_progress(f"Classificando Ego4D: {video_index}/{len(index)} vídeos concluídos",
+                        phase="ego4d_annotations")
         video = videos.get(uid) or {}
         if require_imu and video.get("has_imu") is not True:
             continue

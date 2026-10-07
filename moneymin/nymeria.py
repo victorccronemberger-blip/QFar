@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config, ego4d, nymeria_vrs, task_matching
+from .background_work import report_progress
 
 _ALGORITHM = "nymeria-atomic-device-v4"
 _PLANNED_ALGORITHM = _ALGORITHM + "-planned"
@@ -776,7 +777,9 @@ def planned_candidates(*, task_name: str | None = None, task_id: str | None = No
         candidates = _PLANNED[key]
     else:
         out = []
-        for sid, groups in sequences.items():
+        for sequence_index, (sid, groups) in enumerate(sequences.items()):
+            report_progress(f"Classificando Nymeria: {sequence_index}/{len(sequences)} sequências concluídas",
+                            phase="nymeria_annotations")
             seq_dir = library._path(base, sid)
             try:
                 out.extend(_planned_sequence_batch(seq_dir, groups, list(rules), minimum, maximum,

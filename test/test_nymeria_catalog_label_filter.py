@@ -16,6 +16,26 @@ class CatalogLabelFilterTests(unittest.TestCase):
     def assert_same_labels(self, raw_events, rules):
         events = task_matching.prepare_span_events(raw_events)
         full = task_matching.label_span_events(events, rules.items())
+        def original_unit(normed, rule):
+            import re
+            if not rule.evidence:
+                return False
+            if rule.required_action_pattern is not None and not re.search(rule.required_action_pattern, normed, re.I):
+                return False
+            required = rule.unit_min_evidence_groups
+            if required is None:
+                required = rule.min_evidence_groups
+            if required is None:
+                required = len(rule.evidence)
+            return sum(any(task_matching._term_in(normed, term) for term in group)
+                       for group in rule.evidence) >= required
+        reference = tuple(frozenset(
+            name for name, rule in rules.items()
+            if not dirty and not any(task_matching._term_in(normed, term)
+                                     for term in rule.action_excluded)
+            and original_unit(normed, rule))
+            for _time, _text, normed, dirty in events)
+        self.assertEqual(full, reference, "optimized classifier must preserve the original labels")
         selected = nymeria_library._catalog_label_rules(events, iter(rules.items()))
         self.assertTrue(set(dict(selected)).issubset(rules))
         self.assertEqual(task_matching.label_span_events(events, selected), full)
@@ -193,7 +213,7 @@ class CatalogLabelPlanEquivalenceTests(unittest.TestCase):
         self.assertTrue(any(full.values()))
         self.assertEqual(filtered, full)
 
-    def test_60_then_300_reuses_short_negative_core_classification_once(self):
+    def test_short_annotation_components_skip_classification_for_both_ranges(self):
         rows = [(1000.0 + index * 5, 1005.0 + index * 5, _batch_fixture.ACTION)
                 for index in range(6)]
         key = ("short-negative-core", nymeria._rules_digest())
@@ -204,8 +224,8 @@ class CatalogLabelPlanEquivalenceTests(unittest.TestCase):
             for minimum in (60, 300, 60):
                 self.assertEqual(nymeria_library._catalog_windows(rows, [_batch_fixture.TASK],
                     minimum, 1800, key), [])
-            self.assertEqual(prepare.call_count, 1)
-            self.assertEqual(label.call_count, 1)
+            self.assertEqual(prepare.call_count, 0)
+            self.assertEqual(label.call_count, 0)
         self.assertNotIn(key, nymeria_library._EVENT_CACHE, "negative core needs no full rival pass")
 
     def positive_rows_with_rival(self):
@@ -225,8 +245,8 @@ class CatalogLabelPlanEquivalenceTests(unittest.TestCase):
                           wraps=task_matching.label_span_events) as label:
             self.assertEqual(nymeria_library._catalog_windows(rows, [_batch_fixture.TASK],
                 300, 1800, key), [])
-            self.assertEqual(prepare.call_count, 1)
-            self.assertEqual(label.call_count, 1)
+            self.assertEqual(prepare.call_count, 0)
+            self.assertEqual(label.call_count, 0)
             self.assertNotIn(key, nymeria_library._EVENT_CACHE)
             recovered = nymeria_library._catalog_windows(rows, [_batch_fixture.TASK], 60, 1800, key)
             self.assertTrue(recovered)
@@ -252,6 +272,6 @@ class CatalogLabelPlanEquivalenceTests(unittest.TestCase):
             recovered = nymeria_library._catalog_windows(rows, ["Furniture Assembly"], 60, 1800, key)
             self.assertTrue(recovered)
             self.assertTrue(all(row["task_name"] == "Furniture Assembly" for row in recovered))
-            self.assertEqual(prepare.call_count, 2)
-        self.assertIn((key, (_batch_fixture.TASK,)), nymeria_library._CATALOG_INPUT_CACHE)
+            self.assertEqual(prepare.call_count, 1)
+        self.assertNotIn((key, (_batch_fixture.TASK,)), nymeria_library._CATALOG_INPUT_CACHE)
         self.assertIn((key, ("Furniture Assembly",)), nymeria_library._CATALOG_INPUT_CACHE)

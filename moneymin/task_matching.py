@@ -1423,22 +1423,28 @@ def _evidence_hits(segment: str, rule: TaskRule) -> list[int]:
             for group in rule.evidence]
 
 
-@lru_cache(maxsize=131072)
 def _unit_on_task(segment: str, rule: TaskRule) -> bool:
     """Uma fala só conta quando traz evidência suficiente da própria ação."""
-    if not rule.evidence:
-        return False
-    if (rule.required_action_pattern is not None
-            and not _required_action_pattern(rule.required_action_pattern).search(segment)):
-        return False
     required = rule.unit_min_evidence_groups
     if required is None:
         required = rule.min_evidence_groups
     if required is None:
         required = len(rule.evidence)
+    return _unit_evidence_cached(segment, rule.evidence, required, rule.required_action_pattern)
+
+
+@lru_cache(maxsize=131072)
+def _unit_evidence_cached(segment: str, evidence: tuple[tuple[str, ...], ...],
+                          required: int, action_pattern: str | None) -> bool:
+    # Only these fields determine unit evidence. Hashing the full TaskRule
+    # also traverses unrelated scenario/exclusion tables for every annotation.
+    if not evidence:
+        return False
+    if action_pattern is not None and not _required_action_pattern(action_pattern).search(segment):
+        return False
     return sum(
         _evidence_group_present(segment, group)
-        for group in rule.evidence
+        for group in evidence
     ) >= required
 
 
@@ -1508,7 +1514,7 @@ def _activity_span_score(
     if not full:
         return None, full
     full_text = " ".join(full)
-    if any(_term_in(full_text, term) for term in rule.action_excluded):
+    if _evidence_group_present(full_text, rule.action_excluded):
         return None, full
     kept = [unit for unit in full if not _is_activity_filler(unit, rule)]
     if not kept or not _kept_clears_on_task_gate(kept, rule):
@@ -1544,7 +1550,7 @@ def _longest_proven_target(
     limit = targets[hi]
     for index in range(left, limit + 1):
         normed = flagged[index][2]
-        if normed and any(_term_in(normed, term) for term in rule.action_excluded):
+        if normed and _evidence_group_present(normed, rule.action_excluded):
             limit = index - 1
             break
     while hi > origin and targets[hi] > limit:
@@ -1635,7 +1641,7 @@ def score_action(rule: TaskRule, action_text: str,
     text = " ".join(segments)
     if not text:
         return None
-    if any(_term_in(text, term) for term in rule.action_excluded):
+    if _evidence_group_present(text, rule.action_excluded):
         return None
     if (rule.required_action_pattern is not None
             and not any(_unit_on_task(segment, rule) for segment in segments)):
@@ -1717,9 +1723,8 @@ def label_span_events(
             continue
         labels.append(frozenset(
             name for name, rule in rules
-            if (not any(_term_in(normed, term)
-                        for term in rule.action_excluded)
-                and _unit_on_task(normed, rule))
+            if (_unit_on_task(normed, rule)
+                and not _evidence_group_present(normed, rule.action_excluded))
         ))
     return tuple(labels)
 
@@ -1759,13 +1764,11 @@ def extract_spans(
     for idx, (t, text, normed, base_dirty) in enumerate(rows):
         labels = event_task_names[idx] if event_task_names is not None else None
         if labels is not None and task_name:
-            contradictory = any(
-                _term_in(normed, term) for term in rule.action_excluded)
+            contradictory = _evidence_group_present(normed, rule.action_excluded)
             on_task = not contradictory and task_name in labels
             competing = not on_task and bool(labels & competing_task_names)
         else:
-            contradictory = any(
-                _term_in(normed, term) for term in rule.action_excluded)
+            contradictory = _evidence_group_present(normed, rule.action_excluded)
             on_task = (not base_dirty and not contradictory
                        and _unit_on_task(normed, rule))
             competing = (not on_task and not base_dirty and any(

@@ -605,6 +605,18 @@ def _catalog_label_rules(events, rules):
 
 def _catalog_windows(rows, names, minimum, maximum, cache_key=None, *, rules=None, rivals=None):
     """Apply the same action rules, explicitly without claiming sensor coverage."""
+    # No action can produce a take longer than its annotation component.
+    # Check this before classifying every event against every task.
+    origin = rows[0][0]
+    components = []
+    for start, end, _text in rows:
+        a, b = start - origin, end - origin
+        if components and a <= components[-1][1] + 1e-6:
+            components[-1] = (components[-1][0], max(components[-1][1], b))
+        else:
+            components.append((a, b))
+    if not any(upper - lower >= minimum for lower, upper in components):
+        return []
     # Classification is independent of the requested duration, including when
     # no window passed the first range. Bind it to annotation/rule content and
     # the requested names, rather than reclassifying all rejected recordings.
@@ -612,7 +624,6 @@ def _catalog_windows(rows, names, minimum, maximum, cache_key=None, *, rules=Non
     previous = _CATALOG_INPUT_CACHE.get(input_key) if input_key is not None else None
     cached = _EVENT_CACHE.get(cache_key) if cache_key is not None else None
     lookup = nymeria.selection_rule_for if rules is None else rules.get
-    origin = rows[0][0]
     if previous is not None:
         relative, names, events, selected_labels = previous
     else:
@@ -656,12 +667,6 @@ def _catalog_windows(rows, names, minimum, maximum, cache_key=None, *, rules=Non
             _EVENT_CACHE[cache_key] = (events, labels)
     else:
         labels = selected_labels
-    components = []
-    for a, b, _text in relative:
-        if components and a <= components[-1][1] + 1e-6:
-            components[-1] = (components[-1][0], max(components[-1][1], b))
-        else:
-            components.append((a, b))
     windows = []
     for name in names:
         rule = lookup(name)

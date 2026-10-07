@@ -16,6 +16,7 @@ class CatalogLoader:
         self._ttl_s = ttl_s
         self._max_pending = max_pending
         self._timeout_s = timeout_s
+        self._max_runtime_s = max(timeout_s, 1800)
         self._max_cached = max(1, int(max_cached))
         self._timeout_message = timeout_message or (
             "A preparação das categorias excedeu o tempo esperado. "
@@ -99,7 +100,8 @@ class CatalogLoader:
         body = {"loading": True, "state": row["state"], "message": row["message"],
                 "phase": row["phase"], "job_id": row["job_id"], "identity_bound": True,
                 "elapsed_s": int(now - row["started"])}
-        if now - row["started"] >= self._timeout_s:
+        if (now - row.get("last_progress", row["started"]) >= self._timeout_s
+                or now - row["started"] >= self._max_runtime_s):
             # A 504 is visible, but explicitly describes a live worker so a
             # bounded UI follow-up can recover it without starting another.
             body.update(error=self._timeout_message, code="catalog_work_pending")
@@ -109,6 +111,8 @@ class CatalogLoader:
     def _run(self, row: dict, work: Callable) -> None:
         def progress(message, *, phase: str | None = None):
             with self._lock:
+                if message != row.get("message") or (phase and phase != row.get("phase")):
+                    row["last_progress"] = time.monotonic()
                 row.update(state="running", message=message, phase=phase or message)
         with self._worker:
             with self._lock:
@@ -121,7 +125,7 @@ class CatalogLoader:
                 # campaign preview. Reset must wait for their actual lifetime.
                 from ..campaign_state import campaign_state_lease
                 from ..background_work import responsive_catalog_work
-                with campaign_state_lease(), responsive_catalog_work():
+                with campaign_state_lease(), responsive_catalog_work(progress=progress):
                     result = work(progress)
             except Exception:
                 # Never leave polling stuck forever, or expose credentials in
