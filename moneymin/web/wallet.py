@@ -69,7 +69,9 @@ def reading(record: Any, *, now: float | None = None, max_age_s: int = MAX_AGE_S
         label = {"authentication": "Reconectar Crowtado", "network": "Falha de conexão",
                  "timeout": "Tempo de consulta esgotado", "rate_limit": "Consulta limitada",
                  "service": "Crowtado indisponível", "invalid_response": "Resposta incompleta",
-                 "restricted": "Restrição confirmada", "crowtado_account_missing": "Cadastro Crowtado não encontrado"}.get(issue.get("code"), "Consulta inconclusiva")
+                 "restricted": "Restrição confirmada", "mail_authentication": "Reconectar caixa Hostinger",
+                 "email_verification": "Verificação por e-mail pendente",
+                 "crowtado_account_missing": "Cadastro Crowtado não encontrado"}.get(issue.get("code"), "Consulta inconclusiva")
         return {"code": "error", "label": label, "confirmed": False,
                 "reason": str(record.get("error") or "O saldo salvo precisa de uma nova consulta.")}
     if not all(valid_cents(record.get(field)) for field in MONEY_FIELDS):

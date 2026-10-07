@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from . import config, tls
@@ -54,10 +55,25 @@ DEFAULT_REF = config.CROWTADO_REF
 class CrowtadoError(RuntimeError):
     """Falha de login ou consulta no crowtado."""
 
-    def __init__(self, message: str, *, code: str | None = None, http_status: int | None = None):
+    def __init__(self, message: str, *, code: str | None = None, http_status: int | None = None,
+                 retry_after_seconds: float | None = None):
         super().__init__(message)
         self.account_issue_code = code
         self.http_status = http_status
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _retry_after_seconds(headers) -> float | None:
+    """Read the provider's cooldown without retaining response headers."""
+    value = headers.get("Retry-After") if headers is not None else None
+    if not value:
+        return None
+    try:
+        seconds = float(value) if re.fullmatch(r"\d+", value.strip()) else (
+            parsedate_to_datetime(value).timestamp() - time.time())
+        return max(1.0, seconds) if 0 <= seconds < float("inf") else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def _remote_error(stage: str, status: int, body: Any) -> CrowtadoError:
@@ -81,7 +97,7 @@ def can_use_browser_fallback(error: Exception) -> bool:
     # duplicates requests and hides the original diagnosis.
     return getattr(error, "account_issue_code", None) not in {
         "authentication", "crowtado_account_missing", "rate_limit", "service",
-        "network", "timeout", "tls", "email_verification", "restricted", "device",
+        "network", "timeout", "tls", "email_verification", "mail_authentication", "restricted", "device",
     }
 
 
@@ -113,9 +129,14 @@ class CrowtadoSession:
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
             try:
-                return exc.code, json.loads(text)
+                payload = json.loads(text)
             except (json.JSONDecodeError, ValueError):
-                return exc.code, text
+                payload = text
+            if exc.code == 429:
+                error = _remote_error("Consulta de autenticação Crowtado limitada", exc.code, payload)
+                error.retry_after_seconds = _retry_after_seconds(exc.headers)
+                raise error from exc
+            return exc.code, payload
         except urllib.error.URLError as exc:
             detail = str(getattr(exc, "reason", exc))
             if "CERTIFICATE_VERIFY_FAILED" in detail.upper():
@@ -250,13 +271,14 @@ def _login_locked(email: str, password: str) -> CrowtadoSession:
         if "email_code" not in fatores:
             raise CrowtadoError(f"2º fator não suportado por este cliente: {fatores}")
         # Snapshot ANTES de pedir o código: ignora emails antigos na caixa.
-        from .hostinger_mail import max_uid, wait_for_code
+        from .hostinger_mail import max_uid, wait_for_code, MailAuthenticationError
 
         try:
             uid_base = max_uid(email)
         except Exception as exc:
             raise CrowtadoError("Não foi possível consultar o código por e-mail da Crowtado",
-                                code="email_verification") from exc
+                                code="mail_authentication" if isinstance(exc, MailAuthenticationError)
+                                else "email_verification") from exc
         status, body = sess._fapi(
             f"/v1/client/sign_ins/{sid_sign_in}/prepare_second_factor",
             {"strategy": "email_code"},
@@ -268,7 +290,8 @@ def _login_locked(email: str, password: str) -> CrowtadoSession:
             code = wait_for_code(email, sender="crowtado.com", min_uid=uid_base, timeout=180)
         except Exception as exc:
             raise CrowtadoError("Não foi possível obter o código por e-mail da Crowtado",
-                                code="email_verification") from exc
+                                code="mail_authentication" if isinstance(exc, MailAuthenticationError)
+                                else "email_verification") from exc
         status, body = sess._fapi(
             f"/v1/client/sign_ins/{sid_sign_in}/attempt_second_factor",
             {"strategy": "email_code", "code": code},
@@ -882,7 +905,10 @@ def _site_trpc(sess: CrowtadoSession, proc: str, payload: dict[str, Any] | None,
             error_body = json.loads(exc.read().decode("utf-8", "replace"))
         except (ValueError, UnicodeError):
             error_body = None
-        raise _trpc_error(proc, exc.code, error_body) from exc
+        error = _trpc_error(proc, exc.code, error_body)
+        if exc.code == 429:
+            error.retry_after_seconds = _retry_after_seconds(exc.headers)
+        raise error from exc
     except urllib.error.URLError as exc:
         code = "tls" if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason).upper() else "network"
         raise CrowtadoError("Falha na conexão segura com Crowtado", code=code) from exc

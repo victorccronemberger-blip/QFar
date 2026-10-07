@@ -829,6 +829,8 @@ class BalancesRunner:
         self.started_at = None
         self.finished_at = None
         self.results: dict[str, dict[str, Any]] = {}
+        self.retry_at: float | None = None
+        self.rate_limit_retries = 0
         self._stop = threading.Event()
 
     @property
@@ -853,6 +855,7 @@ class BalancesRunner:
             self.started_at = time.time()
             self.finished_at = None
             self.results = {email: {"email": email, "state": "queued"} for email in creds}
+            self.rate_limit_retries = 0
             self.current = "iniciando consulta sequencial…"
             try:
                 self._thread = threading.Thread(target=self._run, args=(creds, on_result),
@@ -882,6 +885,19 @@ class BalancesRunner:
             previous = self.results.get(email, {"email": email})
             self.results[email] = {**previous, "state": phase,
                                    "started_at": previous.get("started_at") or time.time()}
+
+    def _begin_api_attempt(self, email: str, index: int, total: int) -> bool:
+        """Atomically establish whether this API read starts before a stop request."""
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            self.current_email = email
+            self.phase = "api"
+            self.current = f"consultando conta {index}/{total}: {email}…"
+            previous = self.results.get(email, {"email": email})
+            self.results[email] = {**previous, "state": "api",
+                                   "started_at": previous.get("started_at") or time.time()}
+            return True
 
     def _run(self, creds: dict[str, str], on_result) -> None:
         # Import tardio: Playwright só é carregado se algum fallback for necessário.
@@ -919,12 +935,54 @@ class BalancesRunner:
             for index, (email, senha) in enumerate(creds.items(), 1):
                 if self._stop.is_set():
                     break
-                self._account_phase(email, "api", index, len(creds))
                 try:
-                    summary = consultar_saldo_api(email, senha)
+                    summary = None
+                    for attempt in range(3):
+                        if self.retry_at and self.retry_at > time.time():
+                            delay = self.retry_at - time.time()
+                            with self._lock:
+                                self.phase = "cooldown"
+                                self.current = (f"Crowtado limitou as consultas. Aguardando {int(delay) + 1}s "
+                                                "para tentar novamente automaticamente. Parar cancela a espera.")
+                                previous = self.results.get(email, {"email": email})
+                                self.results[email] = {**previous, "state": "cooldown"}
+                            if self._stop.wait(delay):
+                                break
+                        if self._stop.is_set():
+                            break
+                        # Synchronize request start with stop(): after this point
+                        # the read is considered active and may finish/persist.
+                        if not self._begin_api_attempt(email, index, len(creds)):
+                            break
+                        try:
+                            summary = consultar_saldo_api(email, senha)
+                            self.retry_at = None
+                            break
+                        except CrowtadoError as exc:
+                            if exc.account_issue_code != "rate_limit":
+                                raise
+                            delay = exc.retry_after_seconds
+                            if not isinstance(delay, (int, float)) or not 0 < delay < float("inf"):
+                                delay = 60 * (2 ** attempt)
+                            with self._lock:
+                                self.retry_at = time.time() + delay
+                                if attempt < 2:
+                                    self.rate_limit_retries += 1
+                            if attempt == 2:
+                                raise
+                    if self._stop.is_set() and summary is None:
+                        with self._lock:
+                            self.results[email]["state"] = "not_consulted"
+                        break
                 except Exception as exc:  # noqa: BLE001 — resolve antes da próxima conta
                     if not can_use_browser_fallback(exc):
                         finish(email, None, exc)
+                        if getattr(exc, "account_issue_code", None) == "rate_limit":
+                            with self._lock:
+                                self.error = ("A Crowtado continua limitando as consultas após as tentativas automáticas. "
+                                              "As demais contas não foram consultadas e os saldos anteriores foram preservados. "
+                                              "Atualizar pendentes retoma a consulta respeitando a espera indicada pelo serviço.")
+                            break
                         continue
                     with self._lock:
                         self.fallbacks += 1
@@ -965,6 +1023,8 @@ class BalancesRunner:
                     "current_email": self.current_email, "phase": self.phase,
                     "started_at": self.started_at, "finished_at": self.finished_at,
                     "stop_requested": self._stop.is_set(),
+                    "retry_at": self.retry_at,
+                    "rate_limit_retries": self.rate_limit_retries,
                     "results": [dict(row) for row in self.results.values()]}
 
 

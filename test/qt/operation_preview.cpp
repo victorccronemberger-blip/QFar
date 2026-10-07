@@ -1131,6 +1131,58 @@ public:
     QTimer::singleShot(8000,&window,[]{qApp->exit(208);});
   }
 
+  static void walletCooldownSmoke(MainWindow& window) {
+    auto* integrations = window._pages->widget(2)->findChild<QTabWidget*>();
+    if (!integrations || !window._hostingerToken) { qApp->exit(212); return; }
+    page(window, 2);
+    integrations->setCurrentIndex(1);
+    QApplication::processEvents();
+    if (!window._hostingerToken->isVisible()
+        || window._hostingerToken->echoMode() != QLineEdit::Password) {
+      qApp->exit(213); return;
+    }
+
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(214); return; }
+    QObject::connect(server, &QTcpServer::newConnection, server, [server] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+        const auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        if (!input.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        if (!input.startsWith("GET /api/balances ")) { qApp->exit(215); return; }
+        auto payload = walletFixture();
+        payload.insert("runner", QJsonObject{
+            {"state", "running"}, {"phase", "cooldown"}, {"current", "Crowtado limitou as consultas. Aguardando 17s para tentar novamente automaticamente. Parar cancela a espera."},
+            {"total", 4}, {"done", 0}, {"failed", 0}});
+        const auto body = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+            + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    page(window, 6);
+    window.loadBalances();
+    QTimer::singleShot(350, &window, [&window] {
+      if (!window._balancesState->text().contains(QStringLiteral("Crowtado limitou as consultas"))) {
+        qApp->exit(216); return;
+      }
+      if (!window._balancesStop->isVisible() || !window._balancesStop->isEnabled()) {
+        qApp->exit(217); return;
+      }
+      bool financialActionEnabled = window._balancesWithdrawAll->isEnabled()
+          || window._balancesPayoutMethod->isEnabled();
+      for (auto* button : window._balancesTable->findChildren<QPushButton*>())
+        if (button->property("walletAction").toBool() && button->isEnabled())
+          financialActionEnabled = true;
+      qApp->exit(financialActionEnabled ? 218 : 0);
+    });
+    QTimer::singleShot(8000, &window, [] { qApp->exit(219); });
+  }
+
   static void balancePollingSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(50); return; }
@@ -1682,6 +1734,10 @@ int main(int argc, char** argv) {
   if (app.arguments().contains("--wallet-smoke") || app.arguments().contains("--wallet-preview")) {
     const bool preview = app.arguments().contains("--wallet-preview");
     QTimer::singleShot(100,&window,[&window,preview] { OperationPreview::walletContract(window,preview); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--wallet-cooldown-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::walletCooldownSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--indicator-smoke")) {

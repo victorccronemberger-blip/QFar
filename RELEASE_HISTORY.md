@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **125 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **126 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.72](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.72). Destaques: Instalação pública seleciona somente recortes Ego4D com prova atual, recupera anotações inválidas e informa a configuração necessária sem recusas em sequência.
+Versão atual: [v2.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.73). Destaques: Consulta de saldos aguarda limites temporários com novas tentativas controladas; diagnóstico e campo de renovação do token Hostinger claros.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.73) | 07/10/2026 | Consulta de saldos respeita a espera da Crowtado, repete somente leituras e permite cancelar. Limite persistente mantém outras contas pendentes sem sobrescrever saldos. Identifica token Hostinger recusado e esclarece como renovar o acesso. Preserva campanhas sem meta obrigatória, saques e limpeza de mídia. | [Desde v2.0.72](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.72...v2.0.73) |
 | [v2.0.72](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.72) | 07/10/2026 | Seleção e preparo usam a mesma prova em toda instalação pública. Biblioteca vazia com acesso configurado obtém o catálogo automaticamente; sem prova, sugestões ficam fora da fila. Recupera anotações inválidas sem perder arquivos anteriores e invalida leituras antigas após publicação. Mantém campanhas sem meta obrigatória e mídia sob demanda. | [Desde v2.0.71](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.71...v2.0.72) |
 | [v2.0.71](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.71) | 07/10/2026 | Obtém as anotações temporizadas oficiais antes de gerar a seleção em uma biblioteca Ego4D nova. Leitura por fluxo guarda apenas o índice compacto, preserva arquivos existentes e remove temporários após falha. Inclui o leitor no executável e amplia o tempo da consulta inicial acompanhada em segundo plano. Mantém campanhas sem meta de horas. | [Desde v2.0.70](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.70...v2.0.71) |
 | [v2.0.70](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.70) | 07/10/2026 | Remove meta obrigatória de horas e limite de um recorte por categoria. Prévia informa disponibilidade sem bloquear por déficit, acompanhamento mostra envios confirmados e o motor continua até esgotar os recortes elegíveis ou o usuário parar. Preserva proteção de pendências, deduplicação e limpeza após confirmação. | [Desde v2.0.68](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.68...v2.0.70) |

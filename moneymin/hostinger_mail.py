@@ -33,6 +33,10 @@ class TemporaryMailError(MailError):
     """Falha transitória que pode ser repetida dentro do prazo da consulta."""
 
 
+class MailAuthenticationError(MailError):
+    """A caixa recusou sua credencial; a senha Crowtado não é a causa."""
+
+
 def _connection_id(values: dict[str, Any]) -> str:
     explicit = str(values.get("id") or "").strip()
     if explicit:
@@ -158,6 +162,8 @@ def mailbox_id(*, token: str | None = None, mailbox: str | None = None) -> str:
         return selected
     status, body = _request("/api/v1/me", token=token)
     if status != 200:
+        if status == 401:
+            raise MailAuthenticationError("A Hostinger recusou o token da caixa. Reconecte a caixa em Integrações → Hostinger.")
         if status == 429 or status >= 500:
             raise TemporaryMailError(f"Mail API temporariamente indisponível (HTTP {status})")
         raise MailError(f"/me falhou ({status}): {str(body)[:200]}")
@@ -190,6 +196,8 @@ def search_messages(
         token=token,
     )
     if status != 200:
+        if status == 401:
+            raise MailAuthenticationError("A Hostinger recusou o token da caixa. Reconecte a caixa em Integrações → Hostinger.")
         if status == 429 or status >= 500:
             raise TemporaryMailError(f"Mail API temporariamente indisponível (HTTP {status})")
         raise MailError(f"search falhou ({status}): {str(resp)[:200]}")
@@ -204,6 +212,8 @@ def message_text(uid: int, folder: str = "INBOX", *,
         token=token,
     )
     if status != 200:
+        if status == 401:
+            raise MailAuthenticationError("A Hostinger recusou o token da caixa. Reconecte a caixa em Integrações → Hostinger.")
         if status == 429 or status >= 500:
             raise TemporaryMailError(f"Mail API temporariamente indisponível (HTTP {status})")
         raise MailError(f"text da mensagem {uid} falhou ({status}): {str(body)[:200]}")
@@ -282,6 +292,7 @@ def max_uid(to_address: str | None = None) -> dict[str, int]:
         raise MailError("nenhuma conexão Hostinger configurada")
     cursors: dict[str, int] = {}
     errors: list[str] = []
+    authentication_failures = 0
     for item in connections:
         try:
             for attempt in range(3):
@@ -299,8 +310,11 @@ def max_uid(to_address: str | None = None) -> dict[str, int]:
             cursors[str(item["id"])] = max(
                 (int(message.get("uid", 0)) for message in msgs), default=0)
         except Exception as exc:  # noqa: BLE001 — outra caixa ainda pode responder
+            authentication_failures += isinstance(exc, MailAuthenticationError)
             errors.append(f"{item.get('name') or item['id']}: {exc}")
     if not cursors:
+        if authentication_failures == len(connections):
+            raise MailAuthenticationError("A Hostinger recusou o token das caixas deste endereço. Reconecte em Integrações → Hostinger.")
         raise MailError("nenhuma caixa Hostinger respondeu: " + "; ".join(errors))
     return cursors
 
@@ -338,6 +352,7 @@ def wait_for_code(
         errors: list[str] = []
         successful_searches = 0
         transient_failure = False
+        authentication_failures = 0
         for connection in connections:
             token = str(connection["token"])
             mailbox = str(connection.get("mailbox_id") or "") or None
@@ -379,11 +394,14 @@ def wait_for_code(
                 transient_failure = True
                 continue
             except Exception as exc:  # noqa: BLE001 — tenta as demais conexões
+                authentication_failures += isinstance(exc, MailAuthenticationError)
                 errors.append(
                     f"{connection.get('name') or connection_id}: {exc}")
                 continue
             successful_searches += 1
         if not successful_searches and not transient_failure:
+            if authentication_failures == len(connections):
+                raise MailAuthenticationError("A Hostinger recusou o token das caixas deste endereço. Reconecte em Integrações → Hostinger.")
             raise MailError(
                 "nenhuma caixa Hostinger respondeu: " + ", ".join(errors))
         time.sleep(min(poll, max(0, deadline - time.monotonic())))

@@ -157,10 +157,11 @@ class BalanceForensicsTests(unittest.TestCase):
         instance = runner.BalancesRunner()
         instance.state = "running"
         errors = [crowtado.CrowtadoError("missing", code="crowtado_account_missing"),
-                  crowtado.CrowtadoError("limit", code="rate_limit")]
+                  *[crowtado.CrowtadoError("limit", code="rate_limit") for _ in range(3)]]
         received = []
         with patch.object(crowtado, "consultar_saldo_api", side_effect=errors), \
-             patch.object(crowtado, "consultar_saldo_navegador") as browser:
+             patch.object(crowtado, "consultar_saldo_navegador") as browser, \
+             patch.object(instance._stop, "wait", return_value=False):
             instance._run({"a": "pw", "b": "pw"}, lambda *args: received.append(args))
         browser.assert_not_called()
         self.assertEqual(instance.snapshot()["failed"], 2)

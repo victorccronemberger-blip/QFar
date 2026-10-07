@@ -19,6 +19,9 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     elif explicit == "email_verification":
         code, reason = "email_verification", "A Crowtado exige verificação por e-mail."
         action = "Confira a integração da caixa de entrada para receber o código. Não altere a senha por este diagnóstico."
+    elif explicit == "mail_authentication":
+        code, reason = "mail_authentication", "A Hostinger recusou o token da caixa de e-mail desta conta."
+        action = "Reconecte a caixa em Integrações → Hostinger com um token válido e consulte novamente. A senha Crowtado e o cadastro da conta foram preservados."
     elif explicit == "crowtado_account_missing":
         code, reason = "crowtado_account_missing", "A Crowtado não encontrou uma conta para este e-mail."
         action = "Confira o acesso no site da Crowtado. Uma conta conectada ao Minute não confirma cadastro na Crowtado."

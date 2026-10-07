@@ -1596,7 +1596,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
   _hostingerStatus->setObjectName(QStringLiteral("integrationStatus"));
   hostLayout->addWidget(_hostingerStatus);
   auto* hostHelp = quietLabel(QStringLiteral(
-      "Cole o token da API. O QMoney identifica sozinho as caixas, os endereços e "
+      "Cole o token da API Mail da Hostinger para conectar ou renovar o acesso. O QMoney identifica sozinho as caixas, os endereços e "
       "os domínios, e passa a buscar cada código no lugar certo."));
   hostHelp->setWordWrap(true);
   hostLayout->addWidget(hostHelp);
@@ -1621,8 +1621,8 @@ QWidget* MainWindow::buildIntegrationsPage() {
   _hostingerToken = new QLineEdit;
   _hostingerToken->setEchoMode(QLineEdit::Password);
   _hostingerToken->setPlaceholderText(
-      QStringLiteral("Cole o token de outra conta Hostinger"));
-  hostForm->addRow(QStringLiteral("Adicionar API"), _hostingerToken);
+      QStringLiteral("Cole um token novo para conectar ou renovar a caixa"));
+  hostForm->addRow(QStringLiteral("Token Hostinger"), _hostingerToken);
   connect(_hostingerToken, &QLineEdit::textChanged, this, [this] {
     const bool entered = !_hostingerToken->text().trimmed().isEmpty();
     _hostingerTest->setEnabled(entered || _hostingerProfile->currentIndex() >= 0);
@@ -4938,7 +4938,7 @@ void MainWindow::testHostingerIntegration() {
 void MainWindow::selectHostingerIntegration(int index) {
   _hostingerToken->clear();
   _hostingerToken->setPlaceholderText(
-      QStringLiteral("Cole o token de outra conta Hostinger"));
+      QStringLiteral("Cole um token novo para conectar ou renovar a caixa"));
   _hostingerRemove->setEnabled(index >= 0);
   _hostingerTest->setEnabled(index >= 0);
   _hostingerSave->setEnabled(false);

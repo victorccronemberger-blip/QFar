@@ -263,7 +263,7 @@ def _withdraw_wise_flow(email: str, password: str, wise: dict[str, str]) -> dict
         code = getattr(exc, "account_issue_code", None)
         known_codes = {"authentication", "crowtado_account_missing", "rate_limit",
                        "service", "forbidden", "invalid_response", "network", "timeout",
-                       "tls", "email_verification", "destination_in_use", "payout_pending",
+                       "tls", "email_verification", "mail_authentication", "destination_in_use", "payout_pending",
                        "payout_configuration"}
         result = {"status": "not_requested" if stage == "configure_wise" or getattr(exc, "withdrawal_attempted", True) is False else "unknown",
                   "failureStage": stage,
