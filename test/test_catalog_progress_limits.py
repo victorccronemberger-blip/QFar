@@ -35,8 +35,10 @@ class CatalogProgressLimitsTests(unittest.TestCase):
             with patch("moneymin.web.catalog_loader.time.monotonic", return_value=started + 701):
                 self.assertEqual(loader.poll(initial["job_id"], key=("fixture",))[1], 504)
             with loader._lock:
-                loader._jobs[("fixture",)]["last_progress"] = started + 1800
-            with patch("moneymin.web.catalog_loader.time.monotonic", return_value=started + 1800):
+                loader._jobs[("fixture",)]["last_progress"] = started + 1801
+            # Just past the deadline: subtracting a fractional machine uptime
+            # at the exact boundary can round to slightly less than 1800s.
+            with patch("moneymin.web.catalog_loader.time.monotonic", return_value=started + 1801):
                 self.assertEqual(loader.poll(initial["job_id"], key=("fixture",))[1], 504)
             self.assertEqual(calls, [1])
         finally:
