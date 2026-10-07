@@ -19,8 +19,27 @@ from typing import Any
 
 from . import config, nymeria_vrs, task_matching
 
-_ALGORITHM = "nymeria-atomic-device-v2"
+_ALGORITHM = "nymeria-atomic-device-v3"
 _HANGER_ADJECTIVE = re.compile(r"\bclothes\s+(hangers?)\b", re.IGNORECASE)
+# Nymeria captions name water while washing utensils. Broad yard categories
+# may compete with a kitchen workflow only when a timed caption proves an
+# actual yard action and its object, rather than merely mentioning water.
+_GARDEN_OBJECT_MODIFIERS = r"(?:(?:a|an|the|some|his|her|their|small|large|green|outdoor)\s+)*"
+_GARDEN_ACTION = (
+    r"\b(?:waters?|watering|sprays?|spraying|sprinkles?|sprinkling)\s+" +
+    _GARDEN_OBJECT_MODIFIERS + r"(?:plants?|flowers?|gardens?|grass|lawns?|crops?|seedlings?|soil)\b|"
+    r"\b(?:pours?|pouring|sprays?|spraying|sprinkles?|sprinkling)\s+water\b.{0,55}"
+    r"\b(?:on|onto|over|into|around)\s+" + _GARDEN_OBJECT_MODIFIERS +
+    r"(?:plants?|flowers?|gardens?|grass|lawns?|crops?|seedlings?|soil)\b|"
+    r"\b(?:mows?|mowing|trims?|trimming|prunes?|pruning|cuts?|cutting)\s+" +
+    _GARDEN_OBJECT_MODIFIERS + r"(?:grass|lawns?|hedges?|shrubs?|bushes?|branches?)\b|"
+    r"\b(?:pulls?|pulling|plucks?|plucking|uproots?|uprooting|removes?|removing)\s+" +
+    _GARDEN_OBJECT_MODIFIERS + r"(?:weeds?|grass)\b|"
+    r"\b(?:rakes?|raking|blows?|blowing)\s+" + _GARDEN_OBJECT_MODIFIERS +
+    r"(?:leaves|grass clippings|lawn clippings)\b|"
+    r"\b(?:plants?|planting|digs?|digging|fertilizes?|fertilizing|composts?|composting)\s+" +
+    _GARDEN_OBJECT_MODIFIERS + r"(?:seeds?|seedlings?|plants?|flowers?|soil|garden)\b"
+)
 _SNAPSHOTS: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 _WINDOWS: OrderedDict[tuple, tuple[dict[str, Any], ...]] = OrderedDict()
 _SDK_DIGESTS: OrderedDict[tuple, tuple[int, str]] = OrderedDict()
@@ -92,12 +111,27 @@ def selection_rule_for(task_name: str):
     rule = task_matching.rule_for(name)
     if rule is None:
         return None
+    if name in {"Gardening", "Full Yard Maintenance"}:
+        return replace(rule, required_action_pattern=_GARDEN_ACTION)
+    if name == "Clean Appliance":
+        # Retrieving a pan from the stove and rinsing that pan at the sink
+        # does not prove that the stove itself is being cleaned.
+        return replace(rule, required_action_pattern=(
+            r"\b(?:cleans?|cleaning|cleaned|scrubs?|scrubbing|scrubbed|wipes?|wiping|wiped|"
+            r"rinses?|rinsing|rinsed|descales?|descaling|descaled)\s+(?:down\s+|off\s+)?" +
+            task_matching._OBJECT_MODIFIERS + r"(?:kitchen\s+)?"
+            r"(?:oven|fridge|refrigerator|freezer|microwave|coffee maker|washing machine|"
+            r"washer|dishwasher|appliance|air fryer|cooker|stove|cooktop)\b"))
     if name == "Cleaning Out Car" and rule is not None:
         return replace(rule, evidence=(*rule.evidence,
             ("car", "vehicle", "automobile", "van", "truck", "dashboard", "car seat")),
             min_evidence_groups=None, unit_min_evidence_groups=None)
     if name == "Organize the Garage":
-        return replace(rule, evidence=(("garage",), *rule.evidence[1:]),
+        actions = ("sorts", "sorting", "sort items", "sort boxes", "sort tools", "sort the", "sort a",
+                   "organizes", "organises", "organizing", "organising", "organize the", "organise the",
+                   "arranges", "arranging", "arrange the", "arrange a", "arrange items", "arrange tools",
+                   "rearranges", "rearranging", "tidies", "tidying", "tidy the", "tidy a")
+        return replace(rule, evidence=(*rule.evidence[:-1], actions),
                        min_evidence_groups=None, unit_min_evidence_groups=None)
     if name == "Stack firewood":
         return replace(rule, evidence=(("firewood", "log", "woodpile", "wood pile"),
@@ -120,15 +154,24 @@ def selection_rule_for(task_name: str):
     if name == "Holiday Decoration Setup":
         actions = ("hangs", "hanging a decoration", "hanging the decoration", "hang a decoration",
                    "hang the decoration", "decorates", "decorating", "sets up", "setting up", "set up",
-                   "unpacks", "unpacking", "attaches", "attaching", "installs", "installing")
+                   "unpacks", "unpacking", "attaches", "attaching", "installs", "installing",
+                   "removes", "removing", "takes down", "taking down", "packs", "packing",
+                   "unhooks", "unhooking", "detaches", "detaching")
         return replace(rule, evidence=(*rule.evidence[:-1], actions),
-                       action_excluded=(*rule.action_excluded, "takes down", "taking down"),
+                       action_excluded=rule.action_excluded,
                        min_evidence_groups=None, unit_min_evidence_groups=None)
     return rule
 
 
 def selection_rules():
     return {name: selection_rule_for(name) for name in task_matching.TASK_RULES}
+
+
+def selection_activity_mode(task_name: str) -> bool:
+    # Loading/unloading includes recurring rack transfers and preparation
+    # between them. Use the existing activity proof; it still stops at
+    # hygiene, a real competing action, or sustained foreign activity.
+    return task_matching.canonical_task_name(task_name) == "Using the Dishwasher"
 
 
 def selection_text(text: str) -> str:
@@ -436,7 +479,8 @@ def _windows(snap: dict, task_name: str, minimum: float, maximum: float) -> tupl
             labels = tuple(label for _event, label in selected)
             spans = task_matching.extract_spans(rule, (), min_s=span_minimum, max_s=maximum,
                 prepared_events=prepared, task_name=task_name, event_task_names=labels,
-                competing_task_names=rivals, video_duration_s=upper)
+                competing_task_names=rivals, video_duration_s=upper,
+                activity_mode=selection_activity_mode(task_name))
             for span in spans:
                 start, end = max(lower, span["start"]), min(upper, span["end"])
                 if not span_minimum <= end - start <= maximum:

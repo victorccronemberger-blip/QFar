@@ -608,7 +608,8 @@ def _catalog_windows(rows, names, minimum, maximum, cache_key=None):
             for span in task_matching.extract_spans(rule, (), min_s=min_span, max_s=maximum,
                     prepared_events=tuple(event for event, _label in pairs),
                     event_task_names=tuple(label for _event, label in pairs), task_name=name,
-                    competing_task_names=rivals, video_duration_s=upper):
+                    competing_task_names=rivals, video_duration_s=upper,
+                    activity_mode=nymeria.selection_activity_mode(name)):
                 start, end = max(lower, span["start"]), min(upper, span["end"])
                 if min_span <= end - start <= maximum:
                     windows.append({"task_name": name, "device_seconds": [start + origin, end + origin],

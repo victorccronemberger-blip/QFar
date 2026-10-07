@@ -172,7 +172,8 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
             (FOLD, "C collects and piles clothes hangers from the closet rod while standing.", False),
             (FOLD, "C puts a shirt on a clothes hanger and hangs it inside the closet while standing.", True),
             (FOLD, "C is folding clothes with both hands while standing.", True),
-            ("Organize the Garage", "C arranges utensils on shelves in the kitchen storage room while standing.", False),
+            ("Organize the Garage", "C looks inside a utensil crock on shelves in the kitchen storage room while standing.", False),
+            ("Organize the Garage", "C arranges utensils on shelves in the kitchen storage room while standing.", True),
             ("Organize the Garage", "C organizes tools on the shelves in the garage while standing.", True),
             ("Stack firewood", "C stacks wooden blocks from the Jenga game on the table while standing.", False),
             ("Stack firewood", "C stacks firewood logs into a pile in the backyard while standing.", True),
@@ -181,7 +182,8 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
             ("Watering Outdoor Plants", "C pours water over the plants in the garden while standing.", True),
             ("Water Houseplants", "C holds a watering can beside the houseplants in the living room while standing.", False),
             ("Water Houseplants", "C waters the houseplants in the living room while standing.", True),
-            ("Holiday Decoration Setup", "C removes decorative items from the wall then puts the hanging decorations inside a box while standing.", False),
+            ("Holiday Decoration Setup", "C removes Christmas decorations from the wall then puts the hanging decorations inside a box while standing.", True),
+            ("Holiday Decoration Setup", "C looks at the decorations on the wall while standing.", False),
             ("Holiday Decoration Setup", "C hangs the Christmas decorations and attaches lights to the wall while standing.", True),
         )
         for name, caption, accepted in cases:
@@ -270,6 +272,115 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
                 writer.writerow({"start_time": 1000 + index * 5, "end_time": 1005 + index * 5,
                     "Describe my atomic actions": GARDEN_TEXT if index % 9 == 8 else FOLD_TEXT})
         self.assertEqual(self.candidates(), [])
+
+    def test_dishwasher_workflow_keeps_real_rinsing_between_appliance_transfers(self):
+        self.rgb = tuple(range(1_000_000_000_000, 1_500_000_000_001, 20_000_000))
+        self.imu = tuple(range(1_000_000_000_000, 1_500_000_000_001, 4_000_000))
+        transfer = "C puts a dirty plate into the dishwasher rack while standing in the kitchen."
+        rinse = "C rinses the spatula in her left hand with water from the kitchen sink."
+        rows = [transfer if index % 2 == 0 else rinse for index in range(85)]
+        rows[-1] = "C starts the dishwasher after loading the dirty plates."
+        self._write_workflow(rows)
+        clips = nymeria.automatic_candidates(task_name="Using the Dishwasher", root=self.root,
+            min_dur_s=300, max_dur_s=1800)
+        self.assertTrue(clips)
+        self.assertGreaterEqual(clips[0]["dur_s"], 300)
+        # Catalog expansion and the measured selector must agree about the
+        # action; catalog evidence alone still cannot certify the IMU.
+        from moneymin import nymeria_library
+        raw, _hashes = nymeria._annotation_rows(self.seq)
+        potential = nymeria_library._catalog_windows(raw, ["Using the Dishwasher"], 300, 1800)
+        self.assertEqual(len(potential), len(clips))
+        self.assertAlmostEqual(potential[0]["duration_s"], clips[0]["dur_s"])
+
+    def _write_workflow(self, texts):
+        with (self.narration / "atomic_action.csv").open("w", encoding="utf8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["start_time", "end_time", "Describe my atomic actions"])
+            writer.writeheader()
+            for index, text in enumerate(texts):
+                writer.writerow({"start_time": 1000 + index * 5, "end_time": 1005 + index * 5,
+                                 "Describe my atomic actions": text})
+        nymeria.clear_caches()
+
+    def test_dishwasher_workflow_rejects_sink_only_or_appliance_merely_nearby(self):
+        from moneymin import nymeria_library
+        for text in ("C washes a plate with water at the kitchen sink.",
+                     "C washes a plate in the kitchen sink beside the dishwasher."):
+            with self.subTest(text=text):
+                rows = [(1000 + i * 5, 1005 + i * 5, text) for i in range(85)]
+                self.assertEqual(nymeria_library._catalog_windows(
+                    rows, ["Using the Dishwasher"], 300, 1800), [])
+
+    def test_dishwasher_workflow_does_not_cross_hygiene_real_garden_or_sensor_gaps(self):
+        from moneymin import nymeria_library
+        transfer = "C puts a dirty plate into the dishwasher rack while standing in the kitchen."
+        for boundary in ("C sits down and uses her phone.", GARDEN_TEXT):
+            rows = [(1000 + i * 5, 1005 + i * 5,
+                     boundary if i == 42 else transfer) for i in range(85)]
+            with self.subTest(boundary=boundary):
+                self.assertEqual(nymeria_library._catalog_windows(
+                    rows, ["Using the Dishwasher"], 300, 1800), [])
+        unrelated = [(1000 + i * 5, 1005 + i * 5,
+                      "C reads a book while standing in the living room." if 30 <= i <= 48 else transfer)
+                     for i in range(85)]
+        self.assertEqual(nymeria_library._catalog_windows(
+            unrelated, ["Using the Dishwasher"], 300, 1800), [])
+        self.rgb = tuple(range(1_000_000_000_000, 1_500_000_000_001, 20_000_000))
+        self.imu = tuple(t for t in range(1_000_000_000_000, 1_500_000_000_001, 4_000_000)
+                         if t < 1_200_000_000_000 or t > 1_220_000_000_000)
+        self._write_workflow([transfer] * 85)
+        self.assertEqual(nymeria.automatic_candidates(task_name="Using the Dishwasher", root=self.root,
+            min_dur_s=300, max_dur_s=1800), [])
+
+    def test_broad_yard_rival_needs_an_actual_yard_action(self):
+        from moneymin import task_matching
+        for name in ("Gardening", "Full Yard Maintenance"):
+            rule = nymeria.selection_rule_for(name)
+            with self.subTest(task=name):
+                prepared = task_matching.prepare_span_events([
+                    (0, "C washes a spatula with water in the kitchen sink."),
+                    (5, "C pours water onto plants in the garden."),
+                    (10, "C mows the lawn while standing."),
+                ])
+                labels = task_matching.label_span_events(prepared, [(name, rule)])
+                self.assertFalse(labels[0])
+                self.assertIn(name, labels[1])
+                self.assertIn(name, labels[2])
+        self.assertTrue(nymeria.selection_activity_mode("Using the Dishwasher"))
+        self.assertFalse(nymeria.selection_activity_mode("Brew Coffee or Tea"))
+
+    def test_real_frank_dishwasher_captions_keep_the_named_appliance_action(self):
+        from moneymin import task_matching
+        # Atomic annotations from 20231122_s0_frank_hayden_act2_rjtf5a;
+        # no source recording or account identity is needed in this regression.
+        texts = [
+            "C is leaning towards the dishwasher while putting the spatula on the dishwasher's rack with her left hand, straightens her back then steps towards the kitchen sink.",
+            "C is leaning forward in the kitchen as she puts down the colander on the dishwasher rack using both of her hands and then grabs a plate using both hands",
+            "C is leaning forward in the kitchen as she arranges the kitchenware on the dishwasher rack using both of her hands",
+            "C is standing by the dishwasher, pointing at the dishwasher with her right hand then pushes the button of the dishwasher with her right hand twice.",
+        ]
+        prepared = task_matching.prepare_span_events(enumerate(texts))
+        labels = task_matching.label_span_events(prepared, nymeria.selection_rules().items())
+        for text, names in zip(texts, labels):
+            with self.subTest(text=text):
+                self.assertIn("Using the Dishwasher", names)
+                self.assertNotIn("Gardening", names)
+                self.assertNotIn("Full Yard Maintenance", names)
+
+    def test_clean_appliance_boundary_binds_cleaning_to_the_appliance(self):
+        from moneymin import task_matching
+        rule = nymeria.selection_rule_for("Clean Appliance")
+        texts = [
+            "C is standing in the kitchen as she picks up the pan from the stove using her left hand and then rinses it on the sink as she opens and closes the faucet using her right hand",
+            "C scrubs the oven while standing in the kitchen.",
+            "C wipes the kitchen stove with a sponge while standing.",
+            "C rinses the dishwasher while standing in the kitchen.",
+        ]
+        labels = task_matching.label_span_events(task_matching.prepare_span_events(enumerate(texts)),
+                                                 [("Clean Appliance", rule)])
+        self.assertFalse(labels[0])
+        for result in labels[1:]:
+            self.assertIn("Clean Appliance", result)
 
     def test_full_yard_maintenance_keeps_its_existing_five_minute_minimum(self):
         self.write_rows("C mows the lawn, rakes grass clippings and pulls weeds from soil while standing.",

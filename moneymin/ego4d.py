@@ -79,7 +79,7 @@ IMU_MAX_INTERPOLATION_GAP_MS = 25.0
 
 
 _SELECTION_SNAPSHOT = contextvars.ContextVar("ego4d_selection_snapshot", default=None)
-_SELECTION_VERSION = "ego4d-selection-content-v2"
+_SELECTION_VERSION = "ego4d-selection-content-v3"
 
 
 @contextmanager
@@ -1218,7 +1218,7 @@ def list_task_spans(
         if not has_evidence and not exact_long_scenario:
             continue
         _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
-            uid, events, search_text=search_text)
+            uid, events, search_text=search_text, scenarios=scenarios)
         rivals = task_matching.competing_span_names(task_name, activity_rules)
         if exact_long_scenario:
             scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
@@ -1291,7 +1291,8 @@ def list_task_spans(
     return out
 
 
-def _task_annotation_context(parent_uid: str, events, *, search_text: str | None = None):
+def _task_annotation_context(parent_uid: str, events, *, search_text: str | None = None,
+                             scenarios=()):
     """Classify immutable parent annotations once inside a selection operation.
 
     Keep derived classification, never task approval. Fresh effect boundaries
@@ -1302,12 +1303,17 @@ def _task_annotation_context(parent_uid: str, events, *, search_text: str | None
     snapshot = _SELECTION_SNAPSHOT.get()
     contexts = snapshot.setdefault("@task-window-contexts", {}) if snapshot is not None else {}
     named_rules = tuple(task_matching.TASK_RULES.items())
-    key = (parent_uid, id(events), named_rules) if isinstance(events, tuple) else None
+    scenarios = tuple(str(value) for value in scenarios)
+    key = (parent_uid, id(events), named_rules, scenarios) if isinstance(events, tuple) else None
     context = contexts.get(key) if key is not None else None
     if context is None:
         search = search_text if search_text is not None else task_matching.span_search_text(events)
         rules = [(name, rule) for name, rule in named_rules
-                 if task_matching.span_evidence_possible(rule, search)]
+                 if (task_matching.span_evidence_possible(rule, search)
+                     and (not (rule.required_action_pattern is None
+                               and (len(rule.evidence) == 1
+                                    or rule.unit_min_evidence_groups == 1))
+                          or task_matching.score_scenarios(rule, scenarios) is not None))]
         prepared = task_matching.prepare_span_events(events)
         labels = task_matching.label_span_events(prepared, rules)
         times = tuple(row[0] for row in prepared)
@@ -1340,11 +1346,11 @@ def _narration_evidence_for_video(
     if not rules:
         return []
     _search, all_rules, prepared, labels, times = _task_annotation_context(
-        str(video.get("video_uid") or ""), events, search_text=search_text)
+        str(video.get("video_uid") or ""), events, search_text=search_text, scenarios=scenarios)
     if not prepared:
         return []
-    # Classificar também as tarefas de outros cenários permite detectar uma
-    # mudança de atividade mesmo quando o cenário do vídeo é muito genérico.
+    # Ações específicas de outras cenas continuam detectando mudanças. Regras
+    # amplas exigem contexto: água numa cozinha não prova jardinagem.
     duration = float(video.get("duration_sec") or 0)
     intervals = imu_coverage_intervals(video)
     if not intervals and math.isfinite(duration) and duration > 0:
@@ -1462,7 +1468,7 @@ def rank_all_task_spans(
         # A parent scene controls candidate eligibility, not the classification
         # of contradictory actions that must terminate a candidate window.
         _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
-            uid, events, search_text=search_text)
+            uid, events, search_text=search_text, scenarios=scenarios)
         possible_names = {name for name, _rule in possible_rules}
         exact_long_names = {name for name, _rule in exact_long_rules}
         for name, rule in eligible_rules:
@@ -1575,7 +1581,7 @@ def revalidate_task_windows(
         if not events or video.get("has_imu") is not True or not video.get("s3_path"):
             continue
         scenarios = scenario_values(video)
-        _search, rules, prepared, labels, times = _task_annotation_context(uid, events)
+        _search, rules, prepared, labels, times = _task_annotation_context(uid, events, scenarios=scenarios)
         for name, clip in clips:
             rule = task_matching.rule_for(name)
             window = clip.get("window_s")
@@ -1672,6 +1678,22 @@ def _selection_candidate(clip: dict[str, Any]) -> dict[str, Any]:
             "source_s3_sha256": hashlib.sha256(str(clip.get("s3_path") or "").encode("utf-8")).hexdigest()}
 
 
+def _selection_rules_binding() -> dict[str, Any]:
+    """Bind actual loaded rules/aliases even when source files are in PYZ.
+
+    Algorithm changes also require a new _SELECTION_VERSION; an absent .py
+    file in an installed build cannot serve as the algorithm identity.
+    """
+    from . import task_matching
+    payload = {"schema": 1,
+               "rules": {name: vars(rule) for name, rule in task_matching.TASK_RULES.items()},
+               "aliases": task_matching.TASK_ALIASES}
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                     separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {"name": "loaded-task-rules-v1", "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest()}
+
+
 def _selection_bindings() -> dict[str, dict[str, Any]]:
     from . import task_matching
     snapshot = _SELECTION_SNAPSHOT.get() or {}
@@ -1685,6 +1707,7 @@ def _selection_bindings() -> dict[str, dict[str, Any]]:
              "rank_seed": seed}
     result = {name: {"name": path.name, "bytes": source[1], "sha256": source[2]}
               for name, path in paths.items() for source in [_selection_source(path)]}
+    result["rules_semantic"] = _selection_rules_binding()
     if _SELECTION_SNAPSHOT.get() is not None:
         _SELECTION_SNAPSHOT.get()[cache_key] = result
     return result

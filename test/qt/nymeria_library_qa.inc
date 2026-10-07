@@ -1,5 +1,39 @@
   static void nymeriaLibrarySmoke(MainWindow& window) {
     // The entire acquisition uses loopback fixtures, with no downloads or campaign.
+    // A selected campaign ID names an activity; its broad dataset scenario
+    // cannot identify a task in the Library's canonical task-name list.
+    const auto previousRecords=window._taskRecords;
+    const auto previousSelected=window._campaignSelectedTaskIds;
+    const bool previousTouched=window._campaignTaskSelectionTouched;
+    window._taskRecords=QJsonArray{
+        QJsonObject{{"id","manual-selected"},{"name","Fixture task"},{"scenario","Cooking"}},
+        QJsonObject{{"id","manual-unselected"},{"name","Other fixture task"},{"scenario","Cleaning"}}};
+    window._campaignSelectedTaskIds=QSet<QString>{"manual-selected"};
+    window._campaignTaskSelectionTouched=true;
+    const QJsonObject prefill{{"items",QJsonArray{}},{"total",0},{"offset",window._nymeriaOffset},
+        {"task_names",QJsonArray{"Fixture task","Other fixture task"}},
+        {"summary",QJsonObject{{"sequence_count",0}}}};
+    window._nymeriaTasks->clear();
+    window.renderNymeriaLibrary(prefill);
+    if(window._nymeriaTasks->count()!=2 || window._nymeriaTasks->item(0)->checkState()!=Qt::Checked
+        || window._nymeriaTasks->item(1)->checkState()!=Qt::Unchecked
+        || window._nymeriaTasks->item(0)->data(Qt::UserRole).toString()!="Fixture task") {qApp->exit(199);return;}
+    window._nymeriaTasks->item(0)->setCheckState(Qt::Unchecked);
+    window._nymeriaTasks->item(1)->setCheckState(Qt::Checked);
+    window.renderNymeriaLibrary(prefill);
+    if(window._nymeriaTasks->item(0)->checkState()!=Qt::Unchecked
+        || window._nymeriaTasks->item(1)->checkState()!=Qt::Checked) {qApp->exit(200);return;}
+    window._nymeriaTasks->clear();
+    window._campaignTaskSelectionTouched=false;
+    window.renderNymeriaLibrary(prefill);
+    if(window._nymeriaTasks->item(0)->checkState()!=Qt::Checked
+        || window._nymeriaTasks->item(1)->checkState()!=Qt::Checked) {qApp->exit(201);return;}
+    window._taskRecords=previousRecords;
+    window._campaignSelectedTaskIds=previousSelected;
+    window._campaignTaskSelectionTouched=previousTouched;
+    window._nymeriaTasks->clear();
+    window._nymeriaTable->setRowCount(0);
+    window._nymeriaTotal=0;
     struct Flow {
       int phase=0, reads=0, imports=0, syncs=0, plans=0, downloads=0, stops=0, jobReads=0;
       QJsonObject planBody;

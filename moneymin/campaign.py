@@ -3962,8 +3962,13 @@ def _rank_cache_stamp() -> tuple[tuple[str, int, str], ...]:
             relative = path.name
         source = ego4d._selection_source(path)
         stamp.append((relative, source[1], source[2]))
-    # Duration caches must contain current, resegmented task evidence.
-    stamp.append(("ranked-union", 11, "garment-laundry-selection"))
+    # Frozen modules live in PYZ; their __file__ paths need not exist. Bind the
+    # actual rules and aliases as well, so an installed update cannot reuse an
+    # index built with an older catalogue merely because both sources are missing.
+    rules = ego4d._selection_rules_binding()
+    stamp.append(("task-rules-semantic", rules["bytes"], rules["sha256"]))
+    # Logic changes outside the declared rules also invalidate duration caches.
+    stamp.append(("ranked-union", 12, ego4d._SELECTION_VERSION))
     return tuple(stamp)
 
 
@@ -4222,7 +4227,7 @@ def _merge_rank_seed(
     # requests can need them), while linking their overlapping identities.
     combined = _union_ranked_clips(
         {name: [*buckets.get(name, ()), *seed.get(name, ())]
-         for name in buckets.keys() | seed.keys()}, {},
+         for name in buckets.keys() | seed.keys() | task_matching.TASK_RULES.keys()}, {},
         min_dur_s=min_dur_s, max_dur_s=max_dur_s)
     result: dict[str, tuple[dict[str, Any], ...]] = {}
     for name, candidates in combined.items():

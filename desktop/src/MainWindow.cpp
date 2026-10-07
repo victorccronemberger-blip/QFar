@@ -6712,7 +6712,7 @@ void MainWindow::renderNymeriaLibrary(const QJsonObject& result) {
     for (const auto& value : result.value("task_names").toArray()) checked.insert(value.toString());
   if (firstTasks) for (const auto& value : _taskRecords) {
     const auto task = value.toObject();
-    if (_campaignSelectedTaskIds.contains(task.value("id").toString())) checked.insert(task.value("scenario").toString());
+    if (_campaignSelectedTaskIds.contains(task.value("id").toString())) checked.insert(task.value("name").toString());
   }
   {
     const QSignalBlocker blocker(_nymeriaTasks);

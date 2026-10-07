@@ -30,6 +30,8 @@ class TaskRule:
     supporting: tuple[str, ...] = ()
     excluded: tuple[str, ...] = ()
     min_span_s: float | None = None
+    required_action_pattern: str | None = None
+    required_span_patterns: tuple[str, ...] = ()
     confidence: str = "high"
 
 
@@ -45,6 +47,8 @@ def _r(
     supporting: tuple[str, ...] = (),
     excluded: tuple[str, ...] = (),
     min_span_s: float | None = None,
+    required_action_pattern: str | None = None,
+    required_span_patterns: tuple[str, ...] = (),
 ) -> TaskRule:
     return TaskRule(
         primary=(primary,) if isinstance(primary, str) else primary,
@@ -58,7 +62,42 @@ def _r(
         supporting=supporting,
         excluded=excluded,
         min_span_s=min_span_s,
+        required_action_pattern=required_action_pattern,
+        required_span_patterns=required_span_patterns,
     )
+
+
+# Determiners/adjectives may separate a verb from its object. Another object
+# or a location preposition may not: carrying boxes beside a sofa is not
+# moving the sofa. These patterns constrain only the required action clause.
+_OBJECT_MODIFIERS = (
+    r"(?:(?:a|an|the|his|her|their|our|this|that|some|both|few|new|old|fresh|dirty|clean|"
+    r"wooden|metal|plastic|heavy|large|small|big|red|blue|black|white|brown|"
+    r"empty|full|hot|cold|cooked|frozen|leftover|remaining|delivered|beverage|gym|fitness|dining|dinner)\s+)*"
+)
+_FURNITURE_MOVED = (
+    r"\b(?:lift\w*|carr\w*|mov\w*|relocat\w*)\s+" + _OBJECT_MODIFIERS +
+    r"(?:furniture|chairs?|tables?|sofas?|couches?|cabinets?|wardrobes?|desks?|beds?|shelves?|dressers?|benches?)\b"
+)
+_BEVERAGE_PREPARED = (
+    r"(?:\b(?:brew\w*|steep\w*|grind\w*|tamp\w*|make\w*|makes?|prepar\w*|blend\w*|"
+    r"squeez\w*|mix\w*|stir\w*|pour\w*)\s+" + _OBJECT_MODIFIERS +
+    r"(?:coffee|tea|espresso|beverage|cocoa|hot chocolate|juice|smoothie)\b|"
+    r"\b(?:puts?|putting|plac\w*|insert\w*|load\w*)\b.{0,45}\b(?:coffee|espresso) (?:pod|capsule)\b"
+    r"(?:(?!\b(?:beside|near|next)\b).){0,80}\b(?:in|into)\s+" + _OBJECT_MODIFIERS +
+    r"(?:coffee(?: pod bin of the coffee)?|espresso)\s+(?:machine|maker)\b|"
+    r"\b(?:press\w*|push\w*)\s+(?:(?:a|the|some)\s+)?(?:buttons?|lever)\b.{0,45}"
+    r"\b(?:on|of)\s+" + _OBJECT_MODIFIERS + r"(?:coffee|espresso)\s+(?:machine|maker)\b|"
+    r"\b(?:press\w*|push\w*)\s+(?:down\s+)?" + _OBJECT_MODIFIERS +
+    r"(?:coffee|espresso)\s+(?:machine|maker)\s+(?:buttons?|lever)\b|"
+    r"\bdip\w*\s+" + _OBJECT_MODIFIERS + r"(?:tea bags?|teabags?)\b.{0,55}"
+    r"\b(?:in|into)\s+" + _OBJECT_MODIFIERS + r"(?:water|mug|cup)\b)"
+)
+_BEVERAGE_RESET = (
+    r"\b(?:reset\w*|clean\w*|wipe\w*|rins\w*|wash\w*|discard\w*|dispos\w*|"
+    r"empt\w*|tidy\w*|return\w*|remov\w*|puts? away)\s+" + _OBJECT_MODIFIERS +
+    r"(?:coffee|tea|espresso|station|counter|cups?|mugs?|kettle|grounds|filter)\b"
+)
 
 
 # Catálogo operacional: são as poucas tarefas para as quais há uma relação
@@ -151,14 +190,15 @@ TASK_RULES: dict[str, TaskRule] = {
     ),
     "Hang Curtains": _r(
         ("Fixing something in the home", "jobs related to construction"),
-        ("curtain", "drape"),
-        ("rod", "ring", "hook", "rail"),
+        ("curtain", "drape", "blind"),
+        ("rod", "ring", "hook", "rail", "bracket", "window"),
         ("hang", "mount", "install", "thread", "attach"),
     ),
     "Holiday Decoration Setup": _r(
         ("Hosting a party", "Fixing something in the home"),
         ("decoration", "ornament", "christmas", "holiday", "garland", "lights"),
-        ("unpack", "hang", "place", "arrange", "decorate", "set up", "setup"),
+        ("unpack", "hang", "place", "arrange", "decorate", "set up", "setup",
+         "take down", "takes down", "taking down", "remove", "pack away", "undecorat"),
     ),
     "Replace showerhead": _r(
         "Fixing something in the home",
@@ -497,7 +537,7 @@ TASK_RULES.update({
     "Organize the Garage": _r(
         ("Cleaning / laundry", "Fixing something in the home", "Carpenter"),
         ("garage", "storage room", "storage area"),
-        ("sort", "organiz", "arrange", "tidy", "shelf", "shelves", "clutter")),
+        ("sort", "organiz", "arrange", "tidy", "rearrange", "clear clutter", "put away")),
     "Bedroom Deep Clean": _r(
         "Cleaning / laundry", ("bedroom", "bed room"),
         ("dust", "wipe", "vacuum", "mop", "scrub", "clean", "organiz"),
@@ -523,6 +563,217 @@ TASK_RULES.update({
         "Cleaning / laundry", ("toy", "clothes", "cloth", "garment"),
         ("pick", "collect", "gather", "put away"),
         ("floor", "bin", "basket", "shelf", "storage")),
+    # Captured live organization catalog, 2026-10-06. These descriptions
+    # require the named appliance, recipient or collaborator, not an adjacent
+    # activity in the same broad parent scenario.
+    "Move furniture with someone (2+ people required)": _r(
+        ("Moving furniture", "Assembling furniture", "Cleaning / laundry",
+         "Indoor Navigation (walking)"),
+        ("furniture", "chair", "table", "sofa", "couch", "cabinet", "wardrobe",
+         "desk", "bed", "shelf", "dresser", "bench"),
+        ("lift", "carry", "carries", "carrying", "move", "moving", "relocat"),
+        action_excluded=("alone", "by himself", "by herself", "on his own", "on her own"),
+        required_action_pattern=(
+            r"(?s)(?=.*" + _FURNITURE_MOVED + r")(?:"
+            r"\b(?:c|wearer|he|she)\s+and\s+(?:(?:a|the|another|his|her)\s+)?"
+            r"(?:man|woman|person|friend|worker|helper|other person)\s+"
+            r"(?:(?:are|both|help|helps)\s+)*(?:lift\w*|carr\w*|mov\w*)\b|"
+            r"\b(?:lift\w*|carr\w*|mov\w*)\b.{0,80}\btogether with\s+"
+            r"(?:(?:a|the|another|his|her)\s+)?"
+            r"(?:man|woman|person|friend|worker|helper|other person)\b|"
+            r"\b(?:help\w*|assist\w*)\s+(?:(?:a|the|another|his|her)\s+)?"
+            r"(?:man|woman|person|friend|worker|helper)\s+(?:to\s+)?"
+            r"(?:lift\w*|carr\w*|mov\w*)\b)")),
+    "Receive a delivery at the door": _r(
+        ("Cleaning / laundry", "Indoor Navigation (walking)", "Receiving a delivery"),
+        ("door", "doorstep", "entrance"),
+        ("package", "parcel", "delivery", "cardboard box"),
+        ("receive", "accept", "delivery", "courier", "delivery person", "delivery man",
+         "answer", "opens the door", "opens door"),
+        ("unbox", "unpack", "open the box", "opens the box", "opening the box",
+         "open the package", "opens the package", "open the parcel", "opens the parcel"),
+        unit_min_evidence_groups=2, evidence_window=None,
+        required_action_pattern=(
+            r"\b(?:receiv\w*|accept\w*|unbox\w*|unpack\w*|open\w*)\s+" + _OBJECT_MODIFIERS +
+            r"(?:delivery\s+)?(?:packages?|parcels?|cardboard boxes?|box)\b|"
+            r"\b(?:answer\w*|open\w*)\s+" + _OBJECT_MODIFIERS + r"door\b"),
+        required_span_patterns=(
+            r"\b(?:receiv\w*|accept\w*)\s+" + _OBJECT_MODIFIERS +
+            r"(?:delivery\s+)?(?:packages?|parcels?|cardboard boxes?|box)\b",)),
+    "Clean and organize gym equipment": _r(
+        ("Working out at a gym", "Exercise / working out", "Cleaning / laundry"),
+        ("gym", "fitness", "dumbbell", "barbell", "weight plate", "weight rack",
+         "exercise machine", "treadmill", "bench press"),
+        ("clean", "wipe", "disinfect", "sanitiz", "sanitize", "spray"),
+        ("put back", "puts back", "put the weights back", "puts the weights back",
+         "back on", "back onto", "back in", "return", "rerack", "re-rack", "stow", "organiz", "arrange"),
+        unit_min_evidence_groups=2, evidence_window=None,
+        required_action_pattern=(
+            r"\b(?:clean\w*|wipe\w*|disinfect\w*|sanitiz\w*|spray\w*)\s+(?:down\s+)?" +
+            _OBJECT_MODIFIERS + r"(?:equipment|dumbbells?|barbells?|weights?|weight plates?|"
+            r"exercise machine|treadmill|bench press)\b|"
+            r"\b(?:puts?|plac\w*|return\w*|rerack\w*|re-rack\w*|stow\w*|organiz\w*|arrang\w*)\s+" +
+            _OBJECT_MODIFIERS + r"(?:equipment|dumbbells?|barbells?|weights?|weight plates?)\b")),
+    "Carry items up and down stairs": _r(
+        ("Indoor Navigation (walking)", "Cleaning / laundry", "Moving furniture"),
+        ("stairs", "staircase", "stairway", "upstairs", "downstairs"),
+        ("box", "bag", "item", "object", "carton", "package", "furniture", "chair",
+         "table", "bucket", "basket", "luggage", "suitcase"),
+        ("carry", "carries", "carrying", "haul", "bring", "brings", "take", "takes"),
+        required_action_pattern=(
+            r"\b(?:carr\w*|haul\w*|bring\w*|takes?|taking)\b"
+            r"(?:(?!\b(?:past|beside|near|next|outside)\b).){0,80}"
+            r"\b(?:up|down)\s+(?:(?:a|the)\s+)?(?:stairs|staircase|stairway)\b|"
+            r"\b(?:carr\w*|haul\w*|bring\w*|takes?|taking)\b"
+            r"(?:(?!\b(?:past|beside|near|next|outside)\b).){0,80}\b(?:upstairs|downstairs)\b")),
+    "Serve food": _r(
+        ("Cooking", "Serving food", "Hosting a party", "Waiter"),
+        ("food", "meal", "rice", "soup", "bread", "meat", "salad", "chicken", "fish"),
+        ("serve", "bring", "brings", "carry", "carries", "hand", "give", "place", "put"),
+        ("customer", "guest", "diner", "to the man", "to a man", "to the woman",
+         "to a woman", "to another person", "to someone", "for the man", "for a man",
+         "for the woman", "for a woman", "for someone", "for the child", "to the child",
+         "for her husband", "for his wife", "people at the table", "man", "woman", "person",
+         "child", "family", "husband", "wife"),
+        ("table", "dining table", "dinner table"),
+        action_excluded=("empty plate", "empty bowl", "empty dish", "clean plate", "clean bowl"),
+        required_action_pattern=(
+            r"\b(?:serv\w*|giv\w*|bring\w*|hand\w*|pass\w*|offer\w*|plac\w*|puts?)\b"
+            r".{0,65}\b(?:to|for|in front of)\s+(?:(?:a|the|another|his|her)\s+)?"
+            r"(?:man|woman|person|someone|customer|guest|diner|child|children|family|husband|wife|people)\b|"
+            r"\bserv\w*\s+(?:(?:a|the|another|his|her)\s+)?"
+            r"(?:man|woman|person|someone|customer|guest|diner|child|children|family|people)\b")),
+    "Putting Groceries & Food Away": _r(
+        ("Cleaning / laundry", "Cooking"),
+        ("fridge", "refrigerator", "freezer", "pantry", "cupboard", "food cabinet"),
+        ("grocer", "food", "vegetable", "fruit", "milk", "bottle", "packet", "ingredient",
+         "rice", "flour", "pasta", "cereal", "bread", "meat", "soup"),
+        ("put", "place", "store", "arrange", "unpack", "organiz", "transfer", "sort"),
+        required_action_pattern=(
+            r"\b(?:puts?|plac\w*|stor\w*|arrang\w*|unpack\w*|organiz\w*|transfer\w*|sort\w*)\s+" +
+            _OBJECT_MODIFIERS + r"(?:grocer\w*|food\w*|vegetable\w*|fruit\w*|milk|bottles?|packets?|"
+            r"ingredients?|rice|flour|pasta|cereal|bread|meat|soup)\b"
+            r"(?:(?!\b(?:beside|near|next|outside)\b).){0,65}"
+            r"\b(?:in|into|inside|from|out of|to)\s+" + _OBJECT_MODIFIERS +
+            r"(?:fridge|refrigerator|freezer|pantry|cupboard|food cabinet)\b")),
+    "Brew Coffee or Tea": _r(
+        ("Cooking", "Preparing drinks", "Bartender", "Hosting a party"),
+        ("coffee", "tea", "espresso", "beverage", "cocoa", "hot chocolate", "juice", "smoothie"),
+        ("brew", "steep", "grind", "tamp", "boil", "blend", "squeeze", "pour", "stir", "mix",
+         "prepare", "make", "makes", "pod", "capsule", "press", "push", "dip"),
+        ("reset", "clean", "wipe", "rinse", "wash", "discard", "dispose", "empty", "tidy",
+         "put away", "puts away", "return", "remove"),
+        unit_min_evidence_groups=1, evidence_window=None,
+        action_excluded=("drinks", "drinking", "sips", "sipping"),
+        required_action_pattern=rf"(?:{_BEVERAGE_PREPARED}|{_BEVERAGE_RESET})",
+        required_span_patterns=(_BEVERAGE_PREPARED, _BEVERAGE_RESET)),
+    "Clean and Polish Shoes": _r(
+        ("Cleaning / laundry", "Daily hygiene", "Shoe shining"),
+        ("shoe", "boot", "footwear"),
+        ("polish", "shoe cream", "shoe wax"),
+        ("brush", "buff", "shine", "rub", "wipe"),
+        unit_min_evidence_groups=2,
+        required_action_pattern=(
+            r"\b(?:polish\w*|brush\w*|buff\w*|shin\w*|rub\w*|wipe\w*)\s+" + _OBJECT_MODIFIERS +
+            r"(?:shoes?|boots?|footwear)\b(?!\s+(?:rack|box|shelf|cabinet|brush|lace))|"
+            r"\bappl\w*\b.{0,35}\bpolish\b.{0,35}\bto\s+" + _OBJECT_MODIFIERS +
+            r"(?:shoes?|boots?|footwear)\b")),
+    "Grill Food at a Barbecue": _r(
+        ("Cooking", "Grilling", "Barbecue", "Hosting a party"),
+        ("grill", "barbecue", "barbeque", "bbq", "braai"),
+        ("food", "meat", "chicken", "sausage", "steak", "burger", "fish", "vegetable",
+         "corn", "skewer", "kebab"),
+        ("cook", "grill", "flip", "turn", "tongs", "place", "put", "roast", "remove"),
+        required_action_pattern=(
+            r"\b(?:grills|grilling|grilled|barbecues|barbecuing)\b|"
+            r"\b(?:cooks?|cooking|cooked|flips?|flipping|turns?|turning|roasts?|roasting)\b"
+            r".{0,80}\b(?:on|over|in|using)\s+(?:(?:a|the)\s+)?"
+            r"(?:grill|barbecue|barbeque|bbq|braai)\b")),
+    "Pitch and Pack Up a Tent": _r(
+        ("Camping", "Outdoor recreation", "Indoor Navigation (walking)"),
+        ("tent",),
+        ("pitch", "stake", "peg", "assemble", "disassemble", "dismantle", "insert", "attach", "connect", "unpack",
+         "pack", "fold", "roll", "collapse", "take down", "takes down", "taking down"),
+        required_action_pattern=(
+            r"\b(?:pitch\w*|stake\w*|assembl\w*|disassembl\w*|dismantl\w*|unpack\w*|pack\w*|"
+            r"fold\w*|roll\w*|collaps\w*|take\w*\s+down)\s+"
+            r"(?:(?:up|away|a|the|camping|small|large)\s+)*tent\b|"
+            r"\b(?:insert\w*|attach\w*|connect\w*)\b.{0,45}\btent (?:pole|peg|stake)\b")),
+    "Replace an HVAC or Furnace Filter": _r(
+        ("Fixing something in the home", "jobs related to construction", "Cleaning / laundry"),
+        ("hvac", "furnace", "air conditioner", "air conditioning", "air handler", "heating unit"),
+        ("filter",),
+        ("replace", "remove", "insert", "install", "slide", "swap"),
+        required_action_pattern=(
+            r"\b(?:replac\w*|remov\w*|insert\w*|install\w*|slid\w*|swap\w*)\s+" + _OBJECT_MODIFIERS +
+            r"(?:(?:hvac|furnace|air conditioner|air conditioning|air handler|heating unit)\s+"
+            r"(?:air\s+)?filter|filter\s+(?:in|into|from|out of|of|for)\s+" + _OBJECT_MODIFIERS +
+            r"(?:hvac|furnace|air conditioner|air conditioning|air handler|heating unit))\b")),
+    "Setting the Table": _r(
+        ("Cooking", "Hosting a party", "Cleaning / laundry"),
+        ("table", "dining table", "dinner table"),
+        ("plate", "utensil", "glass", "fork", "spoon", "knife", "napkin", "tableware",
+         "cutlery", "placemat", "bowl"),
+        ("set", "arrange", "place", "put", "lay", "lays"),
+        required_action_pattern=(
+            r"\b(?:sets?|setting|arrang\w*|lays?|laying)\s+" + _OBJECT_MODIFIERS + r"table\b|"
+            r"\b(?:sets?|setting|arrang\w*|plac\w*|puts?|lays?|laying)\s+" + _OBJECT_MODIFIERS +
+            r"(?:plates?|utensils?|glasses?|forks?|spoons?|knives?|napkins?|tableware|cutlery|placemats?|bowls?)\b"
+            r"(?:(?!\b(?:beside|near|next|outside)\b).){0,70}"
+            r"\b(?:on|onto|at)\s+" + _OBJECT_MODIFIERS + r"table\b")),
+    "Set Up and Pack Away a Picnic": _r(
+        ("Having a picnic", "Picnic", "Hosting a party", "Cooking"),
+        ("picnic",),
+        ("blanket", "food", "plate", "tableware", "basket", "cooler"),
+        ("lay", "spread", "set up", "setup", "unpack", "pack", "clear", "arrange", "fold"),
+        required_action_pattern=(
+            r"\b(?:lay\w*|spread\w*|set\w*|unpack\w*|pack\w*|clear\w*|arrang\w*|fold\w*)\s+"
+            r"(?:out\s+|up\s+|away\s+)?" + _OBJECT_MODIFIERS +
+            r"picnic(?: (?:blanket|basket|food|tableware|cooler|items?))?\b|"
+            r"\b(?:lay\w*|spread\w*|set\w*|unpack\w*|pack\w*|clear\w*|arrang\w*|fold\w*)\b"
+            r"(?:(?!\b(?:beside|near|next|outside)\b).){0,75}"
+            r"\b(?:on|onto|for)\s+" + _OBJECT_MODIFIERS + r"picnic\b")),
+    "Using the Dishwasher": _r(
+        ("Cleaning / laundry", "Cooking", "Household cleaners"),
+        ("dishwasher", "dish washer"),
+        ("dish", "plate", "cup", "bowl", "glass", "cutlery", "utensil", "spoon", "fork", "rack",
+         "pan", "spatula", "colander", "strainer", "tray", "tongs", "platter", "pot",
+         "chopping board", "kitchenware"),
+        ("load", "unload", "put", "place", "remove", "take", "takes", "pick", "arrange", "tidy",
+         "move", "start", "switch", "close", "open", "press", "push", "insert"),
+        required_action_pattern=(
+            r"\b(?:load\w*|unload\w*)\s+(?:(?:a|the)\s+)?dish\s?washer\b|"
+            r"\b(?:load\w*|unload\w*|puts?|putting|plac\w*|remov\w*|takes?|taking|"
+            r"picks? up|picking up|arrang\w*|tidy\w*|mov\w*|insert\w*)\b"
+            r"(?:(?!\b(?:beside|near|next)\b).){0,110}\b(?:into|in|from|out of)\s+"
+            r"(?:(?:a|the|kitchen|top|bottom|upper|lower)\s+)*"
+            r"(?:(?:rack|compartment)\s+of\s+(?:(?:a|the|kitchen)\s+)*)?dish\s?washer(?:['’]s)?\b|"
+            r"\b(?:puts?|putting|plac\w*|arrang\w*|tidy\w*|mov\w*|insert\w*)\b"
+            r"(?:(?!\b(?:beside|near|next)\b).){0,110}\b(?:on|onto)\s+"
+            r"(?:(?:a|the|kitchen|top|bottom|upper|lower)\s+)*"
+            r"(?:dish\s?washer(?:['’]s)?\s+(?:(?:top|bottom|upper|lower)\s+)?rack|"
+            r"rack\s+of\s+(?:(?:a|the|kitchen)\s+)*dish\s?washer)\b|"
+            r"\bdish\s?washer(?:['’]s)?\s+(?:(?:top|bottom|upper|lower)\s+)?rack\b"
+            r".{0,110}\b(?:puts?|putting|plac\w*|arrang\w*|tidy\w*|mov\w*)\b"
+            r"(?:(?!\b(?:beside|near|next)\b).){0,70}\b(?:on|onto|in|into)\s+"
+            r"(?:(?:a|the|top|bottom|upper|lower)\s+)*rack\b|"
+            r"\b(?:press\w*|push\w*)\s+(?:(?:a|the)\s+)?buttons?\b.{0,40}"
+            r"\b(?:on|of)\s+(?:(?:a|the|kitchen)\s+)*dish\s?washer\b|"
+            r"\b(?:start\w*|switch\w*|open\w*|close\w*)\s+(?:on\s+|off\s+)?"
+            r"(?:(?:a|the|kitchen)\s+)*dish\s?washer\b")),
+    "Bathroom Clean & Tidy": _r(
+        ("Cleaning / laundry", "Household cleaners", "Daily hygiene"),
+        ("bathroom", "toilet", "shower", "bathtub", "bath tub", "washbasin", "bathroom sink"),
+        ("clean", "scrub", "wipe", "wash", "rinse", "organiz", "tidy", "arrange"),
+        action_excluded=("bicycle", "bike", "washing clothes", "brush washer",
+                         "washes his face", "washes her face", "washes face", "brushes teeth",
+                         "brushes his teeth", "brushes her teeth", "taking a shower", "takes a shower"),
+        required_action_pattern=(
+            r"\b(?:clean\w*|scrub\w*|wipe\w*|wash\w*|rins\w*|organiz\w*|tidy\w*|arrang\w*)\s+(?:down\s+|off\s+)?" +
+            _OBJECT_MODIFIERS + r"(?:bathroom|toilet|shower|bathtub|bath tub|washbasin|bathroom sink)\b|"
+            r"\b(?:clean\w*|scrub\w*|wipe\w*|wash\w*|rins\w*|organiz\w*|tidy\w*|arrang\w*)\b"
+            r"(?:(?!\b(?:beside|near|next|outside)\b).){0,70}"
+            r"\b(?:in|inside)\s+" + _OBJECT_MODIFIERS + r"bathroom\b")),
 })
 
 TASK_ALIASES: dict[str, str] = {
@@ -619,6 +870,12 @@ _NARRATED_CROSS_SCENARIO_TASKS = frozenset({
     "Leaf Raking & Bagging", "Replace Showerhead", "Replace showerhead",
     "Replace Bulbs & Batteries", "Tighten Cabinet & Door Hinges",
     "Hang Curtains", "Hang Art & Mirrors", "Shelve books",
+    "Move furniture with someone (2+ people required)", "Receive a delivery at the door",
+    "Clean and organize gym equipment", "Carry items up and down stairs", "Serve food",
+    "Putting Groceries & Food Away", "Brew Coffee or Tea", "Clean and Polish Shoes",
+    "Grill Food at a Barbecue", "Pitch and Pack Up a Tent", "Replace an HVAC or Furnace Filter",
+    "Setting the Table", "Set Up and Pack Away a Picnic", "Using the Dishwasher",
+    "Bathroom Clean & Tidy", "Holiday Decoration Setup", "Organize the Garage",
 })
 
 
@@ -840,7 +1097,8 @@ _TASK_CONTAINS: dict[str, frozenset[str]] = {
     "Car Wash & Detail": frozenset({"Cleaning Out Car"}),
     "Pet Care Routine": frozenset({"Pet Grooming & Bath", "Pet Feeding"}),
     "Party Setup & Takedown": frozenset({
-        "Drink Station Setup", "Party Cleanup",
+        "Drink Station Setup", "Party Cleanup", "Setting the Table", "Serve food",
+        "Holiday Decoration Setup",
     }),
     "Unpack & Set Up a Room": frozenset({"Furniture Assembly"}),
     "Furniture Assembly/ Disassembly": frozenset({"Furniture Assembly"}),
@@ -851,6 +1109,9 @@ _TASK_CONTAINS: dict[str, frozenset[str]] = {
     "Spreading Mulch or Fertilizer": frozenset({"Spread Mulch"}),
     "Leaf Raking or Blowing": frozenset({"Leaf Raking & Bagging"}),
     "Pack or Unpack a Car for a Trip": frozenset({"Pack the Car for a Trip"}),
+    "Putting Groceries & Food Away": frozenset({"Putting Groceries Away"}),
+    "Bathroom Clean & Tidy": frozenset({"Clean the Bathroom"}),
+    "Drink Station Setup": frozenset({"Brew Coffee or Tea"}),
 }
 
 
@@ -1164,6 +1425,9 @@ def _unit_on_task(segment: str, rule: TaskRule) -> bool:
     """Uma fala só conta quando traz evidência suficiente da própria ação."""
     if not rule.evidence:
         return False
+    if (rule.required_action_pattern is not None
+            and not _required_action_pattern(rule.required_action_pattern).search(segment)):
+        return False
     required = rule.unit_min_evidence_groups
     if required is None:
         required = rule.min_evidence_groups
@@ -1173,6 +1437,11 @@ def _unit_on_task(segment: str, rule: TaskRule) -> bool:
         _evidence_group_present(segment, group)
         for group in rule.evidence
     ) >= required
+
+
+@lru_cache(maxsize=256)
+def _required_action_pattern(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern, re.I)
 
 
 def _sustained_foreign_activity(
@@ -1364,6 +1633,12 @@ def score_action(rule: TaskRule, action_text: str,
     if not text:
         return None
     if any(_term_in(text, term) for term in rule.action_excluded):
+        return None
+    if (rule.required_action_pattern is not None
+            and not any(_unit_on_task(segment, rule) for segment in segments)):
+        return None
+    if any(not any(_required_action_pattern(pattern).search(segment) for segment in segments)
+           for pattern in rule.required_span_patterns):
         return None
     group_units = [
         sum(any(_term_in(segment, term) for term in group)

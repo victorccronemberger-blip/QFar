@@ -117,7 +117,7 @@ class NymeriaLibraryApiTests(unittest.TestCase):
         self.assertEqual(result["total"], 0)
         self.assertEqual(result["summary"]["sequence_count"], 0)
         self.assertIn("Shopping", result["task_names"])
-        self.assertEqual(len(result["task_names"]), 43)
+        self.assertEqual(len(result["task_names"]), 49)
         self.assertNotIn("Gardening", result["task_names"])
         self.assertEqual(result["task_catalog_source"], "local_snapshot_requires_campaign_preflight")
         self.assertEqual(result["worker"]["state"], "idle")

@@ -235,7 +235,7 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
         assert nymeria['ready'] is False
         source_catalog = get('/api/library/nymeria/sequences')
         assert source_catalog['total'] == 0
-        assert len(source_catalog['task_names']) == 43
+        assert len(source_catalog['task_names']) == 49
         assert 'Furniture Assembly' in source_catalog['task_names']
         assert 'Gardening' not in source_catalog['task_names']
         assert source_catalog['task_catalog_source'] == 'local_snapshot_requires_campaign_preflight'

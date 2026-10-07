@@ -49,6 +49,18 @@ class PreparedCatalogTests(unittest.TestCase):
         self.assertTrue(pools["Shopping"])
         self.assertIsNotNone(campaign._load_rank_cache())
 
+    def test_new_supported_activity_without_portable_content_does_not_download_catalog(self):
+        with patch.object(campaign, '_task_candidates',
+                          side_effect=AssertionError('cold task lookup must not acquire sources')):
+            for minimum, maximum in ((300, 1800), (60, 600), (600, 1200)):
+                rows = campaign.available_tasks('fixture@example.invalid', 'org',
+                    remote_tasks=[{'id': 'new-coffee', 'name': 'Brew Coffee or Tea'}],
+                    min_dur_s=minimum, max_dur_s=maximum,
+                    dataset_provider='ego4d', include_unavailable=True)
+                self.assertTrue(rows[0]['mapping_supported'])
+                self.assertEqual(rows[0]['clip_count'], 0)
+                self.assertFalse(rows[0]['available_for_duration'])
+
     def test_async_http_returns_categories_after_duration_changes(self):
         session = Mock()
         session.all_tasks.return_value = self.tasks

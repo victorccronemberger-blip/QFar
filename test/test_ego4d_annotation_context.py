@@ -93,6 +93,26 @@ class AnnotationContextTests(unittest.TestCase):
             with patch.dict(task_matching.TASK_RULES, {self.task: changed}):
                 self.assertEqual(self.recheck().get(self.task, []), [])
 
+    def test_broad_water_labels_need_the_bound_parent_context(self):
+        events = ((0.0, "#C C rinses a spatula with water"),)
+        with ego4d.selection_operation(), patch.object(
+                ego4d, "_cat", side_effect=AssertionError("Context must not fetch metadata")):
+            cooking = ego4d._task_annotation_context("parent", events, scenarios=("Cooking",))
+            garden = ego4d._task_annotation_context("parent", events, scenarios=("Gardening",))
+        self.assertNotIn("Gardening", cooking[3][0])
+        self.assertNotIn("Full Yard Maintenance", cooking[3][0])
+        self.assertIn("Gardening", garden[3][0])
+
+    def test_specific_other_scene_actions_and_hygiene_still_split_spans(self):
+        events = ((0.0, "#C C folds the shirt"),
+                  (5.0, "#C C loads dirty plates into the dishwasher"),
+                  (10.0, "#C C uses the phone while folding a shirt"))
+        context = ego4d._task_annotation_context("parent", events, scenarios=("Cooking",))
+        self.assertIn(self.task, context[3][0])
+        self.assertIn("Using the Dishwasher", context[3][1])
+        self.assertEqual(context[3][2], frozenset())
+        self.assertTrue(context[2][2][3])
+
 
 if __name__ == "__main__":
     unittest.main()

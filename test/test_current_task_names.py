@@ -7,16 +7,16 @@ from moneymin import campaign, task_matching as tm
 
 
 class CurrentTaskNamesTests(unittest.TestCase):
-    def test_all_43_live_account_task_names_are_supported(self):
+    def test_all_49_live_account_task_names_are_supported(self):
         names = json.loads(Path(__file__).with_name("current_minute_task_names.json")
                            .read_text(encoding="utf-8"))
-        self.assertEqual(len(names), 43)
+        self.assertEqual(len(names), 49)
         for name in names:
             with self.subTest(name=name):
                 self.assertIsNotNone(tm.rule_for(name))
                 self.assertIn(tm.canonical_task_name(name), tm.TASK_RULES)
 
-    def test_current_names_map_to_known_actions(self):
+    def test_legacy_names_keep_their_action_mapping(self):
         names = [
             "Cleaning Car", "Planting or Pulling Weeds", "Shopping",
             "Folding Clothes or Putting Them on Hangers", "Using the Laundry Machine",
