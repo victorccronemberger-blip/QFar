@@ -1746,6 +1746,8 @@ def _list_accounts() -> list[dict[str, Any]]:
         if str(email).strip().casefold() in removed:
             continue
         key = str(email).strip().casefold()
+        if account_health.confirmed_ban(email, health.get(key, {}), registrations.get(key)):
+            continue
         if key in registrations and registrations[key]["state"] != "complete":
             continue
         if key in seen:
@@ -2120,6 +2122,33 @@ def _ban_accounts(issues: list[dict]) -> None:
             _save_prefs(prefs)
             _remove_account_data(email)
         account_bans.purge_local_records({account_transfer.email_key(i["email"]) for i in issues})
+
+
+def _reconcile_account_bans() -> list[str]:
+    """Archive confirmed diagnoses left in the active store by older versions."""
+    with _PERSISTENCE_LOCK:
+        health = _load_account_health_history()
+        registrations = registration_state.load()
+        removed = _removed_accounts()
+        candidates = {email: issue for email in (health.keys() | registrations.keys()) - removed
+                      if (issue := account_health.confirmed_ban(
+                          email, health.get(email, {}), registrations.get(email)))}
+        if not candidates:
+            return []
+        owners = set(token_store.records(config.tokens_dir()))
+        owners.update(email for email in registrations
+                      if credential_store.record_path(config.SECRETS_DIR, email).exists())
+        issues = [candidates[email] for email in sorted(owners & candidates.keys())]
+        if issues:
+            _ban_accounts(issues)
+        return [issue["email"] for issue in issues]
+
+
+def _archive_checked_ban(email: str, result: dict) -> None:
+    issue = account_health.confirmed_ban(email, result)
+    if issue:
+        _ban_accounts([issue])
+        result["permanently_removed"] = True
 
 
 def _preflight_fingerprint(emails: list[str], *, _include_cached_org: bool = True) -> str:
@@ -2588,6 +2617,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
     # -- contas ---------------------------------------------------------------
     @app.get("/api/accounts")
     def get_accounts():
+        if not (RUNNER.running or RECOVERY.running or BALANCES_RUNNER.running
+                or _BULK_REGISTER_STATE.get("state") == "running"):
+            _reconcile_account_bans()
         accounts = _list_accounts()
         registrations = registration_state.load()
         removed = _removed_accounts()
@@ -2595,6 +2627,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         known = {row["email"].strip().casefold() for row in accounts}
         for email, registration in registrations.items():
             if (email not in known and email not in removed
+                    and not account_health.confirmed_ban(email, health.get(email, {}), registration)
                     and credential_store.record_path(config.SECRETS_DIR, email).exists()):
                 accounts.append({"email": email, "expires_at": 0, "org_key": None,
                                  "org_name": "Não verificada", "account_kind": "crowtado",
@@ -3248,6 +3281,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
     @app.post("/api/accounts/<email>/check")
     def check_account(email: str):
         result = _check_account_health(email)
+        _archive_checked_ban(email, result)
         ok = result["status"] == "active"
         return jsonify({"ok": ok, **result}), 200 if ok else 400
 
@@ -3276,6 +3310,12 @@ def create_app(*, for_testing: bool = False) -> Flask:
                             "error": issue_text(issue), "issue": issue,
                         }
         results = [results_by_email[email] for email in emails]
+        confirmed = [(result, issue) for result in results
+                     if (issue := account_health.confirmed_ban(result["email"], result))]
+        if confirmed:
+            _ban_accounts([issue for _, issue in confirmed])
+            for result, _ in confirmed:
+                result["permanently_removed"] = True
         return jsonify({
             "ok": True,
             "total": len(results),

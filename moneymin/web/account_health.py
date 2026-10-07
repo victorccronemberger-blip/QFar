@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any
+from datetime import datetime
 
 SERVICES = ("minute", "crowtado")
 
@@ -12,6 +13,36 @@ def provider(check: dict, name: str) -> dict:
         return providers.get(name, {})
     # Old checks only consulted Minute. Never copy them into Crowtado.
     return check if name == "minute" else {}
+
+
+def confirmed_ban(email: str, check: dict, registration: dict | None = None) -> dict | None:
+    """Only current account restrictions authorize permanent local exclusion."""
+    for name in SERVICES:
+        current = provider(check, name)
+        issue = current.get("issue", {})
+        # A payout hold is not a ban on the account's access.
+        if (current.get("status") == "disabled" and
+                issue.get("code") == "restricted" and
+                issue.get("restriction_confirmed") is True and
+                current.get("restriction_kind") != "payout"):
+            return {**issue, "email": email, "provider": name}
+    registration = registration or {}
+    for step_name, step in registration.get("steps", {}).items():
+        if step.get("code") != "restricted":
+            continue
+        name = "minute" if step_name in {"minute_register", "validate"} else "crowtado"
+        current = provider(check, name)
+        try:
+            cleared = (current.get("status") == "active" and
+                       datetime.fromisoformat(current["checked_at"]) >=
+                       datetime.fromisoformat(registration["updated_at"]))
+        except (KeyError, TypeError, ValueError):
+            cleared = False
+        if not cleared:
+            return {"email": email, "provider": name, "code": "restricted",
+                    "restriction_confirmed": True, "stage": "Cadastro · " + name.title(),
+                    "reason": name.title() + " confirmou banimento durante o cadastro."}
+    return None
 
 
 def aggregate(email: str, providers: dict[str, dict]) -> dict:

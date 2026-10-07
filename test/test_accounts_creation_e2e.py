@@ -214,7 +214,7 @@ def test_bad_journal_preserved_and_blocks_creation(setup):
 
 
 @pytest.mark.parametrize("code", ["user_banned", "user_locked", "user_account_disabled", "user_disabled"])
-def test_explicit_clerk_restriction_is_visible_and_prevents_minute_creation_on_resume(setup, code):
+def test_explicit_clerk_restriction_is_archived_and_prevents_minute_creation_on_resume(setup, code):
     app, body, remote, minute_register, *_ = setup
     error = server.crowtado._remote_error("Login Crowtado", 403, {"errors": [{"code": code, "long_message": "sensitive-remote-detail"}]})
     assert error.account_issue_code == "restricted"
@@ -223,11 +223,12 @@ def test_explicit_clerk_restriction_is_visible_and_prevents_minute_creation_on_r
     client = app.test_client()
     client.post("/api/accounts/register?async=1", json=body)
     assert await_terminal(client)["failed"] == 1
-    row = client.get("/api/accounts").get_json()["accounts"][0]
-    assert row["restriction"]["confirmed"] and row["restriction"]["code"] == "restricted"
+    assert client.get("/api/accounts").get_json()["accounts"] == []
+    archived = client.get("/api/accounts/banned").get_json()["accounts"]
+    assert len(archived) == 1 and archived[0]["email"] == EMAIL
+    assert archived[0]["restriction_confirmed"] is True
     remote["login"].side_effect = error
-    client.post(f"/api/accounts/{EMAIL}/resume", json={})
-    assert await_terminal(client)["failed"] == 1
+    assert client.post(f"/api/accounts/{EMAIL}/resume", json={}).status_code == 404
     minute_register.assert_not_called()
     assert remote["criar_conta"].call_count == 1
 
@@ -407,9 +408,14 @@ def test_post_creation_access_failure_is_never_counted_as_success(setup, code):
     result = row["results"][0]
     assert result["created"] is False and result["partial"] is True
     assert result["steps"]["ban_check"]["status"] == "fail" and result["steps"]["ban_check"]["code"] == code
-    account = client.get("/api/accounts").get_json()["accounts"][0]
-    assert account["registration"]["state"] == "incomplete"
-    assert account["restriction"]["confirmed"] is (code == "restricted")
+    accounts = client.get("/api/accounts").get_json()["accounts"]
+    if code == "restricted":
+        assert accounts == []
+        assert server.account_bans.banned_emails() == {EMAIL}
+    else:
+        assert accounts[0]["registration"]["state"] == "incomplete"
+        assert accounts[0]["restriction"]["confirmed"] is False
+        assert server.account_bans.banned_emails() == set()
     assert server._list_accounts() == []
     register.assert_not_called()
     remote["criar_conta"].assert_called_once()
@@ -450,8 +456,8 @@ def test_minute_suspended_org_is_not_counted_as_success(setup):
     assert result["results"][0]["steps"]["minute_register"]["code"] == "restricted"
     register.assert_called_once()
     assert server._list_accounts() == []
-    row = client.get("/api/accounts").get_json()["accounts"][0]
-    assert row["restriction"]["confirmed"] and row["restriction"]["code"] == "restricted"
+    assert client.get("/api/accounts").get_json()["accounts"] == []
+    assert server.account_bans.banned_emails() == {EMAIL}
 
 
 def test_minute_target_org_auth_block_is_not_counted_as_success(setup):

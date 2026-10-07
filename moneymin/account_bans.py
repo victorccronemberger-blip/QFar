@@ -23,6 +23,15 @@ def require_not_banned(email: str) -> None:
 _DROP = object()
 
 
+def _has_delivery_reference(value) -> bool:
+    if isinstance(value, dict):
+        return (bool({"video_path", "sidecar_data_path", "session_id"} & value.keys()) or
+                any(_has_delivery_reference(child) for child in value.values()))
+    if isinstance(value, list):
+        return any(_has_delivery_reference(child) for child in value)
+    return False
+
+
 def _scrub(value, emails):
     if isinstance(value, str):
         return _DROP if value.strip().casefold() in emails else value
@@ -44,7 +53,7 @@ def _scrub(value, emails):
 
 
 def purge_local_records(emails: set[str]) -> None:
-    """Purga registros e backups geridos pelo app; mantém apenas banlist/tombstones."""
+    """Remove active account records; retain delivery evidence and media guards."""
     roots = {config.ROOT, config.LIBRARY_ROOT}
     # Token ownership and canonical-name conflicts must be checked by the store;
     # generic recursive scrubbing could otherwise erase a conflicting primary.
@@ -64,6 +73,11 @@ def purge_local_records(emails: set[str]) -> None:
         paths.update(root.glob("*contas*.txt"))
     for path in sorted(paths):
         if path.name in {"banned_accounts.json", "removed_accounts.json"}:
+            continue
+        # Delivery records retain ownership and pending-media references even
+        # when their account no longer has usable access. Never turn removal
+        # into a reset of campaign/recovery evidence.
+        if path.name.startswith("campaign_") or path.name == "sidecar_migration.json":
             continue
         if path.name.startswith("token_") and path.suffix == ".json":
             continue
@@ -93,6 +107,9 @@ def purge_local_records(emails: set[str]) -> None:
             try:
                 value = decode_json_history_document(raw)
             except JsonlSyntaxError:
+                continue
+            if (any(path.is_relative_to(root / "recovery") for root in roots)
+                    and _has_delivery_reference(value)):
                 continue
             clean = _scrub(value, emails)
             if clean is _DROP:

@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **118 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **119 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.60](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.60). Destaques: Classificação do catálogo evita buscas de exclusão sem evidência e descarta componentes curtos antes da análise. A prévia não varre IMU/VRS; consultas interrompidas retomam o mesmo pedido.
+Versão atual: [v2.0.61](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.61). Destaques: Banimentos confirmados são removidos das contas disponíveis e das campanhas; pendências de rede e retenções de saque são preservadas.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.61](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.61) | 07/10/2026 | Reconcilia banimentos confirmados deixados entre contas disponíveis e arquiva novos banimentos nas verificações. Preserva contas inconclusivas, retenções de saque e registros que protegem mídias pendentes. | [Desde v2.0.60](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.60...v2.0.61) |
 | [v2.0.60](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.60) | 07/10/2026 | Catálogo evita buscas repetidas de exclusão e análise de componentes curtos. Prévia usa estimativas sem ler sensores completos; mantém validação medida e recupera o mesmo pedido após timeout. | [Desde v2.0.57](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.57...v2.0.60) |
 | [v2.0.57](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.57) | 07/10/2026 | Remove classificação automática do catálogo no início; consultas pesadas cedem tempo à API local e a lista de contas elimina leituras duplicadas das credenciais, mantendo o bloqueio de fallbacks corrompidos. | [Desde v2.0.56](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.56...v2.0.57) |
 | [v2.0.56](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.56) | 07/10/2026 | Categorias Nymeria compartilham planejamento e leitura de anotações; inventário evita reler mídia. HTTP 504 mantém a consulta recuperável por identificador, com acompanhamento limitado e vínculo à seleção e identidade atual. | [Desde v2.0.55](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.55...v2.0.56) |
