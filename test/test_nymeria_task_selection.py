@@ -279,7 +279,10 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
         transfer = "C puts a dirty plate into the dishwasher rack while standing in the kitchen."
         rinse = "C rinses the spatula in her left hand with water from the kitchen sink."
         rows = [transfer if index % 2 == 0 else rinse for index in range(85)]
-        rows[-1] = "C starts the dishwasher after loading the dirty plates."
+        # A phase whose atomic interval ends outside the actual cut must not
+        # prove completion. Keep this start fully within the final window.
+        rows[-3] = "C starts the dishwasher after loading the dirty plates."
+        rows[-2:] = ["C closes the dishwasher after loading the dirty plates."] * 2
         self._write_workflow(rows)
         clips = nymeria.automatic_candidates(task_name="Using the Dishwasher", root=self.root,
             min_dur_s=300, max_dur_s=1800)
@@ -292,6 +295,99 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
         potential = nymeria_library._catalog_windows(raw, ["Using the Dishwasher"], 300, 1800)
         self.assertEqual(len(potential), len(clips))
         self.assertAlmostEqual(potential[0]["duration_s"], clips[0]["dur_s"])
+
+    def test_dishwasher_completion_gate_obeys_phase_order_actor_and_cut_boundaries(self):
+        name = "Using the Dishwasher"
+        load = "C puts dirty plates into the dishwasher rack while standing."
+        start = "C starts the dishwasher while standing."
+        unload = "C removes clean plates from the dishwasher rack while standing."
+        store = "C puts clean plates into the kitchen cupboard while standing."
+        generic_button = (
+            "C is standing by the dishwasher, pointing at the dishwasher with her right hand "
+            "then pushes the button of the dishwasher with her right hand twice.")
+        cases = (
+            ([(0, 5, load), (10, 15, start)], 0, 15, True),
+            ([(0, 5, unload), (10, 15, store)], 0, 15, True),
+            ([(0, 5, load)], 0, 20, False),
+            ([(0, 5, unload)], 0, 20, False),
+            ([(0, 5, load), (10, 15, generic_button)], 0, 15, False),
+            ([(0, 5, start), (10, 15, load)], 0, 15, False),
+            ([(0, 5, store), (10, 15, unload)], 0, 15, False),
+            ([(0, 5, load), (10, 15, start), (16, 20, load)], 0, 20, False),
+            ([(0, 5, load), (10, 15, start)], 0, 14, False),
+            ([(0, 5, load), (10, 15, start)], 1, 15, False),
+            ([(0, 5, load), (10, 15, start)], 0, 10, False),
+            ([(0, 5, load), (10, 15, "#O starts the dishwasher.")], 0, 15, False),
+            ([(0, 5, load), (10, 15, "C stands by the dishwasher while her peer starts the dishwasher.")], 0, 15, False),
+            ([(0, 5, load), (10, 15, "C watches her peer as she starts the dishwasher.")], 0, 15, False),
+            ([(0, 5, load), (10, 15, "C tells her peer to start the dishwasher.")], 0, 15, False),
+            ([(0, 5, load), (10, 15, "C starts the dishwasher while her peer stands nearby.")], 0, 15, True),
+            ([(0, 5, "#O puts dirty plates into the dishwasher."), (10, 15, start)], 0, 15, False),
+            ([(0, 5, unload), (10, 15, "C puts the phone into the cupboard.")], 0, 15, False),
+            ([(0, 5, "C washes dirty plates beside the dishwasher."), (10, 15, start)], 0, 15, False),
+            ([(0, 5, load), (10, 15, "C starts the coffee machine beside the dishwasher.")], 0, 15, False),
+            ([(0, 5, load), (10, 15, "C presses the start button of the dishwasher.")], 0, 15, True),
+            ([(0, 5, "C removes dirty plates from the dishwasher."), (10, 15, store)], 0, 15, False),
+            ([(0, 5, unload), (10, 15, "C puts dirty plates into the cupboard.")], 0, 15, False),
+            ([(0, 5, "C unloads the dishwasher of dirty plates."), (10, 15, store)], 0, 15, False),
+        )
+        for rows, left, right, accepted in cases:
+            with self.subTest(rows=rows, start=left, end=right):
+                self.assertEqual(nymeria.selection_window_complete(name, rows, left, right), accepted)
+
+    def test_dishwasher_catalog_and_sdk_reject_loading_only_and_generic_button(self):
+        from moneymin import nymeria_library
+        self.rgb = tuple(range(1_000_000_000_000, 1_500_000_000_001, 20_000_000))
+        self.imu = tuple(range(1_000_000_000_000, 1_500_000_000_001, 4_000_000))
+        load = "C puts dirty plates into the dishwasher rack while standing."
+        for last in (load, "C pushes the button of the dishwasher twice."):
+            self._write_workflow([load] * 82 + [last] * 3)
+            raw, _hashes = nymeria._annotation_rows(self.seq)
+            with self.subTest(final_phase=last):
+                self.assertEqual(nymeria_library._catalog_windows(raw, ["Using the Dishwasher"], 300, 1800), [])
+                self.assertEqual(nymeria.automatic_candidates(task_name="Using the Dishwasher", root=self.root,
+                    min_dur_s=300, max_dur_s=1800), [])
+
+    def test_dishwasher_unload_and_put_away_is_valid_in_catalog_and_measured_selector(self):
+        from moneymin import nymeria_library
+        self.rgb = tuple(range(1_000_000_000_000, 1_500_000_000_001, 20_000_000))
+        self.imu = tuple(range(1_000_000_000_000, 1_500_000_000_001, 4_000_000))
+        text = ("C removes clean plates from the dishwasher rack and puts clean plates "
+                "into the kitchen cupboard while standing.")
+        self._write_workflow([text] * 85)
+        raw, _hashes = nymeria._annotation_rows(self.seq)
+        potential = nymeria_library._catalog_windows(raw, ["Using the Dishwasher"], 300, 1800)
+        clips = nymeria.automatic_candidates(task_name="Using the Dishwasher", root=self.root,
+            min_dur_s=300, max_dur_s=1800)
+        self.assertTrue(potential)
+        self.assertEqual(len(potential), len(clips))
+        self.assertAlmostEqual(potential[0]["duration_s"], clips[0]["dur_s"])
+
+    def test_dirty_unloading_is_rejected_without_requiring_clean_adjective_everywhere(self):
+        from moneymin import nymeria_library
+        self.rgb = tuple(range(1_000_000_000_000, 1_500_000_000_001, 20_000_000))
+        self.imu = tuple(range(1_000_000_000_000, 1_500_000_000_001, 4_000_000))
+        for adjective, accepted in (("dirty ", False), ("clean ", True), ("", True)):
+            text = (f"C removes {adjective}plates from the dishwasher rack and puts "
+                    f"{adjective}plates into the kitchen cupboard while standing.")
+            self._write_workflow([text] * 85)
+            raw, _hashes = nymeria._annotation_rows(self.seq)
+            with self.subTest(adjective=adjective):
+                self.assertEqual(bool(nymeria_library._catalog_windows(
+                    raw, ["Using the Dishwasher"], 300, 1800)), accepted)
+                self.assertEqual(bool(nymeria.automatic_candidates(task_name="Using the Dishwasher", root=self.root,
+                    min_dur_s=300, max_dur_s=1800)), accepted)
+
+    def test_v3_partial_selection_evidence_is_rejected_after_phase_gate_update(self):
+        self.rgb = tuple(range(1_000_000_000_000, 1_500_000_000_001, 20_000_000))
+        self.imu = tuple(range(1_000_000_000_000, 1_500_000_000_001, 4_000_000))
+        self._write_workflow(["C puts dirty plates into the dishwasher rack while standing."] * 85)
+        with patch.object(nymeria, "_ALGORITHM", "nymeria-atomic-device-v3"), \
+             patch.object(nymeria, "selection_window_complete", return_value=True):
+            old = nymeria.automatic_candidates(task_name="Using the Dishwasher", root=self.root,
+                min_dur_s=300, max_dur_s=1800)[0]
+        with self.assertRaisesRegex(ValueError, "evidência Nymeria atual ausente"):
+            nymeria.revalidate_candidate(old)
 
     def _write_workflow(self, texts):
         with (self.narration / "atomic_action.csv").open("w", encoding="utf8", newline="") as handle:

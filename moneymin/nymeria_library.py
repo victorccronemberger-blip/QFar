@@ -611,7 +611,8 @@ def _catalog_windows(rows, names, minimum, maximum, cache_key=None):
                     competing_task_names=rivals, video_duration_s=upper,
                     activity_mode=nymeria.selection_activity_mode(name)):
                 start, end = max(lower, span["start"]), min(upper, span["end"])
-                if min_span <= end - start <= maximum:
+                if (min_span <= end - start <= maximum
+                        and nymeria.selection_window_complete(name, relative, start, end)):
                     windows.append({"task_name": name, "device_seconds": [start + origin, end + origin],
                                     "duration_s": end - start})
     return windows

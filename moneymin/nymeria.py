@@ -19,8 +19,67 @@ from typing import Any
 
 from . import config, nymeria_vrs, task_matching
 
-_ALGORITHM = "nymeria-atomic-device-v3"
+_ALGORITHM = "nymeria-atomic-device-v4"
 _HANGER_ADJECTIVE = re.compile(r"\bclothes\s+(hangers?)\b", re.IGNORECASE)
+_DISHWASHER_OBJECT = (
+    r"(?:dishes|plates?|cups?|bowls?|glasses|cutlery|utensils?|spoons?|forks?|"
+    r"pans?|spatulas?|colanders?|strainers?|trays?|tongs|platters?|pots?|"
+    r"chopping boards?|kitchenware)"
+)
+_DISHWASHER_MODIFIERS = task_matching._OBJECT_MODIFIERS
+_DISHWASHER_MACHINE = (
+    r"(?:(?:a|the|kitchen|top|bottom|upper|lower)\s+)*"
+    r"(?:dish\s?washer(?:['’]s)?(?:\s+(?:(?:top|bottom|upper|lower)\s+)?rack)?|"
+    r"rack\s+of\s+(?:(?:a|the|kitchen)\s+)*dish\s?washer)"
+)
+# The official task requires loading AND starting, or unloading AND putting
+# dishes away. Appliance transfers alone do not complete either alternative.
+_DISHWASHER_PHASE_PATTERNS = {
+    "load": (
+        r"\b(?:loads?|loading|loaded)\s+" + _DISHWASHER_MODIFIERS + r"dish\s?washer\b|"
+        r"\b(?:loads?|loading|loaded|puts?|putting|plac\w*|insert\w*)\s+(?:down\s+)?" +
+        _DISHWASHER_MODIFIERS + _DISHWASHER_OBJECT + r"\b"
+        r"(?:(?!\b(?:beside|near|next)\b).){0,110}\b(?:in|into|on|onto)\s+" +
+        _DISHWASHER_MACHINE + r"\b"
+    ),
+    "start": (
+        r"\b(?:starts?|starting|started)\s+" + _DISHWASHER_MODIFIERS + r"dish\s?washer\b|"
+        r"\b(?:press\w*|push\w*)\s+" + _DISHWASHER_MODIFIERS + r"(?:start|cycle)\s+button\b"
+        r".{0,45}\b(?:on|of)\s+" + _DISHWASHER_MACHINE + r"\b|"
+        r"\b(?:press\w*|push\w*)\s+" + _DISHWASHER_MODIFIERS +
+        r"dish\s?washer(?:['’]s)?\s+(?:start|cycle)\s+button\b"
+    ),
+    "unload": (
+        r"\b(?:unloads?|unloading|unloaded)\s+" + _DISHWASHER_MODIFIERS + r"dish\s?washer\b"
+        r"(?:\s+(?:of|with)\s+" + _DISHWASHER_MODIFIERS + _DISHWASHER_OBJECT + r"\b)?|"
+        r"\b(?:unloads?|unloading|unloaded|remov\w*|takes?|taking|picks? up|picking up)\s+" +
+        _DISHWASHER_MODIFIERS + _DISHWASHER_OBJECT + r"\b"
+        r"(?:(?!\b(?:beside|near|next)\b).){0,90}\b(?:from|out of)\s+" +
+        _DISHWASHER_MACHINE + r"\b"
+    ),
+    "put_away": (
+        r"\b(?:puts?|putting|plac\w*|return\w*|stor\w*)\s+" +
+        _DISHWASHER_MODIFIERS + _DISHWASHER_OBJECT + r"\b"
+        r"(?:(?!\b(?:beside|near|next)\b).){0,90}\b(?:in|into|inside|on|onto|to)\s+" +
+        _DISHWASHER_MODIFIERS + r"(?:kitchen\s+)?(?:cabinet|cupboard|drawer|shelf|shelves)\b|"
+        r"\b(?:puts?|putting)\s+away\s+" + _DISHWASHER_MODIFIERS + _DISHWASHER_OBJECT + r"\b|"
+        r"\b(?:puts?|putting)\s+" + _DISHWASHER_MODIFIERS + _DISHWASHER_OBJECT + r"\s+away\b"
+    ),
+}
+_DISHWASHER_PHASES = {name: re.compile(pattern, re.IGNORECASE)
+                      for name, pattern in _DISHWASHER_PHASE_PATTERNS.items()}
+_DISHWASHER_DIRTY_OBJECT_PATTERN = (
+    r"\b(?:dirty|soiled|unwashed|greasy)\s+" + _DISHWASHER_MODIFIERS + _DISHWASHER_OBJECT + r"\b|"
+    r"\b" + _DISHWASHER_OBJECT + r"\s+(?:(?:that|which)\s+)?"
+    r"(?:are|is|remain|remains)\s+(?:still\s+)?(?:dirty|soiled|unwashed|greasy)\b"
+)
+_DISHWASHER_DIRTY_OBJECT = re.compile(_DISHWASHER_DIRTY_OBJECT_PATTERN, re.IGNORECASE)
+_DISHWASHER_OTHER_ACTOR_SUBJECT_PATTERN = (
+    r"\b(?:peer|observer|another person|other person|someone)\s+"
+    r"(?:(?:is|was|then|also|now|who|as|he|she|to)\s+){0,4}$"
+)
+_DISHWASHER_OTHER_ACTOR_SUBJECT = re.compile(
+    _DISHWASHER_OTHER_ACTOR_SUBJECT_PATTERN, re.IGNORECASE)
 # Nymeria captions name water while washing utensils. Broad yard categories
 # may compete with a kitchen workflow only when a timed caption proves an
 # actual yard action and its object, rather than merely mentioning water.
@@ -95,7 +154,10 @@ def _signature(seq_dir: Path, *, fresh_sdk: bool = False) -> tuple:
 def _rules_digest() -> str:
     # Frozen modules may live inside PYZ; their declared rules remain available.
     rules = {name: vars(rule) for name, rule in selection_rules().items()}
-    value = json.dumps({"algorithm": _ALGORITHM, "rules": rules},
+    value = json.dumps({"algorithm": _ALGORITHM, "rules": rules,
+                       "dishwasher_phase_patterns": _DISHWASHER_PHASE_PATTERNS,
+                       "dishwasher_dirty_object": _DISHWASHER_DIRTY_OBJECT_PATTERN,
+                       "dishwasher_other_actor_subject": _DISHWASHER_OTHER_ACTOR_SUBJECT_PATTERN},
                        sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(value.encode("utf8")).hexdigest()
 
@@ -172,6 +234,40 @@ def selection_activity_mode(task_name: str) -> bool:
     # between them. Use the existing activity proof; it still stops at
     # hygiene, a real competing action, or sustained foreign activity.
     return task_matching.canonical_task_name(task_name) == "Using the Dishwasher"
+
+
+def selection_window_complete(task_name: str, rows, start: float, end: float) -> bool:
+    """Require both official phases entirely inside the actual selected cut."""
+    if task_matching.canonical_task_name(task_name) != "Using the Dishwasher":
+        return True
+    observed = {name: [] for name in _DISHWASHER_PHASES}
+    for left, right, text in rows:
+        # Atomic CSV endpoints have microsecond precision. Do not borrow a
+        # phase that begins in this window but finishes beyond its boundary.
+        if left < start - 1e-6 or right > end + 1e-6:
+            continue
+        for unit_index, unit in enumerate(task_matching._camera_wearer_segments(text)):
+            for phase, pattern in _DISHWASHER_PHASES.items():
+                for match in pattern.finditer(unit):
+                    # Explicitly dirty dishes cannot prove the official clean
+                    # unloading alternative. Scope this to the transferred
+                    # object; loading dirty dishes remains valid.
+                    if (phase in {"unload", "put_away"}
+                            and _DISHWASHER_DIRTY_OBJECT.search(match.group(0))):
+                        continue
+                    # Nymeria also spells the other participant as "peer",
+                    # rather than Ego's #O. Their action cannot finish C's task.
+                    if _DISHWASHER_OTHER_ACTOR_SUBJECT.search(unit[:match.start()]):
+                        continue
+                    observed[phase].append((left, unit_index, match.start()))
+    # Ordering also matters: starting before loading cannot finish the load
+    # performed later; another actor's #O phase is never a wearer completion.
+    return bool(
+        (observed["load"] and observed["start"]
+         and max(observed["load"]) < max(observed["start"]))
+        or (observed["unload"] and observed["put_away"]
+            and max(observed["unload"]) < max(observed["put_away"]))
+    )
 
 
 def selection_text(text: str) -> str:
@@ -484,6 +580,8 @@ def _windows(snap: dict, task_name: str, minimum: float, maximum: float) -> tupl
             for span in spans:
                 start, end = max(lower, span["start"]), min(upper, span["end"])
                 if not span_minimum <= end - start <= maximum:
+                    continue
+                if not selection_window_complete(task_name, snap["rows"], start, end):
                     continue
                 uid = f"nymeria:{snap['seq_id']}:{start:.3f}:{end:.3f}"
                 carrier = {"schema": 1, "dataset": "nymeria", "algorithm": _ALGORITHM,
