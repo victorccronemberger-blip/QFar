@@ -505,13 +505,15 @@ public:
     qApp->exit(!restored._delaySeconds->isHidden() && restored._delaySeconds->value()==75 ? 0:114);
   }
   static void campaignControlsSmoke(MainWindow& window) {
+    const bool recover = qApp->arguments().contains("--preflight-recovery");
+    const bool exhaust = qApp->arguments().contains("--preflight-exhaust");
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(100); return; }
-    struct Flow { int preflights=0, starts=0, stops=0, pauses=0, resumes=0, phase=0; bool running=false, paused=false; QByteArray preflightPath; };
+    struct Flow { int preflights=0, starts=0, stops=0, pauses=0, resumes=0, phase=0; bool running=false, paused=false; QByteArray preflightPath, preflightBody; };
     auto flow=std::make_shared<Flow>();
-    QObject::connect(server,&QTcpServer::newConnection,server,[server,flow] {
+    QObject::connect(server,&QTcpServer::newConnection,server,[server,flow,recover,exhaust] {
       auto* socket=server->nextPendingConnection();
-      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow] {
+      QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow,recover,exhaust] {
         auto input=socket->property("input").toByteArray()+socket->readAll(); socket->setProperty("input",input);
         const int end=input.indexOf("\r\n\r\n");
         if(end<0 || socket->property("answered").toBool()) return;
@@ -519,16 +521,22 @@ public:
           .match(QString::fromLatin1(input.left(end)));
         if(match.hasMatch() && input.size()<end+4+match.captured(1).toInt()) return;
         socket->setProperty("answered",true);
-        QJsonObject result; int delay=0;
+        QJsonObject result; int delay=0; QByteArray status="200 OK";
         if(input.startsWith("POST /api/campaigns/preflight?async=1&request_id=")) {
           ++flow->preflights; delay=250;
           const auto path = input.split(' ').at(1);
-          if (flow->preflights == 1) flow->preflightPath = path;
-          if (flow->preflights <= 3 && flow->preflightPath != path) { qApp->exit(115); return; }
-          if (flow->preflights < 3) result={{"loading",true},{"message","Conferindo acesso…"},{"elapsed_s",137}};
+          const int expected = recover ? 4 : 3;
+          if (flow->preflights == 1) { flow->preflightPath = path; flow->preflightBody = input.mid(end+4); }
+          if ((exhaust || flow->preflights <= expected)
+              && (flow->preflightPath != path || flow->preflightBody != input.mid(end+4))) { qApp->exit(115); return; }
+          if (exhaust || (recover && flow->preflights == 1)) {
+            status="504 Gateway Timeout";
+            result={{"loading",true},{"code","catalog_work_pending"},{"error","Verificação continua no serviço"}};
+          } else if (recover && flow->preflights == 2) { socket->abort(); return; }
+          else if (flow->preflights < expected) result={{"loading",true},{"message","Conferindo acesso…"},{"elapsed_s",137}};
           else result={{"ok",true},{"preflight_id","fixture"},{"accounts",QJsonObject{{"validated",1}}},
                   {"tasks",QJsonObject{{"compatible",1}}},{"blockers",QJsonArray{}},{"warnings",QJsonArray{}}};
-          if (flow->preflights >= 3) result["capacity"] = capacityFixture(QJsonDocument::fromJson(input.mid(end+4)).object(), {"fixture@example.com"});
+          if (!exhaust && flow->preflights >= expected) result["capacity"] = capacityFixture(QJsonDocument::fromJson(input.mid(end+4)).object(), {"fixture@example.com"});
         } else if(input.startsWith("POST /api/campaigns ")) {
           ++flow->starts; flow->running=true; delay=200; result={{"ok",true},{"accounts",QJsonArray{"fixture@example.com"}}};
         } else if(input.startsWith("POST /api/campaigns/pause ")) {
@@ -550,8 +558,8 @@ public:
             {"available_for_duration",true},{"clip_count",1}}}}};
         } else { qApp->exit(101); return; }
         const auto bytes=QJsonDocument(result).toJson(QJsonDocument::Compact);
-        QTimer::singleShot(delay,socket,[socket,bytes] {
-          socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+        QTimer::singleShot(delay,socket,[socket,bytes,status] {
+          socket->write("HTTP/1.1 " + status + "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
             +QByteArray::number(bytes.size())+"\r\n\r\n"+bytes); socket->disconnectFromHost();
         });
       });
@@ -573,8 +581,17 @@ public:
       return;
     }
     auto* timer=new QTimer(&window);
-    QObject::connect(timer,&QTimer::timeout,&window,[&window,flow] {
+    QObject::connect(timer,&QTimer::timeout,&window,[&window,flow,recover,exhaust] {
       auto* dialog=qobject_cast<QDialog*>(QApplication::activeModalWidget());
+      if (exhaust && dialog && dialog->windowTitle()==QStringLiteral("Verificação não concluída")) {
+        if (flow->preflights != 5 || flow->starts || window._campaignPreflightRecoveries != 4) { qApp->exit(116); return; }
+        flow->phase = 99;
+        dialog->accept();
+        QTimer::singleShot(150, &window, [&window,flow] {
+          qApp->exit(flow->preflights==5 && !flow->starts && !window._campaignPreflightPending ? 0 : 117);
+        });
+        return;
+      }
       if(dialog && dialog->windowTitle()==QStringLiteral("Revisar campanha")) {
         if(window._campaignStart->isEnabled() || window._campaignReset->isEnabled()) { qApp->exit(102); return; }
         if(flow->phase==1) { flow->phase=2; dialog->reject(); }
@@ -589,7 +606,7 @@ public:
         if(!window._campaignPreflightPending || window._campaignStart->isEnabled()) qApp->exit(104);
       } else if(flow->phase==1 && window._campaignIndicatorTitle->text()!=QStringLiteral("Verificando campanha")) qApp->exit(105);
       else if(flow->phase==2 && !window._campaignPreflightPending) {
-        if(flow->preflights!=3 || flow->starts || !window._campaignStart->isEnabled()) { qApp->exit(106); return; }
+        if(flow->preflights!=(recover ? 4 : 3) || flow->starts || !window._campaignStart->isEnabled()) { qApp->exit(106); return; }
         flow->phase=3; window._campaignStart->click();
       } else if(flow->phase==4 && window._campaignActive && !window._campaignStartPending) {
         if(flow->starts!=1 || window._campaignStart->isEnabled() || !window._campaignStop->isEnabled()) { qApp->exit(107); return; }

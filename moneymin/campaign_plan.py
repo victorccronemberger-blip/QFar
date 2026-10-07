@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 
-from . import campaign, sent_registry
+from . import campaign, ego4d, sent_registry
 from .campaign_types import CampaignConfig
 
 
@@ -125,13 +125,15 @@ def capacity_error(summary: dict) -> str:
             "Vídeos já enviados e envios pendentes não contam como conteúdo novo.")
 
 
-def build(config: CampaignConfig) -> tuple[dict, list[dict], str]:
+@ego4d.selection_boundary
+def build(config: CampaignConfig, *, catalog_only: bool = False) -> tuple[dict, list[dict], str]:
     registry = sent_registry.load(persist_seed=False)
     fingerprint = hashlib.sha256(json.dumps(registry, sort_keys=True).encode()).hexdigest()
     pools = {}
     review = []
     for task in config.tasks:
-        candidates = campaign.automatic_candidates(task, config)
+        candidates = campaign.automatic_candidates(
+            task, config, **({"catalog_only": True} if catalog_only else {}))
         pools[task.task_id] = copy.deepcopy(candidates)
         for clip in candidates:
             uid = clip["clip_uid"]

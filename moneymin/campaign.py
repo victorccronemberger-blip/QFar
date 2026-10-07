@@ -2840,7 +2840,7 @@ def run_campaign(
 
 
 @ego4d.selection_boundary
-def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str, Any]]:
+def automatic_candidates(tsk: TaskSpec, config: CampaignConfig, *, catalog_only: bool = False) -> list[dict[str, Any]]:
     """Resolve the candidate pool once; a reviewed pool is reused verbatim."""
     if config.candidate_plan is not None:
         if tsk.task_id not in config.candidate_plan:
@@ -2863,7 +2863,7 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
                 shorts = _with_cached_expansion(
                     shorts, tsk.task_name, min_dur_s=tsk.min_dur_s,
                     max_dur_s=tsk.max_dur_s, work_dir=work_dir,
-                    include_disabled=True)
+                    include_disabled=True, **({"catalog_only": True} if catalog_only else {}))
         else:
             shorts = ego4d.list_clips(
                 scenario=tsk.scenario,
@@ -2887,7 +2887,8 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
                 task_name=tsk.task_name, task_id=tsk.task_id,
                 registry_key=tsk.registry_key,
                 min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
-                include_planned=content_mode != "cache")
+                include_planned=content_mode != "cache",
+                **({"catalog_only": True} if catalog_only else {}))
         except Exception:
             nymeria_clips = []
         # Nymeria windows carry current action and measured VRS evidence.
@@ -2896,8 +2897,9 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
         else:
             shorts = [*nymeria_clips, *shorts]
     if content_mode == "cache":
-        shorts = [clip for clip in shorts if _clip_is_cached(clip, work_dir)]
-    else:
+        cached = _catalog_clip_cached_hint if catalog_only else _clip_is_cached
+        shorts = [clip for clip in shorts if cached(clip, work_dir)]
+    elif not catalog_only:
         from .imu_coverage import refine_candidates
         # refine_candidates is Ego4D-IMU-CSV specific; keep Nymeria intact.
         ego: list[dict[str, Any]] = []
@@ -2911,6 +2913,10 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
         ego = refine_candidates(ego, work_dir, tsk.min_dur_s, tsk.max_dur_s)
         shorts = [*ego, *other]
     task_name = tsk.task_name
+    if catalog_only:
+        return [dict(clip, requires_measured_validation=True,
+                     capacity_kind="estimate_before_preparation")
+                for clip in shorts if _catalog_queue_accepts(clip, task_name)]
     return [clip for clip in shorts if _prepare_queue_accepts(clip, task_name, fresh=False)]
 
 

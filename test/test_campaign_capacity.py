@@ -72,7 +72,7 @@ class CampaignCapacityTests(unittest.TestCase):
         case.stack.enter_context(patch.object(server.recovery, 'snapshot', return_value={'items': []}))
         case.candidates = [{'clip_uid': 'clip', 'source': 'ego4d', 'dur_s': 300}]
         case.automatic = case.stack.enter_context(patch.object(
-            campaign, 'automatic_candidates', side_effect=lambda task, config:
+            campaign, 'automatic_candidates', side_effect=lambda task, config, **options:
             config.candidate_plan[task.task_id] if config.candidate_plan is not None else case.candidates))
         return case
 

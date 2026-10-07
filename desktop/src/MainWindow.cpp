@@ -5642,6 +5642,7 @@ void MainWindow::startCampaign() {
 void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccountNames) {
   if (_campaignPreflightPending || _campaignStartPending) return;
   _campaignPreflightPending = true;
+  _campaignPreflightRecoveries = 0;
   updateCampaignActions();
   ++_campaignPollRevision;
   setCampaignIndicator(QStringLiteral("Verificando campanha"),
@@ -5656,6 +5657,27 @@ void MainWindow::preflightCampaign(QJsonObject body, QStringList selectedAccount
 void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAccountNames, const QString& path) {
   _api.post(path, body,
             [this, body, selectedAccountNames, path](bool ok, const QJsonDocument& doc, const QString& error) {
+    const auto reply = doc.object();
+    const bool uncertain = reply.value(QStringLiteral("error_code")) == QJsonValue(QStringLiteral("request_outcome_unknown"))
+        && (reply.value(QStringLiteral("transport_error")) == QJsonValue(QStringLiteral("timeout"))
+            || reply.value(QStringLiteral("transport_error")) == QJsonValue(QStringLiteral("connection")));
+    const bool pending = reply.value(QStringLiteral("loading")) == QJsonValue(true)
+        && reply.value(QStringLiteral("code")) == QJsonValue(QStringLiteral("catalog_work_pending"));
+    if (!_closing && !_campaignClosePending && !ok && (uncertain || pending)
+        && _campaignPreflightRecoveries < 4) {
+      ++_campaignPreflightRecoveries;
+      setCampaignIndicator(QStringLiteral("Verificando campanha"),
+                           QStringLiteral("Recuperando a consulta da mesma verificação (%1/4). Nenhum envio iniciado.")
+                               .arg(_campaignPreflightRecoveries), QStringLiteral("starting"), true);
+      QTimer::singleShot(1200, this, [this, body, selectedAccountNames, path] {
+        if (_closing || _campaignClosePending) {
+          _campaignPreflightPending = false;
+          return;
+        }
+        pollCampaignPreflight(body, selectedAccountNames, path);
+      });
+      return;
+    }
     if (!_closing && !_campaignClosePending && ok && doc.object().value(QStringLiteral("loading")) == QJsonValue(true)) {
       QString message = doc.object().value(QStringLiteral("message")).toString(QStringLiteral("Verificando campanha…"));
       const int elapsed = doc.object().value(QStringLiteral("elapsed_s")).toInt();

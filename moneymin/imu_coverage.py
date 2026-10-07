@@ -8,7 +8,7 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
-from . import config, ego4d
+from . import background_work, config, ego4d
 from .atomic_io import load_json, save_json
 
 
@@ -39,6 +39,7 @@ def _source_fingerprint(path: str, size: int, mtime_ns: int) -> str:
     digest, count = hashlib.sha256(), 0
     with open(path, "rb") as stream:
         while block := stream.read(1024 * 1024):
+            background_work.checkpoint()
             digest.update(block)
             count += len(block)
     after = Path(path).stat()
@@ -68,7 +69,9 @@ def _canonical_intervals(path: str, source_sha256: str, gap_ms: float) -> tuple[
         intervals = []
         if ordered:
             start = previous = ordered[0]
-            for timestamp in ordered[1:]:
+            for index, timestamp in enumerate(ordered[1:]):
+                if index % 256 == 0:
+                    background_work.checkpoint()
                 if timestamp - previous > gap_ms:
                     intervals.append((start, previous))
                     start = timestamp
@@ -96,7 +99,9 @@ def _scan_timestamps(stream, fields):
     required = {"canonical_timestamp_ms", *fields[0], *fields[1]}
     if not required.issubset(reader.fieldnames or []):
         raise ValueError("CSV de IMU sem colunas obrigatórias")
-    for row in reader:
+    for row_index, row in enumerate(reader):
+        if row_index % 256 == 0:
+            background_work.checkpoint()
         try:
             timestamp = float(row["canonical_timestamp_ms"])
         except (ValueError, TypeError):

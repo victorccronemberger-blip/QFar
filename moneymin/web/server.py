@@ -4826,7 +4826,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             try:
                 candidate_plan, clip_review, sent_fingerprint = campaign_plan.build(CampaignConfig(
                     accounts=survivors, tasks=review_tasks, dataset_provider=provider,
-                    content_mode=content_mode, recovery_exclusions=recovery_exclusions))
+                    content_mode=content_mode, recovery_exclusions=recovery_exclusions), catalog_only=True)
                 clip_count = len(clip_review)
                 capacity_summary = campaign_plan.capacity(
                     clip_review, [a.email for a in survivors], target_seconds=target_hours * 3600,

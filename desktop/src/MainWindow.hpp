@@ -438,6 +438,7 @@ private:
   bool _campaignActive{};
   bool _campaignStartPending{};
   bool _campaignPreflightPending{};
+  int _campaignPreflightRecoveries{};
   bool _campaignStopPending{};
   bool _campaignResetPending{};
   bool _campaignStartUncertain{};

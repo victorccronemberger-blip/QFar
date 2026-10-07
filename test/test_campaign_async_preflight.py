@@ -20,7 +20,7 @@ class AsyncPreflightTests(unittest.TestCase):
         self.stack.enter_context(patch.object(server, "_preflight_fingerprint", return_value="fixture-owner"))
         self.stack.enter_context(patch.object(server.recovery, "snapshot", return_value={"items": []}))
         self.stack.enter_context(patch.object(server.campaign, "available_tasks", return_value=[
-            {"id": "task", "name": "Task", "clip_count": 1, "available_for_duration": True}]))
+            {"id": "task", "name": "Task", "scenario": "task", "clip_count": 1, "available_for_duration": True}]))
         self.stack.enter_context(patch.object(server.readiness, "campaign_readiness", return_value={"ready": True, "checks": []}))
         self.stack.enter_context(patch.object(server, "_storage_snapshot", return_value={"free_bytes": 20 * 1024**3}))
         self.resolve = self.stack.enter_context(patch.object(server, "_resolve_org", side_effect=self.slow_access))
@@ -80,6 +80,25 @@ class AsyncPreflightTests(unittest.TestCase):
         self.assertIsNone(response.json["preflight_id"])
         self.assertEqual(response.json["account_issues"][0]["code"], "authentication")
         self.assertNotIn("private-token", response.get_data(as_text=True))
+        self.runner.start.assert_not_called()
+
+    def test_clip_review_uses_catalog_without_reading_sensor_sources(self):
+        from moneymin import imu_coverage
+        clips = [{"clip_uid": "fixture-clip", "parent_video_uid": "fixture-parent",
+                  "window_s": [0, 300], "dur_s": 300, "source": "ego4d"}]
+        self.body.update(include_clip_plan=True, content_mode="dataset")
+        self.stack.enter_context(patch.object(server.campaign.task_matching, "rule_for", return_value=object()))
+        self.stack.enter_context(patch.object(server.campaign, "_compatible_task_clips", return_value=clips))
+        self.stack.enter_context(patch.object(imu_coverage, "refine_candidates",
+                                             side_effect=AssertionError("preview read real IMU")))
+        self.stack.enter_context(patch.object(server.campaign, "_clip_is_cached",
+                                             side_effect=AssertionError("preview opened media")))
+        response = self.finish()
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertTrue(response.json["ok"], response.json)
+        self.assertTrue(response.json["preflight_id"])
+        self.assertTrue(response.json["capacity"]["requires_measured_validation"])
+        self.assertFalse(response.json["capacity"]["campaign_ready"])
         self.runner.start.assert_not_called()
 
     def test_invalid_request_id_is_rejected_before_remote_work(self):

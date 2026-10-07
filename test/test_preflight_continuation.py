@@ -154,7 +154,7 @@ class PreflightContinuationTests(unittest.TestCase):
         candidates = [{'clip_uid': f'fixture-{i}', 'source': 'ego4d', 'dur_s': 900,
                        'parent_video_uid': f'fixture-parent-{i}', 'window_s': [0, 900]}
                       for i in range(32)]
-        def pool(task, cfg):
+        def pool(task, cfg, **options):
             return cfg.candidate_plan[task.task_id] if cfg.candidate_plan is not None else candidates
         with patch.object(server.campaign, 'automatic_candidates', side_effect=pool), \
              patch.object(server.recovery, 'snapshot', return_value={'items': []}):
