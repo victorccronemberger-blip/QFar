@@ -3106,7 +3106,7 @@ def _run_campaign(
         selection_limit = "até esgotar o conteúdo" if until_exhausted else f"n={tsk.count}"
         _log(f"\n=== categoria={display_name} ({selection_limit}) ===")
         _emit("task_start", scenario=tsk.scenario, task_name=display_name,
-              count=tsk.count)
+              count=tsk.count, run_until_exhausted=until_exhausted)
         automatic_selection = not tsk.clip_uids
         try:
             if tsk.clip_uids:

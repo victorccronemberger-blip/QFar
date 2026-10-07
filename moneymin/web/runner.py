@@ -123,7 +123,9 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         count = int(payload.get("count") or 0)
         return {
             "level": "info", "stage": "Conteúdo", "title": name,
-            "detail": f"Selecionando {count} vídeo(s) compatível(is)",
+            "detail": ("Selecionando os recortes compatíveis até esgotar o conteúdo"
+                       if payload.get("run_until_exhausted") is True else
+                       f"Selecionando {count} vídeo(s) compatível(is)"),
         }
     if kind == "sent_reset":
         return {

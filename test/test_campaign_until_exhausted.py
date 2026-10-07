@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from moneymin import campaign
 from moneymin.web import server
-from moneymin.web.runner import CampaignRunner
+from moneymin.web.runner import CampaignRunner, _public_event
 import test_campaign_capacity as capacity_tests
 import test_campaign_selection as selection_tests
 
@@ -108,6 +108,10 @@ class CampaignUntilExhaustedTests(unittest.TestCase):
         self.assertEqual(result.status, 'done')
         self.assertFalse(any(k in {'goal_shortfall', 'task_shortfall'} for k, _ in events))
         self.assertEqual(events[-1][0], 'campaign_done')
+        task_start = next(p for k, p in events if k == 'task_start')
+        self.assertTrue(task_start['run_until_exhausted'])
+        self.assertIn('até esgotar o conteúdo', _public_event('task_start', task_start)['detail'])
+        self.assertNotIn('Selecionando 1', _public_event('task_start', task_start)['detail'])
 
     def test_user_stop_prevents_next_candidate_and_preserves_stopped_state(self):
         result, calls, events = self.run_engine(stop_after=2)
