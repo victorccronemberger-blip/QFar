@@ -384,7 +384,10 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
   connect(&_backendProbe, &QTimer::timeout, this, &MainWindow::probeBackend);
   connect(&_campaignPoll, &QTimer::timeout, this, &MainWindow::pollCampaign);
   connect(&_previewPoll, &QTimer::timeout, this, &MainWindow::pollCampaignPreviews);
-  connect(&_taskReload, &QTimer::timeout, this, &MainWindow::loadTasks);
+  connect(&_taskReload, &QTimer::timeout, this, [this] {
+    _taskCatalogAutomaticPoll = true;
+    loadTasks();
+  });
   connect(&_balancePoll, &QTimer::timeout, this, &MainWindow::loadBalances);
   connect(&_cachePoll, &QTimer::timeout, this, &MainWindow::loadAccelerator);
 
@@ -1776,7 +1779,10 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_contentMode, &QComboBox::currentIndexChanged, this,
           [this] { _taskReload.start(); });
   auto* reloadTasks = new QPushButton(QStringLiteral("Recarregar categorias"));
-  connect(reloadTasks, &QPushButton::clicked, this, &MainWindow::loadTasks);
+  connect(reloadTasks, &QPushButton::clicked, this, [this] {
+    _taskCatalogForceRefresh = true;
+    loadTasks();
+  });
   sourceLayout->addWidget(reloadTasks);
   _campaignReset = new QPushButton(QStringLiteral("Reset completo"));
   _campaignReset->setObjectName(QStringLiteral("campaignFullReset"));
@@ -5050,6 +5056,10 @@ void MainWindow::invalidateCampaignUiRequests() {
   _previewCheckActive = false;
   _campaignStartLookupInFlight = false;
   _taskRequestPending = false;
+  _taskCatalogJobId.clear();
+  _taskCatalogSelection.clear();
+  _taskCatalogAutomaticPoll = false;
+  _taskCatalogForceRefresh = false;
   _operationPolling = false;
   _historyVerifyPending = false;
   _historyVerifyPreviews->setText(QStringLiteral("Verificar prévias no Minute"));
@@ -5239,6 +5249,8 @@ void MainWindow::loadCampaignData() {
 }
 
 void MainWindow::loadTasks() {
+  const bool automaticPoll = _taskCatalogAutomaticPoll;
+  _taskCatalogAutomaticPoll = false;
   if (_campaignResetPending) return;
   _taskReload.stop();
   const int generation = ++_taskLoadGeneration;
@@ -5258,6 +5270,9 @@ void MainWindow::loadTasks() {
   if (account.isEmpty()) {
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
+    _taskRecords = {};
+    _taskCatalogJobId.clear();
+    _taskCatalogSelection.clear();
     _campaignStart->setEnabled(false);
     return;
   }
@@ -5268,12 +5283,27 @@ void MainWindow::loadTasks() {
     loading->setFlags(Qt::NoItemFlags);
   }
   _campaignStart->setEnabled(false);
-  const QString path = QStringLiteral(
+  QString path = QStringLiteral(
       "/api/tasks?async=1&email=%1&min_dur_s=%2&max_dur_s=%3&dataset=%4&content_mode=%5")
       .arg(encoded(account)).arg(_minDuration->value() * 60)
       .arg(_maxDuration->value() * 60)
       .arg(encoded(_dataset->currentData().toString()))
       .arg(encoded(_contentMode->currentData().toString()));
+  const bool selectionChanged = path != _taskCatalogSelection;
+  if (selectionChanged) {
+    _taskCatalogSelection = path;
+    _taskCatalogJobId.clear();
+  }
+  if (selectionChanged || !automaticPoll || !_taskCatalogPollTimer.isValid()) {
+    _taskCatalogPollCount = 0;
+    _taskCatalogTimeoutPollCount = 0;
+    _taskCatalogTimedOut = false;
+    _taskCatalogPollTimer.restart();
+    _taskCatalogTimeoutTimer.invalidate();
+  }
+  if (!_taskCatalogJobId.isEmpty()) path += QStringLiteral("&job_id=%1").arg(encoded(_taskCatalogJobId));
+  else if (_taskCatalogForceRefresh) path += QStringLiteral("&refresh=1");
+  _taskCatalogForceRefresh = false;
   _taskRequestPending = true;
   _api.get(path, [this, generation](bool ok, const QJsonDocument& doc,
                                    const QString& error) {
@@ -5284,21 +5314,57 @@ void MainWindow::loadTasks() {
     }
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
-    if (!ok) {
+    _taskRecords = {};
+    const auto body = doc.object();
+    const QString code = body.value(QStringLiteral("code")).toString();
+    const QString jobId = body.value(QStringLiteral("job_id")).toString();
+    const bool boundJob = body.value(QStringLiteral("identity_bound")).toBool()
+        && QRegularExpression(QStringLiteral("^[0-9a-f]{32}$")).match(jobId).hasMatch();
+    const bool liveTimeout = !ok && code == QStringLiteral("catalog_work_pending")
+        && body.value(QStringLiteral("loading")).toBool() && boundJob;
+    if (!ok && !liveTimeout) {
+      if (body.value(QStringLiteral("error_code")).toString() != QStringLiteral("request_outcome_unknown"))
+        _taskCatalogJobId.clear();
       auto* failure = new QListWidgetItem(QStringLiteral("Falha: ") + error, _campaignTasks);
       failure->setFlags(Qt::NoItemFlags);
       return;
     }
-    if (doc.object().value(QStringLiteral("loading")).toBool()) {
-      QString message = doc.object().value(QStringLiteral("message")).toString(
+    if (body.value(QStringLiteral("loading")).toBool()) {
+      if (boundJob) {
+        if (!_taskCatalogJobId.isEmpty() && _taskCatalogJobId != jobId) {
+          auto* failure = new QListWidgetItem(QStringLiteral("A consulta de categorias mudou. Use Recarregar categorias."), _campaignTasks);
+          failure->setFlags(Qt::NoItemFlags);
+          _taskCatalogJobId.clear();
+          return;
+        }
+        _taskCatalogJobId = jobId;
+      }
+      QString message = body.value(QStringLiteral("message")).toString(
           QStringLiteral("Preparando categorias…"));
-      const int elapsed = doc.object().value(QStringLiteral("elapsed_s")).toInt();
+      const int elapsed = body.value(QStringLiteral("elapsed_s")).toInt();
       if (elapsed > 0) message += QStringLiteral(" (%1 s)").arg(elapsed);
+      if (liveTimeout) {
+        if (!_taskCatalogTimedOut) {
+          _taskCatalogTimedOut = true;
+          _taskCatalogTimeoutTimer.restart();
+        }
+        message = error + QStringLiteral(" · ") + message;
+      }
+      ++_taskCatalogPollCount;
+      if (_taskCatalogTimedOut) ++_taskCatalogTimeoutPollCount;
+      const bool paused = _taskCatalogTimedOut
+          ? _taskCatalogTimeoutPollCount >= 30 || _taskCatalogTimeoutTimer.elapsed() >= 60000
+          : _taskCatalogPollCount >= 250 || _taskCatalogPollTimer.elapsed() >= 300000;
+      if (paused) message += QStringLiteral(
+          " · Acompanhamento pausado. O cálculo continua no serviço; use Recarregar categorias para consultar esta mesma consulta.");
       auto* item = new QListWidgetItem(message, _campaignTasks);
       item->setFlags(Qt::NoItemFlags);
-      if (_pages->currentIndex() == 3) _taskReload.start(1200);
+      item->setToolTip(message);
+      if (_pages->currentIndex() == 3 && !paused) _taskReload.start(_taskCatalogTimedOut ? 2000 : 1200);
       return;
     }
+    _taskCatalogJobId.clear();
+    _taskCatalogTimedOut = false;
     _taskRecords = doc.object().value(QStringLiteral("tasks")).toArray();
     int compatible = 0;
     for (const auto value : _taskRecords) {

@@ -242,6 +242,7 @@ def ready_scenario_clips(
     work_dir: Path | None = None,
     allow_disabled: bool = False,
     require_cached: bool = True,
+    catalog_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Clipes com cenário compatível e evidência atual aceita para a tarefa.
 
@@ -262,8 +263,10 @@ def ready_scenario_clips(
         if not min_dur_s <= dur <= max_dur_s:
             continue
         if require_cached:
-            from .campaign import ego_clip_cache_state
-            if ego_clip_cache_state(clip, work) != "ready":
+            from .campaign import _catalog_clip_cached_hint, ego_clip_cache_state
+            cached = (_catalog_clip_cached_hint(clip, work) if catalog_only
+                      else ego_clip_cache_state(clip, work) == "ready")
+            if not cached:
                 continue
         try:
             candidate = dict(clip)

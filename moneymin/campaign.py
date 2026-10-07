@@ -4701,11 +4701,12 @@ _duration_ranked_pools.cache_clear = _duration_ranked_snapshot.cache_clear
 
 
 def _nymeria_windows(task_name: str, min_dur_s: float,
-                     max_dur_s: float) -> tuple[dict[str, Any], ...]:
+                     max_dur_s: float, *, catalog_only: bool = False) -> tuple[dict[str, Any], ...]:
     """Nymeria owns a cache bound to exact current roots/media/annotations."""
     try:
+        options = {"catalog_only": True} if catalog_only else {}
         clips = nymeria.automatic_candidates(task_name=task_name,
-            min_dur_s=min_dur_s, max_dur_s=max_dur_s, include_planned=True)
+            min_dur_s=min_dur_s, max_dur_s=max_dur_s, include_planned=True, **options)
     except Exception:
         return ()
     return tuple(dict(clip) for clip in clips)
@@ -4720,6 +4721,7 @@ def _compatible_task_clips(
     *,
     min_dur_s: float = 60,
     max_dur_s: float = 1800,
+    catalog_only: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     """Combina fontes compatíveis sem reinterpretar categorias.
 
@@ -4746,7 +4748,7 @@ def _compatible_task_clips(
     if provider == "ego4d":
         return ego_clips
     if provider == "nymeria":
-        return _nymeria_windows(task_name, min_dur_s, max_dur_s)
+        return _nymeria_windows(task_name, min_dur_s, max_dur_s, catalog_only=catalog_only)
     holo_clips: tuple[dict[str, Any], ...] = ()
     if provider in ("all", "holoassist"):
         try:
@@ -4754,7 +4756,8 @@ def _compatible_task_clips(
                 task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
         except FileNotFoundError:
             holo_clips = ()
-    nymeria_clips = _nymeria_windows(task_name, min_dur_s, max_dur_s) if provider in ("all", "ambos") else ()
+    nymeria_clips = (_nymeria_windows(task_name, min_dur_s, max_dur_s, catalog_only=catalog_only)
+                     if provider in ("all", "ambos") else ())
     if provider == "ambos":
         return (*nymeria_clips, *ego_clips)
     return (*holo_clips, *nymeria_clips, *ego_clips)
@@ -4768,6 +4771,7 @@ def _with_cached_expansion(
     max_dur_s: float,
     work_dir: Path | None = None,
     include_disabled: bool = False,
+    catalog_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Acrescenta cenário já gravado pelo acelerador, sem buscar mídia nova.
 
@@ -4778,9 +4782,10 @@ def _with_cached_expansion(
 
     merged = list(clips)
     seen = {str(clip.get("clip_uid") or "") for clip in merged}
+    options = {"catalog_only": True} if catalog_only else {}
     for extra in ready_scenario_clips(
             task_name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-            work_dir=work_dir, allow_disabled=include_disabled):
+            work_dir=work_dir, allow_disabled=include_disabled, **options):
         uid = str(extra.get("clip_uid") or "")
         if not uid or uid in seen:
             continue
@@ -4799,6 +4804,119 @@ def _clip_is_cached(clip: dict[str, Any], work_dir: Path) -> bool:
             ":", "_").replace(".", "_")
         return (Path(work_dir) / f"{stem}_native.mp4").is_file()
     return ego_clip_cache_state(clip, work_dir) == "ready"
+
+
+def _catalog_clip_cached_hint(clip: dict[str, Any], work_dir: Path) -> bool:
+    """Read inventory/encode metadata only; this never admits a media send.
+
+    Category counts do not need to hash a parent MP4 for each of its windows.
+    The actual cache and source bytes are checked by prepare/upload as before.
+    A same-size replacement can therefore retain this hint until that gate.
+    """
+    try:
+        work = Path(work_dir)
+        source_name = str(clip.get("source") or "ego4d")
+        if source_name == "nymeria":
+            if clip.get("acquisition_required") is True:
+                return False
+            uid = str(clip.get("clip_uid") or "")
+            if not uid.startswith("nymeria:"):
+                return False
+            stem = "nymeria_" + uid.replace(":", "_").replace(".", "_")
+            seq_dir = Path(str(clip.get("path") or ""))
+            paths = (work / f"{stem}_native.mp4",
+                     seq_dir / "recording_head/data/data.vrs",
+                     seq_dir / "recording_head/data/motion.vrs")
+            return all(path.is_file() and path.stat().st_size > 0 for path in paths)
+        if source_name == "holoassist":
+            from .holo_accelerator import native_path, source_path, sensors_ready
+            source, native = source_path(clip), native_path(clip, work)
+            if not sensors_ready(clip):
+                return False
+            start_s = dur_s = None
+        else:
+            # Ranked candidates and official rows carry source coordinates.
+            # Do not resolve incomplete inventory through sync_meta here.
+            row = dict(clip)
+            uid = str(row.get("exported_clip_uid") or row.get("clip_uid") or "")
+            if not uid:
+                return False
+            window = row.get("window_s")
+            if isinstance(window, (list, tuple)) and len(window) == 2:
+                row.update(parent_start_sec=window[0], parent_end_sec=window[1])
+            elif "parent_start_sec" not in row or "parent_end_sec" not in row:
+                return False
+            row["exported_clip_uid"] = uid
+            plan = _ego_prepare_plan(row)
+            source, native = work / plan["source_name"], work / plan["native_name"]
+            imu = work / plan["imu_name"]
+            if not imu.is_file() or imu.stat().st_size <= 128:
+                return False
+            start_s, dur_s = plan["norm_start"], plan["dur_s"]
+        if not source.is_file() or not native.is_file():
+            return False
+        source_stat, native_stat = source.stat(), native.stat()
+        if min(source_stat.st_size, native_stat.st_size) <= 1024 * 1024:
+            return False
+        marker = native.with_name(native.name + ".source.json")
+        saved = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            return False
+        expected = {"version": _NATIVE_CACHE_VERSION,
+                    "source_size": source_stat.st_size,
+                    "source_mtime_ns": source_stat.st_mtime_ns,
+                    "prepared_size": native_stat.st_size,
+                    "start_s": None if start_s is None else round(float(start_s), 6),
+                    "dur_s": None if dur_s is None else round(float(dur_s), 6),
+                    "width": 1440, "height": 1080, "fps": 30}
+        return (all(saved.get(key) == value and type(saved.get(key)) is type(value)
+                    for key, value in expected.items())
+                and all(isinstance(saved.get(key), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", saved[key])
+                        for key in ("source_sha256", "prepared_sha256")))
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return False
+
+
+def _catalog_queue_accepts(clip: dict[str, Any], task_name: str) -> bool:
+    """Check current catalog declarations without repeating Nymeria planning.
+
+    These rows were produced by the provider's read-only catalog operation.
+    They are estimates, never a substitute for the fresh preparation gate.
+    """
+    if clip.get("source") != "nymeria":
+        return _prepare_queue_accepts(clip, task_name, fresh=False)
+    try:
+        name = task_matching.canonical_task_name(task_name)
+        carrier = clip["selection_evidence"]
+        task = carrier["task"]
+        if (carrier.get("schema") != 1 or carrier.get("dataset") != "nymeria"
+                or task.get("name") != name or clip.get("task_name_authoritative") != name
+                or task_matching.rule_for(name) is None):
+            return False
+        planned = clip.get("acquisition_required") is True
+        algorithm = nymeria._PLANNED_ALGORITHM if planned else nymeria._ALGORITHM
+        window = _clip_window(clip)
+        duration = float(clip["dur_s"])
+        if (carrier.get("algorithm") != algorithm or window is None
+                or not math.isfinite(duration) or duration <= 0
+                or abs((window[1] - window[0]) - duration) > 1e-6):
+            return False
+        bounds = carrier["duration_bounds_s"]
+        if (not isinstance(bounds, (list, tuple)) or len(bounds) != 2
+                or not float(bounds[0]) <= duration <= float(bounds[1])):
+            return False
+        if planned:
+            device_window = clip.get("planned_device_window_ns")
+            return (carrier.get("sensor_coverage") == "unmeasured"
+                    and clip.get("selection_ready") is False
+                    and device_window == clip.get("device_window_ns")
+                    and device_window == carrier.get("planned_device_window_ns")
+                    and clip.get("clip_uid") ==
+                    f"nymeria-planned:{clip['seq_id']}:{device_window[0]}:{device_window[1]}")
+        return str(clip.get("clip_uid") or "").startswith("nymeria:")
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
 
 
 def _prefer_cached_clips(
@@ -4863,13 +4981,13 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
         # Include the whole candidate/evidence and task, never only its UID.
         key = (task_matching.canonical_task_name(name), ego4d._selection_digest(clip))
         if key not in eligibility:
-            eligibility[key] = _prepare_queue_accepts(clip, name, fresh=False)
+            eligibility[key] = _catalog_queue_accepts(clip, name)
         return eligibility[key]
 
     def cache_ready(clip: dict[str, Any]) -> bool:
         uid = str(clip.get("clip_uid") or "")
         if uid not in ready_by_uid:
-            ready_by_uid[uid] = _clip_is_cached(
+            ready_by_uid[uid] = _catalog_clip_cached_hint(
                 clip, config.MEDIA_DATA_DIR / "ego4d")
         return ready_by_uid[uid]
 
@@ -4887,18 +5005,18 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                     "unavailable_reason": "Esta tarefa ainda não tem uma regra de seleção no QMoney.",
                 })
             continue
-        all_clips = [c for c in _compatible_task_clips(name, dataset_provider)
+        all_clips = [c for c in _compatible_task_clips(name, dataset_provider, catalog_only=True)
                      if 60 <= c["dur_s"] <= 1800]
         clips = list(_compatible_task_clips(
-            name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s))
+            name, dataset_provider, min_dur_s=min_dur_s, max_dur_s=max_dur_s, catalog_only=True))
         if (mode != "dataset"
                 and normalize_dataset_provider(dataset_provider) in ("all", "ambos", "ego4d")):
             all_clips = _with_cached_expansion(
                 all_clips, name, min_dur_s=60, max_dur_s=1800,
-                include_disabled=True)
+                include_disabled=True, catalog_only=True)
             clips = _with_cached_expansion(
                 clips, name, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                include_disabled=True)
+                include_disabled=True, catalog_only=True)
         if mode == "cache":
             all_clips = [clip for clip in all_clips if cache_ready(clip)]
             clips = [clip for clip in clips if cache_ready(clip)]
@@ -4934,6 +5052,7 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                                         if all_clips else None),
                 "available_for_duration": bool(clips),
                 "mapping_supported": True,
+                "requires_measured_validation": True,
                 "unavailable_reason": ("" if clips else
                     "Há conteúdo no catálogo, mas nenhum trecho nesta faixa de duração."
                     if all_clips else

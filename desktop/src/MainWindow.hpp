@@ -7,6 +7,7 @@
 #include <QJsonArray>
 #include <QHash>
 #include <QJsonObject>
+#include <QElapsedTimer>
 #include <QMainWindow>
 #include <QProcess>
 #include <QSet>
@@ -420,6 +421,15 @@ private:
   QJsonArray _taskRecords;
   int _taskLoadGeneration{};
   bool _taskRequestPending{};
+  QString _taskCatalogSelection;
+  QString _taskCatalogJobId;
+  bool _taskCatalogAutomaticPoll{};
+  bool _taskCatalogForceRefresh{};
+  bool _taskCatalogTimedOut{};
+  int _taskCatalogPollCount{};
+  int _taskCatalogTimeoutPollCount{};
+  QElapsedTimer _taskCatalogPollTimer;
+  QElapsedTimer _taskCatalogTimeoutTimer;
   bool _cacheCatalogPending{};
   bool _cacheStartPending{};
   int _lastCampaignSeq{};

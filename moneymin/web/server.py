@@ -2121,7 +2121,7 @@ def _ban_accounts(issues: list[dict]) -> None:
         account_bans.purge_local_records({account_transfer.email_key(i["email"]) for i in issues})
 
 
-def _preflight_fingerprint(emails: list[str]) -> str:
+def _preflight_fingerprint(emails: list[str], *, _include_cached_org: bool = True) -> str:
     """Vincula a prévia à identidade/configuração, não à rotação da sessão."""
     digest = hashlib.sha256()
     for email in sorted(set(emails)):
@@ -2134,7 +2134,9 @@ def _preflight_fingerprint(emails: list[str]) -> str:
         _, token = found
         stable = {"email": token_store.email_key(token["email"]),
                   "subject": token.get("localId") or token.get("user_id") or token.get("uid"),
-                  "organization": {key: token[key] for key in ("org_key", "organization_id", "tenantId") if key in token}}
+                  "organization": {key: token[key] for key in
+                      (("org_key", "organization_id", "tenantId") if _include_cached_org else
+                       ("organization_id", "tenantId")) if key in token}}
         # Remover/revogar as credenciais deve invalidar a prévia; renová-las não.
         identity = {"record": stable,
                     "has_id_token": bool(token.get("idToken") or token.get("id_token")),
@@ -2144,6 +2146,12 @@ def _preflight_fingerprint(emails: list[str]) -> str:
     digest.update(json.dumps(sorted(email.strip().casefold() for email in emails
                                     if email.strip().casefold() in removed)).encode())
     return digest.hexdigest()
+
+
+def _catalog_identity_fingerprint(emails: list[str]) -> str:
+    # Resolving an organization fills org_key during this very job. That cache
+    # write is not an account change and must not discard its completed result.
+    return _preflight_fingerprint(emails, _include_cached_org=False)
 
 
 def _invalidate_balance_after_withdrawal(email: str, result: dict[str, Any]) -> None:
@@ -3298,6 +3306,13 @@ def create_app(*, for_testing: bool = False) -> Flask:
             return jsonify({"error": "Informe um intervalo de duração válido.",
                             "code": "invalid_task_duration"}), 400
         if request.args.get("async") == "1":
+            key = (email, dataset_provider, content_mode, min_dur_s, max_dur_s,
+                   _catalog_identity_fingerprint([email]))
+            job_id = str(request.args.get("job_id", "")).strip()
+            if job_id:
+                result, status = task_catalog.poll(job_id, key=key, scope="campaign-tasks")
+                return jsonify(result), status
+
             def load(progress):
                 try:
                     progress("Conferindo acesso e categorias da conta…")
@@ -3322,9 +3337,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     return {"error": issue["reason"] + " " + issue["action"], "issue": issue}, 400
 
             result, status = task_catalog.get(
-                (email, dataset_provider, content_mode, min_dur_s, max_dur_s,
-                 _preflight_fingerprint([email])), load,
-                scope="campaign-tasks")
+                key, load, scope="campaign-tasks",
+                refresh=request.args.get("refresh") == "1")
             return jsonify(result), status
         try:
             # Uma Session só: _resolve_org + catálogo. Dois refresh seguidos

@@ -88,7 +88,7 @@ class CatalogLoadingTests(unittest.TestCase):
         self.assertTrue(latest_done.wait(2))
         obsolete.assert_not_called()
 
-    def test_timeout_stops_polling_without_starting_duplicate_work(self):
+    def test_timeout_identifies_live_worker_and_recovers_unobserved_result_after_ttl(self):
         loader = CatalogLoader(timeout_s=1)
         entered, release = threading.Event(), threading.Event()
         def slow(progress):
@@ -97,16 +97,108 @@ class CatalogLoadingTests(unittest.TestCase):
             return {"tasks": []}, 200
         work = Mock(side_effect=slow)
         try:
-            loader.get((1,), work)
+            initial, _ = loader.get((1,), work, scope="campaign-tasks")
+            job_id = initial["job_id"]
             self.assertTrue(entered.wait(1))
             with patch("moneymin.web.catalog_loader.time.monotonic", return_value=time.monotonic() + 2):
                 for _ in range(3):
-                    body, status = loader.get((1,), work)
+                    body, status = loader.poll(job_id, key=(1,), scope="campaign-tasks")
                     self.assertEqual(status, 504)
-                    self.assertFalse(body.get("loading"))
+                    self.assertTrue(body["loading"])
+                    self.assertEqual(body["code"], "catalog_work_pending")
+                    self.assertEqual(body["job_id"], job_id)
+                    self.assertTrue(body["identity_bound"])
             self.assertEqual(work.call_count, 1)
         finally:
             release.set()
+        for _ in range(100):
+            with loader._lock:
+                finished = "finished" in loader._jobs[(1,)]
+            if finished:
+                break
+            time.sleep(.01)
+        self.assertTrue(finished)
+        with patch("moneymin.web.catalog_loader.time.monotonic", return_value=time.monotonic() + 600):
+            self.assertEqual(loader.poll(job_id, key=(1,), scope="campaign-tasks"),
+                             ({"tasks": []}, 200))
+        self.assertEqual(work.call_count, 1)
+
+    def test_poll_is_bound_to_current_account_identity_and_selection(self):
+        loader = CatalogLoader()
+        entered, release = threading.Event(), threading.Event()
+        key = ("owner@example.invalid", "ambos", "both", 300, 1800, "identity-original")
+        def slow(progress):
+            progress("Contando anotações", phase="annotations")
+            entered.set()
+            release.wait(5)
+            return {"tasks": [{"id": "private-result"}]}, 200
+        work = Mock(side_effect=slow)
+        try:
+            initial, _ = loader.get(key, work, scope="campaign-tasks")
+            self.assertTrue(entered.wait(1))
+            for changed in (key[:-1] + ("revoked",), key[:3] + (60,) + key[4:],
+                            ("different@example.invalid",) + key[1:]):
+                body, status = loader.poll(initial["job_id"], key=changed, scope="campaign-tasks")
+                self.assertEqual(status, 409)
+                self.assertEqual(body["code"], "catalog_identity_changed")
+                self.assertNotIn("tasks", body)
+            self.assertEqual(loader.poll(initial["job_id"], key=key, scope="wrong")[1], 409)
+            body, status = loader.poll(initial["job_id"], key=key, scope="campaign-tasks")
+            self.assertEqual(status, 202)
+            self.assertEqual(body["phase"], "annotations")
+            self.assertEqual(work.call_count, 1)
+        finally:
+            release.set()
+
+        for _ in range(100):
+            with loader._lock:
+                finished = "finished" in loader._jobs[key]
+            if finished:
+                break
+            time.sleep(.01)
+        self.assertTrue(finished)
+        body, status = loader.poll(initial["job_id"], key=key[:-1] + ("revoked",),
+                                   scope="campaign-tasks")
+        self.assertEqual(status, 409)
+        self.assertNotIn("tasks", body)
+        self.assertEqual(loader.poll(initial["job_id"], key=key, scope="campaign-tasks"),
+                         ({"tasks": [{"id": "private-result"}]}, 200))
+        self.assertEqual(work.call_count, 1)
+
+    def test_poll_missing_job_never_launches_work_and_cache_has_a_hard_bound(self):
+        loader = CatalogLoader(ttl_s=600, max_cached=2)
+        self.assertEqual(loader.poll("unknown", key=(0,))[1], 409)
+        self.assertEqual(loader._jobs, {})
+        identities = []
+        for number in range(3):
+            initial, _ = loader.get((number,), lambda progress: ({"tasks": []}, 200))
+            identities.append(initial["job_id"])
+            for _ in range(100):
+                with loader._lock:
+                    finished = "finished" in loader._jobs[(number,)]
+                if finished:
+                    break
+                time.sleep(.01)
+            self.assertTrue(finished)
+        self.assertEqual(len(loader._jobs), 2)
+        self.assertEqual(loader.poll(identities[0], key=(0,))[1], 409)
+        self.assertEqual(loader.poll(identities[2], key=(2,)), ({"tasks": []}, 200))
+
+    def test_consumed_result_expires_normally_without_poll_restarting_it(self):
+        loader = CatalogLoader(ttl_s=1)
+        work = Mock(return_value=({"tasks": []}, 200))
+        initial, _ = loader.get((1,), work)
+        for _ in range(100):
+            result = loader.poll(initial["job_id"], key=(1,))
+            if result[1] == 200:
+                break
+            time.sleep(.01)
+        self.assertEqual(result, ({"tasks": []}, 200))
+        with patch("moneymin.web.catalog_loader.time.monotonic", return_value=time.monotonic() + 2):
+            body, status = loader.poll(initial["job_id"], key=(1,))
+            self.assertEqual(status, 409)
+            self.assertEqual(body["code"], "catalog_job_unavailable")
+        self.assertEqual(work.call_count, 1)
 
     def test_worker_exception_is_terminal_and_does_not_leak_secrets(self):
         loader = CatalogLoader()

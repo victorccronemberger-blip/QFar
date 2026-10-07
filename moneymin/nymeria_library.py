@@ -33,6 +33,7 @@ _LOCK = threading.RLock()
 _PLAN_CACHE = {}
 _INVENTORY_CACHE = {}
 _EVENT_CACHE = {}
+_CATALOG_INPUT_CACHE = {}
 
 
 class NymeriaCancelled(RuntimeError):
@@ -139,6 +140,7 @@ def import_manifest(path, root=None):
         _PLAN_CACHE.clear()
         _INVENTORY_CACHE.clear()
         _EVENT_CACHE.clear()
+        _CATALOG_INPUT_CACHE.clear()
     return summary(base)
 
 
@@ -441,6 +443,7 @@ def sync_catalog(root=None, progress=None, max_workers=12, should_stop=None):
         _PLAN_CACHE.clear()
         _INVENTORY_CACHE.clear()
         _EVENT_CACHE.clear()
+        _CATALOG_INPUT_CACHE.clear()
         nymeria.clear_caches()
         result = summary(base)
         result.update(sync=report)
@@ -572,21 +575,66 @@ def inventory(root=None, query="", state="all", limit=50, offset=0):
     return {"total": len(items), "offset": offset, "limit": limit, "items": items[offset:offset + limit]}
 
 
-def _catalog_windows(rows, names, minimum, maximum, cache_key=None):
+def _catalog_label_rules(events, rules):
+    """Skip rules whose unit evidence is absent; keep every possible label.
+
+    Unit thresholds may be lower than whole-clip thresholds. Search the exact
+    normalized wearer segments used by label_span_events, including their joins.
+    A group absent from this union cannot occur in any individual event.
+    """
+    block = " ".join(event[2] for event in events if not event[3])
+    present = {}
+    possible = []
+    for name, rule in rules:
+        if not rule.evidence:
+            continue
+        required = rule.unit_min_evidence_groups
+        if required is None:
+            required = rule.min_evidence_groups
+        if required is None:
+            required = len(rule.evidence)
+        count = 0
+        for group in rule.evidence:
+            if group not in present:
+                present[group] = task_matching._evidence_group_present(block, group)
+            count += present[group]
+        if count >= required:
+            possible.append((name, rule))
+    return tuple(possible)
+
+
+def _catalog_windows(rows, names, minimum, maximum, cache_key=None, *, rules=None, rivals=None):
     """Apply the same action rules, explicitly without claiming sensor coverage."""
+    # Classification is independent of the requested duration, including when
+    # no window passed the first range. Bind it to annotation/rule content and
+    # the requested names, rather than reclassifying all rejected recordings.
+    input_key = (cache_key, tuple(names)) if cache_key is not None else None
+    previous = _CATALOG_INPUT_CACHE.get(input_key) if input_key is not None else None
+    cached = _EVENT_CACHE.get(cache_key) if cache_key is not None else None
+    lookup = nymeria.selection_rule_for if rules is None else rules.get
     origin = rows[0][0]
-    relative = [(a - origin, b - origin, nymeria.selection_text(text)) for a, b, text in rows]
-    block = task_matching.span_search_text((a, text) for a, _b, text in relative)
-    names = [name for name in names if nymeria.selection_rule_for(name) is not None
-             and task_matching.span_evidence_possible(nymeria.selection_rule_for(name), block)]
+    if previous is not None:
+        relative, names, events, selected_labels = previous
+    else:
+        relative = [(a - origin, b - origin, nymeria.selection_text(text)) for a, b, text in rows]
+        block = task_matching.span_search_text((a, text) for a, _b, text in relative)
+        names = [name for name in names if lookup(name) is not None
+                 and task_matching.span_evidence_possible(lookup(name), block)]
+        if not names:
+            events, selected_labels = (), ()
+        elif cached is not None:
+            events, selected_labels = cached
+        else:
+            events = task_matching.prepare_span_events((a, text) for a, _b, text in relative)
+            selected_labels = task_matching.label_span_events(events,
+                _catalog_label_rules(events, ((name, lookup(name)) for name in names)))
+        if input_key is not None:
+            if len(_CATALOG_INPUT_CACHE) >= 2048:
+                _CATALOG_INPUT_CACHE.clear()
+            _CATALOG_INPUT_CACHE[input_key] = (relative, tuple(names), events, selected_labels)
     if not names:
         return []
-    cached = _EVENT_CACHE.get(cache_key) if cache_key is not None else None
-    if cached is None:
-        events = task_matching.prepare_span_events((a, text) for a, _b, text in relative)
-        selected_labels = task_matching.label_span_events(events,
-            ((name, nymeria.selection_rule_for(name)) for name in names))
-    else:
+    if cached is not None:
         events, selected_labels = cached
     # A five-minute core needs on-task observations at least five minutes
     # apart. This conservative prefilter avoids classifying all rival tasks
@@ -594,13 +642,14 @@ def _catalog_windows(rows, names, minimum, maximum, cache_key=None):
     possible = []
     for name in names:
         times = [event[0] for event, labels in zip(events, selected_labels) if name in labels]
-        if times and max(times) - min(times) >= max(minimum, nymeria.selection_rule_for(name).min_span_s or 0):
+        if times and max(times) - min(times) >= max(minimum, lookup(name).min_span_s or 0):
             possible.append(name)
     if not possible:
         return []
     names = possible
     if cached is None:
-        labels = task_matching.label_span_events(events, nymeria.selection_rules().items())
+        labels = task_matching.label_span_events(events, _catalog_label_rules(events,
+            (nymeria.selection_rules() if rules is None else rules).items()))
         if cache_key is not None:
             if len(_EVENT_CACHE) >= 2048:
                 _EVENT_CACHE.clear()
@@ -615,13 +664,14 @@ def _catalog_windows(rows, names, minimum, maximum, cache_key=None):
             components.append((a, b))
     windows = []
     for name in names:
-        rule = nymeria.selection_rule_for(name)
+        rule = lookup(name)
         if rule is None:
             continue
         min_span = max(minimum, rule.min_span_s or 0)
         if min_span > maximum:
             continue
-        rivals = task_matching.competing_span_names(name, task_matching.TASK_RULES.items())
+        competing = (task_matching.competing_span_names(name, task_matching.TASK_RULES.items())
+                     if rivals is None else rivals[name])
         for lower, upper in components:
             if upper - lower < min_span:
                 continue
@@ -629,7 +679,7 @@ def _catalog_windows(rows, names, minimum, maximum, cache_key=None):
             for span in task_matching.extract_spans(rule, (), min_s=min_span, max_s=maximum,
                     prepared_events=tuple(event for event, _label in pairs),
                     event_task_names=tuple(label for _event, label in pairs), task_name=name,
-                    competing_task_names=rivals, video_duration_s=upper,
+                    competing_task_names=competing, video_duration_s=upper,
                     activity_mode=nymeria.selection_activity_mode(name)):
                 start, end = max(lower, span["start"]), min(upper, span["end"])
                 if (min_span <= end - start <= maximum

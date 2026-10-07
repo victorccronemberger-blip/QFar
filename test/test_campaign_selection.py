@@ -277,7 +277,7 @@ class CampaignSelectionTests(unittest.TestCase):
         with patch.object(campaign, "_compatible_task_clips", return_value=strict), \
              patch("moneymin.ego_accelerator.configured_budget_gb", return_value=0), \
              patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[extra]) as ready_scenario, \
-             patch.object(campaign, "_clip_is_cached", side_effect=lambda clip, _: clip["clip_uid"] != "remote"):
+             patch.object(campaign, "_catalog_clip_cached_hint", side_effect=lambda clip, _: clip["clip_uid"] != "remote"):
             counts = {
                 mode: campaign.available_tasks(
                     "user@example.com", "org", session=session,

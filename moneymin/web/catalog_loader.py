@@ -3,18 +3,20 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from typing import Callable
 
 
 class CatalogLoader:
     def __init__(self, *, ttl_s: float = 30, max_pending: int = 2, timeout_s: float = 300,
-                 timeout_message: str | None = None):
+                 timeout_message: str | None = None, max_cached: int = 32):
         self._lock = threading.Lock()
         self._worker = threading.Semaphore(1)
         self._jobs: dict[tuple, dict] = {}
         self._ttl_s = ttl_s
         self._max_pending = max_pending
         self._timeout_s = timeout_s
+        self._max_cached = max(1, int(max_cached))
         self._timeout_message = timeout_message or (
             "A preparação das categorias excedeu o tempo esperado. "
             "O cálculo continua no serviço. Tente recarregar em instantes.")
@@ -34,9 +36,7 @@ class CatalogLoader:
     def get(self, key: tuple, work: Callable, *, scope: str | None = None, refresh: bool = False) -> tuple[dict, int]:
         with self._lock:
             now = time.monotonic()
-            for old_key, row in list(self._jobs.items()):
-                if row.get("finished") is not None and now - row["finished"] >= self._ttl_s:
-                    del self._jobs[old_key]
+            self._expire(now)
             # Explicit retries replace terminal cached results, never a read
             # still queued/running. Repeated clicks cannot duplicate workers.
             if refresh and key in self._jobs and "finished" in self._jobs[key]:
@@ -53,6 +53,7 @@ class CatalogLoader:
                     return {"loading": True, "state": "queued",
                             "message": "Aguardando a preparação do catálogo em andamento."}, 202
                 row = {"state": "queued", "started": now, "scope": scope,
+                       "job_id": uuid.uuid4().hex, "phase": "queued",
                        "message": "Aguardando a preparação do catálogo."}
                 self._jobs[key] = row
                 try:
@@ -61,24 +62,60 @@ class CatalogLoader:
                 except RuntimeError:
                     del self._jobs[key]
                     return {"error": "Não foi possível iniciar a consulta. Tente novamente."}, 503
-            row = self._jobs[key]
-            if "finished" in row:
-                return row["result"]
-            if now - row["started"] >= self._timeout_s:
-                # Keep the worker registered: a retry must not spawn duplicates.
-                return {"error": self._timeout_message}, 504
-            return {"loading": True, "state": row["state"], "message": row["message"],
-                    "elapsed_s": int(now - row["started"])}, 202
+            return self._response(self._jobs[key], now)
+
+    def poll(self, job_id: str, *, key: tuple, scope: str | None = None) -> tuple[dict, int]:
+        """Read only the selected, still-authorized job; never launch another build."""
+        with self._lock:
+            now = time.monotonic()
+            self._expire(now)
+            for stored_key, row in self._jobs.items():
+                if row["job_id"] != job_id:
+                    continue
+                # The caller supplies current selection AND account identity.
+                # A removed/replaced credential cannot claim an older result.
+                if stored_key != key or row.get("scope") != scope:
+                    return {"error": "A seleção ou o acesso da conta mudou. Recarregue as categorias.",
+                            "code": "catalog_identity_changed"}, 409
+                return self._response(row, now)
+            return {"error": "A consulta anterior não está mais disponível. Recarregue as categorias.",
+                    "code": "catalog_job_unavailable"}, 409
+
+    def _expire(self, now: float) -> None:
+        # An unobserved terminal result survives the normal TTL, including
+        # after a 504 paused the UI. Bound this retention by result count.
+        for old_key, row in list(self._jobs.items()):
+            if row.get("delivered") is not None and now - row["delivered"] >= self._ttl_s:
+                del self._jobs[old_key]
+        completed = sorted(((key, row) for key, row in self._jobs.items()
+                            if "finished" in row), key=lambda item: item[1]["finished"])
+        for old_key, _ in completed[:-self._max_cached]:
+            del self._jobs[old_key]
+
+    def _response(self, row: dict, now: float) -> tuple[dict, int]:
+        if "finished" in row:
+            row.setdefault("delivered", now)
+            return row["result"]
+        body = {"loading": True, "state": row["state"], "message": row["message"],
+                "phase": row["phase"], "job_id": row["job_id"], "identity_bound": True,
+                "elapsed_s": int(now - row["started"])}
+        if now - row["started"] >= self._timeout_s:
+            # A 504 is visible, but explicitly describes a live worker so a
+            # bounded UI follow-up can recover it without starting another.
+            body.update(error=self._timeout_message, code="catalog_work_pending")
+            return body, 504
+        return body, 202
 
     def _run(self, row: dict, work: Callable) -> None:
-        def progress(message):
+        def progress(message, *, phase: str | None = None):
             with self._lock:
-                row.update(state="running", message=message)
+                row.update(state="running", message=message, phase=phase or message)
         with self._worker:
             with self._lock:
                 if row.get("cancelled"):
                     return
-                row["state"] = "running"
+                row.update(state="running", phase="waiting_local_state",
+                           message="Aguardando acesso ao estado local…")
             try:
                 # Operational catalog reads can migrate journals or retain a
                 # campaign preview. Reset must wait for their actual lifetime.
@@ -91,3 +128,4 @@ class CatalogLoader:
                 result = ({"error": "A consulta falhou. Tente recarregar."}, 500)
             with self._lock:
                 row.update(result=result, finished=time.monotonic())
+                self._expire(time.monotonic())

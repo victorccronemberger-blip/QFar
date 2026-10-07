@@ -17,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from . import config, nymeria_vrs, task_matching
+from . import config, ego4d, nymeria_vrs, task_matching
 
 _ALGORITHM = "nymeria-atomic-device-v4"
 _PLANNED_ALGORITHM = _ALGORITHM + "-planned"
@@ -153,9 +153,10 @@ def _signature(seq_dir: Path, *, fresh_sdk: bool = False) -> tuple:
             os.environ.get("NYMERIA_VENV", ""), _sdk_signature(fresh=fresh_sdk), _rules_digest())
 
 
-def _rules_digest() -> str:
+def _rules_digest(rules=None) -> str:
     # Frozen modules may live inside PYZ; their declared rules remain available.
-    rules = {name: vars(rule) for name, rule in selection_rules().items()}
+    rules = {name: vars(rule) for name, rule in
+             (selection_rules() if rules is None else rules).items()}
     value = json.dumps({"algorithm": _ALGORITHM, "rules": rules,
                        "dishwasher_phase_patterns": _DISHWASHER_PHASE_PATTERNS,
                        "dishwasher_dirty_object": _DISHWASHER_DIRTY_OBJECT_PATTERN,
@@ -411,15 +412,21 @@ def _measured_streams(seq_dir: Path) -> dict[str, Any]:
             "head_device_sha256": hashlib.sha256(serials[0].encode()).hexdigest()}
 
 
-def _annotation_rows(seq_dir: Path) -> tuple[list[tuple[float, float, str]], dict]:
+def _annotation_rows(seq_dir: Path, *, catalog_only: bool = False) -> tuple[list[tuple[float, float, str]], dict]:
     hashes: dict[str, str] = {}
     rows: list[tuple[float, float, str]] = []
     for filename in _ANNOTATIONS:
         path = seq_dir / "narration" / filename
         if not path.is_file():
             continue
-        content = path.read_bytes()
-        hashes[filename] = hashlib.sha256(content).hexdigest()
+        if catalog_only:
+            content, _size, digest = ego4d._selection_source(path)
+            if content is None:
+                continue
+        else:
+            content = path.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+        hashes[filename] = digest
         # Summaries are lineage, not a replacement for atomic action evidence.
         if filename != "atomic_action.csv":
             continue
@@ -639,7 +646,8 @@ def automatic_candidates(*, task_name: str | None = None, task_id: str | None = 
                          registry_key: str | None = None, min_dur_s: float = 60.0,
                          max_dur_s: float = 1800.0, root: Path | None = None,
                          max_results: int | None = None,
-                         include_planned: bool = False) -> list[dict[str, Any]]:
+                         include_planned: bool = False,
+                         catalog_only: bool = False) -> list[dict[str, Any]]:
     if not task_name or task_matching.rule_for(task_name) is None:
         return []
     minimum, maximum = _bounds(min_dur_s, max_dur_s)
@@ -647,6 +655,24 @@ def automatic_candidates(*, task_name: str | None = None, task_id: str | None = 
                              min_dur_s=minimum, max_dur_s=maximum, root=root)
            if include_planned else [])
     planned_sequences = {clip["seq_id"] for clip in out}
+    if catalog_only:
+        # Reuse measured in-memory evidence when already acquired in this
+        # process. Listing categories must never open the SDK or sensor media.
+        base = Path(root or data_root()).resolve()
+        for snap in tuple(_SNAPSHOTS.values()):
+            seq_dir = Path(snap["path"])
+            if seq_dir.parent != base or seq_dir.name in planned_sequences:
+                continue
+            current = tuple(_stat(seq_dir / name) for name in
+                ("metadata.json", "recording_head/data/data.vrs", "recording_head/data/motion.vrs",
+                 *("narration/" + value for value in _ANNOTATIONS)))
+            if current != snap["signature"][2] or snap["proof"]["rules_sha256"] != _rules_digest():
+                continue
+            clips = _windows(snap, task_matching.canonical_task_name(task_name), minimum, maximum)
+            out.extend(bind_task(clip, task_name=task_name, task_id=task_id,
+                                 registry_key=registry_key) for clip in clips)
+        out.sort(key=lambda clip: -clip["dur_s"])
+        return out if max_results is None else out[:max(0, int(max_results))]
     for seq_dir in sequence_dirs(root):
         # A queued annotation window is measured when actually prepared.
         # Existing sources without an acquisition plan retain the old API.
@@ -666,28 +692,42 @@ def automatic_candidates(*, task_name: str | None = None, task_id: str | None = 
 def _planned_sequence(seq_dir: Path, groups: dict, task_name: str,
                       minimum: float, maximum: float) -> list[dict[str, Any]]:
     """Bind annotation estimates without opening, downloading or measuring VRS."""
+    return _planned_sequence_batch(seq_dir, groups, [task_name], minimum, maximum)
+
+
+def _planned_sequence_batch(seq_dir: Path, groups: dict, names,
+                            minimum: float, maximum: float, *, rules=None,
+                            rules_digest=None, rivals=None,
+                            catalog_only=False) -> list[dict[str, Any]]:
+    """Classify a recording once for every requested task, with identical proof."""
     from . import nymeria_library as library
-    metadata_bytes = (seq_dir / "metadata.json").read_bytes()
+    metadata_bytes = (ego4d._selection_source(seq_dir / "metadata.json")[0] if catalog_only
+                      else (seq_dir / "metadata.json").read_bytes())
+    if metadata_bytes is None:
+        raise ValueError("metadata Nymeria ausente")
     metadata = json.loads(metadata_bytes.decode("utf-8-sig"))
     if not isinstance(metadata, dict):
         raise ValueError("metadata Nymeria inválido")
-    rows, hashes = _annotation_rows(seq_dir)
-    digest = _rules_digest()
+    rows, hashes = _annotation_rows(seq_dir, catalog_only=catalog_only)
+    digest = rules_digest or _rules_digest()
     evidence_key = (tuple(sorted(hashes.items())), digest)
-    windows = library._catalog_windows(rows, [task_name], minimum, maximum, evidence_key)
+    windows = library._catalog_windows(rows, names, minimum, maximum, evidence_key,
+                                        rules=rules, rivals=rivals)
     assets = library._asset_identity(groups)
     proof = {"schema": 1, "dataset": "nymeria", "algorithm": _PLANNED_ALGORITHM,
-             "task": {"name": task_name, "id": None, "registry_key": None},
              "duration_bounds_s": [minimum, maximum], "rules_sha256": digest,
              "asset_identity": assets, "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
              "annotations_sha256": hashes, "source_time_domain": "DEVICE_TIME",
              "annotation_time_unit": "seconds", "sensor_coverage": "unmeasured"}
-    rule = selection_rule_for(task_name)
     result = []
     for window in windows:
+        task_name = window["task_name"]
+        rule = (rules[task_name] if rules is not None else selection_rule_for(task_name))
         start_ns, end_ns = (round(value * 1e9) for value in window["device_seconds"])
         uid = f"nymeria-planned:{seq_dir.name}:{start_ns}:{end_ns}"
-        carrier = {**copy.deepcopy(proof), "planned_device_window_ns": [start_ns, end_ns]}
+        carrier = {**copy.deepcopy(proof),
+                   "task": {"name": task_name, "id": None, "registry_key": None},
+                   "planned_device_window_ns": [start_ns, end_ns]}
         result.append({"clip_uid": uid, "exported_clip_uid": uid,
             "seq_id": seq_dir.name, "uid": str(metadata.get("uid") or seq_dir.name),
             "path": str(seq_dir), "parent_video_uid": seq_dir.name,
@@ -705,6 +745,7 @@ def _planned_sequence(seq_dir: Path, groups: dict, task_name: str,
     return result
 
 
+@ego4d.selection_boundary
 def planned_candidates(*, task_name: str | None = None, task_id: str | None = None,
                        registry_key: str | None = None, min_dur_s: float = 60.0,
                        max_dur_s: float = 1800.0, root: Path | None = None,
@@ -716,12 +757,21 @@ def planned_candidates(*, task_name: str | None = None, task_id: str | None = No
     name = task_matching.canonical_task_name(task_name)
     minimum, maximum = _bounds(min_dur_s, max_dur_s)
     base = library._root(root)
-    sequences = library._load(base)["sequences"]
-    signatures = tuple((sid, tuple(_stat(library._path(base, sid, filename)) for filename in
-        ("metadata.json", *("narration/" + value for value in _ANNOTATIONS)))) for sid in sequences)
-    key = (str(base), name, minimum, maximum, _rules_digest(),
-           json.dumps({sid: library._asset_identity(groups) for sid, groups in sequences.items()},
-                      sort_keys=True), signatures)
+    operation = ego4d._SELECTION_SNAPSHOT.get()
+    source_key = ("nymeria-planned-source", str(base))
+    if source_key not in operation:
+        sequences = library._load(base)["sequences"]
+        rules = selection_rules()
+        digest = _rules_digest(rules)
+        rivals = {task: task_matching.competing_span_names(task, task_matching.TASK_RULES.items())
+                  for task in rules}
+        signatures = tuple((sid, tuple(_stat(library._path(base, sid, filename)) for filename in
+            ("metadata.json", *("narration/" + value for value in _ANNOTATIONS)))) for sid in sequences)
+        identity = json.dumps({sid: library._asset_identity(groups) for sid, groups in sequences.items()},
+                              sort_keys=True)
+        operation[source_key] = (sequences, rules, digest, rivals, signatures, identity)
+    sequences, rules, digest, rivals, signatures, identity = operation[source_key]
+    key = (str(base), minimum, maximum, digest, identity, signatures)
     if key in _PLANNED:
         candidates = _PLANNED[key]
     else:
@@ -729,12 +779,13 @@ def planned_candidates(*, task_name: str | None = None, task_id: str | None = No
         for sid, groups in sequences.items():
             seq_dir = library._path(base, sid)
             try:
-                out.extend(_planned_sequence(seq_dir, groups, name, minimum, maximum))
+                out.extend(_planned_sequence_batch(seq_dir, groups, list(rules), minimum, maximum,
+                    rules=rules, rules_digest=digest, rivals=rivals, catalog_only=True))
             except (OSError, ValueError, UnicodeError):
                 continue
         candidates = _remember(_PLANNED, key, tuple(sorted(out, key=lambda clip: -clip["dur_s"])))
     out = [bind_task(clip, task_name=name, task_id=task_id, registry_key=registry_key)
-           for clip in candidates]
+           for clip in candidates if clip["task_name_authoritative"] == name]
     return out if max_results is None else out[:max(0, int(max_results))]
 
 
