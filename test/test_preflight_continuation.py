@@ -17,7 +17,8 @@ class PreflightContinuationTests(unittest.TestCase):
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.secrets = self.root / 'secrets'
         self.secrets.mkdir()
-        for name, value in [('DATA_DIR', self.root), ('SECRETS_DIR', self.secrets), ('ROOT', self.root), ('LIBRARY_ROOT', self.root)]:
+        for name, value in [('DATA_DIR', self.root), ('SECRETS_DIR', self.secrets), ('ROOT', self.root),
+                            ('LIBRARY_ROOT', self.root), ('MEDIA_DATA_DIR', self.root / 'media')]:
             self.stack.enter_context(patch.object(server.config, name, value))
         for name, filename in [('PREFS_PATH', 'prefs.json'), ('BALANCES_PATH', 'balances.json'),
                                ('CROWTADO_PW_PATH', 'passwords.json'), ('ACCOUNT_HEALTH_PATH', 'health.json')]:
@@ -95,6 +96,103 @@ class PreflightContinuationTests(unittest.TestCase):
         self.assertEqual(result['removed_accounts'], [])
         self.assertTrue(server.config.token_path('bad@example.com').exists())
         self.assertFalse((self.root / 'banned_accounts.json').exists())
+
+    def category_sessions(self):
+        self.resolve.side_effect = None
+        self.resolve.return_value = server.config.ORG_KEY
+        def session(email):
+            value = Mock()
+            value.all_tasks.side_effect = (
+                self.failure if email == 'bad@example.com' else lambda _org: [{'id': 'task'}])
+            return value
+        return self.stack.enter_context(patch.object(server.Session, 'from_email', side_effect=session))
+
+    def test_restriction_during_other_account_categories_starts_survivors_without_revalidation(self):
+        sessions = self.category_sessions()
+        result = self.preflight()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['removed_accounts'], ['bad@example.com'])
+        self.assertEqual(result['accounts']['validated'], 1)
+        before = (self.resolve.call_count, self.catalog.call_count, sessions.call_count)
+        response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, sessions.call_count))
+        self.assertEqual([a.email for a in self.runner.start.call_args.args[0].accounts], ['good@example.com'])
+
+    def test_restriction_on_first_catalog_uses_next_account_in_the_same_preflight(self):
+        sessions = self.category_sessions()
+        self.body['accounts'] = ['bad@example.com', 'good@example.com']
+        good_catalog = self.catalog.return_value
+        def catalog(email, *_args, **_kwargs):
+            if email == 'bad@example.com':
+                raise self.failure
+            return good_catalog
+        self.catalog.side_effect = catalog
+        result = self.preflight()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['removed_accounts'], ['bad@example.com'])
+        self.assertEqual(result['accounts']['validated'], 1)
+        self.assertEqual([call.args[0] for call in self.catalog.call_args_list], ['bad@example.com', 'good@example.com'])
+        before = (self.resolve.call_count, self.catalog.call_count, sessions.call_count)
+        response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, sessions.call_count))
+        self.assertEqual([a.email for a in self.runner.start.call_args.args[0].accounts], ['good@example.com'])
+
+    def test_pending_on_healthy_survivor_still_blocks_start(self):
+        with patch.object(server.recovery, 'snapshot', return_value={'items': [
+                {'email': 'good@example.com', 'blocks_campaign': True, 'clip_uid': None}]}):
+            result = self.preflight()
+        self.assertFalse(result['ok'])
+        self.assertIsNone(result['preflight_id'])
+        self.assertIn('good@example.com', ' '.join(result['blockers']))
+        self.runner.start.assert_not_called()
+
+    def test_eight_hour_goal_uses_only_survivor_capacity_and_reuses_candidate_plan(self):
+        sessions = self.category_sessions()
+        self.body['target_hours'] = 8
+        candidates = [{'clip_uid': f'fixture-{i}', 'source': 'ego4d', 'dur_s': 900,
+                       'parent_video_uid': f'fixture-parent-{i}', 'window_s': [0, 900]}
+                      for i in range(32)]
+        def pool(task, cfg):
+            return cfg.candidate_plan[task.task_id] if cfg.candidate_plan is not None else candidates
+        with patch.object(server.campaign, 'automatic_candidates', side_effect=pool), \
+             patch.object(server.recovery, 'snapshot', return_value={'items': []}):
+            result = self.preflight()
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(result['accounts']['validated'], 1)
+            capacity = result['capacity']
+            self.assertTrue(capacity['can_reach_goal'])
+            self.assertEqual(capacity['available_seconds_min'], 28800)
+            self.assertEqual([row['email'] for row in capacity['accounts']], ['good@example.com'])
+            before = (self.resolve.call_count, self.catalog.call_count, sessions.call_count)
+            response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, sessions.call_count))
+        cfg = self.runner.start.call_args.args[0]
+        self.assertEqual([a.email for a in cfg.accounts], ['good@example.com'])
+        self.assertEqual(cfg.target_hours_per_account, 8)
+        self.assertEqual(cfg.candidate_plan['task'], candidates)
+
+    def test_temporary_catalog_failure_never_removes_account_or_switches_catalog(self):
+        self.category_sessions()
+        self.body['accounts'] = ['bad@example.com', 'good@example.com']
+        self.catalog.side_effect = TimeoutError('temporary fixture timeout')
+        result = self.preflight()
+        self.assertFalse(result['ok'])
+        self.assertIsNone(result['preflight_id'])
+        self.assertEqual(result['removed_accounts'], [])
+        self.catalog.assert_called_once()
+        self.assertTrue(server.config.token_path('bad@example.com').exists())
+        self.runner.start.assert_not_called()
+
+    def test_pending_on_removed_account_does_not_block_healthy_survivor(self):
+        with patch.object(server.recovery, 'snapshot', return_value={'items': [
+                {'email': 'bad@example.com', 'blocks_campaign': True, 'clip_uid': None}]}):
+            result = self.preflight()
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['preflight_id'])
+        self.assertEqual(result['removed_accounts'], ['bad@example.com'])
 
     def test_recovery_read_failure_keeps_preflight_blocked_and_returns_diagnostic(self):
         from moneymin import recovery

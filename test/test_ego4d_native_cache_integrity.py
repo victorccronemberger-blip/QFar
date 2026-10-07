@@ -83,6 +83,35 @@ class NativeCacheIntegrityTests(unittest.TestCase):
         self.change_same_stat(self.source, b"X")
         self.assertNotEqual(campaign._native_cache_key(self.source, None, 60), before)
 
+    def test_unsupported_marker_rejected_without_media_io(self):
+        markers = ({"version": 4}, {}, {"version": 5.0}, {"version": True}, None, [])
+        with patch.object(campaign, "_native_cache_fingerprint",
+                          side_effect=AssertionError("unexpected media hash")) as fingerprint, \
+             patch.object(Path, "stat", side_effect=AssertionError("unexpected media stat")) as stat, \
+             patch.object(Path, "open", side_effect=AssertionError("unexpected media open")) as opened:
+            for marker in markers:
+                with self.subTest(marker=marker):
+                    self.assertFalse(campaign._native_cache_marker_matches(
+                        marker, self.source, self.output, None, 60))
+            fingerprint.assert_not_called()
+            stat.assert_not_called()
+            opened.assert_not_called()
+
+    def test_supported_marker_rechecks_source_and_output_bytes(self):
+        self.prior()
+        saved = json.loads(self.marker.read_text(encoding="utf-8"))
+        with patch.object(campaign, "_native_cache_fingerprint",
+                          wraps=campaign._native_cache_fingerprint) as fingerprint:
+            self.assertTrue(campaign._native_cache_marker_matches(
+                saved, self.source, self.output, None, 60))
+            self.assertTrue(any(call.args[0] == self.source for call in fingerprint.call_args_list))
+            self.assertTrue(any(call.args[0] == self.output for call in fingerprint.call_args_list))
+            fingerprint.reset_mock()
+            self.change_same_stat(self.source, b"X")
+            self.assertFalse(campaign._native_cache_marker_matches(
+                saved, self.source, self.output, None, 60))
+            self.assertTrue(any(call.args[0] == self.source for call in fingerprint.call_args_list))
+
     def test_source_changed_same_stat_is_not_ready(self):
         self.prior()
         self.change_same_stat(self.source, b"X")

@@ -6,7 +6,25 @@ este módulo contém somente apresentação e compatibilidade de nomes.
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from importlib.resources import files
+
 from . import task_matching
+
+
+@lru_cache(maxsize=1)
+def library_task_names() -> tuple[str, ...]:
+    """Offline task snapshot for source planning, not an upload authorization.
+
+    The campaign preflight still checks the account's live Minute catalog. Legacy
+    matching aliases do not add tasks to this source-planning list.
+    """
+    names = json.loads(files("moneymin").joinpath("minute_task_names.json").read_text(encoding="utf-8"))
+    if (not isinstance(names, list) or not names
+            or any(not isinstance(name, str) or task_matching.rule_for(name) is None for name in names)):
+        raise ValueError("Invalid packaged task catalog")
+    return tuple(dict.fromkeys(names))
 
 # Compatibilidade com scripts antigos que esperam um cenário principal.
 TASK_TO_SCENARIO: dict[str, str] = {
@@ -192,6 +210,7 @@ BOOSTED_TASKS = {
 
 
 __all__ = [
+    "library_task_names",
     "BOOSTED_TASKS",
     "CATEGORY_PT",
     "SCENARIO_PT",

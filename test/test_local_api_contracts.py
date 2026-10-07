@@ -55,7 +55,14 @@ class LocalApiSessionBoundaryTests(unittest.TestCase):
         operations = _product_operations()
         registered = {(rule.rule, method) for rule in application.url_map.iter_rules()
                       for method in rule.methods - {"HEAD", "OPTIONS"}}
-        self.assertEqual(len(operations), 81)
+        self.assertEqual(len(operations), 89)
+        nymeria_operations = {
+            ("/api/library/nymeria", "GET"), ("/api/library/nymeria/sequences", "GET"),
+            ("/api/library/nymeria/operation", "GET"), ("/api/library/nymeria/stop", "POST"),
+            ("/api/library/nymeria/import", "POST"), ("/api/library/nymeria/sync", "POST"),
+            ("/api/library/nymeria/plan", "POST"), ("/api/library/nymeria/download", "POST"),
+        }
+        self.assertTrue(nymeria_operations <= operations)
         self.assertIn(("/api/library/ego4d/prepared", "GET"), operations)
         self.assertIn(("/api/storage/library/items", "GET"), operations)
         self.assertIn(("/api/accounts/proxies", "GET"), operations)

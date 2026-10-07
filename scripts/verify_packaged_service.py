@@ -233,6 +233,18 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str]) ->
         assert checks['SDK Nymeria']['status'] == 'ok'
         assert checks['Biblioteca Nymeria']['status'] == 'error'
         assert nymeria['ready'] is False
+        source_catalog = get('/api/library/nymeria/sequences')
+        assert source_catalog['total'] == 0
+        assert len(source_catalog['task_names']) == 43
+        assert 'Furniture Assembly' in source_catalog['task_names']
+        assert 'Gardening' not in source_catalog['task_names']
+        assert source_catalog['task_catalog_source'] == 'local_snapshot_requires_campaign_preflight'
+        assert source_catalog['worker']['running'] is False
+        try:
+            get('/api/library/nymeria/sequences', authenticated=False)
+            raise AssertionError('Unauthenticated Nymeria source inventory was accepted')
+        except urllib.error.HTTPError as error:
+            assert error.code == 401
         try:
             get('/api/library/ego4d', authenticated=False)
             raise AssertionError('Unauthenticated library request was accepted')
@@ -347,6 +359,7 @@ def main() -> None:
         "prepared_library_inventory", "prepared_library_authentication",
         "general_local_media_inventory", "owned_process_tree_shutdown",
         "nymeria_sdk_core_device_time", "nymeria_metadata_only_not_ready",
+        "nymeria_source_catalog_and_packaged_current_tasks", "nymeria_source_catalog_authentication",
         "full_campaign_reset_preserves_credentials_and_library"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 

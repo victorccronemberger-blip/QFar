@@ -645,6 +645,9 @@ def _native_cache_marker_matches(
     start_s: float | None, dur_s: float | None,
 ) -> bool:
     """Fail closed on v4, malformed markers or changed source/output bytes."""
+    if (type(saved) is not dict or type(saved.get("version")) is not int
+            or saved["version"] != _NATIVE_CACHE_VERSION):
+        return False
     try:
         expected = _native_cache_marker(src, native, start_s, dur_s)
         return (type(saved) is dict and saved == expected

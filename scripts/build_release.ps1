@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.0.50",
+    [string]$Version = "2.0.51",
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\mingw_64",
     [switch]$Staging
 )
@@ -52,6 +52,7 @@ New-Item -ItemType Directory -Force "$WorkDir\spec" | Out-Null
     --hidden-import _core_pybinds --hidden-import _adt_pybinds `
     --hidden-import _aea_pybinds --hidden-import _ase_pybinds `
     --add-data "$ProjectRoot\moneymin\samsung_uw_calibration.json;moneymin" `
+    --add-data "$ProjectRoot\moneymin\minute_task_names.json;moneymin" `
     --add-data "$ProjectRoot\moneymin\resources;moneymin/resources" `
     --add-data "$ProjectRoot\reference;reference" `
     "$ProjectRoot\packaging\qmoney_service.py"

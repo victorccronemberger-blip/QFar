@@ -177,10 +177,16 @@ TASK_RULES: dict[str, TaskRule] = {
     ),
     "Furniture Assembly": _r(
         "Assembling furniture",
-        ("assembl", "furniture", "shelf", "table", "chair", "cabinet", "drawer",
-         "structure", "panel", "frame", "rack", "desk", "bed"),
-        ("screw", "bolt", "piece", "part", "attach", "fit", "install", "assembl",
-         "tighten", "join", "connect", "build", "construct"),
+        ("furniture", "shelf", "table", "chair", "cabinet", "drawer", "wardrobe",
+         "bookcase", "stool", "bench", "bed frame", "chair frame", "rack", "desk", "bed"),
+        ("screw", "bolt", "attach", "install", "assembl", "fasten", "disassembl",
+         "tighten", "join", "connect", "builds", "built", "build a", "build the", "builds a",
+         "builds the", "building a", "building the", "built a", "built the",
+         "constructs", "construct a", "construct the", "constructs a", "constructs the",
+         "constructing a", "constructing the", "constructed a", "constructed the"),
+        action_excluded=("puzzle", "jigsaw puzzle", "badminton", "racket", "shuttlecock",
+                         "board game", "card game", "game pieces", "party decor", "banner",
+                         "clothing", "clothes", "shirt", "towel", "laundry", "hanger"),
         scenario_sufficient=("Assembling furniture",),
         # O cenário comprova a montagem, mas a higiene continua removendo
         # qualquer janela em que a pessoa apareça sentada.
@@ -410,10 +416,16 @@ TASK_RULES: dict[str, TaskRule] = {
     # Nomes históricos aceitos apenas para configurações antigas.
     "Furniture Assembly/ Disassembly": _r(
         "Assembling furniture",
-        ("assembl", "furniture", "shelf", "table", "chair", "cabinet", "drawer",
-         "structure", "panel", "frame", "rack", "desk", "bed"),
-        ("screw", "bolt", "piece", "part", "attach", "fit", "install", "assembl",
-         "tighten", "join", "connect", "build", "construct"),
+        ("furniture", "shelf", "table", "chair", "cabinet", "drawer", "wardrobe",
+         "bookcase", "stool", "bench", "bed frame", "chair frame", "rack", "desk", "bed"),
+        ("screw", "bolt", "attach", "install", "assembl", "fasten", "disassembl",
+         "tighten", "join", "connect", "builds", "built", "build a", "build the", "builds a",
+         "builds the", "building a", "building the", "built a", "built the",
+         "constructs", "construct a", "construct the", "constructs a", "constructs the",
+         "constructing a", "constructing the", "constructed a", "constructed the"),
+        action_excluded=("puzzle", "jigsaw puzzle", "badminton", "racket", "shuttlecock",
+                         "board game", "card game", "game pieces", "party decor", "banner",
+                         "clothing", "clothes", "shirt", "towel", "laundry", "hanger"),
     ),
     "Drill into workpiece": _r(
         "Carpenter",

@@ -145,6 +145,20 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
         self.assertLess(clips[0]["dur_s"], 300)
         self.assertEqual(clips[0]["selection_evidence"]["task"]["id"], "task-fold")
 
+    def test_nymeria_housekeeping_vacuum_needs_car_context_but_ego_scene_is_preserved(self):
+        from moneymin import task_matching
+        name = "Cleaning Out Car"
+        self.write_rows("C vacuums the floor in the hallway while standing and walking.")
+        self.assertEqual(self.candidates(name), [])
+        self.write_rows("C vacuums the car seat and removes trash from the car interior while standing.")
+        self.assertTrue(self.candidates(name))
+        # The source-specific context requirement does not mutate the Ego4D
+        # rule whose human car-washing scenario supplies the car context.
+        ego_rule = task_matching.rule_for(name)
+        caption = "C vacuums the seat and removes trash from the floor mat while standing."
+        self.assertIsNotNone(task_matching.score_scenarios(ego_rule, ["Car/scooter washing"]))
+        self.assertIsNotNone(task_matching.score_action(ego_rule, caption, [caption] * 12))
+
     def test_explicit_clothing_folds_are_valid_but_cloth_and_sewing_are_not(self):
         for text, accepted in (("C is folding a piece of clothing while standing.", True),
                                ("C is folding a cloth while standing.", False),
@@ -152,6 +166,28 @@ class NymeriaTaskSelectionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.write_rows(text)
                 self.assertEqual(bool(self.candidates()), accepted)
+
+    def test_nymeria_requires_task_action_and_location_instead_of_background_objects(self):
+        cases = (
+            (FOLD, "C collects and piles clothes hangers from the closet rod while standing.", False),
+            (FOLD, "C puts a shirt on a clothes hanger and hangs it inside the closet while standing.", True),
+            (FOLD, "C is folding clothes with both hands while standing.", True),
+            ("Organize the Garage", "C arranges utensils on shelves in the kitchen storage room while standing.", False),
+            ("Organize the Garage", "C organizes tools on the shelves in the garage while standing.", True),
+            ("Stack firewood", "C stacks wooden blocks from the Jenga game on the table while standing.", False),
+            ("Stack firewood", "C stacks firewood logs into a pile in the backyard while standing.", True),
+            ("Watering Outdoor Plants", "C holds a water bottle and checks a plant beside the bedroom table while standing.", False),
+            ("Watering Outdoor Plants", "C holds a watering can beside the plants in the garden while standing.", False),
+            ("Watering Outdoor Plants", "C pours water over the plants in the garden while standing.", True),
+            ("Water Houseplants", "C holds a watering can beside the houseplants in the living room while standing.", False),
+            ("Water Houseplants", "C waters the houseplants in the living room while standing.", True),
+            ("Holiday Decoration Setup", "C removes decorative items from the wall then puts the hanging decorations inside a box while standing.", False),
+            ("Holiday Decoration Setup", "C hangs the Christmas decorations and attaches lights to the wall while standing.", True),
+        )
+        for name, caption, accepted in cases:
+            with self.subTest(task=name, caption=caption):
+                self.write_rows(caption)
+                self.assertEqual(bool(self.candidates(name)), accepted)
 
     def test_catalog_only_and_sdk_failure_are_not_candidates(self):
         (self.media / "data.vrs").unlink()

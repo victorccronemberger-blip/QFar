@@ -1217,12 +1217,8 @@ def list_task_spans(
         )
         if not has_evidence and not exact_long_scenario:
             continue
-        activity_rules = [
-            (name, candidate) for name, candidate in task_matching.TASK_RULES.items()
-            if task_matching.span_evidence_possible(candidate, search_text)
-        ]
-        prepared = task_matching.prepare_span_events(events)
-        event_labels = task_matching.label_span_events(prepared, activity_rules)
+        _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
+            uid, events, search_text=search_text)
         rivals = task_matching.competing_span_names(task_name, activity_rules)
         if exact_long_scenario:
             scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
@@ -1295,6 +1291,33 @@ def list_task_spans(
     return out
 
 
+def _task_annotation_context(parent_uid: str, events, *, search_text: str | None = None):
+    """Classify immutable parent annotations once inside a selection operation.
+
+    Keep derived classification, never task approval. Fresh effect boundaries
+    start a new snapshot; mutable annotations and changed rules cannot reuse it.
+    """
+    from . import task_matching
+
+    snapshot = _SELECTION_SNAPSHOT.get()
+    contexts = snapshot.setdefault("@task-window-contexts", {}) if snapshot is not None else {}
+    named_rules = tuple(task_matching.TASK_RULES.items())
+    key = (parent_uid, id(events), named_rules) if isinstance(events, tuple) else None
+    context = contexts.get(key) if key is not None else None
+    if context is None:
+        search = search_text if search_text is not None else task_matching.span_search_text(events)
+        rules = [(name, rule) for name, rule in named_rules
+                 if task_matching.span_evidence_possible(rule, search)]
+        prepared = task_matching.prepare_span_events(events)
+        labels = task_matching.label_span_events(prepared, rules)
+        times = tuple(row[0] for row in prepared)
+        context = (events, search, rules, prepared, labels, times)
+        if key is not None:
+            # Retain events so its identity cannot be reused in the snapshot.
+            contexts[key] = context
+    return context[1:]
+
+
 def _narration_evidence_for_video(
     video: dict[str, Any],
     events: tuple[tuple[float, str], ...] | list[tuple[float, str]],
@@ -1316,15 +1339,12 @@ def _narration_evidence_for_video(
                  and task_matching.span_evidence_possible(rule, search_text))]
     if not rules:
         return []
-    prepared = task_matching.prepare_span_events(events)
+    _search, all_rules, prepared, labels, times = _task_annotation_context(
+        str(video.get("video_uid") or ""), events, search_text=search_text)
     if not prepared:
         return []
     # Classificar também as tarefas de outros cenários permite detectar uma
     # mudança de atividade mesmo quando o cenário do vídeo é muito genérico.
-    all_rules = [(name, rule) for name, rule in task_matching.TASK_RULES.items()
-                 if task_matching.span_evidence_possible(rule, search_text)]
-    labels = task_matching.label_span_events(prepared, all_rules)
-    times = tuple(row[0] for row in prepared)
     duration = float(video.get("duration_sec") or 0)
     intervals = imu_coverage_intervals(video)
     if not intervals and math.isfinite(duration) and duration > 0:
@@ -1441,12 +1461,8 @@ def rank_all_task_spans(
             continue
         # A parent scene controls candidate eligibility, not the classification
         # of contradictory actions that must terminate a candidate window.
-        activity_rules = [
-            (name, candidate) for name, candidate in named_rules
-            if task_matching.span_evidence_possible(candidate, search_text)
-        ]
-        prepared = task_matching.prepare_span_events(events)
-        event_labels = task_matching.label_span_events(prepared, activity_rules)
+        _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
+            uid, events, search_text=search_text)
         possible_names = {name for name, _rule in possible_rules}
         exact_long_names = {name for name, _rule in exact_long_rules}
         for name, rule in eligible_rules:
@@ -1559,12 +1575,7 @@ def revalidate_task_windows(
         if not events or video.get("has_imu") is not True or not video.get("s3_path"):
             continue
         scenarios = scenario_values(video)
-        search = task_matching.span_search_text(events)
-        rules = [(name, rule) for name, rule in task_matching.TASK_RULES.items()
-                 if task_matching.span_evidence_possible(rule, search)]
-        prepared = task_matching.prepare_span_events(events)
-        labels = task_matching.label_span_events(prepared, rules)
-        times = tuple(row[0] for row in prepared)
+        _search, rules, prepared, labels, times = _task_annotation_context(uid, events)
         for name, clip in clips:
             rule = task_matching.rule_for(name)
             window = clip.get("window_s")

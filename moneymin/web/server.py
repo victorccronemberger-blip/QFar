@@ -84,7 +84,8 @@ from flask import Flask, g, jsonify, request
 from .. import banned_store
 from .. import (
     campaign, config, crowtado, ego4d, ego4d_library, ego_accelerator, fx, holo_accelerator, holoassist,
-    hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store, prepared_library,
+    hostinger_mail, identity, org_policy, readiness, sent_registry, credential_store, prepared_library, nymeria_library,
+    task_catalog as library_task_catalog,
 )
 from ..atomic_io import JsonStateError, decode_json_state, load_json, load_json_state, save_json
 from ..jsonl_history import decode_jsonl_history
@@ -95,6 +96,7 @@ from ..secure_store import SecureStoreError, load_secure_settings, save_secure_s
 from .account_issues import account_issue, issue_text
 from . import wallet, registration_state, account_health
 from .catalog_loader import CatalogLoader
+from .library_runner import LibraryPreparationRunner
 from .org_migration import OrgMigrationRunner
 from .banned_monitor import BannedMonitor
 from .runner import (
@@ -2400,6 +2402,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
     prepared_library_inventory = CatalogLoader(ttl_s=300, max_pending=1, timeout_s=7200,
         timeout_message="A conferência dos arquivos locais demorou demais. Tente verificar o acervo novamente.")
     local_media_inventory = CatalogLoader(ttl_s=3, max_pending=1, timeout_s=300)
+    nymeria_catalog = CatalogLoader(ttl_s=3, max_pending=1, timeout_s=900)
+    nymeria_library_worker = LibraryPreparationRunner()
+    app.extensions["nymeria_library_worker"] = nymeria_library_worker
 
     @app.before_request
     def authenticate_local_client():
@@ -2422,6 +2427,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
         with _HEAVY_RUNNER_LOCK:
             if campaign_drain["requested"]:
                 return campaign_closing_response()
+            if nymeria_library_worker.running and request.path in {
+                    "/api/campaigns", "/api/campaigns/preflight", "/api/campaigns/original",
+                    "/api/campaigns/original/preflight", "/api/recovery/resume"}:
+                return jsonify({"error_code": "library_preparation_busy",
+                                "error": "Aguarde a preparação da Biblioteca terminar antes de iniciar envios."}), 409
             campaign_drain["requests"] += 1
             g.campaign_request_admitted = True
 
@@ -3768,6 +3778,144 @@ def create_app(*, for_testing: bool = False) -> Flask:
         except (OSError, sqlite3.Error):
             return jsonify({"error": "Não foi possível consultar a biblioteca local."}), 503
 
+    @app.get("/api/library/nymeria")
+    def get_nymeria_library():
+        try:
+            result = nymeria_library.inventory(limit=1)
+            result["summary"] = nymeria_library.summary()
+            result["task_names"] = library_task_catalog.library_task_names()
+            result["task_catalog_source"] = "local_snapshot_requires_campaign_preflight"
+        except (OSError, ValueError, RuntimeError):
+            return jsonify({"error": "Não foi possível ler o catálogo Nymeria."}), 503
+        return jsonify({**result, "worker": nymeria_library_worker.snapshot()})
+
+    @app.get("/api/library/nymeria/sequences")
+    def browse_nymeria_library():
+        try:
+            query = request.args.get("q", "")
+            state = request.args.get("state", "all")
+            limit = int(request.args.get("limit", 50))
+            offset = int(request.args.get("offset", 0))
+            if len(query) > 200 or not 1 <= limit <= 100 or not 0 <= offset <= 100000:
+                raise ValueError
+            result = nymeria_library.inventory(query=query, state=state, limit=limit, offset=offset)
+            result["summary"] = nymeria_library.summary()
+            result["task_names"] = library_task_catalog.library_task_names()
+            result["task_catalog_source"] = "local_snapshot_requires_campaign_preflight"
+        except (OSError, ValueError, RuntimeError):
+            return jsonify({"error": "Filtros inválidos ou catálogo Nymeria indisponível."}), 400
+        return jsonify({**result, "worker": nymeria_library_worker.snapshot()})
+
+    @app.get("/api/library/nymeria/operation")
+    def nymeria_library_operation():
+        return jsonify(nymeria_library_worker.snapshot())
+
+    @app.post("/api/library/nymeria/stop")
+    def stop_nymeria_library_operation():
+        nymeria_library_worker.stop()
+        return jsonify({"ok": True, "worker": nymeria_library_worker.snapshot()})
+
+    def start_nymeria_library_work(operation, work):
+        with _HEAVY_RUNNER_LOCK:
+            if campaign_drain["requested"]:
+                return campaign_closing_response()
+            if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running or nymeria_library_worker.running:
+                return jsonify({"error": "Aguarde a campanha, recuperação ou preparação atual terminar."}), 409
+            if campaign_drain["requests"] or campaign_verifications.busy or nymeria_catalog.busy:
+                return jsonify({"error": "Aguarde a verificação ou o planejamento terminar antes de alterar a Biblioteca."}), 409
+            worker = nymeria_library_worker.start(operation, work, root=str(nymeria_library.data_root()))
+        return jsonify({"ok": True, "worker": worker}), 202
+
+    @app.post("/api/library/nymeria/import")
+    def import_nymeria_library_manifest():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or not isinstance(body.get("path"), str) or not body["path"].strip():
+            return jsonify({"error": "Escolha o JSON de URLs do Nymeria."}), 400
+        path = Path(body["path"])
+        try:
+            valid_path = path.is_file() and path.stat().st_size <= 32 * 1024 * 1024
+        except OSError:
+            valid_path = False
+        if not valid_path:
+            return jsonify({"error": "Manifesto Nymeria ausente ou acima de 32 MiB."}), 400
+        return start_nymeria_library_work("import", lambda progress, stopped:
+            nymeria_library.import_manifest(path))
+
+    @app.post("/api/library/nymeria/sync")
+    def sync_nymeria_library_catalog():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body:
+            return jsonify({"error": "A atualização do catálogo não aceita filtros."}), 400
+        return start_nymeria_library_work("sync", lambda progress, stopped:
+            nymeria_library.sync_catalog(progress=progress, should_stop=stopped))
+
+    @app.post("/api/library/nymeria/plan")
+    def plan_nymeria_library_expansion():
+        with _HEAVY_RUNNER_LOCK:
+            if nymeria_library_worker.running:
+                return jsonify({"error": "Aguarde a preparação terminar antes de planejar outras fontes."}), 409
+        body = request.get_json(silent=True)
+        try:
+            if not isinstance(body, dict):
+                raise ValueError
+            tasks = body.get("task_names")
+            if (not isinstance(tasks, list) or not tasks or len(tasks) > 100
+                    or any(not isinstance(name, str) or not name.strip() for name in tasks)):
+                raise ValueError
+            if any(isinstance(body.get(key), bool) for key in
+                   ("min_dur_s", "max_dur_s", "target_seconds", "min_free_gb")):
+                raise ValueError
+            minimum = float(body.get("min_dur_s", 300))
+            maximum = float(body.get("max_dur_s", 1800))
+            target = float(body.get("target_seconds", 28800))
+            reserve_gb = float(body.get("min_free_gb", 50))
+            if (any(not math.isfinite(v) for v in (minimum, maximum, target, reserve_gb))
+                    or not 60 <= minimum <= maximum <= 1800 or not 0 < target <= 43200
+                    or not 5 <= reserve_gb <= 1000):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"error": "Selecione tarefas, duração entre 60 e 1800 s e meta de até 12 h."}), 400
+        def plan(progress):
+            progress("Procurando conteúdo Nymeria nas narrações do catálogo completo…")
+            try:
+                return nymeria_library.plan_expansion(tasks, min_dur_s=minimum,
+                    max_dur_s=maximum, target_seconds=target, progress=progress,
+                    min_free_bytes=int(reserve_gb * 1024 ** 3)), 200
+            except (OSError, ValueError, RuntimeError):
+                return {"error": "Não foi possível planejar o conteúdo. Atualize o catálogo Nymeria."}, 503
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+        with _HEAVY_RUNNER_LOCK:
+            if nymeria_library_worker.running:
+                return jsonify({"error": "Aguarde a preparação terminar antes de planejar outras fontes."}), 409
+            generation = nymeria_library_worker.snapshot().get("run_id")
+            result, status = nymeria_catalog.get((str(nymeria_library.data_root()), generation, digest), plan,
+                                                scope="nymeria-expansion")
+        return jsonify(result), status
+
+    @app.post("/api/library/nymeria/download")
+    def acquire_nymeria_library_sequences():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "Selecione as sequências do plano Nymeria."}), 400
+        seq_ids = body.get("seq_ids")
+        if (not isinstance(seq_ids, list) or not seq_ids or len(seq_ids) > 1100
+                or any(not isinstance(value, str) or not value for value in seq_ids)):
+            return jsonify({"error": "Selecione as sequências do plano Nymeria."}), 400
+        try:
+            reserve_gb = body.get("min_free_gb", 50)
+            if isinstance(reserve_gb, bool):
+                raise ValueError
+            reserve_gb = float(reserve_gb)
+            if not math.isfinite(reserve_gb) or not 5 <= reserve_gb <= 1000:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"error": "A reserva de espaço deve estar entre 5 e 1000 GiB."}), 400
+        # IDs are checked against the imported catalog inside the worker. A
+        # receipt supplied by the browser never becomes an arbitrary URL/path.
+        return start_nymeria_library_work("download", lambda progress, stopped:
+            nymeria_library.acquire_sequences(seq_ids, progress=progress, should_stop=stopped,
+                                              min_free_bytes=int(reserve_gb * 1024 ** 3)))
+
     @app.get("/api/health")
     def get_health():
         """Handshake leve: nunca abrir ferramentas, ler contas ou percorrer mídia."""
@@ -4009,6 +4157,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
         with _HEAVY_RUNNER_LOCK:
             if RUNNER.running or RECOVERY.running:
                 return jsonify({"error": "pare a campanha antes de iniciar o acelerador"}), 409
+            if nymeria_library_worker.running:
+                return jsonify({"error": "Aguarde a preparação da Biblioteca terminar."}), 409
             if HOLO_CACHE_RUNNER.running:
                 return jsonify({"ok": True, "already_running": True,
                                 "runner": HOLO_CACHE_RUNNER.snapshot()})
@@ -4048,7 +4198,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         if provider not in {"ego4d", "holoassist", "all"}:
             return jsonify({"error": "provedor inválido (ego4d|holoassist|all)"}), 400
         with _HEAVY_RUNNER_LOCK:
-            if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running:
+            if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running or nymeria_library_worker.running:
                 return jsonify({
                     "error": "pare a campanha e o acelerador antes de limpar a mídia",
                 }), 409
@@ -4228,7 +4378,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                           for capture in plan.captures]}
 
     def original_not_busy(email):
-        if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running:
+        if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running or nymeria_library_worker.running:
             raise OriginalAdmissionError("original_busy", 409)
         try:
             items = recovery.snapshot()["items"]
@@ -4480,19 +4630,29 @@ def create_app(*, for_testing: bool = False) -> Flask:
         catalog_loaded = False
         if accounts and raw_tasks:
             progress("Conferindo categorias e conteúdo selecionado…")
-            try:
-                catalog = campaign.available_tasks(
-                    accounts[0].email, accounts[0].org_key,
-                    min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                    include_unavailable=True, dataset_provider=provider,
-                    content_mode=content_mode)
-                if not isinstance(catalog, list) or any(not isinstance(item, dict) for item in catalog):
-                    raise RuntimeError("resposta de categorias inválida")
-                catalog_loaded = True
-            except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
-                account_issues.append(account_issue(
-                    accounts[0].email, exc, stage="Carregamento das categorias"))
-                catalog = []
+            catalog = []
+            catalog_owner = None
+            for account in accounts:
+                try:
+                    catalog = campaign.available_tasks(
+                        account.email, account.org_key,
+                        min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                        include_unavailable=True, dataset_provider=provider,
+                        content_mode=content_mode)
+                    if not isinstance(catalog, list) or any(not isinstance(item, dict) for item in catalog):
+                        raise RuntimeError("resposta de categorias inválida")
+                    catalog_loaded = True
+                    catalog_owner = account.email
+                    break
+                except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+                    issue = account_issue(account.email, exc, stage="Carregamento das categorias")
+                    account_issues.append(issue)
+                    catalog = []
+                    # A confirmed restriction removes only this account. Its
+                    # healthy peers reuse this verification; transient catalog
+                    # failures still need attention rather than being hidden.
+                    if issue.get("restriction_confirmed") is not True:
+                        break
             by_id = {str(item.get("id")): item for item in catalog if item.get("id")}
             seen: set[str] = set()
             for raw in raw_tasks if catalog_loaded else []:
@@ -4527,7 +4687,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     return account.email, exc
                 return account.email, selected_ids - account_ids
 
-            others = accounts[1:]
+            restricted = {item["email"] for item in account_issues
+                          if item.get("restriction_confirmed") is True}
+            others = ([account for account in accounts
+                       if account.email != catalog_owner and account.email not in restricted]
+                      if catalog_loaded else [])
             progress("Conferindo categorias nas demais contas…")
             with ThreadPoolExecutor(max_workers=max(1, min(4, len(others)))) as pool:
                 checks = pool.map(_check_account_tasks, others)
@@ -4560,6 +4724,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     "A campanha não foi alterada.")
             else:
                 removed_now = [str(item["email"]) for item in confirmed]
+                removed_emails = set(removed_now)
+                accounts = [account for account in accounts if account.email not in removed_emails]
                 account_issues = [
                     item for item in account_issues if item.get("restriction_confirmed") is not True]
                 listed = ", ".join(removed_now)
@@ -4608,7 +4774,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
         recovery_error = None
         try:
             unresolved = recovery.snapshot()["items"]
-            selected_recovery = [item for item in unresolved if item["email"] in emails]
+            survivor_emails = {account.email for account in survivors}
+            selected_recovery = [item for item in unresolved if item["email"] in survivor_emails]
             unidentified = sorted({item["email"] for item in selected_recovery if item.get("blocks_campaign", True)})
             if unidentified:
                 blockers.append("Pendências sem clipe identificado em: " + ", ".join(unidentified)
@@ -5004,6 +5171,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     return jsonify({"error_code": "preflight_history_changed", "error": "A lista de vídeos usados mudou. Revise a campanha novamente."}), 409
             if RECOVERY.running:
                 return jsonify({"error": "Aguarde a recuperação dos envios terminar."}), 409
+            if nymeria_library_worker.running:
+                return jsonify({"error": "Aguarde a preparação da Biblioteca terminar."}), 409
             try:
                 unresolved = recovery.snapshot()["items"]
             except (ValueError, OSError):
@@ -5166,7 +5335,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         with _HEAVY_RUNNER_LOCK:
             if campaign_drain["requested"]:
                 return campaign_closing_response()
-            if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running:
+            if RUNNER.running or RECOVERY.running or HOLO_CACHE_RUNNER.running or nymeria_library_worker.running:
                 return jsonify({"error": "Aguarde a operação em andamento terminar."}), 409
             try:
                 if email not in {account["email"] for account in _list_accounts()}:
@@ -5198,10 +5367,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
         with _HEAVY_RUNNER_LOCK:
             campaign_drain["requested"] = True
             RUNNER.stop()
+            nymeria_library_worker.stop()
             recovery_thread = getattr(RECOVERY, "_thread", None)
             recovery_active = (RECOVERY.running
                                or (recovery_thread is not None and recovery_thread.is_alive()))
-            ready = (not RUNNER.running and not recovery_active
+            ready = (not RUNNER.running and not recovery_active and not nymeria_library_worker.running
                      and campaign_drain["requests"] == 0)
             return jsonify({"ok": True, "draining": True, "ready": bool(ready)})
 
@@ -5714,10 +5884,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
             return jsonify({"error": "Reset completo não aceita filtros ou caminhos."}), 400
         try:
             with campaign_state_lease(exclusive=True), _HEAVY_RUNNER_LOCK:
-                workers = (RUNNER, RECOVERY, HOLO_CACHE_RUNNER)
+                workers = (RUNNER, RECOVERY, HOLO_CACHE_RUNNER, nymeria_library_worker)
                 catalogs = (task_catalog, campaign_verifications, accelerator_catalog,
                             recovery_catalog, original_library_index, prepared_library_inventory,
-                            local_media_inventory)
+                            local_media_inventory, nymeria_catalog)
                 if (campaign_drain["requested"] or campaign_drain["requests"]
                         or any(worker.running or (getattr(worker, "_thread", None) is not None
                                    and worker._thread.is_alive()) for worker in workers)

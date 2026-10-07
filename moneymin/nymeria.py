@@ -10,14 +10,17 @@ from importlib import metadata as importlib_metadata
 import json
 import math
 import os
+import re
 from bisect import bisect_left
 from collections import OrderedDict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from . import config, nymeria_vrs, task_matching
 
-_ALGORITHM = "nymeria-atomic-device-v1"
+_ALGORITHM = "nymeria-atomic-device-v2"
+_HANGER_ADJECTIVE = re.compile(r"\bclothes\s+(hangers?)\b", re.IGNORECASE)
 _SNAPSHOTS: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 _WINDOWS: OrderedDict[tuple, tuple[dict[str, Any], ...]] = OrderedDict()
 _SDK_DIGESTS: OrderedDict[tuple, tuple[int, str]] = OrderedDict()
@@ -72,9 +75,69 @@ def _signature(seq_dir: Path, *, fresh_sdk: bool = False) -> tuple:
 
 def _rules_digest() -> str:
     # Frozen modules may live inside PYZ; their declared rules remain available.
-    rules = {name: vars(rule) for name, rule in task_matching.TASK_RULES.items()}
-    value = json.dumps(rules, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    rules = {name: vars(rule) for name, rule in selection_rules().items()}
+    value = json.dumps({"algorithm": _ALGORITHM, "rules": rules},
+                       sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(value.encode("utf8")).hexdigest()
+
+
+def selection_rule_for(task_name: str):
+    """Atomic captions need task context absent from Nymeria's script label.
+
+    Ego4D's human car-washing scene can contextualize a caption such as
+    ``vacuum the seat``. Nymeria's generic housekeeping script cannot prove
+    that the room being vacuumed is a car interior.
+    """
+    name = task_matching.canonical_task_name(task_name)
+    rule = task_matching.rule_for(name)
+    if rule is None:
+        return None
+    if name == "Cleaning Out Car" and rule is not None:
+        return replace(rule, evidence=(*rule.evidence,
+            ("car", "vehicle", "automobile", "van", "truck", "dashboard", "car seat")),
+            min_evidence_groups=None, unit_min_evidence_groups=None)
+    if name == "Organize the Garage":
+        return replace(rule, evidence=(("garage",), *rule.evidence[1:]),
+                       min_evidence_groups=None, unit_min_evidence_groups=None)
+    if name == "Stack firewood":
+        return replace(rule, evidence=(("firewood", "log", "woodpile", "wood pile"),
+                                      *rule.evidence[1:]),
+                       action_excluded=(*rule.action_excluded, "jenga", "puzzle", "board game", "game pieces"),
+                       min_evidence_groups=None, unit_min_evidence_groups=None)
+    if name in {"Watering Outdoor Plants", "Water Houseplants"}:
+        actions = ("waters", "watering the", "watering a", "watering plants", "watering flowers",
+                   "watering crops", "watering seedlings", "water the", "water a", "water plants",
+                   "water flowers", "water crops", "pours water", "pouring water", "pour water",
+                   "sprays water", "spraying water", "sprinkles water", "sprinkling water",
+                   "sprays the plants", "spraying the plants", "sprays the flowers", "spraying the flowers",
+                   "turns on the sprinkler", "starts the sprinkler", "runs the sprinkler")
+        context = (("outdoor", "outside", "yard", "backyard", "garden", "patio", "porch", "balcony", "field", "crop")
+                   if name == "Watering Outdoor Plants" else
+                   ("indoor", "inside", "houseplant", "living room", "bedroom", "kitchen", "room", "windowsill", "home"))
+        objects = (*rule.evidence[1], "houseplant") if name == "Water Houseplants" else rule.evidence[1]
+        return replace(rule, evidence=(actions, objects, context),
+                       min_evidence_groups=None, unit_min_evidence_groups=None)
+    if name == "Holiday Decoration Setup":
+        actions = ("hangs", "hanging a decoration", "hanging the decoration", "hang a decoration",
+                   "hang the decoration", "decorates", "decorating", "sets up", "setting up", "set up",
+                   "unpacks", "unpacking", "attaches", "attaching", "installs", "installing")
+        return replace(rule, evidence=(*rule.evidence[:-1], actions),
+                       action_excluded=(*rule.action_excluded, "takes down", "taking down"),
+                       min_evidence_groups=None, unit_min_evidence_groups=None)
+    return rule
+
+
+def selection_rules():
+    return {name: selection_rule_for(name) for name in task_matching.TASK_RULES}
+
+
+def selection_text(text: str) -> str:
+    """A clothes hanger names the hanger; it does not prove a garment.
+
+    Keep the original caption and its timestamps/hashes as source evidence.
+    This normalization affects only action matching, including catalog plans.
+    """
+    return _HANGER_ADJECTIVE.sub(r"\1", text)
 
 
 def _sdk_content_digest(path: Path, *, fresh: bool = False) -> tuple[int, str]:
@@ -235,6 +298,14 @@ def _annotation_rows(seq_dir: Path) -> tuple[list[tuple[float, float, str]], dic
 
 def _snapshot(seq_dir: Path, *, fresh: bool = False) -> dict[str, Any]:
     seq_dir = Path(seq_dir).resolve()
+    # Importing the complete source catalog creates metadata/annotations for
+    # recordings whose media has not been downloaded. Fail before hashing the
+    # SDK and parsing their CSV on every campaign task lookup.
+    for name in ("recording_head/data/data.vrs", "recording_head/data/motion.vrs",
+                 "narration/atomic_action.csv"):
+        required = seq_dir / name
+        if not required.is_file() or required.stat().st_size <= 0:
+            raise ValueError(f"{required.name} Nymeria ausente")
     signature = _signature(seq_dir, fresh_sdk=fresh)
     if not fresh and signature in _SNAPSHOTS:
         return _SNAPSHOTS[signature]
@@ -266,8 +337,8 @@ def _snapshot(seq_dir: Path, *, fresh: bool = False) -> dict[str, Any]:
     if not relative:
         raise ValueError("narração sem cobertura medida RGB/IMU Nymeria")
     events = tuple((start, text) for start, _end, text in relative)
-    prepared = task_matching.prepare_span_events(events)
-    labels = task_matching.label_span_events(prepared, task_matching.TASK_RULES.items())
+    prepared = task_matching.prepare_span_events((start, selection_text(text)) for start, text in events)
+    labels = task_matching.label_span_events(prepared, selection_rules().items())
     proof = {"metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
              "annotations_sha256": hashes,
              "source_signature": [list(item) for item in signature[2]],
@@ -340,7 +411,7 @@ def _windows(snap: dict, task_name: str, minimum: float, maximum: float) -> tupl
            task_name, minimum, maximum)
     if key in _WINDOWS:
         return _WINDOWS[key]
-    rule = task_matching.rule_for(task_name)
+    rule = selection_rule_for(task_name)
     if rule is None:
         return ()
     span_minimum = max(minimum, rule.min_span_s or 0.0)

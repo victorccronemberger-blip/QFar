@@ -104,6 +104,7 @@ jobs:
             --hidden-import _core_pybinds --hidden-import _adt_pybinds `
             --hidden-import _aea_pybinds --hidden-import _ase_pybinds `
             --add-data "$root/moneymin/samsung_uw_calibration.json;moneymin" `
+            --add-data "$root/moneymin/minute_task_names.json;moneymin" `
             --add-data "$root/moneymin/resources;moneymin/resources" `
             --add-data "$root/reference;reference" `
             "$root/packaging/qmoney_service.py"
