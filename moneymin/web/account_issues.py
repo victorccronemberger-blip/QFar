@@ -10,7 +10,10 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     reason = "Não foi possível concluir a verificação desta conta."
     action = "Não remova a conta por este diagnóstico. Verifique novamente; se persistir, copie o diagnóstico para o suporte."
     explicit = getattr(error, "account_issue_code", None)
-    if explicit == "app_check":
+    if isinstance(error, PermissionError):
+        code, reason = "local_permission", "O Windows não permitiu atualizar o acesso local desta conta."
+        action = "A conta permanece cadastrada. Continue com as contas aprovadas e verifique este acesso novamente depois."
+    elif explicit == "app_check":
         code, reason = "app_check", "O serviço recusou a validação App Check desta instalação."
         action = "A integração precisa de uma configuração App Check autorizada pela plataforma. Reconectar a conta não remove essa exigência."
     elif explicit == "email_verification":

@@ -4705,11 +4705,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     issue = account_issue(account.email, exc, stage="Carregamento das categorias")
                     account_issues.append(issue)
                     catalog = []
-                    # A confirmed restriction removes only this account. Its
-                    # healthy peers reuse this verification; transient catalog
-                    # failures still need attention rather than being hidden.
-                    if issue.get("restriction_confirmed") is not True:
-                        break
+                    # Try the other verified accounts; preserve each failure as
+                    # a diagnostic and exclude its owner only from this run.
             by_id = {str(item.get("id")): item for item in catalog if item.get("id")}
             seen: set[str] = set()
             for raw in raw_tasks if catalog_loaded else []:
@@ -4744,8 +4741,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     return account.email, exc
                 return account.email, selected_ids - account_ids
 
-            restricted = {item["email"] for item in account_issues
-                          if item.get("restriction_confirmed") is True}
+            restricted = {item["email"] for item in account_issues}
             others = ([account for account in accounts
                        if account.email != catalog_owner and account.email not in restricted]
                       if catalog_loaded else [])
@@ -4826,7 +4822,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
             warnings.append("há menos de 10 GiB livres na unidade da biblioteca")
 
         removable = {i["email"] for i in account_issues if i.get("restriction_confirmed") is True}
-        survivors = [a for a in accounts if a.email not in removable]
+        skipped_accounts = {i["email"] for i in account_issues if i.get("restriction_confirmed") is not True}
+        survivors = [a for a in accounts if a.email not in removable | skipped_accounts]
+        if target_hours <= 0:
+            estimated_sends = len(selected) * count * len(survivors)
         recovery_exclusions = {}
         recovery_error = None
         try:
@@ -4847,8 +4846,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             recovery_error = failure["recovery_error"]
             blockers.append(failure["error"] + " Abra Recuperação de envios.")
         reusable = (bool(survivors) and bool(selected) and catalog_loaded and ready.get("ready") is True
-                    and len(blockers) == len(account_errors)
-                    and all(i.get("restriction_confirmed") is True for i in account_issues))
+                    and len(blockers) == len(account_errors))
         receipt_id = None
         candidate_plan = None
         clip_review = []
@@ -4897,22 +4895,26 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 receipt_id = uuid.uuid4().hex
                 preflights[receipt_id] = {"body": body, "accounts": survivors, "catalog": catalog,
                                           "candidate_plan": candidate_plan, "sent_fingerprint": sent_fingerprint,
-                                          "issues": account_issues, "expires": now + 600,
-                                          "fingerprint": _preflight_fingerprint(emails)}
+                                          "issues": [i for i in account_issues if i.get("restriction_confirmed") is True],
+                                          "skipped_accounts": sorted(skipped_accounts), "expires": now + 600,
+                                          "fingerprint_emails": [a.email for a in survivors],
+                                          "fingerprint": _preflight_fingerprint([a.email for a in survivors])}
 
         return {
             "ok": not blockers,
             "preflight_id": receipt_id,
             "clip_plan": clip_review,
             "can_remove_and_continue": reusable and bool(removable),
+            "can_skip_and_continue": reusable and bool(skipped_accounts),
+            "skippable_accounts": sorted(skipped_accounts),
             "removable_accounts": sorted(removable),
             "removed_accounts": removed_now,
             "provider": provider,
-            "accounts": {"selected": len(emails), "validated": len(accounts)},
+            "accounts": {"selected": len(emails), "validated": len(survivors)},
             "tasks": {"selected": len(raw_tasks), "compatible": len(selected)},
             "clips": clip_count,
             "estimated_sends": estimated_sends,
-            "account_workers": campaign.clamp_account_workers(requested_workers, len(accounts)),
+            "account_workers": campaign.clamp_account_workers(requested_workers, len(survivors)),
             "target_hours": target_hours,
             "capacity": capacity_summary,
             "blockers": blockers,
@@ -4935,7 +4937,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         retry_body = request.get_json(silent=True)
         if isinstance(retry_body, dict) and retry_body.get("preflight_id"):
             retry_id = retry_body["preflight_id"]
-            frozen_request = {k:v for k,v in retry_body.items() if k not in {"preflight_id", "remove_restricted"}}
+            frozen_request = {k:v for k,v in retry_body.items() if k not in {"preflight_id", "remove_restricted", "skip_unverified"}}
             try:
                 prior = campaign_start_store.lookup(retry_id, kind="dataset", receipt_id=retry_id, body=frozen_request)
             except campaign_start_store.StartConflictError:
@@ -4969,7 +4971,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
         if receipt_id:
             with preflight_lock:
                 receipt = preflights.get(str(receipt_id))
-            original = {k: v for k, v in body.items() if k not in {"preflight_id", "remove_restricted"}}
+            original = {k: v for k, v in body.items() if k not in {"preflight_id", "remove_restricted", "skip_unverified"}}
             invalid = None
             if receipt is None:
                 invalid = ("preflight_missing", "A prévia não está mais disponível. Revise a campanha novamente.")
@@ -4977,13 +4979,15 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 invalid = ("preflight_expired", "A prévia passou de 10 minutos. Atualize e revise antes de iniciar.")
             elif original != receipt["body"]:
                 invalid = ("preflight_request_changed", "Os parâmetros da campanha mudaram. Revise a nova prévia.")
-            elif receipt["fingerprint"] != _preflight_fingerprint(original.get("accounts", [])):
+            elif receipt["fingerprint"] != _preflight_fingerprint(receipt["fingerprint_emails"]):
                 invalid = ("preflight_accounts_changed", "O acesso ou a identidade de uma conta mudou. Revise a nova verificação.")
             if invalid:
                 return jsonify({"error_code": invalid[0], "error": invalid[1]}), 409
             if receipt["issues"] and body.get("remove_restricted") is not True:
                 return jsonify({"error": "Confirme a remoção das contas com restrição para continuar."}), 400
-        elif body.get("remove_restricted"):
+            if receipt["skipped_accounts"] and body.get("skip_unverified") is not True:
+                return jsonify({"error": "Confirme continuar somente com as contas aprovadas. As demais permanecem cadastradas."}), 400
+        elif body.get("remove_restricted") or body.get("skip_unverified"):
             return jsonify({"error": "Execute o preflight antes de remover contas e continuar."}), 400
         cleanup_after_upload = body.get("cleanup_after_upload", True)
         if not isinstance(cleanup_after_upload, bool):
@@ -5271,7 +5275,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 if receipt:
                     if preflights.get(str(receipt_id)) is not receipt:
                         return jsonify({"error_code": "preflight_missing", "error": "A prévia não está mais disponível. Revise a campanha novamente."}), 409
-                    if receipt["fingerprint"] != _preflight_fingerprint(receipt["body"].get("accounts", [])):
+                    if receipt["fingerprint"] != _preflight_fingerprint(receipt["fingerprint_emails"]):
                         return jsonify({"error_code": "preflight_accounts_changed", "error": "O acesso ou a identidade de uma conta mudou. Revise a nova verificação."}), 409
                     if receipt["expires"] <= time.monotonic():
                         return jsonify({"error_code": "preflight_expired", "error": "A prévia passou de 10 minutos. Atualize e revise antes de iniciar."}), 409
@@ -5324,6 +5328,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
         }
         if skipped:
             payload["skipped_accounts"] = skipped
+        if receipt and receipt["skipped_accounts"]:
+            payload["skipped_accounts"] = receipt["skipped_accounts"]
         if receipt_id:
             payload["start_request_id"] = str(receipt_id)
             payload["preflight_id"] = str(receipt_id)

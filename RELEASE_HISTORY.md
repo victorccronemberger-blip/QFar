@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **119 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **120 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.62](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.62). Destaques: Banimentos confirmados são removidos das contas disponíveis e das campanhas; pendências de rede e retenções de saque são preservadas.
+Versão atual: [v2.0.63](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.63). Destaques: Uma conta com verificação inconclusiva pode ficar fora apenas da campanha atual; as contas aprovadas aproveitam a mesma prévia. Persistência no Windows preserva os metadados do acesso salvo.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.63](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.63) | 07/10/2026 | Permite revisar e iniciar com contas aprovadas sem remover as inconclusivas nem repetir a validação. Recalcula participantes e capacidade, mantém recibos e bloqueios globais; corrige substituição de arquivos de acesso recusada pelo Windows. | [Desde v2.0.62](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.62...v2.0.63) |
 | [v2.0.62](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.62) | 07/10/2026 | Reconcilia banimentos confirmados deixados entre contas disponíveis e arquiva novos banimentos nas verificações. Preserva contas inconclusivas, retenções de saque e registros que protegem mídias pendentes. | [Desde v2.0.60](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.60...v2.0.62) |
 | [v2.0.60](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.60) | 07/10/2026 | Catálogo evita buscas repetidas de exclusão e análise de componentes curtos. Prévia usa estimativas sem ler sensores completos; mantém validação medida e recupera o mesmo pedido após timeout. | [Desde v2.0.57](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.57...v2.0.60) |
 | [v2.0.57](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.57) | 07/10/2026 | Remove classificação automática do catálogo no início; consultas pesadas cedem tempo à API local e a lista de contas elimina leituras duplicadas das credenciais, mantendo o bloqueio de fallbacks corrompidos. | [Desde v2.0.56](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.56...v2.0.57) |

@@ -4317,8 +4317,8 @@ void MainWindow::showAccountIssues(const QString& title, const QStringList& bloc
   layout->addWidget(explanation);
   if (continueAction)
     explanation->setText(explanation->text() + QStringLiteral(
-        "\nRevise a campanha com as contas aprovadas antes de continuar. Somente após a confirmação final "
-        "os acessos com restrição confirmada serão removidos e registrados no histórico de contas banidas."));
+        "\nContinue com as contas aprovadas usando esta mesma verificação. "
+        "As contas com diagnóstico inconclusivo ficam fora somente desta campanha e permanecem cadastradas."));
   bool continueRequested = false;
   auto* details = new QPlainTextEdit;
   details->setReadOnly(true);
@@ -5718,13 +5718,16 @@ void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAcc
     }
     const auto result = doc.object();
     const auto receipt = result.value(QStringLiteral("preflight_id"));
-    const bool canContinue = result.value(QStringLiteral("can_remove_and_continue")).toBool();
+    const bool canSkip = result.value(QStringLiteral("can_skip_and_continue")).toBool();
+    const bool canContinue = result.value(QStringLiteral("can_remove_and_continue")).toBool() || canSkip;
     const bool actionable = result.value(QStringLiteral("ok")).toBool() || canContinue;
     const bool receiptValid = receipt.isString() && !receipt.toString().trimmed().isEmpty()
         && receipt.toString() == receipt.toString().trimmed();
     if (!doc.isObject() || !result.value(QStringLiteral("ok")).isBool()
         || (result.contains(QStringLiteral("can_remove_and_continue"))
             && !result.value(QStringLiteral("can_remove_and_continue")).isBool())
+        || (result.contains(QStringLiteral("can_skip_and_continue"))
+            && !result.value(QStringLiteral("can_skip_and_continue")).isBool())
         || (actionable && !receiptValid)) {
       const QString message = QStringLiteral("O serviço não confirmou uma prévia válida. Revise a campanha novamente antes de iniciar.");
       setCampaignIndicator(QStringLiteral("Verificação não concluída"), message, QStringLiteral("error"));
@@ -5792,13 +5795,17 @@ void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAcc
         return showError(QStringLiteral("Campanha não iniciada"),
                          blockerLines.join(QLatin1Char('\n')));
       std::function<void()> continueAction;
-      if (result.value(QStringLiteral("can_remove_and_continue")).toBool()) {
+      if (canContinue) {
         QJsonObject continuation = body;
         continuation.insert(QStringLiteral("preflight_id"), result.value(QStringLiteral("preflight_id")));
-        continuation.insert(QStringLiteral("remove_restricted"), true);
+        if (result.value(QStringLiteral("can_remove_and_continue")).toBool())
+          continuation.insert(QStringLiteral("remove_restricted"), true);
+        if (canSkip) continuation.insert(QStringLiteral("skip_unverified"), true);
         continueAction = [this, continuation, result, selectedAccountNames] {
           QSet<QString> removed;
           for (const auto value : result.value("removable_accounts").toArray()) removed.insert(value.toString());
+          for (const auto value : result.value("skippable_accounts").toArray()) removed.insert(value.toString());
+          for (const auto value : result.value("removed_accounts").toArray()) removed.insert(value.toString());
           QStringList included;
           const auto requested = continuation.value("accounts").toArray();
           for (int i = 0; i < requested.size(); ++i)
@@ -5818,7 +5825,12 @@ void MainWindow::pollCampaignPreflight(QJsonObject body, QStringList selectedAcc
           else if (validated > 0)
             reviewed.insert("estimated_sends", reviewed.value("estimated_sends").toInt() * int(included.size()) / validated);
           auto warnings = reviewed.value("warnings").toArray();
-          warnings.append(QStringLiteral("Ao confirmar, %1 conta(s) com restrição serão removidas antes de iniciar. Voltar mantém os acessos cadastrados.").arg(removed.size()));
+          if (continuation.value("skip_unverified").toBool())
+            warnings.append(QStringLiteral("%1 conta(s) com verificação pendente ficam fora somente desta campanha. Os acessos permanecem cadastrados.")
+                .arg(result.value("skippable_accounts").toArray().size()));
+          if (continuation.value("remove_restricted").toBool())
+            warnings.append(QStringLiteral("Ao confirmar, %1 conta(s) com restrição confirmada serão movidas para Banidas.")
+                .arg(result.value("removable_accounts").toArray().size()));
           reviewed.insert("warnings", warnings);
           CampaignReviewDialog review(reviewed, included, this, continuation);
           setCampaignIndicator(QStringLiteral("Aguardando sua confirmação"),
@@ -5914,6 +5926,7 @@ void MainWindow::submitCampaign(QJsonObject body) {
           auto refreshed = body;
           refreshed.remove(QStringLiteral("preflight_id"));
           refreshed.remove(QStringLiteral("remove_restricted"));
+          refreshed.remove(QStringLiteral("skip_unverified"));
           QStringList names;
           for (const auto account : refreshed.value("accounts").toArray()) names.append(account.toString());
           setStatus(QStringLiteral("Atualizando a prévia. Revise novamente antes de confirmar o início."));

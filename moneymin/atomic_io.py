@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +100,30 @@ def save_json(path: Path, value: Any, *, ensure_ascii: bool = False) -> None:
     save_bytes(path, json.dumps(value, indent=2, ensure_ascii=ensure_ascii).encode("utf-8"))
 
 
+def _windows_replace_file(source: Path, target: Path) -> None:
+    """Replace without discarding the existing Windows ACLs and file streams.
+
+    Keep a same-volume backup until success: ReplaceFile can fail after moving
+    the old file. Never ignore ACL merge errors or fall back to truncating it.
+    """
+    import ctypes
+    backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.replace-backup")
+    replace = ctypes.WinDLL("kernel32", use_last_error=True).ReplaceFileW
+    replace.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                        ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
+    replace.restype = ctypes.c_int
+    if not replace(str(target.resolve()), str(source.resolve()), str(backup.resolve()), 0, None, None):
+        failure = ctypes.WinError(ctypes.get_last_error())
+        if backup.exists() and not target.exists():
+            backup.replace(target)
+        # An ambiguous failure retains any backup for recovery.
+        raise failure
+    try:
+        backup.unlink(missing_ok=True)
+    except OSError:
+        pass  # Persistence succeeded; retain the protected backup if locked.
+
+
 def save_bytes(path: Path, value: bytes) -> None:
     """Persiste bytes completos por replace atômico no mesmo diretório."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +140,11 @@ def save_bytes(path: Path, value: bytes) -> None:
             try:
                 temporary.replace(path)
                 break
-            except PermissionError:
+            except PermissionError as exc:
+                if (sys.platform == "win32" and getattr(exc, "winerror", None) == 5
+                        and path.is_file() and not path.is_symlink()):
+                    _windows_replace_file(temporary, path)
+                    break
                 # Windows can briefly hold the destination during another replace.
                 if attempt == 4:
                     raise

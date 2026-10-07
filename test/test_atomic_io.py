@@ -1,14 +1,58 @@
 import tempfile
 import threading
 import unittest
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from moneymin.atomic_io import load_json, save_bytes, save_json
+from moneymin.atomic_io import load_json, save_bytes, save_json, _windows_replace_file
 
 
 class AtomicIOTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows file metadata contract')
+    def test_native_windows_replace_preserves_existing_named_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'state.json'
+            source = Path(directory) / 'replacement.tmp'
+            target.write_bytes(b'original')
+            stream = Path(str(target) + ':qmoney-test')
+            stream.write_bytes(b'preserved metadata')
+            source.write_bytes(b'replacement')
+            _windows_replace_file(source, target)
+            self.assertEqual(target.read_bytes(), b'replacement')
+            self.assertEqual(stream.read_bytes(), b'preserved metadata')
+            self.assertEqual(list(Path(directory).iterdir()), [target])
+
+    def test_windows_access_denied_uses_metadata_preserving_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            path.write_bytes(b'original')
+            denied = PermissionError('blocked replacement')
+            denied.winerror = 5
+            original = Path.replace
+            with patch('moneymin.atomic_io.sys.platform', 'win32'), \
+                 patch.object(Path, 'replace', side_effect=denied), \
+                 patch('moneymin.atomic_io._windows_replace_file', side_effect=lambda source, target: original(source, target)) as native:
+                save_bytes(path, b'replacement')
+            native.assert_called_once()
+            self.assertEqual(path.read_bytes(), b'replacement')
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_failed_native_replace_preserves_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            path.write_bytes(b'original')
+            denied = PermissionError('denied')
+            denied.winerror = 5
+            with patch('moneymin.atomic_io.sys.platform', 'win32'), \
+                 patch.object(Path, 'replace', side_effect=denied), \
+                 patch('moneymin.atomic_io._windows_replace_file', side_effect=denied):
+                with self.assertRaises(PermissionError):
+                    save_bytes(path, b'replacement')
+            self.assertEqual(path.read_bytes(), b'original')
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
     def test_disk_flush_failure_preserves_original(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
