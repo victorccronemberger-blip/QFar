@@ -76,6 +76,41 @@ class OnDemandCampaignTests(unittest.TestCase):
         self.cleanup.assert_not_called()
         self.prefetch.assert_not_called()
 
+    def test_transient_evaluation_reuses_receipt_and_continues_after_confirmation(self):
+        journals = []
+        events = []
+        def deliver(item, account, *args, **kwargs):
+            if item['clip_uid'] == 'one' and account is self.accounts[0]:
+                kwargs['session_cache'][account.email] = object()
+                journals.append({'session_id': 'existing-fixture', 'account_email': account.email,
+                    'org_key': account.org_key, 'task_id': self.task.task_id,
+                    'chunk_index': 0, 'expected_chunk_count': 1, 'upload_id': 'receipt-fixture',
+                    'state': 'quarantine', 'phase': 'evaluation_review', 'finalized': False,
+                    'finalize_requested': True, 'evaluation_required': True, 'evaluation_verified': False,
+                    'campaign_context': {'registry_key': item['registry_key'], 'clip_uid': 'one'},
+                    'error': 'Avaliação inconclusiva (HTTP -1); envio preservado para revisão.'})
+                return {'email': account.email, 'ok': False, 'session_id': 'existing-fixture',
+                        'uploads': ['receipt-fixture'], 'finalized': False}
+            return self.deliver(item, account)
+        def recover(session, **kwargs):
+            self.assertEqual(kwargs['session_ids'], {'existing-fixture'})
+            self.assertEqual(kwargs['account_email'], self.accounts[0].email)
+            journals[0].update(state='done', phase='done', finalized=True, evaluation_verified=True)
+            return journals
+        self.send.side_effect = deliver
+        with patch.object(campaign, 'list_sidecars', side_effect=lambda: journals), \
+             patch.object(campaign, 'pump_pending', side_effect=recover) as pump, \
+             patch.object(campaign, '_acknowledge_campaign_upload'):
+            result = campaign.run_campaign(self.cfg, progress=lambda k,p: events.append((k,p)))
+        self.assertEqual(result.status, 'done')
+        pump.assert_called_once()
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(self.send.call_count, 4)
+        self.assertEqual(self.cleanup.call_count, 2)
+        self.assertEqual(result.items[0]['accounts'][0]['session_id'], 'existing-fixture')
+        self.assertTrue(result.items[0]['accounts'][0]['evaluation_recovered'])
+        self.assertEqual(sum(k == 'account_evaluation_recovery' for k,p in events), 1)
+
     def test_restricted_account_leaves_survivor_running_and_does_not_retain_batch(self):
         def restricted(item, account, *args, **kwargs):
             if account is self.accounts[0]:
@@ -86,6 +121,22 @@ class OnDemandCampaignTests(unittest.TestCase):
         self.assertEqual(self.prepare.call_count, 2)
         self.assertEqual(self.cleanup.call_count, 2)
         self.assertEqual([call.args[1].email for call in self.send.call_args_list].count(self.accounts[0].email), 1)
+
+    def test_classified_pre_receipt_failure_keeps_other_accounts_running_without_banning(self):
+        events = []
+        def unavailable(item, account, *args, **kwargs):
+            if account is self.accounts[0]:
+                return {'email': account.email, 'ok': False, 'retryable': False, 'access_error': True,
+                        'error': 'PermissionError before send'}
+            return self.deliver(item, account)
+        self.send.side_effect = unavailable
+        log = campaign.run_campaign(self.cfg, progress=lambda k,p: events.append((k,p)))
+        self.assertEqual(log.status, 'partial')
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(self.cleanup.call_count, 2)
+        self.assertEqual([c.args[1].email for c in self.send.call_args_list].count(self.accounts[0].email), 1)
+        self.assertEqual(sum(k == 'account_deferred' for k,p in events), 1)
+        self.assertFalse(any(k == 'account_excluded' for k,p in events))
 
     def test_sensor_rejection_releases_unused_managed_item_before_next_candidate(self):
         def prepare(clip, *args, **kwargs):

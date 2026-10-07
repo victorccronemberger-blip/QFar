@@ -84,7 +84,7 @@ from .task_catalog import (
     TASK_TO_SCENARIO,
 )
 from .upload import UploadError, pump_pending, upload_session, list_sidecars, save_sidecar
-from .upload_types import journal_delivery_confirmed
+from .upload_types import journal_delivery_confirmed, is_pending_evaluation
 
 __all__ = [
     "AccountSpec",
@@ -2773,6 +2773,8 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
             )
     except (AuthError, UploadError) as exc:
         result["error"] = str(exc)
+        if isinstance(exc, AuthError):
+            result["access_error"] = True
         result["restriction_confirmed"] = getattr(exc, "account_issue_code", None) == "restricted"
         result["retryable"] = (exc.retryable if isinstance(exc, UploadError) else
                                getattr(exc, "account_issue_code", None) in {
@@ -3690,6 +3692,41 @@ def _run_campaign(
                     last_result["campaign_attempts"] = attempt
                     if last_result.get("ok"):
                         return last_result
+                    # The uploaded video already has a receipt. Retry only its
+                    # unavailable evaluation/finalization, never the send. Keep
+                    # one bounded recovery pass before the storage guard.
+                    sid = last_result.get("session_id")
+                    if (config.cleanup_after_upload and config.evaluate and config.finalize
+                            and sid and account.email in sessions
+                            and not (should_stop and should_stop())):
+                        try:
+                            owned = [row for row in list_sidecars()
+                                     if row.get("session_id") == sid]
+                            if owned and all(
+                                    row.get("account_email") == account.email
+                                    and row.get("org_key") == account.org_key
+                                    and row.get("task_id") == tsk.task_id
+                                    and row.get("evaluation_http_status") != 429
+                                    and "(HTTP 429)" not in str(row.get("error") or "")
+                                    and is_pending_evaluation(row) for row in owned):
+                                _emit("account_evaluation_recovery", email=account.email)
+                                def recovery_progress(phase: str, state: str, attempt: int,
+                                                      **details: Any) -> None:
+                                    _emit("account_progress", clip_uid=clip_info["clip_uid"],
+                                          task=tsk.scenario, email=account.email,
+                                          phase=phase, state=state, attempt=attempt, **details)
+                                pump_pending(sessions[account.email],
+                                    account_email=account.email, required_org_key=account.org_key,
+                                    session_ids={sid}, on_progress=recovery_progress)
+                                rows = [row for row in list_sidecars()
+                                        if row.get("session_id") == sid]
+                                recovered = _reconcile_uploads(rows, account, item, tsk.task_id)
+                                if recovered and recovered.get("ok"):
+                                    return {**last_result, **recovered, "evaluation_recovered": True}
+                        except Exception as exc:
+                            # Preserve the receipt and let the normal terminal
+                            # guard report the unresolved delivery. No new SID.
+                            _log(f"  recuperação da avaliação preservada ({type(exc).__name__})")
                     if last_result.get("restriction_confirmed") or _is_disabled_error(last_result.get("error")):
                         # Restrição confirmada não deve provocar novas tentativas.
                         return last_result
@@ -3791,6 +3828,15 @@ def _run_campaign(
                     sessions.pop(account.email, None)
                     acc_res["excluded_from_campaign"] = True
                     _emit("account_excluded", email=account.email)
+                elif (not ok and not config.require_all_accounts
+                      and acc_res.get("access_error") is True and not acc_res.get("session_id")
+                      and not acc_res.get("uploads")):
+                    # A classified failure before any receipt may leave this
+                    # campaign without archiving/banning the user's account.
+                    banned.add(account.email)
+                    sessions.pop(account.email, None)
+                    acc_res["excluded_from_campaign"] = True
+                    _emit("account_deferred", email=account.email, error=acc_res.get("error"))
                 if record_error is not None:
                     raise record_error
                 if config.cleanup_after_upload and config.unique_video and delivery_media:
@@ -3953,9 +3999,8 @@ def _run_campaign(
                 break
             retained_accounts = [a for a in pending_accounts
                                  if not account_results.get(a.email, {}).get("excluded_from_campaign")]
-            all_pending_succeeded = _all_pending_uploads_succeeded(
-                retained_accounts, account_results
-            )
+            all_pending_succeeded = not retained_accounts or _all_pending_uploads_succeeded(
+                retained_accounts, account_results)
             # Não espera tarefa de fundo: todas as variantes usadas por contas
             # bem-sucedidas já terminaram; o prefetch do próximo segue ativo.
             _stop_warm()

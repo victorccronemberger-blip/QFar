@@ -10,7 +10,7 @@ from .recovery_errors import RecoveryReadError
 from .media_lifecycle import media_state_lease
 from .operation_lease import OperationLeaseError
 from .campaign_state import campaign_state_operation
-from .upload_types import (is_pending_finalization, journal_delivery_confirmed,
+from .upload_types import (is_pending_finalization, is_pending_evaluation, journal_delivery_confirmed,
                            journal_evaluation_confirmed, journal_flags_valid)
 
 _UNREAD_PUBLICATION = object()
@@ -195,19 +195,20 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
             publication_index = read_publications()
         publication_pending = not publication_registered(rows, publication_index)
     resumable = (delivery_identity_valid and not confirmed and complete_group
-                 and all(row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
+                 and all((row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
+                          or is_pending_evaluation(row))
                          and (row.get("finalized") is not True or journal_delivery_confirmed(row))
                          and row.get("task_id") == first.get("task_id")
                          and row.get("campaign_context") == first.get("campaign_context")
                          for row in rows)
                  and any(row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS}
-                         or is_pending_finalization(row) for row in rows))
+                         or is_pending_finalization(row) or is_pending_evaluation(row) for row in rows))
     if resumable:
         for row in rows:
             if row.get("state") == "done" and row.get("finalized") is True:
                 continue
             if (row.get("state") not in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
-                    and not is_pending_finalization(row)):
+                    and not is_pending_finalization(row) and not is_pending_evaluation(row)):
                 continue
             try:
                 upload._pending_recovery_stage(row)
@@ -369,12 +370,13 @@ def reconcile_confirmed(*, refresh=True) -> dict:
 
 
 @campaign_state_operation
-def resume_account(email: str, resolve_org) -> dict:
+def resume_account(email: str, resolve_org, *, session_id: str | None = None) -> dict:
     """Resume only reviewed, existing sessions of one authenticated account."""
     selected = []
     for rows in _groups():
         item = _describe(rows)
-        if item and item["email"] == email and item["can_resume"]:
+        if (item and item["email"] == email and item["can_resume"]
+                and (session_id is None or item["session_id"] == session_id)):
             selected.append(rows)
     if not selected:
         raise ValueError("Nenhuma sessão desta conta permite retomada automática.")
@@ -412,12 +414,12 @@ class RecoveryRunner:
             self._state = {"state": "idle", "email": None, "error": None}
             self._thread = None
 
-    def start(self, email: str, resolve_org):
+    def start(self, email: str, resolve_org, *, session_id: str | None = None):
         with self._lock:
             if self._state["state"] == "running":
                 raise RuntimeError("Já existe uma recuperação em andamento.")
             self._state = {"state": "running", "email": email, "error": None}
-            self._thread = threading.Thread(target=self._run, args=(email, resolve_org), daemon=True)
+            self._thread = threading.Thread(target=self._run, args=(email, resolve_org, session_id), daemon=True)
             try:
                 self._thread.start()
             except Exception:
@@ -425,10 +427,12 @@ class RecoveryRunner:
                 self._state["error"] = "Não foi possível iniciar a recuperação."
                 raise
 
-    def _run(self, email, resolve_org):
+    def _run(self, email, resolve_org, session_id=None):
         try:
-            result = resume_account(email, resolve_org)
-            owned = [item for item in result['items'] if item['email'] == email]
+            result = (resume_account(email, resolve_org, session_id=session_id) if session_id is not None
+                      else resume_account(email, resolve_org))
+            owned = [item for item in result['items'] if item['email'] == email
+                     and (session_id is None or item['session_id'] == session_id)]
             remains = any(item['status'] != 'confirmed' or not item.get('index_reconciled') for item in owned)
             terminal = {"state": "pending" if remains else "done", "email": email, "error": None,
                         "result": {"reconciled": result.get("reconciled", 0),

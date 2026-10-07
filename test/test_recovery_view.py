@@ -33,6 +33,16 @@ class RecoveryViewTests(unittest.TestCase):
     def save(self, row=None, name="session1.json"):
         (self.journals / name).write_text(json.dumps(row or self.row), encoding="utf-8")
 
+    def test_legacy_transport_outage_offers_recovery_but_quality_rejection_does_not(self):
+        row = {**self.row, "state": "quarantine", "phase": "evaluation_review",
+               "finalized": False, "finalize_requested": True,
+               "evaluation_required": True, "evaluation_verified": False,
+               "error": "Avaliação inconclusiva (HTTP -1); envio preservado para revisão."}
+        self.save(row)
+        self.assertTrue(recovery.snapshot()['items'][0]['can_resume'])
+        self.save({**row, "error": "Avaliação reprovada: quality."})
+        self.assertFalse(recovery.snapshot()['items'][0]['can_resume'])
+
     def assert_history_pending(self, result, count=1):
         # An index ACK without its historical publication remains visible.
         self.assertEqual(len(result["items"]), count)
@@ -478,6 +488,18 @@ class RecoveryViewTests(unittest.TestCase):
         self.assertEqual(pump.call_args.kwargs["session_ids"], {"session1"})
         self.assertEqual(pump.call_args.kwargs["account_email"], "one@example.com")
 
+    def test_selected_session_does_not_resume_other_old_sessions_of_same_account(self):
+        pending = {**self.row, 'state': 'completing', 'phase': 'awaiting_finalize',
+                   'finalized': False, 'finalize_requested': True}
+        self.save(pending)
+        self.save({**pending, 'session_id': 'old-session', 'upload_id': 'old-receipt'}, 'old-session.json')
+        before = (self.journals / 'old-session.json').read_bytes()
+        with patch.object(recovery.campaign.Session, 'from_email', return_value=Mock()), \
+             patch.object(upload, 'pump_pending') as pump:
+            recovery.resume_account('one@example.com', lambda email: 'org', session_id='session1')
+        self.assertEqual(pump.call_args.kwargs['session_ids'], {'session1'})
+        self.assertEqual((self.journals / 'old-session.json').read_bytes(), before)
+
     def test_worker_keeps_failure_private_and_leaves_journals(self):
         self.save({**self.row, "state": "completing", "finalized": False})
         worker = recovery.RecoveryRunner()
@@ -504,7 +526,16 @@ class RecoveryViewTests(unittest.TestCase):
             self.assertEqual(client.post("/api/recovery/resume", json={"email": "unknown@example.com", "confirmed": True}).status_code, 400)
             worker.start.assert_not_called()
             self.assertEqual(client.post("/api/recovery/resume", json={"email": "one@example.com", "confirmed": True}).status_code, 202)
-        worker.start.assert_called_once_with("one@example.com", server._resolve_org)
+            worker.start.assert_called_once_with("one@example.com", server._resolve_org)
+            worker.start.reset_mock()
+            for sid in ('../foreign', True, None, '', 'unknown-session'):
+                response = client.post('/api/recovery/resume', json={
+                    'email': 'one@example.com', 'confirmed': True, 'session_id': sid})
+                self.assertIn(response.status_code, (400, 409))
+            worker.start.assert_not_called()
+            self.assertEqual(client.post('/api/recovery/resume', json={
+                'email': 'one@example.com', 'confirmed': True, 'session_id': 'session1'}).status_code, 202)
+        worker.start.assert_called_once_with("one@example.com", server._resolve_org, session_id='session1')
 
     def test_active_recovery_protects_media_and_reset(self):
         from moneymin.web import server

@@ -93,6 +93,7 @@ from .upload_types import (
     UploadError,
     UploadResult,
     is_pending_finalization,
+    is_pending_evaluation,
     journal_delivery_confirmed,
     journal_flags_valid,
 )
@@ -2032,7 +2033,19 @@ def evaluate_upload(session: Any, upload_id: str) -> dict[str, Any]:
     Retorna o EvaluationResult ({upload_id, checks:[...]}).
     Levanta UploadError se falhar (404, 429, etc.).
     """
-    status, text = session.request("POST", f"/api/v1/uploads/{upload_id}/evaluate")
+    def request_evaluation() -> tuple[int, str]:
+        # Evaluation reuses an accepted upload receipt. A transport outage is
+        # not a quality rejection and must not trigger a new video/session.
+        status, text = session.request("POST", f"/api/v1/uploads/{upload_id}/evaluate")
+        if status == -1 or status == 408 or 500 <= status <= 599:
+            raise UploadError(f"Avaliação não concluída (HTTP {status}).",
+                              status_code=status, transient=True, phase="evaluate")
+        # A 429 is returned to the caller without an immediate retry burst.
+        return status, text
+
+    (status, text), _attempts = _with_retry(
+        request_evaluation, max_retries=3, retry_delay=2.0,
+        retry_backoff=2.0, label="evaluate")
     if status != 200:
         raise UploadError(f"Avaliação não concluída (HTTP {status}).", status_code=status,
                           transient=(status == -1 or status in (408, 429) or status >= 500),
@@ -2685,9 +2698,16 @@ def upload_session(
             chunk.state = STATE_FAILED
             blocked.append(chunk)
         if blocked:
+            retryable_evaluation = all(
+                type((c.evaluate_result or {}).get("http_status")) is int
+                and ((c.evaluate_result or {})["http_status"] in {-1, 408, 429}
+                     or 500 <= (c.evaluate_result or {})["http_status"] <= 599)
+                for c in blocked)
             _update_persisted_journals(
                 state=STATE_QUARANTINE, phase="evaluation_review", finalized=False,
                 evaluation_required=True, evaluation_verified=False,
+                evaluation_http_status=((blocked[0].evaluate_result or {})["http_status"]
+                                        if retryable_evaluation else None),
                 error="; ".join(dict.fromkeys(c.error for c in blocked)))
             return result
 
@@ -2936,7 +2956,8 @@ def _pending_recovery_stage(item: dict[str, Any]) -> str:
     if has_id and phase in complete_phases:
         stage = "complete"
     elif has_id and item.get("finalize_requested") is True and (
-            phase in finalize_phases or is_pending_finalization(item)):
+            phase in finalize_phases or is_pending_finalization(item)
+            or is_pending_evaluation(item)):
         stage = "finalize"
     elif has_id and item.get("transport_artifact") == "sidecar" and phase in {
             "registered", "sas", "sas_ready", "sas_reminted", "transport", "sidecar_preflight"}:
@@ -2990,7 +3011,8 @@ def pump_pending(
     all_journals = list_sidecars()
     if state is None:
         pending = [s for s in all_journals if (isinstance(s.get("state"), str) and s.get("state") in TRANSIENT_STATES)
-                   or s.get("state") == STATE_LOSS or is_pending_finalization(s)]
+                   or s.get("state") == STATE_LOSS or is_pending_finalization(s)
+                   or is_pending_evaluation(s)]
     else:
         pending = [item for item in all_journals if item.get("state") == state]
     session_email = getattr(session, "email", None)
@@ -3062,11 +3084,11 @@ def pump_pending(
         try:
             if upload_id and sidecar.get("finalize_requested") is True and (
                     phase in {"awaiting_finalize", "finalize", "finalizing"}
-                    or is_pending_finalization(sidecar)):
+                    or is_pending_finalization(sidecar) or is_pending_evaluation(sidecar)):
                 # A crash can leave every completed chunk in done before the
                 # session-level checkpoint is written. Preserve its receipt
                 # and continue only evaluation/finalize, without local media.
-                if is_pending_finalization(sidecar):
+                if is_pending_finalization(sidecar) or is_pending_evaluation(sidecar):
                     sidecar.update(state=STATE_COMPLETING, phase="awaiting_finalize")
                     save_sidecar(sidecar)
                 updated.append(sidecar)
@@ -3267,7 +3289,8 @@ def pump_pending(
                                       transient=False, phase="evaluate")
             except UploadError as exc:
                 item.update(state=STATE_QUARANTINE, phase="evaluation_review", finalized=False,
-                            evaluation_required=True, evaluation_verified=False, error=str(exc))
+                            evaluation_required=True, evaluation_verified=False,
+                            evaluation_http_status=exc.status_code, error=str(exc))
                 evaluation_blocked = True
             else:
                 item.update(evaluation_required=True, evaluation_verified=True)

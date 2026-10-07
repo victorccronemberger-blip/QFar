@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 STATE_CREATING = "creating"
@@ -58,6 +59,36 @@ def is_pending_finalization(row: dict[str, Any]) -> bool:
             and row.get("phase") == "done" and row.get("finalize_requested") is True
             and row.get("finalized") is not True
             and isinstance(upload_id, str) and bool(upload_id.strip()))
+
+
+def is_pending_evaluation(row: dict[str, Any]) -> bool:
+    """Only a known receipt with an unavailable quality check can be retried.
+
+    Older desktop journals saved the exact generated outage diagnostic instead
+    of a status field. Rejected/malformed evaluations remain review-only.
+    Retrying this gate never authorizes a create/PUT or bypasses evaluation.
+    """
+    if (not journal_flags_valid(row) or row.get("state") != STATE_QUARANTINE
+            or row.get("phase") != "evaluation_review"
+            or row.get("finalize_requested") is not True
+            or row.get("finalized") is True
+            or row.get("evaluation_required") is not True
+            or row.get("evaluation_verified") is not False
+            or not isinstance(row.get("upload_id"), str)
+            or not row["upload_id"].strip()):
+        return False
+    upload_id = row["upload_id"]
+    if (upload_id in {".", ".."} or any(char.isspace() or ord(char) < 32
+            or ord(char) == 127 or char in "/\\?#%" for char in upload_id)):
+        return False
+    if "evaluation_http_status" in row:
+        status = row["evaluation_http_status"]
+    else:
+        match = re.fullmatch(
+            r"Avaliação inconclusiva \(HTTP (-1|408|429|5\d{2})\); envio preservado para revisão\.",
+            str(row.get("error") or ""))
+        status = int(match.group(1)) if match else None
+    return type(status) is int and (status in {-1, 408, 429} or 500 <= status <= 599)
 
 
 def journal_delivery_confirmed(row: dict[str, Any]) -> bool:

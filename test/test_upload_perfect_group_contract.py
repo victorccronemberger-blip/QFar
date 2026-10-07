@@ -92,7 +92,8 @@ class PerfectGroupContractTests(unittest.TestCase):
                     s,r,sid=self.send(statuses)
                     self.assertIs(r.finalized,False)
                     self.assertFalse(any(m=='DELETE' or p.endswith('/fail') for m,p,_ in s.calls))
-                    self.assertEqual(sum(p.endswith('/evaluate') for _,p,_ in s.calls),2)
+                    expected = 4 if unknown == 'outage' else 2
+                    self.assertEqual(sum(p.endswith('/evaluate') for _,p,_ in s.calls), expected)
                     for i in (0,1):
                         row=upload.load_sidecar(sid,i)
                         self.assertEqual(row['state'],upload.STATE_QUARANTINE)

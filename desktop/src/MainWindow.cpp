@@ -4354,6 +4354,11 @@ void MainWindow::openRecovery() {
   summary->setTextFormat(Qt::PlainText);
   summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
   layout->addWidget(summary);
+  auto* recoverySearch = new QLineEdit(dialog);
+  recoverySearch->setObjectName(QStringLiteral("recoverySearch"));
+  recoverySearch->setPlaceholderText(QStringLiteral("Buscar conta, clipe ou sessão"));
+  recoverySearch->setAccessibleName(QStringLiteral("Buscar registros de recuperação"));
+  layout->addWidget(recoverySearch);
   auto* table = new QTableWidget(0, 4);
   configureTable(table, QStringLiteral("Registros de recuperação"),
                  QStringLiteral("As sessões que ainda precisam de atenção aparecem aqui."));
@@ -4361,6 +4366,15 @@ void MainWindow::openRecovery() {
   table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
   table->setEditTriggers(QAbstractItemView::NoEditTriggers);
   layout->addWidget(table, 1);
+  const auto filterRecovery = [table, recoverySearch] {
+    for (int row = 0; row < table->rowCount(); ++row) {
+      bool match = recoverySearch->text().isEmpty();
+      for (int column = 0; column < table->columnCount(); ++column)
+        if (table->item(row, column) && table->item(row, column)->text().contains(recoverySearch->text(), Qt::CaseInsensitive)) match = true;
+      table->setRowHidden(row, !match);
+    }
+  };
+  connect(recoverySearch, &QLineEdit::textChanged, dialog, filterRecovery);
   auto* failed = card(QStringLiteral("Leitura não concluída"), quietLabel(QStringLiteral(
       "A lista não foi carregada. Ainda não foi possível confirmar quais envios precisam de atenção.\n\n"
       "Clique em Tentar novamente. Se o erro persistir, copie o diagnóstico para identificar a causa.\n\n"
@@ -4379,6 +4393,10 @@ void MainWindow::openRecovery() {
   auto* resume = new QPushButton(QStringLiteral("Retomar envios desta conta"), dialog);
   resume->setEnabled(false);
   resumeRow->addWidget(resume);
+  connect(table, &QTableWidget::itemSelectionChanged, dialog, [table, resume] {
+    resume->setText(table->selectedItems().isEmpty() ? QStringLiteral("Retomar envios desta conta")
+                    : QStringLiteral("Retomar sessão selecionada"));
+  });
   layout->addWidget(resumePanel);
   auto* poll = new QTimer(dialog);
   poll->setInterval(1500);
@@ -4400,7 +4418,7 @@ void MainWindow::openRecovery() {
   buttons->addWidget(reconcile);
   layout->addLayout(buttons);
   const QPointer<QDialog> guard(dialog);
-  const auto render = [this, guard, table, summary, reconcile, resume, resumeAccount, poll, retry, copyDiagnostic, failed, resumePanel, reconciliationHint](bool ok, const QJsonDocument& document, const QString& error) {
+  const auto render = [this, guard, table, summary, reconcile, resume, resumeAccount, poll, retry, copyDiagnostic, failed, resumePanel, reconciliationHint, filterRecovery](bool ok, const QJsonDocument& document, const QString& error) {
     if (!guard) return;
     retry->setEnabled(true);
     if (!ok) {
@@ -4451,6 +4469,7 @@ void MainWindow::openRecovery() {
       const QStringList values{item.value("email").toString(), item.value("clip_uid").toString(QStringLiteral("Não identificado")), item.value("session_id").toString(), status};
       for (int column = 0; column < values.size(); ++column) {
         auto* value = cell(values[column]);
+        value->setData(Qt::UserRole, item.value("can_resume").toBool());
         value->setToolTip(values[column] + QStringLiteral("\n") + item.value("detail").toString()
             + (item.value("blocks_campaign").toBool(true)
                ? QStringLiteral("\nBloqueia novas campanhas nesta conta até identificar o clipe.")
@@ -4458,6 +4477,7 @@ void MainWindow::openRecovery() {
         table->setItem(row, column, value);
       }
     }
+    filterRecovery();
     const int reconciliationPending = data.contains("reconciliation_pending") ? data.value("reconciliation_pending").toInt() : data.value("confirmed").toInt();
     const int publicationPending = data.value("publication_pending").toInt();
     summary->setText(QStringLiteral("%1 sessão(ões) pendente(s) · %2 confirmação(ões) para reconciliar")
@@ -4510,17 +4530,32 @@ void MainWindow::openRecovery() {
   connect(copyDiagnostic, &QPushButton::clicked, dialog, [guard] {
     if (guard) QApplication::clipboard()->setText(QString::fromUtf8(guard->property("recoveryDiagnostic").toByteArray()));
   });
-  connect(resume, &QPushButton::clicked, dialog, [this, guard, resume, resumeAccount, summary, refresh] {
-    const QString email = resumeAccount->currentText();
+  connect(resume, &QPushButton::clicked, dialog, [this, guard, table, resume, resumeAccount, summary, refresh] {
+    QString email = resumeAccount->currentText();
+    QString sessionId;
+    if (!table->selectedItems().isEmpty() && table->currentRow() >= 0) {
+      const auto* selected = table->item(table->currentRow(), 0);
+      const auto* session = table->item(table->currentRow(), 2);
+      if (!selected || !session || table->isRowHidden(table->currentRow())
+          || !selected->data(Qt::UserRole).toBool()) {
+        summary->setText(QStringLiteral("A sessão selecionada precisa de revisão e não será retomada automaticamente."));
+        return;
+      }
+      email = selected->text();
+      sessionId = session->text();
+    }
     if (email.isEmpty() || !guard || _campaignResetPending || _recoveryCommandPending) return;
     if (QMessageBox::question(guard, QStringLiteral("Retomar envios existentes"),
-        QStringLiteral("Retomar os envios interrompidos de %1? Esta ação pode transferir mídia pendente e concluir as sessões existentes no serviço.").arg(email),
+        (sessionId.isEmpty() ? QStringLiteral("Retomar os envios interrompidos de %1? Esta ação pode transferir mídia pendente e concluir as sessões existentes no serviço.").arg(email)
+         : QStringLiteral("Retomar somente a sessão %1 de %2? As demais sessões serão preservadas. Esta ação pode concluir o envio existente no serviço.").arg(sessionId, email)),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
     if (_campaignResetPending || _recoveryCommandPending) return;
     _recoveryCommandPending = true;
     updateCampaignActions();
     resume->setEnabled(false);
-    _api.post(QStringLiteral("/api/recovery/resume"), {{"email", email}, {"confirmed", true}},
+    QJsonObject request{{"email", email}, {"confirmed", true}};
+    if (!sessionId.isEmpty()) request.insert(QStringLiteral("session_id"), sessionId);
+    _api.post(QStringLiteral("/api/recovery/resume"), request,
               [this, guard, summary, resume, refresh](bool ok, const QJsonDocument&, const QString& error) {
       _recoveryCommandPending = false;
       updateCampaignActions();

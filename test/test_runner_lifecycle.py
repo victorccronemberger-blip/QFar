@@ -6,6 +6,22 @@ from moneymin.web import runner
 
 
 class CampaignErrorPresentationTests(unittest.TestCase):
+    def test_incomplete_batch_does_not_misclassify_as_video_preparation(self):
+        message = runner.friendly_campaign_error(
+            "RuntimeError: lote incompleto após todas as tentativas; a campanha "
+            "preservou a mídia e não adquiriu outro vídeo. Contas pendentes: "
+            "private@example.invalid: Avaliação inconclusiva (HTTP -1)")
+        self.assertIn("envio continua sem confirmação", message)
+        self.assertNotIn("preparar", message)
+        self.assertNotIn("private@example.invalid", message)
+        self.assertIn("Recuperação", message)
+
+    def test_evaluation_outage_is_distinct_from_access_and_preparation(self):
+        message = runner.friendly_campaign_error("Avaliação inconclusiva (HTTP -1)")
+        self.assertIn("avaliação", message)
+        self.assertIn("não deve ser removida", message)
+        self.assertNotIn("preparar", message)
+
     def test_terminal_cleanup_error_never_promises_continuation_or_blames_accounts(self):
         message = runner.friendly_campaign_error('Mídia reservada para envio anterior ou limpeza incompleta; a campanha não adquiriu outro vídeo.')
         self.assertIn('campanha parou', message)

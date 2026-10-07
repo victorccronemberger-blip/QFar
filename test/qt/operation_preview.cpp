@@ -625,6 +625,154 @@ public:
     });
     timer->start(25); QTimer::singleShot(10000,&window,[] { qApp->exit(109); });
   }
+  static void campaignEvaluationResumeSmoke(MainWindow& window) {
+    struct Flow { int reads=0; int recoveryReads=0; int resumeRequests=0; bool terminal=false; bool wrongResume=false; int phase=0; };
+    auto flow = std::make_shared<Flow>();
+    auto* server = new QTcpServer(&window);
+    if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(220); return; }
+    QObject::connect(server, &QTcpServer::newConnection, server, [server, flow] {
+      auto* socket = server->nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, flow] {
+        const auto input = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", input);
+        const int headerEnd = input.indexOf("\r\n\r\n");
+        if (headerEnd < 0 || socket->property("answered").toBool()) return;
+        const auto length = QRegularExpression(QStringLiteral("Content-Length: (\\d+)"),
+            QRegularExpression::CaseInsensitiveOption).match(QString::fromLatin1(input.left(headerEnd)));
+        if (length.hasMatch() && input.size() < headerEnd + 4 + length.captured(1).toInt()) return;
+        socket->setProperty("answered", true);
+        QJsonObject payload;
+        if (input.startsWith("GET /api/campaigns/current")) {
+          ++flow->reads;
+          if (!flow->terminal) {
+            payload = QJsonObject{
+              {"state", "running"}, {"stage", "Retomando avaliação"},
+              {"current", "Retomando avaliação do lote existente; aguardando confirmação do serviço."},
+              {"pause_requested", false},
+              {"totals", QJsonObject{{"total_sends", 1}, {"ok_sends", 0}, {"failed_sends", 0}}},
+              {"operation", QJsonObject{
+                {"accounts", QJsonArray{QJsonObject{{"email", "fixture@example.invalid"},
+                  {"state", "recovering"}, {"detail", "Retomando avaliação do envio existente."}}}},
+                {"counts", QJsonObject{{"recovering", 1}}}}},
+              {"events", QJsonArray{}}};
+          } else {
+            payload = QJsonObject{
+              {"state", "error"}, {"stage", "Lote não confirmado"},
+              {"current", "Lote não confirmado; a avaliação não confirmou a conclusão dos envios."},
+              {"pause_requested", false},
+              {"totals", QJsonObject{{"total_sends", 1}, {"ok_sends", 0}, {"failed_sends", 1}}},
+              {"operation", QJsonObject{
+                {"accounts", QJsonArray{QJsonObject{{"email", "fixture@example.invalid"},
+                  {"state", "unconfirmed"}, {"failed", 1},
+                  {"detail", "A avaliação do lote não confirmou os envios."}}}},
+                {"counts", QJsonObject{{"unconfirmed", 1}}}}},
+              {"events", QJsonArray{}}};
+          }
+        } else if (input.startsWith("GET /api/recovery?async=1")) {
+          ++flow->recoveryReads;
+          payload = QJsonObject{{"pending", 2}, {"confirmed", 0},
+            {"items", QJsonArray{
+              QJsonObject{{"email", "fixture@example.invalid"}, {"clip_uid", "clip-keep"},
+                {"session_id", "session-keep-001"}, {"status", "pending"}, {"can_resume", true},
+                {"detail", "Outra sessão preservada para recuperação."}},
+              QJsonObject{{"email", "fixture@example.invalid"}, {"clip_uid", "clip-selected"},
+                {"session_id", "session-selected-002"}, {"status", "pending"}, {"can_resume", true},
+                {"detail", "Sessão escolhida para retomada."}}}},
+            {"worker", QJsonObject{{"state", "idle"}}}};
+        } else if (input.startsWith("POST /api/recovery/resume ")) {
+          ++flow->resumeRequests;
+          const auto requestBody = QJsonDocument::fromJson(input.mid(headerEnd + 4)).object();
+          flow->wrongResume = requestBody.value("email") != QStringLiteral("fixture@example.invalid")
+              || requestBody.value("session_id") != QStringLiteral("session-selected-002")
+              || requestBody.value("confirmed") != QJsonValue(true);
+          payload = QJsonObject{{"ok", true}};
+        } else { qCritical() << "Unexpected campaign evaluation QA request" << input.left(input.indexOf('\r')); qApp->exit(221); return; }
+        const auto body = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+            + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+    page(window, 3);
+    window._taskReload.stop();
+    {
+      const QSignalBlocker accounts(window._campaignAccounts), tasks(window._campaignTasks);
+      auto* account = new QListWidgetItem(QStringLiteral("fixture@example.invalid"), window._campaignAccounts);
+      account->setData(Qt::UserRole, QStringLiteral("fixture@example.invalid"));
+      account->setCheckState(Qt::Checked);
+      auto* task = new QListWidgetItem(QStringLiteral("Fixture"), window._campaignTasks);
+      task->setData(Qt::UserRole, QStringLiteral("fixture-task"));
+      task->setCheckState(Qt::Checked);
+    }
+    window._campaignActive = false;
+    window._campaignStart->setText(QStringLiteral("Iniciar campanha"));
+    window.updateCampaignActions();
+    auto phase = std::make_shared<int>(0);
+    auto* poll = new QTimer(&window);
+    QObject::connect(poll, &QTimer::timeout, &window, [&window, flow, phase, poll] {
+      if (*phase == 0 && flow->reads == 1 && window._campaignStage->text() == QStringLiteral("Retomando avaliação")) {
+        const auto visible = window._campaignStage->text() + window._campaignCurrent->text()
+            + window._campaignIndicatorTitle->text() + window._campaignIndicatorDetail->text()
+            + window._campaignProgress->format() + window._campaignIndicatorMetric->text();
+        if (!window._campaignStop->isEnabled() || window._campaignStart->isEnabled()) { qApp->exit(222); return; }
+        if (visible.contains(QStringLiteral("h confirmadas"), Qt::CaseInsensitive)
+            || visible.contains(QStringLiteral("hora"), Qt::CaseInsensitive)
+            || visible.contains(QStringLiteral("preparo"), Qt::CaseInsensitive)
+            || visible.contains(QStringLiteral("preparação"), Qt::CaseInsensitive)) { qApp->exit(223); return; }
+        if (!window._campaignCurrent->text().contains(QStringLiteral("Retomando avaliação"))) { qApp->exit(224); return; }
+        flow->terminal = true;
+        *phase = 1;
+        window.pollCampaign();
+      } else if (*phase == 1 && flow->reads == 2 && window._campaignStage->text() == QStringLiteral("Lote não confirmado")) {
+        const auto visible = window._campaignStage->text() + window._campaignCurrent->text()
+            + window._campaignIndicatorTitle->text() + window._campaignIndicatorDetail->text()
+            + window._campaignProgress->format() + window._campaignIndicatorMetric->text();
+        if (window._campaignStop->isEnabled() || !window._campaignStart->isEnabled()
+            || window._campaignStart->text() != QStringLiteral("Iniciar campanha")) { qApp->exit(225); return; }
+        if (!window._campaignCurrent->text().contains(QStringLiteral("não confirmou"))
+            || !window._campaignStats->text().contains(QStringLiteral("1 falhas"))) { qApp->exit(226); return; }
+        if (visible.contains(QStringLiteral("h confirmadas"), Qt::CaseInsensitive)
+            || visible.contains(QStringLiteral("hora"), Qt::CaseInsensitive)
+            || visible.contains(QStringLiteral("preparo"), Qt::CaseInsensitive)
+            || visible.contains(QStringLiteral("preparação"), Qt::CaseInsensitive)) { qApp->exit(227); return; }
+        *phase = 2;
+        window.openRecovery();
+      } else if (*phase == 2 && flow->recoveryReads > 0) {
+        for (auto* dialog : window.findChildren<QDialog*>()) {
+          if (dialog->windowTitle() != QStringLiteral("Recuperação de envios")) continue;
+          auto* table = dialog->findChild<QTableWidget*>();
+          auto* search = dialog->findChild<QLineEdit*>(QStringLiteral("recoverySearch"));
+          QPushButton* resume = nullptr;
+          for (auto* button : dialog->findChildren<QPushButton*>())
+            if (button->text().startsWith(QStringLiteral("Retomar"))) resume = button;
+          if (!table || !search || !resume || table->rowCount() != 2 || !resume->isEnabled()) continue;
+          search->setText(QStringLiteral("session-selected-002"));
+          table->setCurrentCell(1, 0);
+          table->selectRow(1);
+          if (table->isRowHidden(1) || !table->isRowHidden(0)
+              || resume->text() != QStringLiteral("Retomar sessão selecionada")) { qApp->exit(229); return; }
+          *phase = 3;
+          QTimer::singleShot(100, dialog, [&window] {
+            for (auto* message : window.findChildren<QMessageBox*>())
+              if (message->windowTitle() == QStringLiteral("Retomar envios existentes")) {
+                if (auto* yes = message->button(QMessageBox::Yes)) yes->click();
+              }
+          });
+          resume->click();
+          return;
+        }
+      } else if (*phase == 3 && flow->resumeRequests == 1) {
+        poll->stop();
+        qApp->exit(flow->wrongResume ? 230 : 0);
+      }
+    });
+    poll->start(20);
+    window.pollCampaign();
+    QTimer::singleShot(8000, &window, [] { qApp->exit(228); });
+  }
   static void acceleratorSmoke(MainWindow& window) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(90); return; }
@@ -1649,6 +1797,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--campaign-controls-smoke") || app.arguments().contains("--campaign-controls-manual")) {
     QTimer::singleShot(100,&window,[&window] { OperationPreview::campaignControlsSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--campaign-evaluation-resume-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignEvaluationResumeSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--accelerator-smoke")) {

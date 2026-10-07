@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from moneymin import upload
+from moneymin import upload, config
+from moneymin.upload_types import is_pending_evaluation
 from moneymin.minute_api import _auth_failure
 from moneymin.web.account_issues import account_issue
 
@@ -37,6 +38,41 @@ class EvaluationContractTests(unittest.TestCase):
                     upload.evaluate_upload(session, "u")
         session.request.return_value = (200, json.dumps(self.evaluation()))
         self.assertEqual(upload.evaluate_upload(session, "u"), self.evaluation())
+
+    def test_transport_outage_retries_only_the_existing_upload(self):
+        session = Mock()
+        session.request.side_effect = [(-1, "transport failure"),
+                                       (503, "unavailable"),
+                                       (200, json.dumps(self.evaluation()))]
+        with patch.object(upload.time, "sleep") as sleep:
+            self.assertEqual(upload.evaluate_upload(session, "u"), self.evaluation())
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(session.request.call_count, 3)
+        for request in session.request.call_args_list:
+            self.assertEqual(request.args, ("POST", "/api/v1/uploads/u/evaluate"))
+
+    def test_persistent_outage_is_bounded_and_not_quality_approval(self):
+        session = Mock()
+        session.request.return_value = (-1, "transport failure")
+        with patch.object(upload.time, "sleep") as sleep:
+            with self.assertRaises(upload.UploadError) as raised:
+                upload.evaluate_upload(session, "u")
+        self.assertEqual(raised.exception.status_code, -1)
+        self.assertEqual(raised.exception.attempts, 3)
+        self.assertEqual(session.request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_rejection_rate_limit_and_malformed_reply_are_not_retried(self):
+        for response in [(401, "denied"), (429, "slow down"),
+                         (200, "invalid"), (200, json.dumps(self.evaluation(uid="other")))]:
+            with self.subTest(response=response):
+                session = Mock()
+                session.request.return_value = response
+                with patch.object(upload.time, "sleep") as sleep:
+                    with self.assertRaises(upload.UploadError):
+                        upload.evaluate_upload(session, "u")
+                self.assertEqual(session.request.call_count, 1)
+                sleep.assert_not_called()
 
 
 class SessionQualityGateTests(unittest.TestCase):
@@ -120,6 +156,57 @@ class DisabledAccessDiagnosticTests(unittest.TestCase):
         self.assertEqual(_auth_failure(503, 'User account is disabled.', "Profile").account_issue_code, "service")
 
 class RecoveryQualityGateTests(unittest.TestCase):
+    def test_unavailable_evaluation_can_resume_but_rejection_and_ambiguous_journals_cannot(self):
+        row = {'session_id': 's', 'account_email': 'a@example.com', 'org_key': 'org',
+               'chunk_index': 0, 'expected_chunk_count': 1, 'upload_id': 'u',
+               'state': upload.STATE_QUARANTINE, 'phase': 'evaluation_review',
+               'finalize_requested': True, 'finalized': False,
+               'evaluation_required': True, 'evaluation_verified': False,
+               'error': 'Avaliação inconclusiva (HTTP -1); envio preservado para revisão.'}
+        self.assertTrue(is_pending_evaluation(row))
+        for changes in ({'error': 'Avaliação reprovada: quality.'}, {'error': 'HTTP -1'},
+                        {'upload_id': ''}, {'upload_id': '../other'}, {'upload_id': 'u?secret'},
+                        {'upload_id': 'u%2fother'}, {'upload_id': 'u\n'},
+                        {'finalize_requested': False}, {'finalized': True},
+                        {'evaluation_verified': 'false'}, {'phase': 'quality_rejected'},
+                        {'evaluation_http_status': None}, {'evaluation_http_status': True},
+                        {'evaluation_http_status': 400}, {'evaluation_http_status': '503'}):
+            with self.subTest(changes=changes):
+                self.assertFalse(is_pending_evaluation({**row, **changes}))
+
+    def test_real_persisted_outage_resumes_evaluation_without_create_or_put(self):
+        with tempfile.TemporaryDirectory(prefix='qmoney-evaluation-recovery-') as root, ExitStack() as stack:
+            stack.enter_context(patch.object(config, 'DATA_DIR', Path(root) / 'state'))
+            path = Path(root) / 'inert.mp4'
+            path.write_bytes(b'fixture')
+            session = SimpleNamespace(email='a@example.invalid', request=Mock(
+                return_value=(-1, 'unavailable')))
+            stack.enter_context(patch.object(upload, '_probe_duration_ms', return_value=1000))
+            transport = stack.enter_context(patch.object(upload, '_upload_single_chunk', return_value=
+                upload.ChunkResult('existing-receipt', 0, 'fixed-session_0', 'inert-blob', 7, 1000)))
+            finalize = stack.enter_context(patch.object(upload, '_finalize_session', return_value=(True, 204)))
+            stack.enter_context(patch.object(upload.time, 'sleep'))
+            result = upload.upload_session(session, path, 'org', session_id='fixed-session',
+                evaluate=True, normalize=False, sidecar=False, persist_sidecar=True)
+            self.assertFalse(result.finalized)
+            finalize.assert_not_called()
+            saved = upload.load_sidecar('fixed-session', 0)
+            self.assertTrue(is_pending_evaluation(saved))
+            self.assertEqual(saved['evaluation_http_status'], -1)
+            session.request.return_value = (200, json.dumps({'upload_id': 'existing-receipt',
+                'checks': [{'id': 'quality', 'label': 'Quality', 'status': 'pass', 'detail': None}]}))
+            upload.pump_pending(session, account_email=session.email, required_org_key='org',
+                                session_ids={'fixed-session'})
+            recovered = upload.load_sidecar('fixed-session', 0)
+            self.assertTrue(upload.journal_delivery_confirmed(recovered))
+            self.assertEqual(recovered['upload_id'], 'existing-receipt')
+            self.assertEqual(recovered['session_id'], 'fixed-session')
+            self.assertEqual(transport.call_count, 1)
+            finalize.assert_called_once_with(session, 'org', 'fixed-session', 1)
+            self.assertTrue(path.exists())
+            for request in session.request.call_args_list:
+                self.assertEqual(request.args, ('POST', '/api/v1/uploads/existing-receipt/evaluate'))
+
     def run_recovery(self, evaluation, phase='awaiting_finalize', required=True, verified=False):
         journal = {'session_id': 's', 'account_email': 'a@example.com', 'org_key': 'org',
                    'chunk_index': 0, 'expected_chunk_count': 1, 'upload_id': 'u',

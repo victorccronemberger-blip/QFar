@@ -5417,6 +5417,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
     def resume_recovery():
         body = request.get_json(silent=True) or {}
         email = body.get("email")
+        session_id = body.get("session_id")
+        if "session_id" in body and (not isinstance(session_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{1,160}", session_id) is None):
+            return jsonify({"error": "Selecione uma sessão de recuperação válida."}), 400
         if body.get("confirmed") is not True or not isinstance(email, str) or not email:
             return jsonify({"error": "Confirme a conta e a retomada dos envios existentes."}), 400
         with _HEAVY_RUNNER_LOCK:
@@ -5427,9 +5431,14 @@ def create_app(*, for_testing: bool = False) -> Flask:
             try:
                 if email not in {account["email"] for account in _list_accounts()}:
                     return jsonify({"error": "Conecte novamente essa conta antes de retomar."}), 400
-                if not any(item["email"] == email and item["can_resume"] for item in recovery.snapshot()["items"]):
+                if not any(item["email"] == email and item["can_resume"]
+                           and (session_id is None or item["session_id"] == session_id)
+                           for item in recovery.snapshot()["items"]):
                     return jsonify({"error": "Nenhuma sessão desta conta permite retomada automática; revise o histórico."}), 409
-                RECOVERY.start(email, _resolve_org)
+                if session_id is None:
+                    RECOVERY.start(email, _resolve_org)
+                else:
+                    RECOVERY.start(email, _resolve_org, session_id=session_id)
             except (ValueError, OSError, RuntimeError):
                 return jsonify({"error": "Não foi possível iniciar a recuperação. Os registros foram preservados."}), 409
         return jsonify({"worker": RECOVERY.snapshot()}), 202

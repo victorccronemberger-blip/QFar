@@ -43,6 +43,14 @@ def friendly_campaign_error(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return "O QMoney não conseguiu concluir esta etapa. Tente novamente."
+    if "lote incompleto após todas as tentativas" in text:
+        return ("A campanha parou porque um envio continua sem confirmação. "
+                "Os envios concluídos e a mídia pendente foram preservados. "
+                "Confira Recuperação de envios e o diagnóstico no Histórico.")
+    if "avaliação inconclusiva" in text or "avaliação não concluída" in text:
+        return ("O Minute não confirmou a avaliação deste envio. O recibo e o vídeo "
+                "foram preservados; confira Recuperação de envios. A conta não deve "
+                "ser removida por este diagnóstico.")
     if "mídia reservada para envio anterior" in text or "limpeza incompleta" in text:
         return ("Os envios confirmados foram preservados. A campanha parou porque "
                 "há mídia protegida por registros anteriores ou uma falha na limpeza. "
@@ -263,6 +271,12 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             "level": "error", "stage": "Envio", "title": "Lote incompleto",
             "detail": "Uma ou mais contas não concluíram o envio; o vídeo foi preservado.",
         }
+    if kind == "account_evaluation_recovery":
+        return {"level": "warning", "stage": "Avaliação", "title": "Retomando avaliação",
+                "detail": f"{email} · conferindo o mesmo recibo, sem reenviar o vídeo"}
+    if kind == "account_deferred":
+        return {"level": "warning", "stage": "Acesso", "title": "Conta fora desta execução",
+                "detail": f"{email} · falhou antes do envio; as demais contas continuam. O cadastro foi preservado."}
     if kind == "storage_cleanup":
         files = int(payload.get("files") or 0)
         mib = float(payload.get("bytes") or 0) / (1024 ** 2)
