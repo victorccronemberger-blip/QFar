@@ -102,6 +102,61 @@ class NymeriaLibraryTests(unittest.TestCase):
             return Response(data[offset:end + 1], 206, {"Content-Range": f"bytes {offset}-{end}/{len(data)}"})
         return Response(data)
 
+    def test_portable_setup_imports_all_sequences_without_network_or_inventory(self):
+        self.add_sequence("sequence_two")
+        portable = Path(self.temporary.name) / "portable app"
+        portable.mkdir()
+        companion = portable / "nymeria_plus_download_urls.json"
+        companion.write_text(json.dumps(self.catalog), "utf8")
+        fresh = Path(self.temporary.name) / "different customer library"
+        with patch.object(library, "summary", side_effect=AssertionError("startup must stay light")):
+            result = library.initialize_portable_catalog(portable, fresh)
+        self.assertEqual(result["state"], "imported")
+        self.assertEqual(result["sequence_count"], 2)
+        self.assertEqual(set(library._load(fresh)["sequences"]), {"sequence_one", "sequence_two"})
+        self.assertEqual(self.calls, [])
+        companion.unlink()
+        self.assertEqual(library.initialize_portable_catalog(portable, fresh)["state"], "preserved")
+
+    def test_portable_setup_never_replaces_manual_or_damaged_existing_catalog(self):
+        portable = Path(self.temporary.name) / "portable"
+        portable.mkdir()
+        (portable / "nymeria_plus_download_urls.json").write_text("not-valid-json", "utf8")
+        existing = self.root / "_catalog/download_urls.json"
+        for raw in (existing.read_bytes(), b"damaged-customer-catalog"):
+            existing.write_bytes(raw)
+            self.assertEqual(library.initialize_portable_catalog(portable, self.root)["state"], "preserved")
+            self.assertEqual(existing.read_bytes(), raw)
+
+    def test_portable_setup_invalid_companion_does_not_create_catalog_or_leak_input(self):
+        portable = Path(self.temporary.name) / "portable"
+        portable.mkdir()
+        fresh = Path(self.temporary.name) / "fresh"
+        companion = portable / "nymeria_plus_download_urls.json"
+        for raw in ("private-signed-url-not-json", '{"sequences": []}'):
+            companion.write_text(raw, "utf8")
+            result = library.initialize_portable_catalog(portable, fresh)
+            self.assertEqual(result["state"], "error")
+            self.assertNotIn("private-signed-url", str(result))
+            self.assertFalse((fresh / "_catalog/download_urls.json").exists())
+
+    def test_portable_setup_rejects_oversized_companion_and_can_retry_after_repair(self):
+        portable = Path(self.temporary.name) / "portable"
+        portable.mkdir()
+        fresh = Path(self.temporary.name) / "fresh"
+        companion = portable / "nymeria_plus_download_urls.json"
+        with companion.open("wb") as stream:
+            stream.truncate(32 * 1024 * 1024 + 1)
+        self.assertEqual(library.initialize_portable_catalog(portable, fresh)["state"], "error")
+        companion.write_text(json.dumps(self.catalog), "utf8")
+        self.assertEqual(library.initialize_portable_catalog(portable, fresh)["state"], "imported")
+
+    def test_missing_portable_setup_does_not_scan_user_directories_or_create_library(self):
+        fresh = Path(self.temporary.name) / "fresh"
+        self.assertEqual(library.initialize_portable_catalog(None, fresh), {"state": "not_supplied"})
+        self.assertEqual(library.initialize_portable_catalog(self.temporary.name, fresh), {"state": "not_supplied"})
+        self.assertFalse(fresh.exists())
+
     def test_entire_catalog_is_imported_and_annotation_only_never_ready(self):
         self.add_sequence("sequence_two")
         self.add_sequence("sequence_empty", empty=True)

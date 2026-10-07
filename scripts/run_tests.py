@@ -121,7 +121,7 @@ def main() -> int:
         for name in ("aws-credentials", "aws-config", "boto-config"):
             (root / name).write_text("", encoding="utf-8")
         private_prefixes = ("QMONEY_", "MINUTE_", "AWS_", "HOSTINGER_", "EGO4D_",
-                            "CROWTADO_", "CLARU_")
+                            "CROWTADO_", "CLARU_", "NYMERIA_")
         excluded_keys = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                          "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
                          "GOOGLE_APPLICATION_CREDENTIALS", "BOTO_CONFIG",

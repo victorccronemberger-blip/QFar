@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 
 
 class _ProbeProcess:
@@ -178,7 +182,7 @@ class _ProbeProcess:
             self._job = None
 
 
-def probe(service: Path, user_root: Path, library: Path, expected: list[str], *, test_manifest=False) -> None:
+def probe(service: Path, user_root: Path, library: Path, expected: list[str], *, test_manifest=False, portable_setup=False) -> None:
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
@@ -194,6 +198,31 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str], *,
                        AWS_SHARED_CREDENTIALS_FILE=str(user_root / "secrets/aws/credentials"),
                        AWS_CONFIG_FILE=str(user_root / "secrets/aws/config"), AWS_EC2_METADATA_DISABLED="true")
     user_root.mkdir(parents=True, exist_ok=True)
+    if portable_setup:
+        # Companion supplied privately beside a relocated app. Only the small
+        # verified source catalog is seeded; acquiring VRS would hit an inert
+        # fixture URL and fail this check. No external Python/SDK is available.
+        portable_app = user_root / "relocated app"
+        portable_app.mkdir()
+        groups = {}
+        annotation_zip = io.BytesIO()
+        with zipfile.ZipFile(annotation_zip, "w") as bundle:
+            bundle.writestr("narration/atomic_action.csv", "start_time,end_time,Describe my atomic actions\n")
+        for name, data in {
+                "metadata_json": b'{"uid":"native_setup","head_duration_sec":600}',
+                "narration": annotation_zip.getvalue(),
+                "timesync_and_imu": b"unacquired-real-IMU-required",
+                "recording_head_data_data_vrs": b"unacquired-real-VRS-required"}.items():
+            groups[name] = {"filename": name + ".zip", "sha1sum": hashlib.sha1(data).hexdigest(),
+                            "file_size_bytes": len(data), "download_url": "https://fixture.fbcdn.net/" + name + ".zip"}
+            if name in {"metadata_json", "narration"}:
+                target = (library / "data/nymeria/native_setup/metadata.json" if name == "metadata_json"
+                          else library / "data/nymeria/_catalog/archives/native_setup/narration.zip")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        (portable_app / "nymeria_plus_download_urls.json").write_text(
+            json.dumps({"sequences": {"native_setup": groups}}), encoding="utf8")
+        environment["QMONEY_PORTABLE_ROOT"] = str(portable_app)
     process = _ProbeProcess([str(service), "--no-browser", "--host", "127.0.0.1", "--porta", str(port),
                              "--parent-pid", str(os.getpid())], cwd=user_root, env=environment)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -238,12 +267,27 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str], *,
         assert checks['Biblioteca Nymeria']['status'] == 'error'
         assert nymeria['ready'] is False
         source_catalog = get('/api/library/nymeria/sequences')
-        assert source_catalog['total'] == 0
+        assert source_catalog['total'] == (1 if portable_setup else 0)
         assert len(source_catalog['task_names']) == 49
         assert 'Furniture Assembly' in source_catalog['task_names']
         assert 'Gardening' not in source_catalog['task_names']
         assert source_catalog['task_catalog_source'] == 'local_snapshot_requires_campaign_preflight'
-        assert source_catalog['worker']['running'] is False
+        if portable_setup:
+            setup_deadline = time.monotonic() + 15
+            while source_catalog['worker']['running']:
+                assert get('/api/health')['ok'] is True
+                if time.monotonic() >= setup_deadline:
+                    raise RuntimeError('Native portable catalog setup did not finish')
+                time.sleep(.1)
+                source_catalog = get('/api/library/nymeria/sequences')
+            assert source_catalog['setup']['state'] == 'imported'
+            assert source_catalog['worker']['state'] == 'done'
+            assert source_catalog['worker']['result']['sync']['errors'] == {}
+            assert source_catalog['summary']['by_state']['downloaded'] == 0
+            assert not (library / 'data/nymeria/native_setup/recording_head/data/data.vrs').exists()
+            assert not (library / 'data/nymeria/native_setup/recording_head/data/motion.vrs').exists()
+        else:
+            assert source_catalog['worker']['running'] is False
         try:
             get('/api/library/nymeria/sequences', authenticated=False)
             raise AssertionError('Unauthenticated Nymeria source inventory was accepted')
@@ -375,6 +419,9 @@ def main() -> None:
         probe(service, customer, library, ["fixture@example.invalid"])
         assert credentials.read_bytes() == original
         probe(service, root / "customer-b", library, [], test_manifest=True)
+        portable_library = root / "relocated-library"
+        shutil.copytree(library, portable_library, ignore=shutil.ignore_patterns('_catalog'))
+        probe(service, root / "customer-c", portable_library, [], portable_setup=True)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"passed": True, "checks": ["fresh_installation", "restart_preserves_credentials",
         "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started",
@@ -384,7 +431,9 @@ def main() -> None:
         "nymeria_sdk_core_device_time", "nymeria_metadata_only_not_ready",
         "nymeria_source_catalog_and_packaged_current_tasks", "nymeria_source_catalog_authentication",
         "nymeria_manifest_import_without_external_python_or_sdk",
-        "full_campaign_reset_preserves_credentials_and_library"]}, indent=2), encoding="utf-8")
+        "full_campaign_reset_preserves_credentials_and_library",
+        "native_private_manifest_bootstrap_in_relocated_library",
+        "native_catalog_setup_acquires_no_vrs_or_imu"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 
 

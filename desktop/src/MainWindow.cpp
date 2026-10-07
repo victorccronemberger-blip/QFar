@@ -11,6 +11,7 @@
 #include "OriginalCaptureDialog.hpp"
 #include "OwnedServiceProcesses.hpp"
 #include "LibraryRootSelection.hpp"
+#include "PackagedServiceEnvironment.hpp"
 #include <QMenu>
 #include <QWidgetAction>
 #include <QPointer>
@@ -4010,20 +4011,14 @@ void MainWindow::startBackend() {
     const QString libraryRoot = selectLibraryRoot(savedLibrary, appDir, workingDirectory);
     QDir().mkpath(workingDirectory);
     // Contas e segredos pertencem ao usuário Windows, nunca à biblioteca.
-    for (const QString& key : environment.keys()) {
-      if (key.startsWith(QStringLiteral("AWS_"), Qt::CaseInsensitive) ||
-          key.startsWith(QStringLiteral("HOSTINGER_"), Qt::CaseInsensitive) ||
-          key.startsWith(QStringLiteral("MINUTE_"), Qt::CaseInsensitive) ||
-          key.startsWith(QStringLiteral("EGO4D_"), Qt::CaseInsensitive) ||
-          key.startsWith(QStringLiteral("CROWTADO_"), Qt::CaseInsensitive))
-        environment.remove(key);
-    }
+    environment = packagedServiceEnvironment(environment);
     environment.insert(QStringLiteral("QMONEY_USER_ROOT"), workingDirectory);
     environment.insert(QStringLiteral("AWS_SHARED_CREDENTIALS_FILE"), workingDirectory + QStringLiteral("/secrets/aws/credentials"));
     environment.insert(QStringLiteral("AWS_CONFIG_FILE"), workingDirectory + QStringLiteral("/secrets/aws/config"));
     environment.insert(QStringLiteral("AWS_EC2_METADATA_DISABLED"), QStringLiteral("true"));
     environment.insert(QStringLiteral("QMONEY_LIBRARY_ROOT"), libraryRoot);
     environment.insert(QStringLiteral("QMONEY_RUNTIME_ROOT"), appDir + QStringLiteral("/runtime"));
+    environment.insert(QStringLiteral("QMONEY_PORTABLE_ROOT"), appDir);
     environment.insert(QStringLiteral("QMONEY_APP_VERSION"),
                        QCoreApplication::applicationVersion());
     environment.insert(QStringLiteral("PLAYWRIGHT_BROWSERS_PATH"),
@@ -6805,6 +6800,9 @@ void MainWindow::renderNymeriaLibrary(const QJsonObject& result) {
       .arg(summary.value("atomic_action_count").toInt()).arg(counts.value("cataloged").toInt())
       .arg(counts.value("downloaded").toInt()).arg(counts.value("measured").toInt())
       .arg(bytesText(qint64(summary.value("disk_free_bytes").toDouble()))));
+  const QString setupMessage = result.value("setup").toObject().value("message").toString();
+  if (!setupMessage.isEmpty())
+    _nymeriaSummary->setText(_nymeriaSummary->text() + QStringLiteral("\n") + setupMessage);
   QSet<QString> checked;
   for (int i=0; i<_nymeriaTasks->count(); ++i)
     if (_nymeriaTasks->item(i)->checkState()==Qt::Checked) checked.insert(_nymeriaTasks->item(i)->data(Qt::UserRole).toString());

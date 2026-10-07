@@ -2,6 +2,7 @@
 secrets/
 .env
 token_*.json
+nymeria_plus_download_urls.json
 
 # Dados locais (baixados / gerados / estado da conta) — nunca publicar
 data/

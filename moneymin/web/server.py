@@ -2443,6 +2443,16 @@ def create_app(*, for_testing: bool = False) -> Flask:
     nymeria_catalog = CatalogLoader(ttl_s=3, max_pending=1, timeout_s=900)
     nymeria_library_worker = LibraryPreparationRunner()
     app.extensions["nymeria_library_worker"] = nymeria_library_worker
+    portable_setup = (nymeria_library.initialize_portable_catalog(os.environ.get("QMONEY_PORTABLE_ROOT"))
+                      if not for_testing else {"state": "not_supplied"})
+    if portable_setup["state"] == "imported":
+        # Only tiny official metadata/narration assets are synchronized here.
+        # The existing worker reports progress and holds the campaign barrier;
+        # the threaded HTTP service remains free to load accounts and health.
+        with _HEAVY_RUNNER_LOCK:
+            nymeria_library_worker.start("sync", lambda progress, stopped:
+                nymeria_library.sync_catalog(progress=progress, should_stop=stopped),
+                root=str(nymeria_library.data_root()))
 
     @app.before_request
     def authenticate_local_client():
@@ -3844,7 +3854,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             result["task_catalog_source"] = "local_snapshot_requires_campaign_preflight"
         except (OSError, ValueError, RuntimeError):
             return jsonify({"error": "Não foi possível ler o catálogo Nymeria."}), 503
-        return jsonify({**result, "worker": nymeria_library_worker.snapshot()})
+        return jsonify({**result, "worker": nymeria_library_worker.snapshot(), "setup": portable_setup})
 
     @app.get("/api/library/nymeria/sequences")
     def browse_nymeria_library():
@@ -3861,7 +3871,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             result["task_catalog_source"] = "local_snapshot_requires_campaign_preflight"
         except (OSError, ValueError, RuntimeError):
             return jsonify({"error": "Filtros inválidos ou catálogo Nymeria indisponível."}), 400
-        return jsonify({**result, "worker": nymeria_library_worker.snapshot()})
+        return jsonify({**result, "worker": nymeria_library_worker.snapshot(), "setup": portable_setup})
 
     @app.get("/api/library/nymeria/operation")
     def nymeria_library_operation():
@@ -3895,8 +3905,12 @@ def create_app(*, for_testing: bool = False) -> Flask:
             valid_path = False
         if not valid_path:
             return jsonify({"error": "Manifesto Nymeria ausente ou acima de 32 MiB."}), 400
-        return start_nymeria_library_work("import", lambda progress, stopped:
-            nymeria_library.import_manifest(path))
+        def import_selected_manifest(progress, stopped):
+            result = nymeria_library.import_manifest(path)
+            portable_setup.clear()
+            portable_setup.update(state="configured", message="Manifesto NymeriaPlus importado.")
+            return result
+        return start_nymeria_library_work("import", import_selected_manifest)
 
     @app.post("/api/library/nymeria/sync")
     def sync_nymeria_library_catalog():

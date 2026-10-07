@@ -16,7 +16,8 @@ inline QString selectLibraryRoot(const QString& savedRoot, const QString& appDir
     if (QFileInfo::exists(root.filePath("data/ego4d/timed_narrations.jsonl")) ||
         QFileInfo::exists(root.filePath("data/ego4d/clip_narrations.json")) ||
         QFileInfo::exists(root.filePath("data/holoassist")) ||
-        QFileInfo::exists(root.filePath("data/nymeria/_catalog/download_urls.json")))
+        QFileInfo::exists(root.filePath("data/nymeria/_catalog/download_urls.json")) ||
+        QFileInfo(root.filePath("nymeria_plus_download_urls.json")).isFile())
       return QDir::cleanPath(QFileInfo(candidate).absoluteFilePath());
   }
   return QDir::cleanPath(userRoot);

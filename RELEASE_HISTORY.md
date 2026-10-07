@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **121 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **122 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.65](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.65). Destaques: Reconcilia recibos antigos confirmados sem histórico antes da limpeza, elimina varreduras repetidas do armazenamento e informa corretamente quando a campanha para. Respeita bibliotecas novas e exclusivas do Nymeria.
+Versão atual: [v2.0.66](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.66). Destaques: Configura automaticamente o catálogo privado NymeriaPlus fornecido junto ao app, sincroniza apenas anotações em segundo plano e remove variáveis Nymeria herdadas de outras instalações.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.66](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.66) | 07/10/2026 | Importa o catálogo privado portátil pela Biblioteca existente e sincroniza apenas metadados e anotações. Preserva configurações anteriores, informa falhas sem bloquear o serviço e evita caminhos Nymeria herdados do Windows. SDK incluído e verificação em instalação isolada. | [Desde v2.0.65](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.65...v2.0.66) |
 | [v2.0.65](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.65) | 07/10/2026 | Reconstrói localmente o histórico de recibos confirmados sem tentativa correspondente, preservando registros pendentes e históricos ambíguos. Limpeza resolve o armazenamento uma vez, informa bytes retidos e não promete continuação após parada. Corrige a escolha de bibliotecas vazias ou somente Nymeria e amplia a verificação do pacote em instalação isolada. | [Desde v2.0.63](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.63...v2.0.65) |
 | [v2.0.63](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.63) | 07/10/2026 | Permite revisar e iniciar com contas aprovadas sem remover as inconclusivas nem repetir a validação. Recalcula participantes e capacidade, mantém recibos e bloqueios globais; corrige substituição de arquivos de acesso recusada pelo Windows. | [Desde v2.0.62](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.62...v2.0.63) |
 | [v2.0.62](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.62) | 07/10/2026 | Reconcilia banimentos confirmados deixados entre contas disponíveis e arquiva novos banimentos nas verificações. Preserva contas inconclusivas, retenções de saque e registros que protegem mídias pendentes. | [Desde v2.0.60](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.60...v2.0.62) |

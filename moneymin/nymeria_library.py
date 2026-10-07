@@ -130,7 +130,7 @@ def _manifest(value):
     return {"schema": 1, "sequences": normalized}
 
 
-def import_manifest(path, root=None):
+def import_manifest(path, root=None, *, summarize=True):
     """Persist every recording and its official asset integrity information."""
     value = _manifest(json.loads(Path(path).read_text("utf-8-sig")))
     base = _root(root)
@@ -141,7 +141,38 @@ def import_manifest(path, root=None):
         _INVENTORY_CACHE.clear()
         _EVENT_CACHE.clear()
         _CATALOG_INPUT_CACHE.clear()
-    return summary(base)
+    return summary(base) if summarize else {"sequence_count": len(value["sequences"])}
+
+
+def initialize_portable_catalog(app_root, root=None):
+    """Adopt an explicitly supplied private companion through the normal importer.
+
+    Never scan a user's Downloads, copy credentials, or replace their existing
+    catalog. No inventory, SDK bootstrap, classification or network at startup.
+    """
+    if not app_root:
+        return {"state": "not_supplied"}
+    try:
+        base = _root(root)
+        destination = _path(base, "_catalog", "download_urls.json")
+        if destination.exists():
+            return {"state": "preserved"}
+        portable = _root(app_root)
+        companion = _path(portable, "nymeria_plus_download_urls.json")
+        if not companion.is_file():
+            return {"state": "not_supplied"}
+        if companion.stat().st_size > 32 * 1024 * 1024:
+            raise ValueError("Manifesto acima de 32 MiB.")
+        # Serialize the existence check with an explicit import in this process.
+        with _LOCK:
+            if destination.exists():
+                return {"state": "preserved"}
+            result = import_manifest(companion, base, summarize=False)
+        return {"state": "imported", **result,
+                "message": "NymeriaPlus configurado automaticamente. Vídeos e IMU serão baixados durante a campanha."}
+    except (OSError, ValueError, RuntimeError):
+        return {"state": "error", "message":
+                "Não foi possível importar a configuração portátil NymeriaPlus. Na Biblioteca, use Importar manifesto JSON para escolher um JSON válido."}
 
 
 def _load(root):

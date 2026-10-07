@@ -1,5 +1,6 @@
 """Library jobs use isolated source data and cannot authenticate to Minute."""
 from contextlib import ExitStack
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -121,6 +122,45 @@ class NymeriaLibraryApiTests(unittest.TestCase):
         self.assertNotIn("Gardening", result["task_names"])
         self.assertEqual(result["task_catalog_source"], "local_snapshot_requires_campaign_preflight")
         self.assertEqual(result["worker"]["state"], "idle")
+
+    def test_native_bootstrap_sync_is_background_and_blocks_campaign_until_complete(self):
+        entered, release = threading.Event(), threading.Event()
+        def sync(*, progress, should_stop):
+            entered.set()
+            release.wait(3)
+            return {"sequence_count": 1100}
+        with patch.dict(os.environ, {"QMONEY_LOCAL_API_TOKEN": "fixture-local-auth", "QMONEY_PORTABLE_ROOT": "portable"}), \
+                patch.object(server, "_restore_registration_batch"), \
+                patch.object(nymeria_library, "initialize_portable_catalog", return_value={"state": "imported", "sequence_count": 1100}), \
+                patch.object(nymeria_library, "sync_catalog", side_effect=sync) as catalog:
+            try:
+                self.app = server.create_app()
+                self.client = self.app.test_client()
+                self.worker = self.app.extensions["nymeria_library_worker"]
+                self.client.environ_base["HTTP_X_QMONEY_SESSION"] = "fixture-local-auth"
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(self.client.get("/api/health").get_json()["ok"])
+                self.assertEqual(self.client.get("/api/accounts").status_code, 200)
+                self.assertEqual(self.client.post("/api/campaigns/preflight", json={}).status_code, 409)
+                self.assertEqual(self.client.get("/api/library/nymeria/sequences").get_json()["setup"]["sequence_count"], 1100)
+            finally:
+                release.set()
+                self.wait_worker()
+            self.assertEqual(self.worker.snapshot()["state"], "done")
+            catalog.assert_called_once()
+
+    def test_invalid_native_companion_keeps_health_available_and_reports_setup_error(self):
+        safe = {"state": "error", "message": "Escolha um manifesto válido na Biblioteca."}
+        with patch.dict(os.environ, {"QMONEY_LOCAL_API_TOKEN": "fixture-local-auth"}), \
+                patch.object(server, "_restore_registration_batch"), \
+                patch.object(nymeria_library, "initialize_portable_catalog", return_value=safe):
+            self.app = server.create_app()
+            self.client = self.app.test_client()
+            self.worker = self.app.extensions["nymeria_library_worker"]
+            self.client.environ_base["HTTP_X_QMONEY_SESSION"] = "fixture-local-auth"
+            self.assertTrue(self.client.get("/api/health").get_json()["ok"])
+            self.assertEqual(self.client.get("/api/library/nymeria").get_json()["setup"], safe)
+            self.assertFalse(self.worker.running)
 
     def test_invalid_requests_never_start_a_source_worker(self):
         for path, body in (("import", {}), ("sync", {"unexpected": 1}),
