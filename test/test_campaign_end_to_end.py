@@ -37,13 +37,16 @@ class CampaignEndToEndTests(unittest.TestCase):
 
     def test_pending_clip_reservation_is_per_account_and_preserves_media(self):
         pending = [{"email": self.emails[0], "clip_uid": "clip", "blocks_campaign": False}]
+        self.cleanup.return_value = {"files": 0, "bytes": 0, "errors": [], "protected": 1,
+                                     "retained_managed": 1}
         with patch.object(server.recovery, "snapshot", return_value={"items": pending}):
             response = self.client.post("/api/campaigns", json=self.body)
             self.assertEqual(response.status_code, 200, response.get_json())
             snap, log = self.finish()
         self.assertEqual([call.args[1].email for call in self.send.call_args_list], self.emails[1:])
         self.assertEqual(snap["totals"]["ok_sends"], 1)
-        self.cleanup.assert_not_called()
+        self.cleanup.assert_called_once()
+        self.assertEqual(log["status"], "error")
 
     def test_skipped_account_does_not_become_a_confirmed_delivery(self):
         self.send.side_effect = lambda item, account, *a, **k: {
@@ -345,23 +348,23 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["accounts"]["validated"], 3)
 
-    def test_prepared_cache_survives_successful_campaign(self):
+    def test_explicit_retention_keeps_prepared_cache_after_successful_campaign(self):
         with patch("moneymin.ego_accelerator.configured_budget_gb", return_value=400), \
              patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]), \
              patch.object(campaign, "_clip_is_cached", return_value=True), \
              patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
-            response = self.client.post("/api/campaigns", json=self.body)
+            response = self.client.post("/api/campaigns", json={**self.body, "cleanup_after_upload": False})
             self.assertEqual(response.status_code, 200, response.get_json())
             snap, log = self.finish()
         self.assertEqual((snap["state"], log["status"]), ("done", "done"))
         self.cleanup.assert_not_called()
         self.assertEqual(self.prepare.call_count, 1)
 
-    def test_prepared_ego_cache_survives_without_budget_file(self):
+    def test_explicit_retention_keeps_prepared_ego_cache_without_budget_file(self):
         with patch("moneymin.ego_accelerator.configured_budget_gb", return_value=0), \
              patch.object(campaign, "_clip_is_cached", return_value=True), \
              patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
-            response = self.client.post("/api/campaigns", json=self.body)
+            response = self.client.post("/api/campaigns", json={**self.body, "cleanup_after_upload": False})
             self.assertEqual(response.status_code, 200, response.get_json())
             snap, log = self.finish()
         self.assertEqual((snap["state"], log["status"]), ("done", "done"))
@@ -378,14 +381,15 @@ class CampaignEndToEndTests(unittest.TestCase):
                  "duration_ms": 300000, "video_path": str(self.root / "holo.mp4"),
                  "imu_real": True}), \
              patch.object(campaign, "_enforce_account_video_cache", return_value=(0, 0)):
-            response = self.client.post("/api/campaigns", json={**self.body, "dataset": "holoassist"})
+            response = self.client.post("/api/campaigns", json={**self.body, "dataset": "holoassist",
+                                                                         "cleanup_after_upload": False})
             self.assertEqual(response.status_code, 200, response.get_json())
             snap, log = self.finish()
         self.assertEqual((snap["state"], log["status"]), ("done", "done"))
         self.cleanup.assert_not_called()
         self.prepare.assert_not_called()
 
-    def test_mixed_cache_and_dataset_uses_cache_first_and_cleans_only_download(self):
+    def test_mixed_cache_and_dataset_uses_cache_first_and_releases_each_managed_item(self):
         candidates = [
             {"clip_uid": "remote", "parent_video_uid": "remote-parent",
              "dur_s": 300, "source": "ego4d"},
@@ -408,7 +412,7 @@ class CampaignEndToEndTests(unittest.TestCase):
             snap, log = self.finish()
         self.assertEqual((snap["state"], log["status"]), ("done", "done"))
         self.assertEqual([item["clip_uid"] for item in log["items"]], ["local", "remote"])
-        self.cleanup.assert_called_once()
+        self.assertEqual(self.cleanup.call_count, 2)
 
     def test_cache_only_never_selects_remote_clip(self):
         candidates = [
@@ -428,7 +432,7 @@ class CampaignEndToEndTests(unittest.TestCase):
             snap, log = self.finish()
         self.assertEqual((snap["state"], log["status"]), ("done", "done"))
         self.assertEqual([item["clip_uid"] for item in log["items"]], ["local"])
-        self.cleanup.assert_not_called()
+        self.cleanup.assert_called_once()
         self.assertFalse(self.prepare.call_args.kwargs["allow_download"])
 
     def test_cache_only_does_not_prefetch_next_clip(self):
@@ -649,7 +653,7 @@ class CampaignEndToEndTests(unittest.TestCase):
             "error": "policy refused", "retryable": False}
         self.client.post("/api/campaigns", json=self.body)
         snap, log = self.finish()
-        self.assertEqual(log["status"], "partial")
+        self.assertEqual(log["status"], "error")
         self.assertEqual(snap["totals"]["failed_sends"], 1)
         self.assertEqual(self.send.call_count, 2)
         self.cleanup.assert_not_called()
@@ -671,7 +675,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         snap, log = self.finish()
         self.assertEqual((snap["state"], log["status"]), ("error", "error"))
         self.send.assert_not_called()
-        self.cleanup.assert_not_called()
+        self.cleanup.assert_called_once()
 
     def test_stop_drains_current_send_and_prevents_next_account(self):
         entered, release = threading.Event(), threading.Event()

@@ -216,7 +216,7 @@ def campaign_readiness(
                 ))
 
     if selected in {"nymeria", "ambos"}:
-        from . import nymeria, nymeria_vrs
+        from . import nymeria, nymeria_library, nymeria_vrs
         root = nymeria.data_root()
         try:
             nymeria_vrs._bootstrap_projectaria()
@@ -229,13 +229,35 @@ def campaign_readiness(
             "Project Aria DEVICE_TIME disponível" if sdk_ok
             else "SDK Project Aria indisponível; repare a instalação do QMoney",
         ))
-        sequences = nymeria.list_sequences(root) if sdk_ok else []
-        usable = sum(sequence.get("selection_ready") is True for sequence in sequences)
+        if mode == "cache":
+            sequences = nymeria.list_sequences(root) if sdk_ok else []
+            usable = sum(sequence.get("selection_ready") is True for sequence in sequences)
+            detail = (f"{usable} sequência(s) com RGB/IMU medidos em {root}" if usable else
+                      f"nenhuma sequência com RGB/IMU medidos em {root}")
+        else:
+            # A manifest plus synchronized atomic annotations enables the queue.
+            # Opening every VRS here would force an up-front source download.
+            try:
+                base = nymeria_library._root(root)
+                sequences = nymeria_library._load(base)["sequences"]
+                usable = sum(nymeria_library._path(base, sid, "metadata.json").is_file()
+                    and nymeria_library._path(base, sid, "narration", "atomic_action.csv").is_file()
+                    for sid in sequences)
+            except (OSError, ValueError, RuntimeError):
+                usable = 0
+            if usable:
+                detail = f"{usable} sequência(s) no catálogo; cada fonte será baixada e medida quando usada"
+            else:
+                # Existing measured sources also work without an acquisition
+                # manifest; only their remote replacement requires importing it.
+                sequences = nymeria.list_sequences(root) if sdk_ok else []
+                usable = sum(sequence.get("selection_ready") is True for sequence in sequences)
+                detail = (f"{usable} sequência(s) locais com RGB/IMU medidos" if usable else
+                          "importe o manifesto e sincronize as anotações na Biblioteca Nymeria")
         checks.append(_check(
             "Biblioteca Nymeria",
             "ok" if usable else "error",
-            f"{usable} sequência(s) com narrações e RGB/IMU medidos em {root}" if usable
-            else f"nenhuma sequência com narrações e RGB/IMU medidos em {root}",
+            detail,
         ))
 
     if selected in {"ego4d", "ambos", "all"}:

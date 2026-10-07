@@ -26,6 +26,7 @@ def media_cleanup_protection() -> dict:
     from . import campaign_start_store, original_capture
     groups = _groups(include_reconciled=True)
     paths, hashes = set(), set()
+    publications = _UNREAD_PUBLICATION
     for rows in groups:
         if any(not journal_flags_valid(row) for row in rows):
             raise ValueError('Registros de envio inválidos impedem a limpeza segura.')
@@ -35,7 +36,9 @@ def media_cleanup_protection() -> dict:
             journal_delivery_confirmed(row) and row.get('campaign_reconciled') is True for row in rows))
         if releasable:
             from .campaign_evidence import publication_index, publication_registered
-            releasable = publication_registered(rows, publication_index())
+            if publications is _UNREAD_PUBLICATION:
+                publications = publication_index()
+            releasable = publication_registered(rows, publications)
         if not releasable:
             for row in rows:
                 context = row.get('campaign_context')
@@ -153,16 +156,29 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
                   and (not context.get("task_id") or context["task_id"] == first.get("task_id"))
                   and all(row.get("campaign_context") == first.get("campaign_context")
                           and row.get("task_id") == first.get("task_id") for row in rows))
+    delivery_uids = [context["clip_uid"]] if identified else []
+    delivery_identity_valid = identified
+    if identified:
+        try:
+            delivery_uids = sent_registry.delivery_clip_uids({
+                "clip_uid": context["clip_uid"], "task_id": first.get("task_id"),
+                "registry_key": context["registry_key"],
+                "session_id": sid, "org_key": first.get("org_key"), "account_email": email,
+                "content_provenance": context.get("content_provenance")})
+        except (ValueError, TypeError, KeyError):
+            # Keep the receipt's canonical identity visible. An unverified
+            # acquisition alias may neither credit delivery nor authorize retry.
+            delivery_identity_valid = False
     expected = first.get("expected_chunk_count", 1)
     complete_group = _complete_chunk_group(rows)
     delivery_confirmed = (complete_group
                           and all(journal_delivery_confirmed(row)
                                   and row.get("campaign_context") == first.get("campaign_context")
                                   for row in rows))
-    confirmed = identified and delivery_confirmed
+    confirmed = delivery_identity_valid and delivery_confirmed
     # A history reset releases only confirmed deliveries. An interrupted
     # session stays visible and reserved even when its old history was reset.
-    if delivery_confirmed and (reset_checker or sent_registry.recovery_was_reset)(
+    if delivery_confirmed and (not identified or delivery_identity_valid) and (reset_checker or sent_registry.recovery_was_reset)(
             sid, context["registry_key"] if identified else "",
             context.get("history_name", "") if identified else ""):
         return None
@@ -173,7 +189,7 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
         if publication_index is _UNREAD_PUBLICATION:
             publication_index = read_publications()
         publication_pending = not publication_registered(rows, publication_index)
-    resumable = (identified and not confirmed and complete_group
+    resumable = (delivery_identity_valid and not confirmed and complete_group
                  and all(row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
                          and (row.get("finalized") is not True or journal_delivery_confirmed(row))
                          and row.get("task_id") == first.get("task_id")
@@ -199,8 +215,9 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
     return {
         "email": email, "session_id": sid,
         "clip_uid": context.get("clip_uid") if identified else None,
+        "delivery_clip_uids": delivery_uids,
         "status": "confirmed" if confirmed else "pending" if resumable else "needs_review",
-        "blocks_campaign": not identified,
+        "blocks_campaign": not delivery_identity_valid,
         "can_resume": bool(resumable),
         "chunks_found": len(rows), "chunks_expected": expected if type(expected) is int else None,
         "index_reconciled": index_reconciled,
@@ -244,7 +261,12 @@ def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
     excluded: dict[str, set[str]] = {}
     for item in items:
         if item.get("clip_uid"):
-            excluded.setdefault(item["clip_uid"], set()).add(item["email"])
+            # This field is produced from immutable journal lineage by
+            # _describe. Generic history/candidate aliases are not consulted.
+            identities = [item["clip_uid"], *item.get("delivery_clip_uids", [])]
+            for uid in identities:
+                if isinstance(uid, str) and uid:
+                    excluded.setdefault(uid, set()).add(item["email"])
     return {uid: sorted(emails) for uid, emails in excluded.items()}
 
 
@@ -265,7 +287,8 @@ def reconcile_confirmed() -> dict:
             continue
         first = rows[0]
         context = first.get("campaign_context") or contexts[(item["session_id"], item["email"])]
-        deliveries.append((context["registry_key"], item["clip_uid"], item["email"]))
+        deliveries.extend((context["registry_key"], uid, item["email"])
+                          for uid in item["delivery_clip_uids"])
         if any(row.get('campaign_reconciled') is not True for row in rows):
             confirmed.append(rows)
     # Commit the complete sent index first. An interrupted acknowledgment can

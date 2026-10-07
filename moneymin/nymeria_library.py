@@ -24,6 +24,8 @@ import zipfile
 import requests
 
 from . import nymeria, task_matching
+from .media_lifecycle import (cleanup_operation, cleanup_managed_media,
+                              record_managed_media)
 
 _GROUPS = ("metadata_json", "narration", "timesync_and_imu", "recording_head_data_data_vrs")
 _IDENTITY = re.compile(r"[A-Za-z0-9_-]+\Z")
@@ -257,6 +259,7 @@ def _download(asset, target, root, progress=None, should_stop=None, min_free_byt
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         if _valid_asset(target, asset, should_stop):
+            _own_source_download(target, root, asset)
             return target
         raise ValueError("Arquivo Nymeria existente diverge da origem; foi preservado.")
     partial = _path(root, *target.with_name(target.name + ".part").relative_to(root).parts)
@@ -310,12 +313,22 @@ def _download(asset, target, root, progress=None, should_stop=None, min_free_byt
                 raise ValueError("SHA-1 ou tamanho do arquivo Nymeria não confere; parcial preservado.")
             partial.replace(target)
             binding.unlink(missing_ok=True)
+            _own_source_download(target, root, asset)
             return target
         except requests.RequestException as exc:
             offset = partial.stat().st_size if partial.exists() else 0
             if attempt == 2:
                 raise RuntimeError("Download Nymeria interrompido; os bytes parciais foram preservados.") from exc
     raise RuntimeError("Download Nymeria incompleto.")
+
+
+def _own_source_download(target, root, asset):
+    # Catalogs and narration stay small and reusable. Only officially verified
+    # bulky sources are temporary campaign media; supplied foreign files are
+    # never adopted solely because they happen to have the expected filename.
+    if target.suffix == '.vrs' or target.name == 'timesync_and_imu.zip':
+        record_managed_media(target, root=root, provider='nymeria',
+                             role='source_download', expected_digest=asset['sha1sum'], algorithm='sha1')
 
 
 def _extract(archive, root, sid, prefix, should_stop=None, min_free_bytes=0):
@@ -345,18 +358,26 @@ def _extract(archive, root, sid, prefix, should_stop=None, min_free_bytes=0):
                         digest.update(block)
                 if target.stat().st_size != item.file_size or _hash(target, "sha256") != digest.hexdigest():
                     raise ValueError("Fonte Nymeria extraída existente diverge; foi preservada.")
+                if item.filename == 'recording_head/data/motion.vrs':
+                    record_managed_media(target, root=root, provider='nymeria',
+                                         role='source_imu', expected_digest=digest.hexdigest())
                 continue
             temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
             if shutil.disk_usage(target.parent).free < item.file_size + min_free_bytes:
                 raise OSError("Espaço insuficiente para extrair a fonte Nymeria.")
             try:
+                digest = hashlib.sha256()
                 with bundle.open(item) as source, temporary.open("xb") as output:
                     for block in iter(lambda: source.read(1024 * 1024), b""):
                         _check_stop(should_stop)
                         output.write(block)
+                        digest.update(block)
                 if temporary.stat().st_size != item.file_size:
                     raise ValueError("Tamanho do arquivo Nymeria extraído divergente.")
                 temporary.replace(target)
+                if item.filename == 'recording_head/data/motion.vrs':
+                    record_managed_media(target, root=root, provider='nymeria',
+                                         role='source_imu', expected_digest=digest.hexdigest())
             finally:
                 temporary.unlink(missing_ok=True)
     return len(selected)
@@ -771,3 +792,64 @@ def acquire_sequences(seq_ids, root=None, progress=None, should_stop=None, min_f
         return {"ok": True, "sequences": results, "summary": summary(base),
                 "space_quote": {"source_download_bytes": required, "extraction_bytes": extraction,
                                 "min_free_bytes": min_free_bytes, "disk_free_bytes": free}}
+
+
+def ensure_sequence_for_campaign(clip, *, allow_download=True, progress=None,
+                                 should_stop=None, min_free_bytes=50 * 1024**3):
+    """Acquire exactly the current planned recording through the library path."""
+    if not isinstance(clip, dict) or type(allow_download) is not bool:
+        raise ValueError('Seleção Nymeria inválida.')
+    sid = clip.get('seq_id')
+    if not isinstance(sid, str) or not _IDENTITY.fullmatch(sid):
+        raise ValueError('Identidade de sequência Nymeria inválida.')
+    supplied = clip.get('path')
+    if supplied is not None and (not isinstance(supplied, str) or not supplied):
+        raise ValueError('Caminho da sequência Nymeria inválido.')
+    base = _root(Path(supplied).parent if supplied else None)
+    directory = _path(base, sid)
+    if supplied and Path(supplied).absolute() != directory.absolute():
+        raise ValueError('Caminho da sequência Nymeria diverge da identidade.')
+    if not allow_download:
+        if not all(_path(base, sid, 'recording_head', 'data', name).is_file()
+                   for name in ('data.vrs', 'motion.vrs')):
+            raise NymeriaLibraryError('Fontes locais Nymeria ausentes; download está desativado.',
+                                      'source_download_disabled')
+        return directory
+    acquire_sequences([sid], root=base, progress=progress, should_stop=should_stop,
+                      min_free_bytes=min_free_bytes)
+    return directory
+
+
+@cleanup_operation
+def cleanup_sequence_sources(seq_id, root=None, *, protected_paths=(), protection=None):
+    """Release a finished recording's owned bulk sources, retaining its catalog.
+
+    The campaign calls this only after its whole account batch is confirmed.
+    Journal hashes and explicit consumers independently keep each needed source.
+    A later window reacquires the original recording through acquire_sequences.
+    """
+    if not isinstance(seq_id, str) or not _IDENTITY.fullmatch(seq_id):
+        raise ValueError('Identidade de sequência Nymeria inválida.')
+    base = _root(root)
+    paths = [_path(base, seq_id, 'recording_head', 'data', name)
+             for name in ('data.vrs', 'motion.vrs')]
+    paths.append(_path(base, '_catalog', 'archives', seq_id, 'timesync_and_imu.zip'))
+    result = cleanup_managed_media(paths, allowed_roots=(base,),
+                                   protected_paths=protected_paths, protection=protection)
+    if result['removed_paths']:
+        measured = _path(base, '_catalog', 'measured', seq_id + '.json')
+        # This is an app observation bound to the removed VRS, not a source
+        # narration/index. It cannot keep advertising readiness after eviction.
+        if measured.is_file():
+            try:
+                size = measured.stat().st_size
+                measured.unlink()
+                result['files'] += 1
+                result['bytes'] += size
+            except OSError as exc:
+                result['errors'].append(f'{measured.name}: {type(exc).__name__}')
+        _PLAN_CACHE.clear()
+        _INVENTORY_CACHE.clear()
+        nymeria.clear_caches()
+    result['seq_id'] = seq_id
+    return result

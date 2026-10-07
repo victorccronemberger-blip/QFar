@@ -20,6 +20,7 @@ from typing import Any
 from . import config, nymeria_vrs, task_matching
 
 _ALGORITHM = "nymeria-atomic-device-v4"
+_PLANNED_ALGORITHM = _ALGORITHM + "-planned"
 _HANGER_ADJECTIVE = re.compile(r"\bclothes\s+(hangers?)\b", re.IGNORECASE)
 _DISHWASHER_OBJECT = (
     r"(?:dishes|plates?|cups?|bowls?|glasses|cutlery|utensils?|spoons?|forks?|"
@@ -101,6 +102,7 @@ _GARDEN_ACTION = (
 )
 _SNAPSHOTS: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 _WINDOWS: OrderedDict[tuple, tuple[dict[str, Any], ...]] = OrderedDict()
+_PLANNED: OrderedDict[tuple, tuple[dict[str, Any], ...]] = OrderedDict()
 _SDK_DIGESTS: OrderedDict[tuple, tuple[int, str]] = OrderedDict()
 _SDK_WRAPPERS = (
     "__init__.py", "core/__init__.py", "core/calibration.py",
@@ -329,6 +331,7 @@ def inventory_signature(root: Path | None = None) -> tuple:
 def clear_caches() -> None:
     _SNAPSHOTS.clear()
     _WINDOWS.clear()
+    _PLANNED.clear()
 
 
 def _remember(cache: OrderedDict, key: tuple, value: Any) -> Any:
@@ -592,9 +595,11 @@ def _windows(snap: dict, task_name: str, minimum: float, maximum: float) -> tupl
                 windows.append({"clip_uid": uid, "exported_clip_uid": uid,
                     "seq_id": snap["seq_id"], "uid": snap["uid"], "path": snap["path"],
                     "window_s": [start, end], "device_window_ns": [t0 + round(start * 1e9), t0 + round(end * 1e9)],
+                    "source_clock_domain": "aria_DEVICE_TIME_ns", "window_origin_device_timestamp_ns": t0,
                     "dur_s": end - start, "source": "nymeria", "needs_cut": True,
                     "parent_video_uid": snap["seq_id"], "scenario": rule.primary[0],
                     "task_name_authoritative": task_name, "selection_evidence": carrier,
+                    "capacity_kind": "measured_rgb_imu_window", "readiness": "measured",
                     "action_text": span["action_text"], "match_score": span["match_score"]})
     unique = {clip["clip_uid"]: clip for clip in windows}
     return _remember(_WINDOWS, key, tuple(sorted(unique.values(), key=lambda clip: -clip["dur_s"])))
@@ -633,12 +638,20 @@ def bind_task(clip: dict[str, Any], *, task_name: str, task_id: str | None = Non
 def automatic_candidates(*, task_name: str | None = None, task_id: str | None = None,
                          registry_key: str | None = None, min_dur_s: float = 60.0,
                          max_dur_s: float = 1800.0, root: Path | None = None,
-                         max_results: int | None = None) -> list[dict[str, Any]]:
+                         max_results: int | None = None,
+                         include_planned: bool = False) -> list[dict[str, Any]]:
     if not task_name or task_matching.rule_for(task_name) is None:
         return []
     minimum, maximum = _bounds(min_dur_s, max_dur_s)
-    out = []
+    out = (planned_candidates(task_name=task_name, task_id=task_id, registry_key=registry_key,
+                             min_dur_s=minimum, max_dur_s=maximum, root=root)
+           if include_planned else [])
+    planned_sequences = {clip["seq_id"] for clip in out}
     for seq_dir in sequence_dirs(root):
+        # A queued annotation window is measured when actually prepared.
+        # Existing sources without an acquisition plan retain the old API.
+        if seq_dir.name in planned_sequences:
+            continue
         try:
             snap = _snapshot(seq_dir)
             clips = _windows(snap, task_matching.canonical_task_name(task_name), minimum, maximum)
@@ -650,9 +663,188 @@ def automatic_candidates(*, task_name: str | None = None, task_id: str | None = 
     return out if max_results is None else out[:max(0, int(max_results))]
 
 
+def _planned_sequence(seq_dir: Path, groups: dict, task_name: str,
+                      minimum: float, maximum: float) -> list[dict[str, Any]]:
+    """Bind annotation estimates without opening, downloading or measuring VRS."""
+    from . import nymeria_library as library
+    metadata_bytes = (seq_dir / "metadata.json").read_bytes()
+    metadata = json.loads(metadata_bytes.decode("utf-8-sig"))
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata Nymeria inválido")
+    rows, hashes = _annotation_rows(seq_dir)
+    digest = _rules_digest()
+    evidence_key = (tuple(sorted(hashes.items())), digest)
+    windows = library._catalog_windows(rows, [task_name], minimum, maximum, evidence_key)
+    assets = library._asset_identity(groups)
+    proof = {"schema": 1, "dataset": "nymeria", "algorithm": _PLANNED_ALGORITHM,
+             "task": {"name": task_name, "id": None, "registry_key": None},
+             "duration_bounds_s": [minimum, maximum], "rules_sha256": digest,
+             "asset_identity": assets, "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+             "annotations_sha256": hashes, "source_time_domain": "DEVICE_TIME",
+             "annotation_time_unit": "seconds", "sensor_coverage": "unmeasured"}
+    rule = selection_rule_for(task_name)
+    result = []
+    for window in windows:
+        start_ns, end_ns = (round(value * 1e9) for value in window["device_seconds"])
+        uid = f"nymeria-planned:{seq_dir.name}:{start_ns}:{end_ns}"
+        carrier = {**copy.deepcopy(proof), "planned_device_window_ns": [start_ns, end_ns]}
+        result.append({"clip_uid": uid, "exported_clip_uid": uid,
+            "seq_id": seq_dir.name, "uid": str(metadata.get("uid") or seq_dir.name),
+            "path": str(seq_dir), "parent_video_uid": seq_dir.name,
+            # Annotation-origin coordinates support preview/dedup only.
+            # The preparation resolver replaces them with the measured origin.
+            "window_s": [(start_ns / 1e9) - rows[0][0], (end_ns / 1e9) - rows[0][0]],
+            "planned_device_window_ns": [start_ns, end_ns], "device_window_ns": [start_ns, end_ns],
+            "source_clock_domain": "aria_DEVICE_TIME_ns",
+            "window_origin_device_timestamp_ns": round(rows[0][0] * 1e9), "dur_s": (end_ns - start_ns) / 1e9,
+            "source": "nymeria", "needs_cut": True, "scenario": rule.primary[0],
+            "task_name_authoritative": task_name, "selection_evidence": carrier,
+            "acquisition_required": True, "selection_ready": False,
+            "readiness": "pending_acquisition", "capacity_kind": "annotation_estimate",
+            "requires_measured_validation": True})
+    return result
+
+
+def planned_candidates(*, task_name: str | None = None, task_id: str | None = None,
+                       registry_key: str | None = None, min_dur_s: float = 60.0,
+                       max_dur_s: float = 1800.0, root: Path | None = None,
+                       max_results: int | None = None) -> list[dict[str, Any]]:
+    """Return a download queue from atomic annotations, never measured capacity."""
+    if not task_name or selection_rule_for(task_name) is None:
+        return []
+    from . import nymeria_library as library
+    name = task_matching.canonical_task_name(task_name)
+    minimum, maximum = _bounds(min_dur_s, max_dur_s)
+    base = library._root(root)
+    sequences = library._load(base)["sequences"]
+    signatures = tuple((sid, tuple(_stat(library._path(base, sid, filename)) for filename in
+        ("metadata.json", *("narration/" + value for value in _ANNOTATIONS)))) for sid in sequences)
+    key = (str(base), name, minimum, maximum, _rules_digest(),
+           json.dumps({sid: library._asset_identity(groups) for sid, groups in sequences.items()},
+                      sort_keys=True), signatures)
+    if key in _PLANNED:
+        candidates = _PLANNED[key]
+    else:
+        out = []
+        for sid, groups in sequences.items():
+            seq_dir = library._path(base, sid)
+            try:
+                out.extend(_planned_sequence(seq_dir, groups, name, minimum, maximum))
+            except (OSError, ValueError, UnicodeError):
+                continue
+        candidates = _remember(_PLANNED, key, tuple(sorted(out, key=lambda clip: -clip["dur_s"])))
+    out = [bind_task(clip, task_name=name, task_id=task_id, registry_key=registry_key)
+           for clip in candidates]
+    return out if max_results is None else out[:max(0, int(max_results))]
+
+
+def revalidate_planned_candidate(clip: dict[str, Any], *, task_name: str | None = None,
+                                task_id: str | None = None, registry_key: str | None = None,
+                                root: Path | None = None) -> dict[str, Any]:
+    """A plan authorizes acquiring one source; it cannot authorize a send."""
+    from . import nymeria_library as library
+    carrier = clip.get("selection_evidence")
+    if (not isinstance(carrier, dict) or carrier.get("schema") != 1
+            or carrier.get("dataset") != "nymeria" or carrier.get("algorithm") != _PLANNED_ALGORITHM
+            or clip.get("acquisition_required") is not True
+            or carrier.get("sensor_coverage") != "unmeasured"):
+        raise ValueError("plano de aquisição Nymeria atual ausente")
+    task = carrier.get("task")
+    if not isinstance(task, dict) or not isinstance(task.get("name"), str):
+        raise ValueError("categoria do plano Nymeria ausente")
+    name = task_matching.canonical_task_name(task_name or task["name"])
+    if name != task["name"] or selection_rule_for(name) is None:
+        raise ValueError("categoria Nymeria diverge do plano")
+    for field, expected in (("id", task_id), ("registry_key", registry_key)):
+        if expected is not None and task.get(field) != expected:
+            raise ValueError("identidade da tarefa Nymeria diverge do plano")
+    bounds = carrier.get("duration_bounds_s")
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+        raise ValueError("faixa do plano Nymeria inválida")
+    minimum, maximum = _bounds(*bounds)
+    base = library._root(root)
+    sid = clip.get("seq_id")
+    groups = library._load(base)["sequences"].get(sid) if isinstance(sid, str) else None
+    if groups is None:
+        raise ValueError("sequência do plano Nymeria fora do manifesto atual")
+    seq_dir = library._path(base, sid)
+    if Path(str(clip.get("path") or "")).resolve() != seq_dir:
+        raise ValueError("sequência Nymeria fora da biblioteca atual")
+    candidates = _planned_sequence(seq_dir, groups, name, minimum, maximum)
+    match = next((item for item in candidates if item["clip_uid"] == clip.get("clip_uid")), None)
+    if match is None:
+        raise ValueError("janela sem evidência atômica atual do plano Nymeria")
+    match = bind_task(match, task_name=name, task_id=task.get("id"), registry_key=task.get("registry_key"))
+    for field in match:
+        if clip.get(field) != match[field]:
+            raise ValueError("evidência ou janela do plano Nymeria desatualizada")
+    return match
+
+
+def _resolved_planned_window(snap: dict, planned: dict) -> dict[str, Any]:
+    """Reclassify the exact absolute planned cut inside measured source coverage."""
+    carrier = planned["selection_evidence"]
+    minimum, maximum = _bounds(*carrier["duration_bounds_s"])
+    task = carrier["task"]
+    left_ns, right_ns = planned["planned_device_window_ns"]
+    measured = snap["measured"]
+    start, end = ((value - measured["t0_ns"]) / 1e9 for value in (left_ns, right_ns))
+    if (left_ns < measured["t0_ns"] or right_ns > measured["t1_ns"]
+            or not minimum <= end - start <= maximum
+            or not any(a <= start and b >= end for a, b in measured["intervals"])
+            or not selection_window_complete(task["name"], snap["rows"], start, end)):
+        raise ValueError("janela planejada sem cobertura RGB/IMU e tarefa completa medidas pelo SDK Nymeria")
+    # This classifier sees only observations within the requested cut. A
+    # wider SDK window cannot lend an absent phase or hide a rival activity.
+    selected = [(event, label) for event, label in zip(snap["prepared"], snap["labels"])
+                if start <= event[0] <= end]
+    rule = selection_rule_for(task["name"])
+    rivals = task_matching.competing_span_names(task["name"], task_matching.TASK_RULES.items())
+    spans = task_matching.extract_spans(rule, (), min_s=max(minimum, rule.min_span_s or 0),
+        max_s=maximum, prepared_events=tuple(event for event, _ in selected),
+        event_task_names=tuple(label for _, label in selected), task_name=task["name"],
+        competing_task_names=rivals, video_duration_s=end,
+        activity_mode=selection_activity_mode(task["name"]))
+    span = next((item for item in spans if item["start"] <= start + 1e-6
+                 and item["end"] >= end - 1e-6), None)
+    if span is None:
+        raise ValueError("ações medidas não comprovam toda a janela planejada Nymeria")
+    uid = f"nymeria:{snap['seq_id']}:{start:.3f}:{end:.3f}"
+    proof = {"schema": 1, "dataset": "nymeria", "algorithm": _ALGORITHM,
+             "task": copy.deepcopy(task), "window_s": [start, end],
+             "duration_bounds_s": [minimum, maximum], **copy.deepcopy(snap["proof"]),
+             "acquisition_plan": copy.deepcopy(planned)}
+    return {"clip_uid": uid, "exported_clip_uid": uid, "seq_id": snap["seq_id"],
+            "uid": snap["uid"], "path": snap["path"], "window_s": [start, end],
+            "device_window_ns": [left_ns, right_ns], "dur_s": end - start,
+            "source_clock_domain": "aria_DEVICE_TIME_ns",
+            "window_origin_device_timestamp_ns": measured["t0_ns"],
+            "source": "nymeria", "needs_cut": True, "parent_video_uid": snap["seq_id"],
+            "scenario": rule.primary[0], "task_name_authoritative": task["name"],
+            "task_id": task.get("id"), "registry_key": task.get("registry_key"),
+            "capacity_kind": "measured_rgb_imu_window", "readiness": "measured",
+            "selection_evidence": proof, "action_text": span["action_text"],
+            "match_score": span["match_score"],
+            "acquired_from_planned_clip_uid": planned["clip_uid"],
+            "dedup_clip_uids": [planned["clip_uid"]]}
+
+
+def resolve_planned_candidate(clip: dict[str, Any], *, root: Path | None = None) -> dict[str, Any]:
+    """After acquisition, prove the same complete activity against real SDK clocks."""
+    planned = revalidate_planned_candidate(clip, root=root)
+    snap = _snapshot(Path(planned["path"]), fresh=True)
+    result = _resolved_planned_window(snap, planned)
+    # Only this standard measured carrier may reach prepare/upload revalidation.
+    result = revalidate_candidate(result, fresh=True, root=root)
+    result["acquired_from_planned_clip_uid"] = planned["clip_uid"]
+    result["dedup_clip_uids"] = list(dict.fromkeys([planned["clip_uid"],
+                                                 *clip.get("dedup_clip_uids", [])]))
+    return result
+
+
 def revalidate_candidate(clip: dict[str, Any], *, task_name: str | None = None,
                          task_id: str | None = None, registry_key: str | None = None,
-                         fresh: bool = True) -> dict[str, Any]:
+                         fresh: bool = True, root: Path | None = None) -> dict[str, Any]:
     carrier = clip.get("selection_evidence")
     if (not isinstance(carrier, dict) or carrier.get("schema") != 1
             or carrier.get("dataset") != "nymeria" or carrier.get("algorithm") != _ALGORITHM):
@@ -671,19 +863,28 @@ def revalidate_candidate(clip: dict[str, Any], *, task_name: str | None = None,
         if clip.get(field) != expected:
             raise ValueError("vínculo de tarefa Nymeria inválido")
     seq_dir = Path(str(clip.get("path") or "")).resolve()
-    if seq_dir not in sequence_dirs():
+    if seq_dir not in sequence_dirs(root):
         raise ValueError("sequência Nymeria fora da biblioteca atual")
     bounds = carrier.get("duration_bounds_s")
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
         raise ValueError("faixa da evidência Nymeria inválida")
     minimum, maximum = _bounds(*bounds)
     snap = _snapshot(seq_dir, fresh=fresh)
-    candidates = _windows(snap, name, minimum, maximum)
-    match = next((item for item in candidates if item["clip_uid"] == clip.get("clip_uid")), None)
+    acquisition_plan = carrier.get("acquisition_plan")
+    if acquisition_plan is not None:
+        if not isinstance(acquisition_plan, dict):
+            raise ValueError("plano de aquisição da evidência Nymeria inválido")
+        planned = revalidate_planned_candidate(acquisition_plan, task_name=name,
+            task_id=task.get("id"), registry_key=task.get("registry_key"), root=root)
+        match = _resolved_planned_window(snap, planned)
+    else:
+        candidates = _windows(snap, name, minimum, maximum)
+        match = next((item for item in candidates if item["clip_uid"] == clip.get("clip_uid")), None)
     if match is None:
         raise ValueError("janela sem evidência atual da tarefa Nymeria")
     match = bind_task(match, task_name=name, task_id=task.get("id"), registry_key=task.get("registry_key"))
-    for field in ("seq_id", "parent_video_uid", "window_s", "device_window_ns", "dur_s",
+    for field in ("clip_uid", "exported_clip_uid", "seq_id", "parent_video_uid", "window_s", "device_window_ns", "dur_s",
+                  "source_clock_domain", "window_origin_device_timestamp_ns", "capacity_kind", "readiness",
                   "selection_evidence"):
         if clip.get(field) != match[field]:
             raise ValueError("evidência ou janela Nymeria desatualizada")

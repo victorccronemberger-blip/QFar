@@ -21,6 +21,8 @@ Semântica:
 from __future__ import annotations
 
 import threading
+import math
+import re
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,80 @@ _LOCK = threading.RLock()
 def _path() -> Path:
     """Caminho do registro (lido na hora — DATA_DIR é patchável nos testes)."""
     return config.DATA_DIR / FILE_NAME
+
+
+def delivery_clip_uids(item: dict[str, Any]) -> list[str]:
+    """Canonical receipt ID plus an exact, byte-bound Nymeria acquisition ID.
+
+    The provisional ID is an anti-repeat alias, never another delivery. This
+    reconstructs its absolute source interval from immutable preparation
+    lineage; arbitrary cached dedup IDs cannot create confirmed aliases.
+    No SDK or deleted source file is needed to read or reset past receipts.
+    """
+    uid = item.get('clip_uid')
+    if not isinstance(uid, str) or not uid:
+        raise ValueError('Identidade de entrega inválida.')
+    lineage = item.get('content_provenance')
+    from .content_provenance import canonical_digest
+    if (isinstance(lineage, dict) and isinstance(lineage.get('content'), dict)
+            and lineage['content'].get('dataset') == 'nymeria'):
+        if (lineage.get('schema') != 1
+                or canonical_digest({k: v for k, v in lineage.items() if k != 'delivery_binding_sha256'}) != lineage.get('delivery_binding_sha256')
+                or any(item.get(field) is not None and lineage.get(field) != item[field]
+                       for field in ('session_id', 'task_id', 'org_key'))):
+            raise ValueError('Vínculo de entrega Nymeria inválido; preserve o registro.')
+        lineage = lineage['content']
+    if not isinstance(lineage, dict) or lineage.get('dataset') != 'nymeria':
+        return [uid]
+    evidence = lineage.get('selection_evidence')
+    plan = evidence.get('acquisition_plan') if isinstance(evidence, dict) else None
+    if plan is None:
+        return [uid]
+    try:
+        if (not isinstance(plan, dict) or lineage.get('schema') != 1
+                or lineage.get('clip_uid') != uid
+                or canonical_digest({k: v for k, v in lineage.items() if k != 'lineage_sha256'})
+                != lineage.get('lineage_sha256')
+                or evidence.get('schema') != 1 or evidence.get('dataset') != 'nymeria'
+                or not isinstance(evidence.get('algorithm'), str)
+                or not re.fullmatch(r'nymeria-atomic-device-v[4-9]\d*', evidence['algorithm'])):
+            raise ValueError
+        sid = lineage['parent_video_uid']
+        task, planned_evidence = evidence['task'], plan['selection_evidence']
+        window, measured = evidence['window_s'], evidence['measured_window_ns']
+        absolute = plan['planned_device_window_ns']
+        if (not isinstance(sid, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', sid)
+                or plan.get('seq_id') != sid or plan.get('parent_video_uid') != sid
+                or plan.get('source') != 'nymeria' or plan.get('acquisition_required') is not True
+                or plan.get('source_clock_domain') != 'aria_DEVICE_TIME_ns'
+                or not isinstance(task, dict) or not isinstance(task.get('name'), str)
+                or task.get('id') != item.get('task_id')
+                or task.get('registry_key') != item.get('registry_key')
+                or not isinstance(planned_evidence, dict) or planned_evidence.get('task') != task
+                or planned_evidence.get('schema') != 1 or planned_evidence.get('dataset') != 'nymeria'
+                or planned_evidence.get('algorithm') != evidence['algorithm'] + '-planned'
+                or planned_evidence.get('sensor_coverage') != 'unmeasured'
+                or planned_evidence.get('planned_device_window_ns') != absolute
+                or plan.get('device_window_ns') != absolute
+                or not isinstance(window, (list, tuple)) or len(window) != 2
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in window)
+                or window[0] < 0 or window[1] <= window[0]
+                or lineage.get('window_s') != window
+                or not isinstance(measured, (list, tuple)) or len(measured) != 2
+                or any(type(v) is not int or v < 0 for v in measured)
+                or measured[1] <= measured[0]
+                or not isinstance(absolute, (list, tuple)) or len(absolute) != 2
+                or any(type(v) is not int or v < 0 for v in absolute)
+                or not measured[0] <= absolute[0] < absolute[1] <= measured[1]
+                or window != [(v - measured[0]) / 1e9 for v in absolute]):
+            raise ValueError
+        canonical = f'nymeria:{sid}:{window[0]:.3f}:{window[1]:.3f}'
+        alias = f'nymeria-planned:{sid}:{absolute[0]}:{absolute[1]}'
+        if uid != canonical or plan.get('clip_uid') != alias or plan.get('exported_clip_uid') != alias:
+            raise ValueError
+        return [uid, alias]
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ValueError('Vínculo do plano Nymeria com a entrega inválido; preserve o histórico.') from None
 
 
 def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
@@ -73,9 +149,10 @@ def _seed_from_logs() -> dict[str, dict[str, list[str]]]:
                 if (isinstance(acc, dict) and acc.get("ok") is True
                         and not acc.get("skipped") and acc.get("finalized") is not False
                         and isinstance(acc.get("email"), str)):
-                    entry = data.setdefault(scenario, {}).setdefault(uid, [])
-                    if acc["email"] not in entry:
-                        entry.append(acc["email"])
+                    for identity in delivery_clip_uids(item):
+                        entry = data.setdefault(scenario, {}).setdefault(identity, [])
+                        if acc["email"] not in entry:
+                            entry.append(acc["email"])
     return data
 
 
@@ -267,7 +344,8 @@ def _history_deliveries(path: Path) -> list[tuple[str, str, str, str | None, boo
                 raise ValueError("Histórico de campanha sem recibo válido; preserve os arquivos para revisão.")
             confirmed = (account.get("ok") is True and not account.get("skipped")
                          and ("finalized" not in account or account["finalized"] is True))
-            deliveries.append((scenario, uid, account["email"], account.get("session_id"), confirmed))
+            for identity in delivery_clip_uids(item):
+                deliveries.append((scenario, identity, account["email"], account.get("session_id"), confirmed))
     return deliveries
 
 
@@ -348,6 +426,12 @@ def _scoped_reset(scenario: str | None, history_names: Collection[str]) -> None:
                              and isinstance(owner, str) and bool(owner)
                              and (not context.get("task_id") or context["task_id"] == task_id))
             identity = _delivery_identity(context["registry_key"], context["clip_uid"], owner) if context_valid else None
+            context_identities = {identity} if identity is not None else set()
+            if context_valid:
+                for uid in delivery_clip_uids({'clip_uid': context['clip_uid'], 'task_id': task_id,
+                        'registry_key': context['registry_key'], 'session_id': sid, 'org_key': org_key,
+                        'content_provenance': context.get('content_provenance')}):
+                    context_identities.add(_delivery_identity(context['registry_key'], uid, owner))
             complete = (isinstance(org_key, str) and bool(org_key.strip())
                         and type(expected) is int and expected > 0 and len(rows) == expected
                         and all(type(row.get("chunk_index")) is int for row in rows)
@@ -357,7 +441,10 @@ def _scoped_reset(scenario: str | None, history_names: Collection[str]) -> None:
                                 and row.get("task_id") == task_id and row.get("campaign_context") == context
                                 and type(row.get("expected_chunk_count", 1)) is int
                                 and row.get("expected_chunk_count", 1) == expected for row in rows))
-            old_receipts = [entry for entry in session_entries.get(sid, ()) if entry[1] and entry[2]]
+            # An acquisition alias shares the receipt; it is not a second
+            # canonical journal identity and cannot make a group ambiguous.
+            old_receipts = [entry for entry in session_entries.get(sid, ()) if entry[1] and entry[2]
+                            and not entry[0][1].startswith('nymeria-planned:')]
             old_identities = {entry[0] for entry in old_receipts}
             matches_old = len(old_identities) == 1 and all(entry[0][2] == owner
                 and (identity is None or entry[0] == identity)
@@ -371,9 +458,10 @@ def _scoped_reset(scenario: str | None, history_names: Collection[str]) -> None:
                 # even if the persisted index was older than their campaign.
                 protected.update(entry[0] for entry in session_entries.get(sid, ()))
                 if identity is not None:
-                    protected.add(identity)
+                    protected.update(context_identities)
                     if complete:
-                        retained.append((context["registry_key"], context["clip_uid"], owner))
+                        retained.extend((context['registry_key'], uid, owner)
+                                        for _key, uid, _email in context_identities)
         removable = old - protected
         for key in list(data):
             for uid in list(data[key]):
@@ -449,6 +537,7 @@ def summary() -> list[dict[str, Any]]:
     """Resumo por cenário: nº de clipes enviados e total de envios (pares conta×clipe)."""
     out = []
     for scen, clips in sorted(load().items()):
+        deliveries = {uid: emails for uid, emails in clips.items() if not uid.startswith('nymeria-planned:')}
         label = scen
         task_id = None
         if scen.startswith("minute|"):
@@ -456,7 +545,7 @@ def summary() -> list[dict[str, Any]]:
         out.append({
             "scenario": label or "(sem cenário)",
             "task_id": task_id,
-            "sent_clips": len(clips),
-            "sends": sum(len(emails) for emails in clips.values()),
+            "sent_clips": len(deliveries),
+            "sends": sum(len(emails) for emails in deliveries.values()),
         })
     return out

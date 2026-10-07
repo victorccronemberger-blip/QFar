@@ -1767,12 +1767,12 @@ QWidget* MainWindow::buildCampaignPage() {
   sourceLayout->addWidget(_dataset, 1);
   _contentMode = new ComboBox;
   configureCombo(_contentMode, 190);
-  _contentMode->addItem(QStringLiteral("Cache + dataset"), QStringLiteral("both"));
+  _contentMode->addItem(QStringLiteral("Sob demanda"), QStringLiteral("both"));
   _contentMode->addItem(QStringLiteral("Somente cache pronto"), QStringLiteral("cache"));
   _contentMode->addItem(QStringLiteral("Catálogo do dataset"), QStringLiteral("dataset"));
   _contentMode->setToolTip(QStringLiteral(
-      "Somente cache usa clipes já preparados. Catálogo seleciona clipes elegíveis sem priorizar o cache. "
-      "Cache + dataset começa pelos prontos e completa com o catálogo."));
+      "Sob demanda reaproveita arquivos locais ou baixa uma fonte quando necessário, prepara, envia e libera a mídia após confirmar todas as contas. "
+      "Somente cache usa clipes já preparados. Catálogo seleciona clipes elegíveis sem priorizar os arquivos locais."));
   connect(_contentMode, &QComboBox::currentIndexChanged, this,
           [this] { _taskReload.start(); });
   auto* reloadTasks = new QPushButton(QStringLiteral("Recarregar categorias"));
@@ -2008,8 +2008,10 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_delayMode, &QComboBox::currentIndexChanged, parameters, [this, form] {
     form->setRowVisible(_delaySeconds, _delayMode->currentData().toString() == QStringLiteral("fixed"));
   });
-  _cleanupAfter = new QCheckBox(QStringLiteral("Liberar mídia local após cada envio"));
+  _cleanupAfter = new QCheckBox(QStringLiteral("Liberar mídia após confirmar os envios do recorte"));
   _cleanupAfter->setChecked(true);
+  _cleanupAfter->setToolTip(QStringLiteral(
+      "Apaga fontes, recortes e derivados após a confirmação de todas as contas. Arquivos em uso ou necessários para recuperar um envio pendente são preservados."));
   form->addRow(QString(), _cleanupAfter);
   auto* hours = new QWidget;
   auto* hoursLayout = new QHBoxLayout(hours);
@@ -2501,7 +2503,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheLastRun = quietLabel(QStringLiteral("Última preparação: aguardando leitura."));
   _cacheLastRun->setWordWrap(true);
   heroLayout->addWidget(_cacheLastRun);
-  auto* libraryContext = card(QStringLiteral("PREPARAÇÃO ANTECIPADA"), hero);
+  auto* libraryContext = card(QStringLiteral("PREPARAÇÃO ANTECIPADA · OPCIONAL"), hero);
   libraryContext->setObjectName(QStringLiteral("libraryContext"));
   libraryContext->setMinimumWidth(280);
   _cacheState->setWordWrap(true);
@@ -2532,7 +2534,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
     if (_cacheBudgetHelp) form->setRowVisible(_cacheBudgetHelp, ego);
     if (_cacheMinimum) form->setRowVisible(_cacheMinimum->parentWidget(), ego);
     if (_cacheProviderHelp) _cacheProviderHelp->setText(ego
-        ? QStringLiteral("Ego4D: prepara vídeos e sensores antecipadamente. A campanha usa primeiro os arquivos prontos.")
+        ? QStringLiteral("Preparação manual opcional. A campanha pode baixar, preparar e liberar cada recorte quando precisar.")
         : QStringLiteral("HoloAssist: prepara os clipes da tarefa escolhida para uso posterior na campanha."));
     if (_cacheTaskHelp) _cacheTaskHelp->setText(ego
         ? QStringLiteral("A categoria escolhida entra primeiro. O limite em GB é compartilhado entre categorias.")
@@ -2554,11 +2556,10 @@ QWidget* MainWindow::buildAcceleratorPage() {
   });
   form->addRow(QStringLiteral("Provedor"), _cacheProvider);
   _cacheProviderHelp = quietLabel(QStringLiteral(
-      "Ego4D: prepara vídeos e sensores antecipadamente. A campanha usa primeiro os arquivos prontos."));
+      "Preparação manual opcional. A campanha pode baixar, preparar e liberar cada recorte quando precisar."));
   _cacheProviderHelp->setWordWrap(true);
   form->addRow(QString(), _cacheProviderHelp);
   _cacheProvider->setToolTip(_cacheProviderHelp->text());
-  form->setRowVisible(_cacheProviderHelp, false);
   _cacheTask = new ComboBox;
   configureCombo(_cacheTask, 240);
   connect(_cacheTask, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
@@ -2576,7 +2577,7 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheBudget->setRange(0, 2147483647);
   _cacheBudget->setKeyboardTracking(false);
   _cacheBudget->setSpecialValueText(QStringLiteral("0 GB · desativado"));
-  _cacheBudget->setValue(400);
+  _cacheBudget->setValue(0);
   _cacheBudget->setSuffix(QStringLiteral(" GB"));
   connect(_cacheBudget, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
     const bool off = _cacheBudget->value() == 0;
@@ -6524,7 +6525,7 @@ QWidget* MainWindow::buildNymeriaLibraryTab() {
   });
   connect(_nymeriaSync, &QPushButton::clicked, this, &MainWindow::syncNymeriaCatalog);
   connect(_nymeriaRefresh, &QPushButton::clicked, this, [this] { loadNymeriaLibrary(); pollNymeriaJob(); });
-  layout->addWidget(quietLabel(QStringLiteral("Categorias a preparar")));
+  layout->addWidget(quietLabel(QStringLiteral("Preparação manual opcional · categorias")));
   _nymeriaTasks = new QListWidget;
   _nymeriaTasks->setObjectName(QStringLiteral("nymeriaTaskSelection"));
   _nymeriaTasks->setMinimumHeight(100); _nymeriaTasks->setMaximumHeight(150);
@@ -6553,9 +6554,9 @@ QWidget* MainWindow::buildNymeriaLibraryTab() {
   _nymeriaReserve->setObjectName(QStringLiteral("nymeriaDiskReserve"));
   _nymeriaReserve->setRange(5, 1000); _nymeriaReserve->setValue(50); _nymeriaReserve->setSuffix(QStringLiteral(" GiB"));
   preparation->addWidget(_nymeriaReserve); preparation->addStretch();
-  _nymeriaPlanButton = new QPushButton(QStringLiteral("Planejar conteúdo"));
+  _nymeriaPlanButton = new QPushButton(QStringLiteral("Estimar conteúdo"));
   _nymeriaPlanButton->setObjectName(QStringLiteral("nymeriaPlan"));
-  _nymeriaAcquire = new QPushButton(QStringLiteral("Baixar e medir plano"));
+  _nymeriaAcquire = new QPushButton(QStringLiteral("Baixar plano antecipadamente"));
   _nymeriaAcquire->setObjectName(QStringLiteral("nymeriaAcquirePlan"));
   preparation->addWidget(_nymeriaPlanButton); preparation->addWidget(_nymeriaAcquire); layout->addLayout(preparation);
   connect(_nymeriaTargetHours, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] { invalidateNymeriaPlan(); });
@@ -6563,11 +6564,11 @@ QWidget* MainWindow::buildNymeriaLibraryTab() {
     connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this] { invalidateNymeriaPlan(); });
   connect(_nymeriaPlanButton, &QPushButton::clicked, this, &MainWindow::planNymeriaLibrary);
   connect(_nymeriaAcquire, &QPushButton::clicked, this, &MainWindow::acquireNymeriaPlan);
-  _nymeriaPotential = quietLabel(QStringLiteral("O plano usa as anotações para escolher fontes. Vídeo e IMU serão medidos antes de entrar na campanha."));
+  _nymeriaPotential = quietLabel(QStringLiteral("As anotações estimam o conteúdo. Na campanha, cada fonte é baixada e seu vídeo e IMU são medidos antes do envio. O download antecipado é opcional."));
   _nymeriaPotential->setObjectName(QStringLiteral("nymeriaPlanSummary")); _nymeriaPotential->setWordWrap(true);
   layout->addWidget(_nymeriaPotential);
   auto* campaignOrigin = new QHBoxLayout;
-  auto* originHelp = quietLabel(QStringLiteral("A campanha usa a origem selecionada em Nova campanha. Escolha Ambos para usar também o Nymeria preparado."));
+  auto* originHelp = quietLabel(QStringLiteral("Escolha Ambos em Nova campanha para adquirir Ego4D e Nymeria sob demanda, preparar, enviar e liberar cada recorte confirmado."));
   originHelp->setWordWrap(true); campaignOrigin->addWidget(originHelp, 1);
   _nymeriaUseCombined = new QPushButton(QStringLiteral("Usar Ego4D + Nymeria"));
   _nymeriaUseCombined->setObjectName(QStringLiteral("nymeriaUseCombined"));
@@ -6642,7 +6643,7 @@ void MainWindow::updateNymeriaLibraryActions() {
   const bool spaceAllowed = spaceComplete ? _nymeriaPlan.value("fits_available_disk")==QJsonValue(true)
       : _nymeriaPlan.value("fits_source_downloads")==QJsonValue(true);
   _nymeriaAcquire->setText(!_nymeriaPlan.isEmpty() && !spaceComplete
-      ? QStringLiteral("Verificar espaço e baixar") : QStringLiteral("Baixar e medir plano"));
+      ? QStringLiteral("Verificar espaço e baixar antecipadamente") : QStringLiteral("Baixar plano antecipadamente"));
   _nymeriaAcquire->setEnabled(idle && !_nymeriaPlan.value("selected_seq_ids").toArray().isEmpty() && spaceAllowed
       && _nymeriaPlan.value("disk_free_bytes").toDouble() >= _nymeriaPlan.value("download_bytes").toDouble()
           + double(_nymeriaReserve->value()) * 1024 * 1024 * 1024);

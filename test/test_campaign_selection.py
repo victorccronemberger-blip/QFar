@@ -114,7 +114,10 @@ class CampaignSelectionTests(unittest.TestCase):
         self.cfg = CampaignConfig(
             accounts=[AccountSpec(f"user{i}@example.com", "org") for i in range(24)],
             tasks=self.tasks, work_dir=self.tmp / "media", dataset_provider="ego4d",
-            shuffle_schedule=False)
+            # These fixtures exercise selection across failed candidates.
+            # Bounded acquire/deliver/release is tested separately with its
+            # fail-before-next-source contract enabled.
+            shuffle_schedule=False, cleanup_after_upload=False)
         self.seed = {
             task.task_name: tuple({"clip_uid": f"{task.task_id}-{duration}",
                                    "parent_video_uid": f"parent-{task.task_id}",

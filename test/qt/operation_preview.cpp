@@ -50,6 +50,7 @@ public:
 #include "campaign_restriction_qa.inc"
 #include "nymeria_library_qa.inc"
 #include "campaign_all_compatible_qa.inc"
+#include "campaign_on_demand_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -1609,6 +1610,10 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--campaign-all-compatible-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignAllCompatiblePreferenceSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--campaign-on-demand-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignOnDemandSmoke(window); });
     return app.exec();
   }
   if (app.arguments().contains("--original-library-smoke")) {

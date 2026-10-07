@@ -155,14 +155,14 @@
         }
         if(!window._nymeriaAcquire->isEnabled() || !window._nymeriaPotential->text().contains("ainda precisam ser medidos")
             || !window._nymeriaPotential->text().contains("será conferido antes de baixar")
-            || window._nymeriaAcquire->text()!="Verificar espaço e baixar") {qApp->exit(193);return;}
+            || window._nymeriaAcquire->text()!="Verificar espaço e baixar antecipadamente") {qApp->exit(193);return;}
         ++flow->phase; window._nymeriaReserve->setValue(55);
         if(window._nymeriaAcquire->isEnabled() || !window._nymeriaPlan.isEmpty()) {qApp->exit(194);return;}
         window._nymeriaMinimum->setValue(6);
         if(window._nymeriaAcquire->isEnabled() || !window._nymeriaPlan.isEmpty()) {qApp->exit(194);return;}
         window._nymeriaPlanButton->click();
       } else if(flow->phase==6 && flow->plans==4 && window._nymeriaAcquire->isEnabled()) {
-        if(window._nymeriaAcquire->text()!="Baixar e medir plano") {qApp->exit(193);return;}
+        if(window._nymeriaAcquire->text()!="Baixar plano antecipadamente") {qApp->exit(193);return;}
         ++flow->phase; window._nymeriaAcquire->click();
       } else if(flow->phase==7 && flow->downloads==1 && window._nymeriaStop->isEnabled()) {
         if(window._nymeriaSync->isEnabled() || window._nymeriaImport->isEnabled() || window._nymeriaAcquire->isEnabled()) {qApp->exit(195);return;}

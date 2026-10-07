@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **114 releases públicas**, atualizado em **06/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **115 releases públicas**, atualizado em **06/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.54](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.54). Destaques: Continuidade da campanha após retirar contas restritas, seleção de todas as tarefas compatíveis e aquisição do catálogo completo Nymeria pela Biblioteca, com atividade e sensores reais.
+Versão atual: [v2.0.55](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.55). Destaques: Campanha sob demanda, liberação de mídia após a confirmação do lote e aquisição Nymeria durante a execução, com verificação dos sensores reais.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.55](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.55) | 06/10/2026 | Campanha adquire e prepara um recorte por vez, libera arquivos gerenciados após confirmação e protege pendências. Nymeria usa o catálogo para planejar e mede a fonte durante a execução; preparo antecipado fica opcional. | [Desde v2.0.54](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.54...v2.0.55) |
 | [v2.0.54](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.54) | 06/10/2026 | Contas restritas saem e a campanha aproveita a validação já concluída. Biblioteca Nymeria importa, pesquisa, planeja e baixa fontes com sensores medidos; corrige classificações falsas e acelera a consulta de anotações Ego4D. | [Desde v2.0.50](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.50...v2.0.54) |
 | [v2.0.50](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.50) | 06/10/2026 | Reset completo elimina históricos locais, recibos, pendências e reservas, incluindo as fontes legadas e o estado da interface. Preserva contas e Biblioteca e corrige a abertura com início de campanha pendente. | [Desde v2.0.47](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.47...v2.0.50) |
 | [v2.0.47](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.47) | 06/10/2026 | Biblioteca Nymeria local com SDK Aria incluído. Seleção verifica tarefa e relógio das narrações; preparo e encodes preservam PTS reais. Cada parte recebe IMU e diagnóstico próprios; fontes ou vínculos alterados bloqueiam o envio. | [Desde v2.0.46](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.46...v2.0.47) |

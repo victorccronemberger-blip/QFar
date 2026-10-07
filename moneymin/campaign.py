@@ -378,6 +378,7 @@ def _normalize_video(src: Path, out_dir: Path, *,
                 if (_native_cache_marker_matches(saved, src, out, start_s, dur_s)
                         and _native_cache_duration_ok(probe_video(out), dur_s)
                         and _native_cache_marker_matches(saved, src, out, start_s, dur_s)):
+                    _record_generated_media(out, root=out_dir, role="prepared_video")
                     return out
             except (OSError, ValueError, TypeError, RuntimeError):
                 pass
@@ -438,6 +439,7 @@ def _normalize_video(src: Path, out_dir: Path, *,
             tmp.replace(out)
             published = True
             marker_tmp.replace(marker)
+            _record_generated_media(out, root=out_dir, role="prepared_video")
             return out
         except BaseException as exc:
             if published:
@@ -605,6 +607,16 @@ def _native_cache_fingerprint(path: Path, *, allow_empty: bool = False) -> tuple
             or identity(after) != identity(Path(path).stat())):
         raise RuntimeError("arquivo de cache vazio ou alterado durante leitura")
     return size, digest.hexdigest()
+
+
+def _record_generated_media(path: Path, *, root: Path, role: str) -> None:
+    """Bind a successfully produced derivative to its actual bytes."""
+    from .media_lifecycle import record_managed_media
+    _size, digest = _native_cache_fingerprint(path)
+    provider = ("nymeria" if path.name.startswith("nymeria_") else
+                "holoassist" if path.name.startswith("holoassist_") else "ego4d")
+    record_managed_media(path, root=root, provider=provider, role=role,
+                         expected_digest=digest)
 
 
 def _native_cache_key(
@@ -973,17 +985,30 @@ def prepare_nymeria_clip(
     *,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     allow_download: bool = True,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Extrai RGB+IMU reais do Aria VRS e monta item Minute-ready."""
-    from . import content_provenance, nymeria_vrs
+    from . import content_provenance, nymeria_vrs, nymeria_library
 
-    _ = allow_download  # dados já locais na library Nymeria
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     def _progress(phase: str, **payload: Any) -> None:
         if progress:
             progress(phase, payload)
+
+    if clip.get("acquisition_required") is True:
+        if not allow_download:
+            raise RuntimeError("Fonte Nymeria ainda não adquirida; modo somente cache impede download.")
+        nymeria.revalidate_planned_candidate(clip)
+        _progress("source_acquisition")
+        def _acquisition_progress(value: Any) -> None:
+            payload = value if isinstance(value, dict) else {"message": str(value)}
+            _progress("source_acquisition", **payload)
+        nymeria_library.ensure_sequence_for_campaign(
+            clip, progress=_acquisition_progress, should_stop=should_stop)
+        clip = nymeria.resolve_planned_candidate(clip)
+        _progress("source_measured", measured=True)
 
     clip_uid = str(clip.get("clip_uid") or "")
     seq_dir = Path(str(clip.get("path") or ""))
@@ -1036,6 +1061,7 @@ def prepare_nymeria_clip(
             data_vrs, native, t0_ns=t0_ns, t1_ns=t1_ns,
             output_args=[*_native_video_codec_args(nvenc=False), *container_args],
             stats=rgb_diag)
+    _record_generated_media(native, root=work_dir, role="prepared_video")
     _progress("video_ready", bytes=native.stat().st_size)
     _progress("encode_ready", encoder="CPU", measured_pts=True)
     probe = probe_video(native)
@@ -1409,6 +1435,7 @@ def _cut_video_chunk(src: Path, dest: Path, start_s: float, dur_s: float,
                 if preserve_pts:
                     _require_same_video_pts(src, dest, start_ns=round(start_s * 1e9),
                                             end_ns=round((start_s + dur_s) * 1e9))
+                _record_generated_media(dest, root=dest.parent, role="delivery_chunk")
                 return dest
         except OSError:
             pass
@@ -1437,6 +1464,7 @@ def _cut_video_chunk(src: Path, dest: Path, start_s: float, dur_s: float,
                                         end_ns=round((start_s + dur_s) * 1e9))
                 tmp.replace(dest)
                 ready.write_text(expected, encoding="utf-8")
+                _record_generated_media(dest, root=dest.parent, role="delivery_chunk")
                 return dest
             finally:
                 tmp.unlink(missing_ok=True)
@@ -1467,6 +1495,7 @@ def _cut_video_chunk(src: Path, dest: Path, start_s: float, dur_s: float,
                 f"corte de chunk falhou: {(res.stderr or '')[:400]}")
         tmp.replace(dest)
         ready.write_text(expected, encoding="utf-8")
+        _record_generated_media(dest, root=dest.parent, role="delivery_chunk")
         return dest
 
 
@@ -1576,10 +1605,12 @@ def _per_account_video(base: Path, profile: DeviceProfile, *, preserve_pts: bool
     lock = _lock_for_account_video(out)
     with lock:
         if _valid_account_video(out, base, preserve_pts=preserve_pts):
+            _record_generated_media(out, root=base.parent, role="account_video")
             return out
         with _cpu_slots(1):
             # Pode ter ficado pronto enquanto esta conta aguardava o lock/slot.
             if _valid_account_video(out, base, preserve_pts=preserve_pts):
+                _record_generated_media(out, root=base.parent, role="account_video")
                 return out
             ff = _ffmpeg_bin()
             mb = profile.video_bitrate_mbps
@@ -1636,6 +1667,7 @@ def _per_account_video(base: Path, profile: DeviceProfile, *, preserve_pts: bool
                 tmp.replace(out)
                 _account_video_ok_path(out).write_text(
                     _ACCOUNT_VIDEO_ENCODE_VERSION + ("-vfr1" if preserve_pts else ""), encoding="utf-8")
+                _record_generated_media(out, root=base.parent, role="account_video")
             finally:
                 if tmp.exists():
                     try:
@@ -1948,6 +1980,14 @@ def _expected_prefetch_paths(
             recording / "IMU" / "Magnetometer_sync.txt",
             work / f"{safe_stem}_native.mp4",
         ]
+    elif clip_info.get("source") == "nymeria":
+        clip_uid = str(clip_info.get("clip_uid") or "")
+        stem = "nymeria_" + clip_uid.replace(":", "_").replace(".", "_")
+        seq_dir = Path(str(clip_info.get("path") or ""))
+        paths = [work / f"{stem}_native.mp4"]
+        if seq_dir.is_absolute():
+            paths.extend(seq_dir / "recording_head" / "data" / name
+                         for name in ("data.vrs", "motion.vrs"))
     else:
         clip_uid = str(
             clip_info.get("exported_clip_uid") or clip_info.get("clip_uid") or ""
@@ -1976,7 +2016,8 @@ def _cleanup_uploaded_item(
     *,
     protected_paths: set[Path] | None = None,
 ) -> dict[str, Any]:
-    """Apaga fonte, IMU, normalizado e variantes após o lote confirmar."""
+    """Release only application-owned bytes after the batch is confirmed."""
+    from .media_lifecycle import cleanup_managed_media, managed_media_paths
     candidates = [Path(value) for value in item.get("_cleanup_paths", [])
                   if isinstance(value, str) and value]
     base_value = item.get("video_path")
@@ -1997,8 +2038,6 @@ def _cleanup_uploaded_item(
             chunk_variants = []
         candidates.extend(variants)
         candidates.extend(chunk_variants)
-    for path in list(candidates):
-        candidates.extend(_media_companions(path))
     protected_keys: set[str] = set()
     for protected in protected_paths or set():
         try:
@@ -2016,12 +2055,51 @@ def _cleanup_uploaded_item(
             protected_count += 1
             continue
         filtered.append(candidate)
-    result = _delete_media_files(
+    result = cleanup_managed_media(
         filtered,
         allowed_roots=(Path(work_dir), holoassist.data_dir() / "recordings"),
+        protected_paths=protected_paths or set(),
     )
+    # A source/encode marker describes a present MP4. Remove it only after
+    # that specific media was released; protected and foreign bytes keep it.
+    companions = [companion for raw in result["removed_paths"]
+                  for companion in _media_companions(Path(raw))]
+    companion_result = _delete_media_files(
+        companions, allowed_roots=(Path(work_dir), holoassist.data_dir() / "recordings"))
+    result["files"] += companion_result["files"]
+    result["bytes"] += companion_result["bytes"]
+    result["errors"].extend(companion_result["errors"])
+    if item.get("source") == "nymeria" and item.get("seq_id"):
+        from . import nymeria_library
+        candidate = item.get("_content_candidate") or {}
+        seq_dir = Path(str(candidate.get("path") or ""))
+        if seq_dir.is_absolute():
+            released = nymeria_library.cleanup_sequence_sources(
+                str(item["seq_id"]), root=seq_dir.parent,
+                protected_paths=protected_paths or set())
+            result["files"] += released["files"]
+            result["bytes"] += released["bytes"]
+            result["errors"].extend(released["errors"])
+            candidates.extend(Path(row["path"]) for row in (item.get("_content_inputs") or {}).values()
+                              if isinstance(row, dict) and isinstance(row.get("path"), str))
+    roots = [Path(work_dir), holoassist.data_dir() / "recordings"]
+    candidate = item.get("_content_candidate") or {}
+    if item.get("source") == "nymeria" and isinstance(candidate.get("path"), str):
+        seq_dir = Path(candidate["path"])
+        if seq_dir.is_absolute():
+            roots.append(seq_dir.parent)
+    result["retained_managed"] = len(managed_media_paths(candidates, allowed_roots=tuple(roots)))
     result["protected"] = protected_count
     return result
+
+
+def _cleanup_rejected_prepare(clip: dict[str, Any], work_dir: Path) -> dict[str, Any]:
+    """Release an unconsumed candidate; journals still protect every binding."""
+    paths = _expected_prefetch_paths(clip, work_dir)
+    return _cleanup_uploaded_item({"source": clip.get("source"),
+                                   "seq_id": clip.get("seq_id"),
+                                   "_content_candidate": clip,
+                                   "_cleanup_paths": [str(path) for path in paths]}, work_dir)
 
 
 @cleanup_operation
@@ -2107,6 +2185,56 @@ def _all_pending_uploads_succeeded(
         bool(results.get(account.email, {}).get("ok"))
         for account in pending_accounts
     )
+
+
+def _cleanup_confirmed_account_media(
+    item: dict[str, Any], account: AccountSpec, result: dict[str, Any],
+    paths: list[str], work_dir: Path, *, protected_paths: set[Path],
+) -> dict[str, Any] | None:
+    """Release an account variant only after its durable receipt is complete."""
+    if (result.get("ok") is not True or result.get("finalized") is not True
+            or not isinstance(result.get("session_id"), str) or not paths):
+        return None
+    from . import recovery
+    from .media_lifecycle import cleanup_managed_media
+    groups = recovery._groups(include_reconciled=True)
+    rows = next((rows for rows in groups if rows[0]["session_id"] == result["session_id"]
+                 and rows[0]["account_email"] == account.email
+                 and rows[0]["org_key"] == account.org_key), None)
+    if (not rows or not recovery._complete_chunk_group(rows)
+            or not all(journal_delivery_confirmed(row)
+                       and row.get("campaign_reconciled") is True for row in rows)):
+        return None
+    from .campaign_evidence import publication_index, publication_registered
+    if not publication_registered(rows, publication_index()):
+        return None
+    base = Path(item["video_path"])
+    # Common native/chunk media serves the other accounts in this item. Only
+    # account variants are released early; the batch releases shared media.
+    candidates = [Path(path) for path in paths
+                  if Path(path).parent == base.parent
+                  and Path(path).name.startswith(base.stem + "_acc")]
+    variant = Path(paths[0])
+    if any(os.path.normcase(str(variant.resolve())) == os.path.normcase(str(consumer.resolve()))
+           for consumer in protected_paths):
+        # The next/current account can be cutting this same device variant
+        # before it has published a journal. Keep its complete chunk family.
+        return None
+    guards = set(protected_paths)
+    for path in candidates:
+        if any(path.parent == consumer.parent
+               and path.name.startswith(consumer.stem + "_ch")
+               for consumer in protected_paths):
+            guards.add(path)
+    released = cleanup_managed_media(candidates, allowed_roots=(Path(work_dir),),
+                                     protected_paths=guards)
+    companions = [companion for raw in released["removed_paths"]
+                  for companion in _media_companions(Path(raw))]
+    extra = _delete_media_files(companions, allowed_roots=(Path(work_dir),))
+    released["files"] += extra["files"]
+    released["bytes"] += extra["bytes"]
+    released["errors"].extend(extra["errors"])
+    return released
 
 
 # --- envio para uma conta -----------------------------------------------------
@@ -2574,6 +2702,10 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                     "video_path": str(part), "imu_csv": part_imu, "frames_csv": part_frames,
                     "sidecar_bytes": chunk_zips[-1], "recorded_at": rec_at})
         result["session_id"] = session_id
+        # The coordinator consumes this private carrier before persisting the
+        # account result. It permits per-account eviction after the journals
+        # and immutable receipt have been published, without guessing filenames.
+        result["_delivery_media_paths"] = [str(video_path), *(str(path) for path in chunk_paths)]
         if item.get("source") in {"ego4d", "nymeria"}:
             try:
                 result["source_provenance"] = content_provenance.bind_content_delivery(
@@ -2754,7 +2886,8 @@ def automatic_candidates(tsk: TaskSpec, config: CampaignConfig) -> list[dict[str
             nymeria_clips = nymeria.automatic_candidates(
                 task_name=tsk.task_name, task_id=tsk.task_id,
                 registry_key=tsk.registry_key,
-                min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s)
+                min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
+                include_planned=content_mode != "cache")
         except Exception:
             nymeria_clips = []
         # Nymeria windows carry current action and measured VRS evidence.
@@ -2795,6 +2928,28 @@ def _batch_footage_overlaps(previous: dict, candidate: dict) -> bool:
     """Match original footage, independently of category and encoded variants."""
     if str(previous.get("source") or "ego4d") != str(candidate.get("source") or "ego4d"):
         return False
+    if previous.get("source") == "nymeria":
+        def device_window(row: dict) -> tuple[int, int] | None:
+            values = row.get("device_window_ns") or row.get("planned_device_window_ns")
+            if (row.get("source_clock_domain") == "aria_DEVICE_TIME_ns"
+                    and isinstance(values, (list, tuple)) and len(values) == 2
+                    and all(type(value) is int and value >= 0 for value in values)
+                    and values[1] > values[0]):
+                return values[0], values[1]
+            return None
+        old_window, new_window = device_window(previous), device_window(candidate)
+        if old_window and new_window:
+            if previous.get("parent_video_uid") != candidate.get("parent_video_uid"):
+                return False
+            overlap = min(old_window[1], new_window[1]) - max(old_window[0], new_window[0])
+            return overlap * 5 >= min(old_window[1] - old_window[0],
+                                     new_window[1] - new_window[0]) * 3
+        if (previous.get("acquisition_required") is True
+                or candidate.get("acquisition_required") is True):
+            # Annotation-relative and SDK-relative clocks cannot be compared.
+            old_ids = {previous.get("clip_uid"), *previous.get("dedup_clip_uids", [])} - {None, ""}
+            new_ids = {candidate.get("clip_uid"), *candidate.get("dedup_clip_uids", [])} - {None, ""}
+            return bool(old_ids & new_ids)
     if (previous.get("parent_video_uid") and candidate.get("parent_video_uid")
             and _clip_window(previous) is not None and _clip_window(candidate) is not None):
         # Distinct cuts can share an old catalog alias. Canonical source
@@ -2843,10 +2998,10 @@ def _run_campaign(
       sem ocupar workers; cada envio só é liberado ao fim da sua reserva.
     - `config.active_hours`: janela local de envio (ex.: (7, 18)) — fora dela a
       campanha aguarda a próxima abertura antes de cada envio.
-    - `config.cleanup_after_upload`: mantém o prefetch do próximo vídeo e apaga
-      a mídia somente quando todas as contas pendentes do item confirmaram
-      sucesso. Arquivos compartilhados com o prefetch ficam protegidos até o
-      próximo item; em falha, parada ou lote parcial tudo é mantido.
+    - `config.cleanup_after_upload`: baixa e prepara somente o item em uso,
+      envia para suas contas e libera os arquivos gerenciados após confirmação.
+      Um envio pendente impede a aquisição de outro item. Prefetch de mídia e
+      retenção de cache ficam disponíveis somente quando a limpeza é desligada.
     """
     sends = {"ok": 0, "failed": 0, "skipped": 0}
 
@@ -2899,7 +3054,9 @@ def _run_campaign(
 
     def _reserve_batch_footage(email: str, candidate: dict) -> dict:
         reservation = {key: candidate[key] for key in (
-            "clip_uid", "source", "parent_video_uid", "window_s", "dedup_clip_uids")
+            "clip_uid", "source", "parent_video_uid", "window_s", "dedup_clip_uids",
+            "device_window_ns", "planned_device_window_ns", "source_clock_domain",
+            "acquisition_required")
             if key in candidate}
         batch_footage.setdefault(email, []).append(reservation)
         return reservation
@@ -2956,7 +3113,7 @@ def _run_campaign(
                         <= tsk.max_dur_s
                     }
                 for uid in tsk.clip_uids:
-                    if uid.startswith("nymeria:"):
+                    if uid.startswith(("nymeria:", "nymeria-planned:")):
                         if dataset_provider not in {"all", "ambos", "nymeria"}:
                             _log(f"  [!] clipe {uid} pertence ao Nymeria — pulando")
                             continue
@@ -2967,6 +3124,7 @@ def _run_campaign(
                                 registry_key=tsk.registry_key,
                                 min_dur_s=tsk.min_dur_s,
                                 max_dur_s=tsk.max_dur_s,
+                                include_planned=content_mode != "cache",
                             )
                         }
                         nymeria_clip = compatible.get(uid)
@@ -3118,12 +3276,17 @@ def _run_campaign(
             sent_to = _candidate_sent_emails(registry_key, clip_info)
             batch_reserved = _batch_reserved_emails(clip_info)
             reserved = _candidate_reserved_emails(config, clip_info) | batch_reserved
-            if all(a.email in sent_to | reserved for a in config.accounts):
+            eligible_accounts = [a for a in config.accounts if a.email not in banned
+                                 and (not quota_s or (account_seconds.get(a.email, 0) < quota_s
+                                      and task_seconds.get(a.email, 0) < per_task_cap_s))
+                                 and (quota_s or not automatic_selection
+                                      or task_sends.get(a.email, 0) < tsk.count)]
+            if not eligible_accounts or all(a.email in sent_to | reserved for a in eligible_accounts):
                 _log(f"  clipe {clip_info['clip_uid'][:12]} já enviado ou reservado por pendência "
                      f"em todas as contas — pulando (sem baixar/reencodar)")
                 # account_done mantém o progresso da UI consistente; o item nem
                 # chega a existir (nada a registrar no log da campanha)
-                for account in config.accounts:
+                for account in eligible_accounts:
                     _emit("account_done", clip_uid=clip_info["clip_uid"],
                           task=tsk.scenario, email=account.email, ok=account.email not in reserved,
                           skipped=True, reason=("source_reserved_in_campaign" if account.email in batch_reserved
@@ -3173,6 +3336,8 @@ def _run_campaign(
                         payload: dict[str, Any],
                         _clip_uid: str = str(clip_info["clip_uid"]),
                     ) -> None:
+                        if should_stop and should_stop():
+                            raise RuntimeError("preparo interrompido pelo usuário")
                         _emit(
                             "clip_prepare_progress",
                             clip_uid=_clip_uid,
@@ -3189,6 +3354,7 @@ def _run_campaign(
                     item = prepare_nymeria_clip(
                         clip_info, work_dir, progress=_prepare_progress,
                         allow_download=content_mode != "cache",
+                        should_stop=should_stop,
                     )
                 if item is None:
                     clip, video = _ego_clip_inputs(clip_info)
@@ -3213,6 +3379,9 @@ def _run_campaign(
                         f"vídeo preparado excede a duração máxima de {tsk.max_dur_s:g}s"
                     )
             except Exception as exc:  # noqa: BLE001 — pula o clipe, segue a campanha
+                if should_stop and should_stop():
+                    _emit("campaign_stopped", reason="parada durante aquisição ou preparo")
+                    break
                 imu_fail = any(reason in str(exc).lower() for reason in (
                         "cobertura imu insuficiente", "sem amostras válidas de imu",
                         "sem cobertura contínua de imu", "atravessa trecho sem cobertura",
@@ -3244,6 +3413,18 @@ def _run_campaign(
                     _log(f"    [!] prepare falhou: {error}")
                     _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
                           task_name=display_name, ok=False, error=error)
+                    if config.cleanup_after_upload:
+                        cleanup = _cleanup_rejected_prepare(clip_info, work_dir)
+                        _emit("storage_cleanup", clip_uid=clip_info["clip_uid"],
+                              files=cleanup["files"], bytes=cleanup["bytes"],
+                              errors=cleanup["errors"], protected=cleanup["protected"])
+                        # A rejected sensor window is safe to skip after its
+                        # owned, unused files are released. Acquisition/encode
+                        # failures may hold partial downloads: stop this cycle.
+                        if (not imu_fail or cleanup["errors"]
+                                or cleanup.get("retained_managed", 0)):
+                            raise RuntimeError(
+                                "Preparo interrompido; nenhum outro vídeo foi adquirido. " + error) from exc
                     continue
                 item = carved_item["item"]
                 clip_info = carved_item["clip"]
@@ -3256,7 +3437,18 @@ def _run_campaign(
                     _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
                           task_name=display_name, ok=False,
                           error="carve fora da duração")
+                    if config.cleanup_after_upload:
+                        _cleanup_uploaded_item(item, work_dir)
+                        raise RuntimeError(
+                            "Recorte preparado fora da duração; nenhum outro vídeo foi adquirido.")
                     continue
+            # Acquisition resolves catalog-only Nymeria identities against the
+            # measured SDK clock before dedup, reservations or delivery.
+            if clip_info.get("acquisition_required") is True:
+                resolved = item.get("_content_candidate")
+                if not isinstance(resolved, dict) or resolved.get("acquisition_required") is True:
+                    raise ValueError("Fonte Nymeria adquirida sem candidato medido confirmado.")
+                clip_info = dict(resolved)
             # IMU carving can produce a different proven source interval.
             # Account eligibility follows the footage that will actually go out.
             batch_reserved = _batch_reserved_emails(clip_info)
@@ -3288,7 +3480,8 @@ def _run_campaign(
                     a.email not in banned
                     and task_sends.get(a.email, 0) + int(a.email in current_recipients) < tsk.count
                     for a in task_accounts)
-            if should_prefetch and content_mode != "cache":
+            if (should_prefetch and content_mode != "cache"
+                    and not config.cleanup_after_upload):
                 _prefetch_following(
                     prefetch,
                     clips,
@@ -3395,7 +3588,7 @@ def _run_campaign(
                 int(config.account_workers or 1),
                 len(pending_accounts) or 1)
             warm_pool = None
-            if config.unique_video:
+            if config.unique_video and not config.cleanup_after_upload:
                 # Re-encode só das que vão sair agora (+1 de folga).
                 warm_n = min(len(pending_accounts), workers + 1)
                 warm_pool = _warm_account_videos(
@@ -3523,6 +3716,7 @@ def _run_campaign(
                 seconds: dict[str, float] = task_seconds,
                 duration_s: float = float(item.get("duration_ms") or 0) / 1000.0,
             ) -> None:
+                delivery_media = acc_res.pop("_delivery_media_paths", [])
                 if (acc_res.get("ok") and not acc_res.get("skipped")
                         and acc_res.get("finalized") is not True):
                     acc_res = {**acc_res, "ok": False,
@@ -3548,7 +3742,13 @@ def _run_campaign(
                 ok = acc_res.get("ok")
                 if ok and not acc_res.get("skipped") and acc_res.get("finalized") is True:
                     try:
-                        sent_registry.mark_sent(sent_key, clip_uid, account.email)
+                        identities = (sent_registry.delivery_clip_uids(item)
+                                      if item.get("source") == "nymeria" else [clip_uid])
+                        if len(identities) > 1:
+                            sent_registry.mark_sent_many([
+                                (sent_key, identity, account.email) for identity in identities])
+                        else:
+                            sent_registry.mark_sent(sent_key, clip_uid, account.email)
                         if acc_res.get("session_id"):
                             _acknowledge_campaign_upload(acc_res["session_id"])
                     except Exception as exc:
@@ -3577,6 +3777,25 @@ def _run_campaign(
                     _emit("account_excluded", email=account.email)
                 if record_error is not None:
                     raise record_error
+                if config.cleanup_after_upload and config.unique_video and delivery_media:
+                    # Queued accounts can share a persisted device identity.
+                    # Protect their exact variant before they publish journals.
+                    consumers = {Path(item["video_path"])}
+                    for other in pending_accounts:
+                        if other.email not in results:
+                            consumers.add(_account_video_path(
+                                Path(item["video_path"]), device_profile.get_profile(other.email)))
+                    try:
+                        released = _cleanup_confirmed_account_media(
+                            item, account, acc_res, delivery_media, work_dir,
+                            protected_paths=consumers)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        _log(f"  armazenamento: variante preservada para revisão ({type(exc).__name__})")
+                    else:
+                        if released and released["files"]:
+                            _emit("storage_cleanup", clip_uid=clip_uid, email=account.email,
+                                  files=released["files"], bytes=released["bytes"],
+                                  errors=released["errors"], protected=released["skipped"])
 
             batch_started_at = time.monotonic() if pending_accounts else None
             batch_reservations: dict[str, dict] = {}
@@ -3716,8 +3935,10 @@ def _run_campaign(
                 _emit("campaign_stopped", reason="parada pelo usuário")
                 _stop_warm()
                 break
+            retained_accounts = [a for a in pending_accounts
+                                 if not account_results.get(a.email, {}).get("excluded_from_campaign")]
             all_pending_succeeded = _all_pending_uploads_succeeded(
-                pending_accounts, account_results
+                retained_accounts, account_results
             )
             # Não espera tarefa de fundo: todas as variantes usadas por contas
             # bem-sucedidas já terminaram; o prefetch do próximo segue ativo.
@@ -3725,9 +3946,10 @@ def _run_campaign(
             failed_accounts = [
                 result for result in account_results.values()
                 if not result.get("ok") and not result.get("skipped")
-                and not result.get("excluded_from_campaign")
+                and (not result.get("excluded_from_campaign")
+                     or result.get("session_id") or result.get("uploads"))
             ]
-            if config.require_all_accounts and failed_accounts:
+            if (config.require_all_accounts or config.cleanup_after_upload) and failed_accounts:
                 details = "; ".join(
                     f"{result.get('email')}: {result.get('error') or 'erro desconhecido'}"
                     for result in failed_accounts
@@ -3737,17 +3959,12 @@ def _run_campaign(
                       accounts=[r.get("email") for r in failed_accounts])
                 raise RuntimeError(
                     "lote incompleto após todas as tentativas; "
-                    "a campanha não avançou. Contas pendentes: " + details
+                    "a campanha preservou a mídia e não adquiriu outro vídeo. "
+                    "Contas pendentes: " + details
                 )
             if pending_accounts:
-                if reserved:
+                if reserved and not config.cleanup_after_upload:
                     _log("  armazenamento: mídia preservada para a recuperação do envio anterior")
-                elif (config.cleanup_after_upload and all_pending_succeeded
-                        and clip_info.get("_cache_ready_at_selection")):
-                    removed, freed = _enforce_account_video_cache(work_dir)
-                    _log("  armazenamento: cache preparado preservado"
-                         + (f"; variantes antigas: {removed} arquivo(s), "
-                            f"{freed / (1024 ** 3):.1f} GB liberados" if removed else ""))
                 elif config.cleanup_after_upload and all_pending_succeeded:
                     cleanup = _cleanup_uploaded_item(
                         item,
@@ -3771,6 +3988,12 @@ def _run_campaign(
                         + (f"; falhas: {len(cleanup['errors'])}"
                            if cleanup["errors"] else "")
                     )
+                    if cleanup["errors"] or cleanup.get("retained_managed", 0):
+                        _emit("item_incomplete", clip_uid=clip_info["clip_uid"],
+                              task=tsk.scenario, reason="media_retained_for_recovery")
+                        raise RuntimeError(
+                            "Mídia reservada para envio anterior ou limpeza incompleta; "
+                            "a campanha não adquiriu outro vídeo. Resolva a pendência e retome.")
                 elif config.cleanup_after_upload and not all_pending_succeeded:
                     _log(
                         "  armazenamento: mídia mantida porque há conta "
@@ -3783,6 +4006,12 @@ def _run_campaign(
                              f"{freed / (1024 ** 3):.1f} GB")
                 _emit("item_done", clip_uid=clip_info["clip_uid"],
                       task=tsk.scenario, partial=False)
+            elif config.cleanup_after_upload:
+                cleanup = _cleanup_uploaded_item(item, work_dir)
+                if cleanup["errors"] or cleanup.get("retained_managed", 0):
+                    raise RuntimeError(
+                        "Mídia reservada para envio anterior ou limpeza incompleta; "
+                        "a campanha não adquiriu outro vídeo. Resolva a pendência e retome.")
             # (log: sem os blobs/csv brutos — grandes; identity fica por conta)
 
         if log.status != "stopped" and not quota_s and automatic_selection:
@@ -3987,6 +4216,14 @@ def _rank_evidenced(buckets):
 
 
 def _clip_window(clip: dict[str, Any]) -> tuple[float, float] | None:
+    if (clip.get("source") == "nymeria"
+            and clip.get("source_clock_domain") == "aria_DEVICE_TIME_ns"):
+        canonical = clip.get("device_window_ns") or clip.get("planned_device_window_ns")
+        if (isinstance(canonical, (list, tuple)) and len(canonical) == 2
+                and all(type(value) is int and value >= 0 for value in canonical)
+                and canonical[1] > canonical[0]):
+            return canonical[0] / 1e9, canonical[1] / 1e9
+        return None
     window = clip.get("window_s")
     if not isinstance(window, (list, tuple)) or len(window) != 2:
         return None
@@ -4187,7 +4424,10 @@ def _prepare_queue_accepts(clip: dict[str, Any], task_name: str | None, *,
     uid = str(clip.get("clip_uid") or "")
     if source == "nymeria" or uid.startswith("nymeria:"):
         try:
-            nymeria.revalidate_candidate(clip, task_name=task_name, fresh=fresh)
+            if clip.get("acquisition_required") is True:
+                nymeria.revalidate_planned_candidate(clip, task_name=task_name)
+            else:
+                nymeria.revalidate_candidate(clip, task_name=task_name, fresh=fresh)
         except (OSError, ValueError, RuntimeError, ImportError):
             return False
         return True
@@ -4465,7 +4705,7 @@ def _nymeria_windows(task_name: str, min_dur_s: float,
     """Nymeria owns a cache bound to exact current roots/media/annotations."""
     try:
         clips = nymeria.automatic_candidates(task_name=task_name,
-            min_dur_s=min_dur_s, max_dur_s=max_dur_s)
+            min_dur_s=min_dur_s, max_dur_s=max_dur_s, include_planned=True)
     except Exception:
         return ()
     return tuple(dict(clip) for clip in clips)

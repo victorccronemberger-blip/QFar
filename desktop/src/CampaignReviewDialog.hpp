@@ -136,6 +136,12 @@ public:
       layout->addWidget(available);
       auto* basis = new QLabel(QStringLiteral("Estimativa de trechos novos sem repetição material. Preparação, recebimento e avaliação ainda serão verificados."));
       basis->setObjectName(QStringLiteral("quiet")); basis->setWordWrap(true); layout->addWidget(basis);
+      if (capacity.value("requires_measured_validation").toBool()) {
+        auto* pending = new QLabel(QStringLiteral("%1 recorte(s) estimados pelas anotações. A fonte será adquirida e seu vídeo e sensores serão medidos antes do envio; as horas ainda dependem dessa validação.")
+            .arg(capacity.value("pending_acquisition_clips").toInt()));
+        pending->setObjectName(QStringLiteral("campaignAcquisitionEstimate"));
+        pending->setWordWrap(true); layout->addWidget(pending);
+      }
     } else if (requestedSeconds(result, request) > 0 || !std::isfinite(requestedSeconds(result, request))) {
       auto* unknown = new QLabel(QStringLiteral("A capacidade de conteúdo não foi confirmada para esta meta. Volte e verifique a campanha novamente."));
       unknown->setObjectName(QStringLiteral("campaignCapacitySummary")); unknown->setWordWrap(true); layout->addWidget(unknown);
@@ -191,9 +197,10 @@ public:
       auto* clipPage = new QWidget;
       auto* clipLayout = new QVBoxLayout(clipPage);
       clipLayout->setContentsMargins(0, 0, 0, 0);
-      auto* clipTable = new QTableWidget(clips.size(), 5);
+      auto* clipTable = new QTableWidget(clips.size(), 6);
+      clipTable->setObjectName(QStringLiteral("campaignClipPlanTable"));
       clipTable->setHorizontalHeaderLabels({QStringLiteral("Clipe"), QStringLiteral("Categoria"),
-          QStringLiteral("Duração"), QStringLiteral("Elegíveis"), QStringLiteral("Excluídas")});
+          QStringLiteral("Duração"), QStringLiteral("Elegíveis"), QStringLiteral("Excluídas"), QStringLiteral("Verificação")});
       clipTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
       clipTable->verticalHeader()->hide();
       clipTable->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -209,7 +216,10 @@ public:
         const QStringList values{clip.value("clip_uid").toString(), clip.value("task").toString(),
             QStringLiteral("%1 min").arg(clip.value("duration_s").toDouble() / 60, 0, 'f', 1),
             QString::number(clip.value("eligible_accounts").toArray().size()),
-            QString::number(clip.value("excluded_accounts").toArray().size())};
+            QString::number(clip.value("excluded_accounts").toArray().size()),
+            clip.value("requires_measured_validation").toBool() ? QStringLiteral("Aquisição e medição pendentes")
+                : clip.value("readiness").toString() == "measured" ? QStringLiteral("Vídeo e sensores medidos")
+                : QStringLiteral("Preparação pendente")};
         for (int column = 0; column < values.size(); ++column) {
           auto* item = new QTableWidgetItem(values[column]);
           item->setToolTip(values[column]);
@@ -220,6 +230,8 @@ public:
         if (row < 0 || row >= clips.size()) { detail->clear(); return; }
         const auto clip = clips[row].toObject();
         QStringList lines;
+        if (clip.value("requires_measured_validation").toBool())
+          lines << QStringLiteral("Estimativa das anotações: a fonte será adquirida e medida antes do envio.");
         for (const auto account : clip.value("eligible_accounts").toArray())
           lines << account.toString() + QStringLiteral(" — elegível; envio sujeito à preparação e aos limites da campanha");
         for (const auto account : clip.value("excluded_accounts").toArray())

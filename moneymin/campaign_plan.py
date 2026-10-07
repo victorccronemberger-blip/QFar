@@ -21,7 +21,7 @@ def available_seconds(review: list[dict], emails: list[str]) -> dict[str, float]
         duration = float(row.get("duration_s") or 0)
         if not math.isfinite(duration) or duration <= 0:
             continue
-        window = row.get("window_s")
+        window = campaign._clip_window(row)
         parent = row.get("parent_video_uid")
         if (parent and isinstance(window, (list, tuple)) and len(window) == 2
                 and all(type(value) in (int, float) and math.isfinite(value) for value in window)
@@ -110,6 +110,9 @@ def capacity(review: list[dict], emails: list[str], *, target_seconds: float = 0
         "shortfall_account_count": shortfall,
         "estimated_sends": sum(row["estimated_sends"] for row in accounts),
         "candidate_clips": len(review), "accounts": accounts,
+        "pending_acquisition_clips": sum(row.get("acquisition_required") is True for row in review),
+        "requires_measured_validation": any(row.get("requires_measured_validation") is True for row in review),
+        "campaign_ready": False,
     }
 
 
@@ -144,6 +147,13 @@ def build(config: CampaignConfig) -> tuple[dict, list[dict], str]:
                 "dedup_clip_uids": list(clip.get("dedup_clip_uids") or ()),
                 "parent_video_uid": clip.get("parent_video_uid"),
                 "window_s": list(clip["window_s"]) if clip.get("window_s") else None,
+                "device_window_ns": list(clip["device_window_ns"]) if clip.get("device_window_ns") else None,
+                "source_clock_domain": clip.get("source_clock_domain"),
+                "window_origin_device_timestamp_ns": clip.get("window_origin_device_timestamp_ns"),
+                "capacity_kind": clip.get("capacity_kind", "estimate_before_preparation"),
+                "readiness": clip.get("readiness", "pending_preparation"),
+                "acquisition_required": clip.get("acquisition_required") is True,
+                "requires_measured_validation": clip.get("requires_measured_validation") is True,
                 "imu_refined_from": clip.get("imu_refined_from"),
                 "eligible_accounts": [a.email for a in config.accounts if a.email not in excluded],
                 "excluded_accounts": [a.email for a in config.accounts if a.email in excluded],

@@ -20,7 +20,7 @@ from .media_lifecycle import cleanup_operation, media_state_lease
 
 DEFAULT_TASK = "Furniture Assembly"
 MAX_BUDGET_GB = 2_147_483_647
-DEFAULT_BUDGET_GB = 400
+DEFAULT_BUDGET_GB = 0
 # Taxas medidas nos MP4 já gravados: clipe exportado, vídeo-pai e native 8 Mbit/s.
 _SOURCE_EXPORTED_MIB_PER_MIN = 12
 _SOURCE_PARENT_MIB_PER_MIN = 42
