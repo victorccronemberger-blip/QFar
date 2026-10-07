@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
+from .background_work import checkpoint as _background_checkpoint
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1005,7 @@ _TERM_RE: dict[str, re.Pattern[str]] = {}
 
 def _term_in(block: str, term: str) -> bool:
     """Evidência por palavra. 'bin' não casa 'cabinet'; 'cut' casa 'cuts/cutting'."""
+    _background_checkpoint()
     t = _norm_term(term)
     if not t:
         return False
@@ -1030,6 +1032,7 @@ def _evidence_group_pattern(group: tuple[str, ...]) -> re.Pattern[str]:
 
 
 def _evidence_group_present(block: str, group: tuple[str, ...]) -> bool:
+    _background_checkpoint()
     return _evidence_group_pattern(group).search(block) is not None
 
 
@@ -1708,6 +1711,7 @@ def label_span_events(
     rules = tuple(named_rules)
     labels: list[frozenset[str]] = []
     for _t, _text, normed, base_dirty in prepared_events:
+        _background_checkpoint()
         if base_dirty:
             labels.append(frozenset())
             continue

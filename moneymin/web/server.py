@@ -1961,7 +1961,7 @@ def _save_balances(balances: dict[str, Any]) -> None:
         save_json(BALANCES_PATH, balances)
 
 
-def _crowtado_creds() -> dict[str, str]:
+def _crowtado_creds(*, include_individual: bool = True) -> dict[str, str]:
     """Reutiliza credenciais da mesma identidade, inclusive lotes de criação."""
     creds: dict[str, str] = {}
     def collect(rec):
@@ -1994,7 +1994,8 @@ def _crowtado_creds() -> dict[str, str]:
                       if isinstance(password, str) and password})
     # Registros individuais são a fonte primária para credenciais novas. Eles
     # não competem entre contas durante uma gravação e vencem dados legados.
-    creds.update(credential_store.load_all(config.SECRETS_DIR))
+    if include_individual:
+        creds.update(credential_store.load_all(config.SECRETS_DIR))
     return creds
 
 
@@ -2598,7 +2599,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 accounts.append({"email": email, "expires_at": 0, "org_key": None,
                                  "org_name": "Não verificada", "account_kind": "crowtado",
                                  "last_check": health.get(email, {}), "has_minute_access": config.token_path(email).exists()})
-        passwords = _crowtado_creds()
+        # Each row performs a strict primary lookup below. Do not decrypt the
+        # entire primary store first, then decrypt those same records again.
+        passwords = _crowtado_creds(include_individual=False)
         balances = _load_balances()
         for account in accounts:
             account.setdefault("has_minute_access", True)

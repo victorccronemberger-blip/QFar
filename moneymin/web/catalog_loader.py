@@ -120,7 +120,8 @@ class CatalogLoader:
                 # Operational catalog reads can migrate journals or retain a
                 # campaign preview. Reset must wait for their actual lifetime.
                 from ..campaign_state import campaign_state_lease
-                with campaign_state_lease():
+                from ..background_work import responsive_catalog_work
+                with campaign_state_lease(), responsive_catalog_work():
                     result = work(progress)
             except Exception:
                 # Never leave polling stuck forever, or expose credentials in

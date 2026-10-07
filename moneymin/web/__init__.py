@@ -135,17 +135,8 @@ def _run_claimed_service(host: str, port: int, parent_pid: int | None) -> None:
     print(f"QMoney service em http://{host}:{port}  (Ctrl+C para sair)")
     app = create_app()
 
-    def warm_catalog() -> None:
-        try:
-            campaign.warm_task_catalog()
-            print("Catálogo de vídeos pronto.")
-        except Exception:  # aquecimento é otimização; a API tenta de novo
-            print("Catálogo será carregado ao abrir a campanha.")
-
-    # O catálogo é pesado na primeira leitura. Prepará-lo enquanto o usuário vê
-    # a tela inicial evita que a página Nova campanha pareça travada.
-    threading.Thread(target=warm_catalog, daemon=True,
-                     name="qmoney-catalog-warmup").start()
+    # Cold classification runs only through the requested catalog job. Starting
+    # it here competes with account loading before the user opens a campaign.
     _serve(app, host, port, False)
 
 

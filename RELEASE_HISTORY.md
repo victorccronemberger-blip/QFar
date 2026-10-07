@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **116 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **117 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.56](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.56). Destaques: Planejamento compartilhado das categorias e recuperação da mesma consulta após HTTP 504, com inventário leve e validação completa no preparo.
+Versão atual: [v2.0.57](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.57). Destaques: Contas carregam sem disputar a abertura do app com a classificação do catálogo; consultas pesadas cedem tempo às requisições locais e a lista evita abrir credenciais duas vezes.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.57](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.57) | 07/10/2026 | Remove classificação automática do catálogo no início; consultas pesadas cedem tempo à API local e a lista de contas elimina leituras duplicadas das credenciais, mantendo o bloqueio de fallbacks corrompidos. | [Desde v2.0.56](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.56...v2.0.57) |
 | [v2.0.56](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.56) | 07/10/2026 | Categorias Nymeria compartilham planejamento e leitura de anotações; inventário evita reler mídia. HTTP 504 mantém a consulta recuperável por identificador, com acompanhamento limitado e vínculo à seleção e identidade atual. | [Desde v2.0.55](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.55...v2.0.56) |
 | [v2.0.55](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.55) | 06/10/2026 | Campanha adquire e prepara um recorte por vez, libera arquivos gerenciados após confirmação e protege pendências. Nymeria usa o catálogo para planejar e mede a fonte durante a execução; preparo antecipado fica opcional. | [Desde v2.0.54](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.54...v2.0.55) |
 | [v2.0.54](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.54) | 06/10/2026 | Contas restritas saem e a campanha aproveita a validação já concluída. Biblioteca Nymeria importa, pesquisa, planeja e baixa fontes com sensores medidos; corrige classificações falsas e acelera a consulta de anotações Ego4D. | [Desde v2.0.50](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.50...v2.0.54) |
