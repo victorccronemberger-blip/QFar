@@ -113,7 +113,7 @@ class NymeriaLibraryTests(unittest.TestCase):
             result = library.initialize_portable_catalog(portable, fresh)
         self.assertEqual(result["state"], "imported")
         self.assertEqual(result["sequence_count"], 2)
-        self.assertEqual(set(library._load(fresh)["sequences"]), {"sequence_one", "sequence_two"})
+        self.assertEqual(set(library._load(fresh.resolve())["sequences"]), {"sequence_one", "sequence_two"})
         self.assertEqual(self.calls, [])
         companion.unlink()
         self.assertEqual(library.initialize_portable_catalog(portable, fresh)["state"], "preserved")
