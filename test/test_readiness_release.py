@@ -76,11 +76,34 @@ class ReleaseReadinessTests(unittest.TestCase):
         ego_dir.mkdir(parents=True)
         (ego_dir / "ego4d.json").write_text("{}", encoding="utf-8")
         (ego_dir / "clips.csv").write_text("clip_uid\n", encoding="utf-8")
+        (ego_dir / "timed_narrations.jsonl").write_text(
+            '{"video_uid":"fixture","events":[[0,"#C folds"]]}\n', encoding="utf-8")
         with mock.patch.object(readiness, "_aws_credentials_present", return_value=False), \
              mock.patch("moneymin.campaign._load_rank_cache", return_value=None):
             result = readiness.campaign_readiness("ego4d", content_mode="cache")
         check = next(item for item in result["checks"] if item["name"] == "Credenciais Ego4D")
         self.assertEqual(check["status"], "warning")
+        self.assertTrue(result["ready"])
+
+    def test_missing_annotations_cannot_make_a_cached_public_catalog_ready(self):
+        ego_dir = self.root / "data" / "ego4d"
+        ego_dir.mkdir(parents=True)
+        (ego_dir / "ego4d.json").write_text("{}", encoding="utf-8")
+        (ego_dir / "clips.csv").write_text("clip_uid\n", encoding="utf-8")
+        with mock.patch.object(readiness, "_aws_credentials_present", return_value=False), \
+             mock.patch("moneymin.campaign._load_rank_cache", return_value=None):
+            result = readiness.campaign_readiness("ego4d", content_mode="cache")
+        check = next(item for item in result["checks"] if item["name"] == "Anotações Ego4D")
+        self.assertEqual(check["status"], "error")
+        self.assertIn("Integrações", check["detail"])
+        self.assertFalse(result["ready"])
+
+    def test_licensed_public_install_reports_automatic_annotation_bootstrap(self):
+        with mock.patch.object(readiness, "_aws_credentials_present", return_value=True):
+            result = readiness.campaign_readiness("ego4d")
+        check = next(item for item in result["checks"] if item["name"] == "Anotações Ego4D")
+        self.assertEqual(check["status"], "warning")
+        self.assertIn("automaticamente", check["detail"])
         self.assertTrue(result["ready"])
 
     def test_release_instructions_never_reference_developer_scripts(self):

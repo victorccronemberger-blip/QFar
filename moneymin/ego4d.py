@@ -160,6 +160,16 @@ def _selection_rank_seed(path: Path) -> None:
         snapshot["@rank_seed_path"] = Path(path)
 
 
+def _invalidate_selection_inputs() -> None:
+    """A catalog publication must replace missing/corrupt bytes read earlier."""
+    snapshot = _SELECTION_SNAPSHOT.get()
+    if snapshot is not None:
+        seed = snapshot.get("@rank_seed_path")
+        snapshot.clear()
+        if seed is not None:
+            snapshot["@rank_seed_path"] = seed
+
+
 @lru_cache(maxsize=2)
 def _action_bytes_cached(raw: bytes | None) -> dict[str, str]:
     """Metadados temporizados de ações Ego4D, indexados por clipe."""
@@ -526,7 +536,12 @@ def sync_task_annotations() -> Path:
     import ijson
     with _TASK_CATALOG_LOCK:
         target = timed_narrations_path()
-        if has_timed_narrations():
+        # Another waiter may have published the catalog after this caller read
+        # the previous bytes. Inspect the actual file while holding the lock.
+        with selection_operation(fresh=True):
+            existing = has_timed_narrations() and bool(load_timed_narrations())
+        if existing:
+            _invalidate_selection_inputs()
             return target
         sync_meta()
         with selection_operation(fresh=True):
@@ -566,6 +581,7 @@ def sync_task_annotations() -> Path:
             if not count:
                 raise ValueError("Ego4D sem anotações temporizadas válidas para vídeos com IMU")
             staging.replace(target)
+            _invalidate_selection_inputs()
             return target
         except ijson.JSONError as exc:
             raise ValueError("Anotações Ego4D incompletas ou inválidas; catálogo anterior preservado") from exc
@@ -577,7 +593,7 @@ def sync_task_annotations() -> Path:
 
 def ensure_task_annotations() -> None:
     """Bootstrap licensed real catalogs before binding any selection evidence."""
-    if has_timed_narrations():
+    if has_timed_narrations() and load_timed_narrations():
         return
     try:
         _aws_creds()
@@ -586,6 +602,8 @@ def ensure_task_annotations() -> None:
     meta, _ = sync_meta()
     if _valid_metadata(meta):
         sync_task_annotations()
+    else:
+        raise ValueError("Catálogo Ego4D inválido; atualize o catálogo em Integrações antes de selecionar os recortes")
 
 
 def diagnostics(*, check_access: bool = False) -> dict[str, Any]:
@@ -1083,6 +1101,7 @@ def _timed_bytes_cached(
     try:
         with io.StringIO(raw.decode("utf-8") if raw is not None else "") as fh:
             for line in fh:
+                checkpoint()
                 line = line.strip()
                 if not line:
                     continue
@@ -1092,9 +1111,11 @@ def _timed_bytes_cached(
                     # Uma linha incompleta não deve apagar milhares de vídeos
                     # válidos já lidos.
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 uid = str(rec.get("video_uid") or "")
                 events = rec.get("events") or []
-                if not uid or not events:
+                if not uid or not isinstance(events, (list, tuple)) or not events:
                     continue
                 parsed: list[tuple[float, str]] = []
                 for item in events:
@@ -1103,7 +1124,7 @@ def _timed_bytes_cached(
                     try:
                         when = float(item[0])
                         text = str(item[1]).strip()
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
                     if (not math.isfinite(when) or when < 0 or not text
                             or re.search(r"#\s*summary\b", text, re.I)):

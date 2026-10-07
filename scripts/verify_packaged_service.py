@@ -261,6 +261,25 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str], *,
         assert "fixture-private-token" not in json.dumps(accounts)
         assert get("/api/campaigns/current")["state"] == "idle"
         assert get("/api/recovery")["items"] == []
+        # Public executable, no companion ZIP or AWS credentials: a portable
+        # index is not permission to start preparing unverifiable sources.
+        annotations = library / 'data/ego4d/timed_narrations.jsonl'
+        held_annotations = annotations.with_suffix('.jsonl.probe-held')
+        assert not held_annotations.exists()
+        annotations.rename(held_annotations)
+        try:
+            incomplete = get('/api/readiness?dataset=ego4d')
+            annotation_check = next(c for c in incomplete['checks'] if c['name'] == 'Anotações Ego4D')
+            assert incomplete['ready'] is False and annotation_check['status'] == 'error'
+            assert 'Integrações' in annotation_check['detail']
+            preview = get('/api/campaigns/preflight', method='POST', body={
+                'dataset': 'ego4d', 'accounts': [], 'tasks': [], 'target_hours': 12})
+            assert preview['run_until_exhausted'] is True and preview['target_hours'] == 0
+            assert preview['ok'] is False
+            assert any('Anotações Ego4D' in blocker for blocker in preview['blockers'])
+            assert get('/api/campaigns/current')['state'] == 'idle'
+        finally:
+            held_annotations.rename(annotations)
         nymeria = get('/api/readiness?dataset=nymeria')
         checks = {row['name']: row for row in nymeria['checks']}
         assert checks['SDK Nymeria']['status'] == 'ok'
@@ -437,7 +456,9 @@ def main() -> None:
         "nymeria_manifest_import_without_external_python_or_sdk",
         "full_campaign_reset_preserves_credentials_and_library",
         "native_private_manifest_bootstrap_in_relocated_library",
-        "native_catalog_setup_acquires_no_vrs_or_imu"]}, indent=2), encoding="utf-8")
+        "native_catalog_setup_acquires_no_vrs_or_imu",
+        "public_install_missing_ego_annotations_cannot_start",
+        "public_install_legacy_hours_do_not_gate_campaign"]}, indent=2), encoding="utf-8")
     print("Packaged service checks passed; no uploads or withdrawals requested.")
 
 

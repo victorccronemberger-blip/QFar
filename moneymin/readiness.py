@@ -284,6 +284,19 @@ def campaign_readiness(
                 if mode == "cache" and catalog_ok else
                 "perfil AWS autorizado não encontrado"),
         ))
+        annotations_ok = any(
+            path.is_file() and path.stat().st_size > 0
+            for path in (ego_dir / "timed_narrations.jsonl", ego_dir / "clip_narrations.json")
+        )
+        checks.append(_check(
+            "Anotações Ego4D",
+            "ok" if annotations_ok else ("warning" if aws_ok else "error"),
+            "anotações locais disponíveis; cada recorte será validado antes do preparo"
+            if annotations_ok else (
+                "serão obtidas automaticamente antes da seleção dos recortes"
+                if aws_ok else
+                "configure o acesso Ego4D em Integrações e atualize as categorias"),
+        ))
         if catalog_ok:
             from . import ego_accelerator
             from .campaign import _load_rank_cache

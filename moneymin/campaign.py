@@ -4457,12 +4457,8 @@ def _prepare_queue_accepts(clip: dict[str, Any], task_name: str | None, *,
         return True
     if not isinstance(clip.get("selection_evidence"), dict):
         return True
-    # Sem arquivo de narração o índice portátil segue na fila. Com narração,
-    # só fica o trecho que esta biblioteca prova.
-    if not (_narration_file_present(ego4d.timed_narrations_path())
-            or _narration_file_present(
-                config.MEDIA_DATA_DIR / "ego4d" / "clip_narrations.json")):
-        return True
+    # The portable seed can suggest a source, but queue admission must match
+    # the same current evidence gate used by preparation on every installation.
     try:
         ego4d.revalidate_selection_evidence(clip, task_name=task_name, fresh=fresh)
     except ValueError:
@@ -5080,6 +5076,9 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
                 "unavailable_reason": ("" if clips else
                     "Há conteúdo no catálogo, mas nenhum trecho nesta faixa de duração."
                     if all_clips else
+                    "As anotações Ego4D ainda não estão disponíveis. Configure o acesso em Integrações e atualize as categorias."
+                    if normalize_dataset_provider(dataset_provider) == "ego4d"
+                    and not _local_narration_catalog() else
                     "Nenhum trecho atende à atividade e aos sensores no provedor escolhido."),
                 "match_confidence": rule.confidence,
                 "match_scenarios": list(rule.primary),

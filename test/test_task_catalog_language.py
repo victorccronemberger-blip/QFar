@@ -5,11 +5,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from moneymin import campaign, config, minute_api, task_catalog
+from moneymin import campaign, config, ego4d, minute_api, task_catalog
 
 
 class TaskCatalogLanguageTests(unittest.TestCase):
-    def test_translated_api_catalog_still_selects_real_portable_dataset_content(self):
+    def test_translated_api_catalog_still_selects_current_dataset_content(self):
         canonical = {'id': 'fixture-shopping', 'name': 'Shopping',
                      'description': 'Fixture shopping activity',
                      'categories': [{'slug': 'errands', 'label': 'Errands'}]}
@@ -18,7 +18,23 @@ class TaskCatalogLanguageTests(unittest.TestCase):
                                      ('en-US,en;q=0.9', 'Shopping')):
             with self.subTest(language=language), tempfile.TemporaryDirectory() as folder, \
                  patch.object(config, 'ACCEPT_LANGUAGE', language), \
-                 patch.object(config, 'DATA_DIR', Path(folder)):
+                 patch.object(config, 'DATA_DIR', Path(folder)), \
+                 patch.object(config, 'MEDIA_DATA_DIR', Path(folder)), \
+                 patch.object(ego4d, 'EGO4D_DIR', Path(folder) / 'ego4d'), \
+                 patch.object(campaign, '_RANK_INPUT_SIGNATURE', None):
+                library = Path(folder) / 'ego4d'
+                library.mkdir()
+                (library / 'ego4d.json').write_text(json.dumps({'videos': [{
+                    'video_uid': 'shopping-parent', 'has_imu': True, 'duration_sec': 600,
+                    'scenarios': ['Grocery shopping indoors'], 's3_path': 's3://fixture/shopping.mp4'}]}), 'utf8')
+                (library / 'clips.csv').write_text(
+                    'exported_clip_uid,parent_video_uid,parent_start_sec,parent_end_sec,s3_path\n'
+                    'shopping-clip,shopping-parent,0,600,s3://fixture/shopping-clip.mp4\n', 'utf8')
+                (library / 'clip_narrations.json').write_text(json.dumps({
+                    'shopping-clip': '#C C picks groceries from the store shelf'}), 'utf8')
+                (library / 'timed_narrations.jsonl').write_text(json.dumps({
+                    'video_uid': 'shopping-parent', 'events': [[t, '#C C picks groceries from the store shelf']
+                                                              for t in range(0, 601, 5)]}), 'utf8')
                 session = minute_api.Session.__new__(minute_api.Session)
                 # Simulate the observed API: translated by langCode unless
                 # canonical English is explicitly requested. No auth/network.

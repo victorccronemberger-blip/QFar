@@ -99,6 +99,11 @@ class CampaignSelectionTests(unittest.TestCase):
         self.stack.enter_context(patch.object(campaign.ego4d, "has_timed_narrations", return_value=True))
         self.stack.enter_context(patch.object(campaign.ego4d, "rank_all_task_spans", return_value={}))
         self.stack.enter_context(patch.object(campaign.ego4d, "narration_evidence_clips", return_value={}))
+        # This unit suite supplies approved inert candidates and mocks media
+        # preparation/account delivery. Real catalog admission, including the
+        # public installation without annotations, is tested separately.
+        self.stack.enter_context(patch.object(campaign.ego4d, "revalidate_selection_evidence",
+                                             return_value={"justification": {"status": "locally_revalidated"}}))
         self.stack.enter_context(patch.object(campaign, "_task_candidates", return_value=()))
         self.stack.enter_context(patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]))
         self.stack.enter_context(patch.object(campaign.sent_registry, "is_sent_to_all", return_value=False))

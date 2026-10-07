@@ -17,9 +17,10 @@ class PreparedCatalogTests(unittest.TestCase):
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.stack.enter_context(patch.object(campaign.config, "DATA_DIR", self.root))
         self.stack.enter_context(patch.object(campaign.config, "MEDIA_DATA_DIR", self.root / "library"))
-        # Sem arquivo de narração, o índice portátil continua sendo o piso e a
-        # consulta de categorias não varre anotações. Com narração, o teste
-        # dedicado exige o catálogo narrado.
+        self.stack.enter_context(patch.object(ego4d, "EGO4D_DIR", self.root / "library" / "ego4d"))
+        self.stack.enter_context(patch.object(ego4d, "_aws_creds", side_effect=RuntimeError("not configured")))
+        # A public, unconfigured install can inspect the seed, but cannot count
+        # those suggestions as current activity/sensor evidence for a campaign.
         for func in (campaign._rank_cache_stamp, campaign._ranked_pools_cached,
                      campaign._duration_ranked_pools):
             func.cache_clear()
@@ -29,14 +30,16 @@ class PreparedCatalogTests(unittest.TestCase):
         names = json.loads((Path(__file__).parent / "current_minute_task_names.json").read_text())
         self.tasks = [{"id": str(i), "name": name} for i, name in enumerate(names)]
 
-    def test_first_load_and_duration_changes_use_real_portable_index(self):
+    def test_first_load_and_duration_changes_do_not_admit_unproven_portable_index(self):
         for minimum, maximum in ((300, 1800), (60, 600), (600, 1200), (300, 1800)):
             with self.subTest(duration=(minimum, maximum)):
                 rows = campaign.available_tasks("fixture@example.invalid", "org", remote_tasks=self.tasks,
                     min_dur_s=minimum, max_dur_s=maximum, dataset_provider="ego4d",
                     include_unavailable=True)
                 self.assertEqual(len(rows), len(self.tasks))
-                self.assertTrue(any(r["clip_count"] > 0 for r in rows))
+                self.assertFalse(any(r["clip_count"] > 0 for r in rows))
+                self.assertTrue(all('Integrações' in r['unavailable_reason']
+                                    for r in rows if r['mapping_supported']))
                 for row in rows:
                     if row.get("dur_range_s"):
                         self.assertGreaterEqual(row["dur_range_s"][0], minimum)
@@ -79,4 +82,4 @@ class PreparedCatalogTests(unittest.TestCase):
                         self.fail("prepared catalog did not finish")
                     time.sleep(.01)
                 self.assertEqual(response.status_code, 200, response.json)
-                self.assertTrue(any(row["clip_count"] for row in response.json["tasks"]))
+                self.assertFalse(any(row["clip_count"] for row in response.json["tasks"]))
