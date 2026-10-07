@@ -3072,7 +3072,8 @@ def _run_campaign(
         batch_footage.setdefault(email, []).append(reservation)
         return reservation
 
-    quota_s = max(0.0, float(config.target_hours_per_account or 0) * 3600.0)
+    until_exhausted = config.run_until_exhausted
+    quota_s = 0.0 if until_exhausted else max(0.0, float(config.target_hours_per_account or 0) * 3600.0)
     n_tasks = max(1, len(config.tasks))
     per_task_cap_s = (quota_s / n_tasks) * 1.3 if quota_s else 0.0
     _emit("campaign_start", accounts=[a.email for a in config.accounts],
@@ -3102,7 +3103,8 @@ def _run_campaign(
             break
         display_name = tsk.task_label or tsk.task_name or tsk.scenario
         registry_key = tsk.registry_key
-        _log(f"\n=== categoria={display_name} (n={tsk.count}) ===")
+        selection_limit = "até esgotar o conteúdo" if until_exhausted else f"n={tsk.count}"
+        _log(f"\n=== categoria={display_name} ({selection_limit}) ===")
         _emit("task_start", scenario=tsk.scenario, task_name=display_name,
               count=tsk.count)
         automatic_selection = not tsk.clip_uids
@@ -3273,7 +3275,7 @@ def _run_campaign(
                     or task_seconds.get(a.email, 0) >= per_task_cap_s
                     for a in config.accounts):
                 break
-            if automatic_selection and not quota_s and all(
+            if automatic_selection and not quota_s and not until_exhausted and all(
                     a.email in banned or task_sends.get(a.email, 0) >= tsk.count
                     for a in config.accounts):
                 break
@@ -3290,7 +3292,7 @@ def _run_campaign(
             eligible_accounts = [a for a in config.accounts if a.email not in banned
                                  and (not quota_s or (account_seconds.get(a.email, 0) < quota_s
                                       and task_seconds.get(a.email, 0) < per_task_cap_s))
-                                 and (quota_s or not automatic_selection
+                                 and (until_exhausted or quota_s or not automatic_selection
                                       or task_sends.get(a.email, 0) < tsk.count)]
             if not eligible_accounts or all(a.email in sent_to | reserved for a in eligible_accounts):
                 _log(f"  clipe {clip_info['clip_uid'][:12]} já enviado ou reservado por pendência "
@@ -3481,6 +3483,8 @@ def _run_campaign(
                     < per_task_cap_s
                     for account in config.accounts
                 )
+            elif until_exhausted:
+                should_prefetch = any(a.email not in banned for a in task_accounts)
             else:
                 available_accounts = [a for a in task_accounts
                                       if a.email not in banned and a.email not in sent_to | reserved
@@ -3543,7 +3547,7 @@ def _run_campaign(
                         continue
                     if task_seconds.get(account.email, 0) >= per_task_cap_s:
                         continue
-                elif automatic_selection and task_sends.get(account.email, 0) >= tsk.count:
+                elif automatic_selection and not until_exhausted and task_sends.get(account.email, 0) >= tsk.count:
                     continue
                 if not config.allow_new_accounts:
                     age = device_profile.profile_age_days(account.email)
@@ -4032,7 +4036,7 @@ def _run_campaign(
                         "a campanha não adquiriu outro vídeo. Resolva a pendência e retome.")
             # (log: sem os blobs/csv brutos — grandes; identity fica por conta)
 
-        if log.status != "stopped" and not quota_s and automatic_selection:
+        if log.status != "stopped" and not quota_s and not until_exhausted and automatic_selection:
             remaining = {a.email: tsk.count - task_sends.get(a.email, 0)
                          for a in config.accounts if task_sends.get(a.email, 0) < tsk.count}
             if remaining:

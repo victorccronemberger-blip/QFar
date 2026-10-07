@@ -30,7 +30,7 @@ class PreflightContinuationTests(unittest.TestCase):
             self.stack.enter_context(patch.object(server, name, Mock(running=False)))
         for email in ['good@example.com', 'bad@example.com']:
             server.config.token_path(email).write_text(json.dumps({'email': email, 'idToken': 'secret', 'refreshToken': 'private'}))
-        self.body = {'accounts': ['good@example.com', 'bad@example.com'],
+        self.body = {'run_until_exhausted': False, 'accounts': ['good@example.com', 'bad@example.com'],
                      'tasks': [{'task_id': 'task'}], 'dataset': 'ego4d'}
         server.CROWTADO_PW_PATH.write_text(json.dumps({'bad@example.com': 'saved-password', 'good@example.com': 'healthy-password'}))
         self.failure = AuthError('disabled', code='restricted')

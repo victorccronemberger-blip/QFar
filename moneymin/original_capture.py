@@ -583,7 +583,7 @@ def run_original_capture_campaign(cfg, log=None, *, progress=None, should_stop=N
     from .minute_api import Session
     if (len(cfg.accounts) != 1 or len(cfg.tasks) != 1 or type(cfg.tasks[0].count) is not int or cfg.tasks[0].count != 1
             or cfg.unique_video is not False or cfg.realistic_timeline is not False or cfg.cleanup_after_upload is not False
-            or cfg.share_clips is not False or cfg.target_hours_per_account != 0 or cfg.candidate_plan is not None
+            or cfg.share_clips is not False or cfg.target_hours_per_account != 0 or cfg.run_until_exhausted is not False or cfg.candidate_plan is not None
             or type(cfg.evaluate) is not bool or type(cfg.finalize) is not bool):
         _fail('incompatible_config')
     account, task = cfg.accounts[0], cfg.tasks[0]

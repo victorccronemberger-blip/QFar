@@ -385,7 +385,6 @@ private:
   bool _campaignAccountsLoaded{};
   int _campaignDraftQuantity{1};
   QTimer _campaignDraftSave;
-  QDoubleSpinBox* _targetHours{};
   QSpinBox* _minDuration{};
   QSpinBox* _maxDuration{};
   QComboBox* _delayMode{};

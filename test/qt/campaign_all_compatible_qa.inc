@@ -14,7 +14,8 @@
     auto restored=std::make_shared<MainWindow>(qobject_cast<oclero::qlementine::QlementineStyle*>(qApp->style()),nullptr,false);
     const auto migrated=QJsonDocument::fromJson(QSettings().value("campaign/draft").toByteArray()).object();
     if(QSettings().contains("campaign/useAllCompatibleNextStart") || restored->_dataset->currentData().toString()!="ambos"
-        || restored->_targetHours->value()!=8 || restored->_minDuration->value()!=5 || restored->_maxDuration->value()!=17
+        || migrated.contains("target_hours") || !migrated.value("run_until_exhausted").toBool()
+        || restored->_minDuration->value()!=5 || restored->_maxDuration->value()!=17
         || restored->_campaignTaskSelectionTouched || !restored->_campaignSelectedTaskIds.isEmpty()
         || restored->_campaignDraftAccounts.size()!=2 || migrated.value("accounts")!=accounts
         || migrated.value("delay_seconds").toInt()!=75 || migrated.value("account_workers").toInt()!=3
@@ -74,11 +75,10 @@
       if(restored->_campaignTaskSelectionTouched || !restored->_campaignSelectedTaskIds.isEmpty()) {qApp->exit(167);return;}
       restored->_backendReady=false;
       restored->_campaignTasks->item(1)->setCheckState(Qt::Unchecked);
-      restored->_targetHours->setValue(2.5);
       restored->_dataset->setCurrentIndex(restored->_dataset->findData("ego4d"));
       restored->_taskReload.stop();restored->_campaignDraftSave.stop();restored->saveCampaignDraft();
       MainWindow second(qobject_cast<oclero::qlementine::QlementineStyle*>(qApp->style()),nullptr,false);
-      const bool preserved=second._dataset->currentData().toString()=="ego4d" && second._targetHours->value()==2.5
+      const bool preserved=second._dataset->currentData().toString()=="ego4d"
           && second._minDuration->value()==5 && second._maxDuration->value()==17 && second._delaySeconds->value()==75
           && second._accountWorkers->currentData().toInt()==3 && second._campaignDraftAccounts.size()==2
           && second._campaignTaskSelectionTouched && second._campaignSelectedTaskIds==QSet<QString>{"task-one"}

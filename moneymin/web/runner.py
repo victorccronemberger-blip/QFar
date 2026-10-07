@@ -341,6 +341,7 @@ class CampaignRunner:
         self.error: str | None = None
         self.log_path: str | None = None
         self.target_seconds_per_account = 0.0
+        self.run_until_exhausted = False
         self.account_seconds: dict[str, float] = {}
         self.credited_deliveries: set[tuple[str, str, str]] = set()
         self._reported_outcomes: set[tuple[tuple[str, str, str], str]] = set()
@@ -372,6 +373,10 @@ class CampaignRunner:
                 hours = float(getattr(cfg, "target_hours_per_account", 0) or 0)
                 if not math.isfinite(hours) or not math.isfinite(hours * 3600) or hours < 0:
                     raise ValueError
+                if type(cfg.run_until_exhausted) is not bool:
+                    raise ValueError
+                if cfg.run_until_exhausted:
+                    hours = 0.0
                 for task in cfg.tasks:
                     if type(task.count) is not int or task.count < 1:
                         raise ValueError
@@ -387,6 +392,7 @@ class CampaignRunner:
             self.error = None
             self.log_path = None
             self.target_seconds_per_account = hours * 3600
+            self.run_until_exhausted = cfg.run_until_exhausted
             self.account_seconds = {a.email: 0.0 for a in cfg.accounts}
             self.credited_deliveries.clear()
             self._reported_outcomes.clear()
@@ -397,7 +403,9 @@ class CampaignRunner:
             self.current = "iniciando…"
             self.stage = "Início"
             n_acc = max(1, len(cfg.accounts))
-            if hours > 0:
+            if cfg.run_until_exhausted:
+                self.total_sends = 0  # Open campaign: no artificial goal or percentage.
+            elif hours > 0:
                 # estimativa: sessão média ~15 min até a campanha reportar o real
                 per = max(1, int(hours * 3600 / 900 + 0.999))
                 self.total_sends = per * n_acc
@@ -453,6 +461,7 @@ class CampaignRunner:
             self.error = None
             self.log_path = None
             self.target_seconds_per_account = 0.0
+            self.run_until_exhausted = False
             self.account_seconds.clear()
             self.credited_deliveries.clear()
             self._reported_outcomes.clear()
@@ -757,6 +766,7 @@ class CampaignRunner:
                 "state": self.state,
                 "pause_requested": self.pause_requested,
                 "start_request_id": self.start_request_id,
+                "run_until_exhausted": self.run_until_exhausted,
                 "events": events,
                 "last_seq": self._seq,
                 "operation": self.operation.snapshot(self.state in {"done", "stopped", "error"}),

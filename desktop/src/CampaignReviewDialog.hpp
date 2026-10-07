@@ -19,6 +19,7 @@
 class CampaignReviewDialog final : public QDialog {
 public:
   static double requestedSeconds(const QJsonObject& result, const QJsonObject& request) {
+    if (request.value("run_until_exhausted").toBool(result.value("run_until_exhausted").toBool())) return 0;
     const auto value = request.contains("target_hours") ? request.value("target_hours") : result.value("target_hours");
     if (value.isUndefined()) return 0;
     if (!value.isDouble() || !std::isfinite(value.toDouble()) || value.toDouble() < 0)
@@ -125,12 +126,19 @@ public:
     layout->addWidget(estimate);
     const auto capacity = result.value("capacity").toObject();
     if (capacityValid) {
-      auto* available = new QLabel(QStringLiteral("Meta: %1 h por conta · conteúdo novo estimado: até %2–%3 h por conta\n%4 conta(s) abaixo da meta · %5 h disponíveis no total")
+      const bool untilExhausted = request.value("run_until_exhausted").toBool(result.value("run_until_exhausted").toBool());
+      const QString availableText = untilExhausted
+          ? QStringLiteral("Conteúdo novo estimado: até %1–%2 h por conta · %3 h disponíveis no total")
+              .arg(capacity.value("available_seconds_min").toDouble() / 3600., 0, 'f', 2)
+              .arg(capacity.value("available_seconds_max").toDouble() / 3600., 0, 'f', 2)
+              .arg(capacity.value("total_available_seconds").toDouble() / 3600., 0, 'f', 2)
+          : QStringLiteral("Meta: %1 h por conta · conteúdo novo estimado: até %2–%3 h por conta\n%4 conta(s) abaixo da meta · %5 h disponíveis no total")
           .arg(capacity.value("target_seconds_per_account").toDouble() / 3600., 0, 'f', 2)
           .arg(capacity.value("available_seconds_min").toDouble() / 3600., 0, 'f', 2)
           .arg(capacity.value("available_seconds_max").toDouble() / 3600., 0, 'f', 2)
           .arg(capacity.value("shortfall_account_count").toInt())
-          .arg(capacity.value("total_available_seconds").toDouble() / 3600., 0, 'f', 2));
+          .arg(capacity.value("total_available_seconds").toDouble() / 3600., 0, 'f', 2);
+      auto* available = new QLabel(availableText);
       available->setObjectName(QStringLiteral("campaignCapacitySummary"));
       available->setWordWrap(true);
       layout->addWidget(available);
@@ -147,7 +155,11 @@ public:
       unknown->setObjectName(QStringLiteral("campaignCapacitySummary")); unknown->setWordWrap(true); layout->addWidget(unknown);
     }
     if (!request.isEmpty()) {
-      QString details = QStringLiteral("Meta: %1 h por conta · Vídeos: %2–%3 min")
+      QString details = request.value("run_until_exhausted").toBool(result.value("run_until_exhausted").toBool())
+          ? QStringLiteral("Até acabar o conteúdo elegível ou você parar · Vídeos: %1–%2 min")
+              .arg(request.value("min_dur_s").toInt() / 60)
+              .arg(request.value("max_dur_s").toInt() / 60)
+          : QStringLiteral("Meta: %1 h por conta · Vídeos: %2–%3 min")
           .arg(request.value("target_hours").toDouble(), 0, 'f', 1)
           .arg(request.value("min_dur_s").toInt() / 60)
           .arg(request.value("max_dur_s").toInt() / 60);
@@ -180,6 +192,7 @@ public:
       auto* capacityTable = new QTableWidget(rows.size(), 4);
       capacityTable->setObjectName(QStringLiteral("campaignCapacityTable"));
       capacityTable->setHorizontalHeaderLabels({QStringLiteral("Conta"), QStringLiteral("Até h disponíveis"), QStringLiteral("Déficit h"), QStringLiteral("Envios estimados")});
+      capacityTable->setColumnHidden(2, request.value("run_until_exhausted").toBool(result.value("run_until_exhausted").toBool()));
       capacityTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
       for (int column = 1; column < 4; ++column) capacityTable->horizontalHeader()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
       capacityTable->verticalHeader()->hide(); capacityTable->setEditTriggers(QAbstractItemView::NoEditTriggers);

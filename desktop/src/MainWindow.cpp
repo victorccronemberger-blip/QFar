@@ -1284,7 +1284,9 @@ void MainWindow::renderOperation(const QJsonObject& snapshot) {
       : QStringLiteral("Conecte as contas, confira os requisitos e revise a prévia antes de iniciar."));
   const auto totals = snapshot.value("totals").toObject();
   if (rows.isEmpty() && state == "idle") _operationTotal->setText(QStringLiteral("Nenhuma campanha em execução"));
-  else if (totals.value("progress_unit").toString() == "seconds" && OperationSummary::number(totals.value("progress_completed")) && OperationSummary::number(totals.value("progress_target"))) {
+  else if (snapshot.value("run_until_exhausted").toBool()) {
+    _operationTotal->setText(QStringLiteral("%1 envios confirmados").arg(totals.value("ok_sends").toDouble(), 0, 'f', 0));
+  } else if (totals.value("progress_unit").toString() == "seconds" && OperationSummary::number(totals.value("progress_completed")) && OperationSummary::number(totals.value("progress_target"))) {
     _operationTotal->setText(QStringLiteral("%1 / %2 h confirmadas")
         .arg(QLocale(QLocale::Portuguese, QLocale::Brazil).toString(totals.value("progress_completed").toDouble() / 3600., 'f', 2),
              QLocale(QLocale::Portuguese, QLocale::Brazil).toString(totals.value("progress_target").toDouble() / 3600., 'f', 2)));
@@ -1951,12 +1953,10 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* form = new QFormLayout(parameters);
   configureForm(form);
   form->setContentsMargins(0, 0, 0, 0);
-  _targetHours = new QDoubleSpinBox;
-  _targetHours->setRange(0.5, 12.0);
-  _targetHours->setSingleStep(0.5);
-  _targetHours->setValue(8.0);
-  _targetHours->setSuffix(QStringLiteral(" h / conta"));
-  form->addRow(QStringLiteral("Meta de gravação"), _targetHours);
+  auto* campaignEnd = quietLabel(QStringLiteral("A campanha continua até acabar o conteúdo elegível ou você apertar Parar."));
+  campaignEnd->setObjectName(QStringLiteral("campaignUntilExhausted"));
+  campaignEnd->setWordWrap(true);
+  form->addRow(QStringLiteral("Encerramento"), campaignEnd);
   _minDuration = new QSpinBox;
   _minDuration->setRange(1, 30);
   _minDuration->setValue(1);
@@ -1988,7 +1988,6 @@ QWidget* MainWindow::buildCampaignPage() {
   durationLayout->addStretch();
   _minDuration->setAccessibleName(QStringLiteral("Duração mínima"));
   _maxDuration->setAccessibleName(QStringLiteral("Duração máxima"));
-  _targetHours->setMaximumWidth(200);
   _minDuration->setFixedWidth(130);
   _maxDuration->setFixedWidth(130);
   form->addRow(QStringLiteral("Duração dos vídeos"), duration);
@@ -2168,7 +2167,6 @@ QWidget* MainWindow::buildCampaignPage() {
     const int workerIndex = _accountWorkers->findData(draft.value(QStringLiteral("account_workers")).toInt(6));
     if (workerIndex >= 0) _accountWorkers->setCurrentIndex(workerIndex);
     _campaignDraftQuantity = qMax(1, draft.value(QStringLiteral("quantity")).toInt(1));
-    _targetHours->setValue(draft.value(QStringLiteral("target_hours")).toDouble(8.0));
     _minDuration->setValue(draft.value(QStringLiteral("min_duration")).toInt(1));
     _maxDuration->setValue(draft.value(QStringLiteral("max_duration")).toInt(30));
     _delaySeconds->setValue(draft.value(QStringLiteral("delay_seconds")).toInt());
@@ -2180,16 +2178,16 @@ QWidget* MainWindow::buildCampaignPage() {
   QSettings campaignSettings;
   const QString allCompatibleNextStart = QStringLiteral("campaign/useAllCompatibleNextStart");
   if (campaignSettings.value(allCompatibleNextStart, false).toBool()) {
-    const QSignalBlocker datasetBlocker(_dataset), hoursBlocker(_targetHours);
+    const QSignalBlocker datasetBlocker(_dataset);
     _dataset->setCurrentIndex(_dataset->findData(QStringLiteral("ambos")));
-    _targetHours->setValue(8);
     _campaignSelectedTaskIds.clear();
     _campaignTaskSelectionTouched = false;
     // The destination list is not loaded yet. Update the restored draft
     // directly so this one-time preference never clears the saved accounts.
     auto migratedDraft = draft;
     migratedDraft.insert(QStringLiteral("dataset"), QStringLiteral("ambos"));
-    migratedDraft.insert(QStringLiteral("target_hours"), 8);
+    migratedDraft.remove(QStringLiteral("target_hours"));
+    migratedDraft.insert(QStringLiteral("run_until_exhausted"), true);
     migratedDraft.insert(QStringLiteral("tasks"), QJsonArray{});
     migratedDraft.insert(QStringLiteral("tasks_touched"), false);
     campaignSettings.setValue(QStringLiteral("campaign/draft"), QJsonDocument(migratedDraft).toJson(QJsonDocument::Compact));
@@ -2215,7 +2213,6 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_campaignAccountCount, &QSpinBox::valueChanged, this, scheduleDraft);
   connect(_dataset, &QComboBox::currentIndexChanged, this, scheduleDraft);
   connect(_contentMode, &QComboBox::currentIndexChanged, this, scheduleDraft);
-  connect(_targetHours, &QDoubleSpinBox::valueChanged, this, scheduleDraft);
   for (auto* spin : {_minDuration, _maxDuration, _delaySeconds, _hourStart, _hourEnd})
     connect(spin, &QSpinBox::valueChanged, this, scheduleDraft);
   connect(_delayMode, &QComboBox::currentIndexChanged, this, scheduleDraft);
@@ -5616,8 +5613,7 @@ void MainWindow::startCampaign() {
       {QStringLiteral("dataset"), _dataset->currentData().toString()},
       {QStringLiteral("content_mode"), _contentMode->currentData().toString()},
       {QStringLiteral("tasks"), tasks},
-      {QStringLiteral("count"), 1},
-      {QStringLiteral("target_hours"), _targetHours->value()},
+      {QStringLiteral("run_until_exhausted"), true},
       {QStringLiteral("account_workers"), _accountWorkers->currentData().toInt()},
       {QStringLiteral("min_dur_s"), _minDuration->value() * 60},
       {QStringLiteral("max_dur_s"), _maxDuration->value() * 60},
@@ -6138,9 +6134,11 @@ void MainWindow::pollCampaign() {
     const QString goalText = hoursGoal
         ? QStringLiteral("%1 de %2 h confirmadas nesta campanha").arg(done / 3600., 0, 'f', 2).arg(total / 3600., 0, 'f', 2)
         : QStringLiteral("%1 de %2 novos envios confirmados").arg(done).arg(total);
-    const QString progressText = total > 0 ? goalText + QStringLiteral(" · %1%\n").arg(percent) : QString();
+    const bool untilExhausted = snap.value("run_until_exhausted").toBool();
+    const QString progressText = untilExhausted ? QStringLiteral("%1 envios confirmados · até acabar o conteúdo ou você parar\n").arg(successful)
+        : total > 0 ? goalText + QStringLiteral(" · %1%\n").arg(percent) : QString();
     setCampaignIndicator(headline, progressText + current, state, running && !paused && total == 0);
-    _campaignIndicatorMetric->setText(total > 0
+    _campaignIndicatorMetric->setText(untilExhausted ? QStringLiteral("%1 envios confirmados").arg(successful) : total > 0
         ? (hoursGoal ? QStringLiteral("%1 / %2 h · %3%")
               .arg(done / 3600., 0, 'f', 2).arg(total / 3600., 0, 'f', 2).arg(percent)
                      : QStringLiteral("%1 / %2 envios · %3%").arg(done).arg(total).arg(percent))
@@ -6150,7 +6148,7 @@ void MainWindow::pollCampaign() {
       static_cast<CampaignStatusIcon*>(_campaignIndicatorIcon)->setState(QStringLiteral("error"), headline);
     _campaignIndicatorProgress->setValue(percent);
     _campaignProgress->setValue(percent);
-    _campaignProgress->setFormat(total > 0
+    _campaignProgress->setFormat(untilExhausted ? QStringLiteral("%1 envios confirmados · sem meta de horas").arg(successful) : total > 0
         ? hoursGoal ? QStringLiteral("Meta: %1 de %2 h · %p%")
             .arg(done / 3600., 0, 'f', 2).arg(total / 3600., 0, 'f', 2)
             : QStringLiteral("Envios confirmados: %1 de %2 · %p%").arg(successful).arg(total)
@@ -9424,7 +9422,7 @@ void MainWindow::saveCampaignDraft() {
       {QStringLiteral("quantity"), quantity},
       {QStringLiteral("dataset"), _dataset->currentData().toString()},
       {QStringLiteral("content_mode"), _contentMode->currentData().toString()},
-      {QStringLiteral("target_hours"), _targetHours->value()},
+      {QStringLiteral("run_until_exhausted"), true},
       {QStringLiteral("account_workers"), _accountWorkers->currentData().toInt()},
       {QStringLiteral("min_duration"), _minDuration->value()},
       {QStringLiteral("max_duration"), _maxDuration->value()},

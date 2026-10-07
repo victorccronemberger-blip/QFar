@@ -80,6 +80,7 @@ class CampaignCapacityTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         case.body['accounts'] = ['good@example.com']
+        case.body['run_until_exhausted'] = False  # Explicit legacy bounded API contract.
         case.stack.enter_context(patch.object(server.recovery, 'snapshot', return_value={'items': []}))
         case.candidates = [{'clip_uid': 'clip', 'source': 'ego4d', 'dur_s': 300}]
         case.automatic = case.stack.enter_context(patch.object(

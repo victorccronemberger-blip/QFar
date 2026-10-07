@@ -82,6 +82,9 @@ class CampaignConfig:
     min_account_age_days: float = MIN_ACCOUNT_AGE_DAYS
     shuffle_schedule: bool = True
     target_hours_per_account: float = 0.0
+    # Desktop campaigns consume the eligible pool until it ends or the user stops.
+    # Library callers retain their explicit count/target unless they opt in.
+    run_until_exhausted: bool = False
     dataset_provider: str = "all"
     content_mode: str = "both"
     # Evita crescimento contínuo do disco: após TODAS as contas pendentes

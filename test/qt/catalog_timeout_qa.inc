@@ -56,14 +56,14 @@
     {
       const QSignalBlocker accounts(window._campaignAccounts), dataset(window._dataset),
           mode(window._contentMode), minimum(window._minDuration), maximum(window._maxDuration),
-          hours(window._targetHours), cleanup(window._cleanupAfter);
+          cleanup(window._cleanupAfter);
       window._campaignAccounts->clear();
       auto* account = new QListWidgetItem("fixture@example.invalid", window._campaignAccounts);
       account->setData(Qt::UserRole, "fixture@example.invalid"); account->setCheckState(Qt::Checked);
       window._dataset->setCurrentIndex(window._dataset->findData("ambos"));
       window._contentMode->setCurrentIndex(window._contentMode->findData("both"));
       window._minDuration->setValue(5); window._maxDuration->setValue(30);
-      window._targetHours->setValue(8); window._cleanupAfter->setChecked(true);
+      window._cleanupAfter->setChecked(true);
     }
     window._taskReload.stop(); window._backendReady = true;
     auto phase = std::make_shared<int>(0);
@@ -80,7 +80,7 @@
       const bool ready = item->data(Qt::UserRole).toString() == "garden";
       if (*phase == 0 && ready) {
         if (!*sawTimeout || *requests != 3 || !window._campaignStart->isEnabled()
-            || !window._taskCatalogJobId.isEmpty() || window._targetHours->value() != 8
+            || !window._taskCatalogJobId.isEmpty()
             || !window._cleanupAfter->isChecked()) { qApp->exit(243); return; }
         *phase = 1; window.loadTasks();
       } else if (*phase == 1 && item->text().contains("Consulta para retomada")

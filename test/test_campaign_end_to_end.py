@@ -117,7 +117,7 @@ class CampaignEndToEndTests(unittest.TestCase):
                     account_workers=1, account_retry_s=0), **kw)))
         self.stack.enter_context(patch.object(minute_api, "_request", side_effect=AssertionError("network forbidden")))
         self.client = server.create_app(for_testing=True).test_client()
-        self.body = {"accounts": self.emails, "tasks": [{"task_id": "task"}], "dataset": "ego4d"}
+        self.body = {"run_until_exhausted": False, "accounts": self.emails, "tasks": [{"task_id": "task"}], "dataset": "ego4d"}
 
     def finish(self):
         self.instance._thread.join(5)

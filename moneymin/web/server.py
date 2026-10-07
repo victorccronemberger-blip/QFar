@@ -2376,6 +2376,8 @@ def _validate_campaign_request(body: Any) -> None:
         raise ValueError("delay_mode inválido (off|clip|fixed)")
     if not isinstance(body.get("cleanup_after_upload", True), bool):
         raise ValueError("cleanup_after_upload deve ser true ou false")
+    if not isinstance(body.get("run_until_exhausted", True), bool):
+        raise ValueError("run_until_exhausted deve ser true ou false")
     if _parse_active_hours(body.get("active_hours")) is False:
         raise ValueError("active_hours inválido — use [início, fim] com 0 <= início < fim <= 24")
 
@@ -4661,6 +4663,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
             min_dur_s, max_dur_s = _parse_duration_range(body)
             count = max(1, min(int(body.get("count", 1)), 200))
             target_hours = max(0.0, min(float(body.get("target_hours") or 0), 12.0))
+            until_exhausted = body.get("run_until_exhausted", True)
+            if until_exhausted:
+                target_hours = 0.0
         except (TypeError, ValueError, OverflowError) as exc:
             return {"error": f"parâmetros inválidos: {exc}"}, 400
 
@@ -4882,7 +4887,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 clip_count = len(clip_review)
                 capacity_summary = campaign_plan.capacity(
                     clip_review, [a.email for a in survivors], target_seconds=target_hours * 3600,
-                    count_per_task=None if target_hours > 0 else count)
+                    count_per_task=None if until_exhausted or target_hours > 0 else count)
                 estimated_sends = capacity_summary["estimated_sends"]
                 refined_count = sum(bool(row.get("imu_refined_from")) for row in clip_review)
                 if refined_count:
@@ -4930,6 +4935,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             "estimated_sends": estimated_sends,
             "account_workers": campaign.clamp_account_workers(requested_workers, len(survivors)),
             "target_hours": target_hours,
+            "run_until_exhausted": until_exhausted,
             "capacity": capacity_summary,
             "blockers": blockers,
             "recovery_error": recovery_error,
@@ -5032,6 +5038,9 @@ def create_app(*, for_testing: bool = False) -> Flask:
             if "target_hours" in body:
                 target_hours = max(0.0, min(float(body.get("target_hours") or 0), 12.0))
             else:
+                target_hours = 0.0
+            until_exhausted = body.get("run_until_exhausted", True)
+            if until_exhausted:
                 target_hours = 0.0
             min_dur_s, max_dur_s = _parse_duration_range(body)
             raw_delay_s = float(body.get("delay_s", 0))
@@ -5230,6 +5239,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                              unique_video=False,
                              allow_new_accounts=False,
                              target_hours_per_account=target_hours,
+                             run_until_exhausted=until_exhausted,
                              dataset_provider=dataset_provider,
                              content_mode=content_mode,
                              cleanup_after_upload=cleanup_after_upload,
