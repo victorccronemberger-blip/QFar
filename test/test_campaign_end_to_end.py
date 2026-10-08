@@ -121,7 +121,8 @@ class CampaignEndToEndTests(unittest.TestCase):
 
     def _run_transport_recovery_campaign(self, *, recovery_succeeds, stop_during_backoff=False,
                                          mixed_owner=False, first_pass="transport",
-                                         terminal_retry=False, account_max_attempts=3):
+                                         terminal_retry=False, account_max_attempts=3,
+                                         precreate_retry=False):
         candidates = [
             {"clip_uid": uid, "dur_s": 300, "source": "ego4d"}
             for uid in ("clip-a", "clip-b")
@@ -133,6 +134,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         send_pairs = []
         retry_links = []
         retry_recorded_at = []
+        precreate_attempts = {}
         profile = Mock()
         engine_errors = []
 
@@ -151,6 +153,18 @@ class CampaignEndToEndTests(unittest.TestCase):
             # that same seam so the campaign's recovery branch can use it.
             kwargs["session_cache"][account.email] = Mock(email=account.email)
             if clip_uid == "clip-a" and account.email == self.emails[0]:
+                if precreate_retry:
+                    attempt = precreate_attempts.get(account.email, 0) + 1
+                    precreate_attempts[account.email] = attempt
+                    if attempt == 1:
+                        return {"email": account.email, "org_key": account.org_key,
+                                "ok": False, "retryable": True,
+                                "error": "Os registros de envio estão ocupados; tente novamente."}
+                    if attempt == 2:
+                        return {"email": account.email, "org_key": account.org_key,
+                                "ok": True, "finalized": True,
+                                "session_id": "sid-after-contention",
+                                "uploads": ["upload-after-contention"]}
                 retry_of = item.get("_retry_of_session_id")
                 if retry_of is not None:
                     retry_links.append(retry_of)
@@ -302,6 +316,17 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertLess(order.index(("reconcile", self.emails[0], "clip-a")), first_cleanup)
         self.assertLess(order.index(("send", "clip-a", self.emails[1])), first_cleanup)
         self.assertLess(first_cleanup, order.index(("prepare", "clip-b")))
+        self.assertEqual(snapshot["totals"]["ok_sends"], 4)
+
+    def test_retryable_journal_contention_retries_account_before_abandoning_batch(self):
+        snapshot, history, _rows, _order, pump_calls, send_pairs, _stop, _links, _recorded = \
+            self._run_transport_recovery_campaign(
+                recovery_succeeds=False, precreate_retry=True)
+        self.assertEqual(history["status"], "done")
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a", "clip-b"])
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 2)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[1])), 1)
+        self.assertEqual(pump_calls, [])
         self.assertEqual(snapshot["totals"]["ok_sends"], 4)
 
     def test_transport_recovery_resumes_pending_finalize_on_same_receipt(self):

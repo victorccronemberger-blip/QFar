@@ -1445,11 +1445,14 @@ def load_sidecar(session_id: str, chunk_index: int = 0) -> dict[str, Any] | None
 def list_sidecars(state: str | None = None) -> list[dict[str, Any]]:
     """Valida todos os journals antes de retornar o filtro de estado."""
     from .media_lifecycle import media_state_lease
+    from .operation_lease import OperationLeaseError
     out: list[dict[str, Any]] = []
     try:
         # Read one coherent generation while writers/cleanup hold the same
-        # short local barrier. No network work occurs under this lease.
-        with media_state_lease(wait=True):
+        # local barrier. Large journal stores and concurrent account workers
+        # can serialize scans here; wait boundedly for a reader/writer to finish.
+        # No network work occurs under this lease.
+        with media_state_lease(wait=True, timeout_s=30.0):
             # iterdir reports directory I/O failures; glob can silently omit them.
             paths = sorted(path for path in sidecars_dir().iterdir() if path.name.lower().endswith(".json"))
             for path in paths:
@@ -1461,6 +1464,13 @@ def list_sidecars(state: str | None = None) -> list[dict[str, Any]]:
                     raise ValueError("invalid journal identity")
                 if state is None or data.get("state") == state:
                     out.append(data)
+    except OperationLeaseError as exc:
+        if exc.busy:
+            raise UploadError("Os registros de envio estão ocupados; tente novamente.",
+                              transient=True, phase="recovery") from None
+        raise UploadError(
+            "Não foi possível reservar a leitura dos registros; preserve-os para revisão.",
+            transient=False, phase="recovery") from None
     except (OSError, UnicodeError, ValueError, UploadError):
         # Corrupt or unknown receipts must never become proof of no prior upload.
         # Keep diagnostics independent of filenames, payloads and parser errors.

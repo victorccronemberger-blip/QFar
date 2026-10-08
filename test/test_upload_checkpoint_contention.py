@@ -8,13 +8,17 @@ import tempfile
 import threading
 import time
 import unittest
+import subprocess
+import sys
+import os
 from unittest.mock import patch
 from unittest.mock import Mock
 from types import SimpleNamespace
 import zipfile
 
 from moneymin import config, media_lifecycle, recovery, upload, validate
-from moneymin.operation_lease import operation_lease
+import moneymin.operation_lease as operation_lease_module
+from moneymin.operation_lease import operation_lease, OperationLeaseError
 
 
 class UploadCheckpointContentionTests(unittest.TestCase):
@@ -113,18 +117,14 @@ class UploadCheckpointContentionTests(unittest.TestCase):
     def test_publisher_deadline_preserves_existing_bytes_and_receipt(self):
         row, path = self.journal('bounded-session')
         before = path.read_bytes()
-        thread, release, errors = self.holder()
-        try:
-            # Expire the real contended lease after its 30-second deadline;
-            # avoid keeping the test stalled for half a minute.
-            with patch.object(media_lifecycle.time, 'monotonic', side_effect=[0.0, 30.1]):
-                with self.assertRaises(upload.UploadError) as raised:
-                    upload.save_sidecar({**row, 'phase': 'transport_done'})
-            self.assertEqual(raised.exception.phase, 'recovery')
-            self.assertTrue(raised.exception.retryable)
-            self.assertEqual(path.read_bytes(), before)
-        finally:
-            self.finish_holder(thread, release, errors)
+        with patch.object(media_lifecycle, 'media_state_lease',
+                          side_effect=OperationLeaseError(
+                              'Uma operação local está em andamento.', busy=True)):
+            with self.assertRaises(upload.UploadError) as raised:
+                upload.save_sidecar({**row, 'phase': 'transport_done'})
+        self.assertEqual(raised.exception.phase, 'recovery')
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(path.read_bytes(), before)
         upload.save_sidecar({**row, 'phase': 'transport_done'})
         self.assertEqual(upload.load_sidecar(row['session_id'])['upload_id'], row['upload_id'])
 
@@ -150,19 +150,137 @@ class UploadCheckpointContentionTests(unittest.TestCase):
             self.assertEqual(upload.save_sidecar({**row, 'phase': 'transport_done'}), path)
         self.assertEqual(directory.call_count, 1)
 
-    def test_reader_default_deadline_and_cleanup_nonblocking_are_preserved(self):
-        thread, release, errors = self.holder()
-        try:
-            with patch.object(media_lifecycle.time, 'monotonic', side_effect=[0.0, 2.1]):
-                with self.assertRaises(upload.UploadError):
-                    upload.list_sidecars()
-            started = time.monotonic()
-            with self.assertRaises(ValueError):
+    def test_reader_contention_is_retryable_and_cleanup_remains_nonblocking(self):
+        busy = OperationLeaseError('Uma operação local está em andamento.', busy=True)
+        with patch.object(media_lifecycle, 'operation_lease', side_effect=busy), \
+             patch.object(media_lifecycle.time, 'monotonic', side_effect=[0.0, 30.1, 30.2]):
+            with self.assertRaises(upload.UploadError) as raised:
+                upload.list_sidecars()
+            self.assertTrue(raised.exception.retryable)
+            self.assertEqual(raised.exception.phase, 'recovery')
+            self.assertIn('ocupados', str(raised.exception))
+        started = time.perf_counter()
+        with patch.object(media_lifecycle, 'operation_lease', side_effect=busy):
+            with self.assertRaises(OperationLeaseError):
                 with media_lifecycle.media_state_lease():
                     self.fail('cleanup unexpectedly acquired another caller\'s lease')
-            self.assertLess(time.monotonic() - started, .5)
+        self.assertLess(time.perf_counter() - started, .5)
+
+    def test_local_reader_wait_deadline_is_bounded_and_retryable(self):
+        key = os.path.normcase(str((config.DATA_DIR / '.media-lifecycle.lock').resolve()))
+
+        class BusyLocalLock:
+            def acquire(self, *, blocking=True, timeout=-1):
+                return False
+
+            def release(self):
+                raise AssertionError('unacquired local lock was released')
+
+        with patch.dict(operation_lease_module._LOCKS, {key: BusyLocalLock()}), \
+             patch.object(media_lifecycle.time, 'monotonic',
+                          side_effect=[0.0, 30.1, 30.2]):
+            with self.assertRaises(upload.UploadError) as raised:
+                upload.list_sidecars()
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(raised.exception.phase, 'recovery')
+
+    def test_local_lease_io_failure_is_not_misreported_as_contention(self):
+        with patch.object(media_lifecycle, 'media_state_lease',
+                          side_effect=OperationLeaseError(
+                              'Não foi possível reservar a operação local.')):
+            with self.assertRaises(upload.UploadError) as raised:
+                upload.list_sidecars()
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.phase, 'recovery')
+        self.assertNotIn('ocupados', str(raised.exception))
+        self.assertIn('reservar a leitura', str(raised.exception))
+
+    def test_listing_remains_reentrant_when_caller_already_holds_media_barrier(self):
+        row, _path = self.journal('nested-list-session')
+        with media_lifecycle.media_state_lease():
+            self.assertEqual(upload.list_sidecars(), [row])
+
+    def test_cross_process_media_lock_contention_is_retryable(self):
+        path = config.DATA_DIR / '.media-lifecycle.lock'
+        code = ('import sys\nfrom moneymin.operation_lease import operation_lease\n'
+                'with operation_lease(sys.argv[1]):\n print("owned", flush=True)\n'
+                ' sys.stdin.readline()\n')
+        child = subprocess.Popen([sys.executable, '-B', '-c', code, str(path)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'owned')
+            with self.assertRaises(upload.UploadError) as raised:
+                with patch.object(media_lifecycle.time, 'monotonic',
+                                  side_effect=[0.0, 30.1, 30.2]):
+                    upload.list_sidecars()
+            self.assertTrue(raised.exception.retryable)
+            self.assertIn('ocupados', str(raised.exception))
         finally:
-            self.finish_holder(thread, release, errors)
+            child.communicate('\n', timeout=5)
+        self.assertEqual(child.returncode, 0)
+
+    def test_permission_failure_opening_lease_is_not_busy(self):
+        with patch.object(Path, 'open', side_effect=PermissionError('private permission detail')):
+            with self.assertRaises(OperationLeaseError) as raised:
+                with operation_lease(self.root / 'inaccessible.lock'):
+                    self.fail('lease unexpectedly acquired')
+        self.assertFalse(raised.exception.busy)
+
+    def test_large_journal_listing_waits_for_concurrent_checkpoint_barrier(self):
+        total = 11_283
+        journal_dir = upload.sidecars_dir()
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(total):
+            sid = f'bulk-session-{index:05d}'
+            path = journal_dir / upload._sidecar_filename(sid, 0)
+            path.write_text(json.dumps({'session_id': sid, 'chunk_index': 0,
+                                        'state': 'done'}), encoding='utf8')
+
+        entered, release = threading.Event(), threading.Event()
+        readers_ready = threading.Barrier(4)
+        errors, observed = [], []
+
+        def holder():
+            try:
+                with media_lifecycle.media_state_lease():
+                    entered.set()
+                    if not release.wait(10):
+                        raise AssertionError('lease holder was not released')
+            except BaseException as error:
+                errors.append(error)
+
+        def reader():
+            try:
+                readers_ready.wait(timeout=5)
+                observed.append(upload.list_sidecars())
+            except BaseException as error:
+                errors.append(error)
+
+        holder_thread = threading.Thread(target=holder)
+        reader_threads = [threading.Thread(target=reader) for _ in range(3)]
+        holder_thread.start()
+        self.assertTrue(entered.wait(3))
+        try:
+            for thread in reader_threads:
+                thread.start()
+            readers_ready.wait(timeout=5)
+            # Give the reader a scheduling turn to enter the contended lease;
+            # the bound itself is not tested with a timing threshold here.
+            time.sleep(0.05)
+        finally:
+            release.set()
+            for thread in (holder_thread, *reader_threads):
+                if thread.ident is not None:
+                    thread.join(60)
+                    self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(observed), 3)
+        for snapshot in observed:
+            self.assertEqual(len(snapshot), total)
+            self.assertEqual(snapshot[0]['session_id'], 'bulk-session-00000')
+            self.assertEqual(snapshot[-1]['session_id'], f'bulk-session-{total - 1:05d}')
 
     def test_successful_transport_waits_for_reader_without_repeating_http(self):
         sid = 'transport-session'

@@ -27,10 +27,13 @@ def media_state_lease(*, wait=False, timeout_s=2.0):
     stack = ExitStack()
     while True:
         try:
-            stack.enter_context(operation_lease(config.DATA_DIR/'.media-lifecycle.lock'))
+            remaining = max(0.0, deadline - time.monotonic()) if wait else 0.0
+            stack.enter_context(operation_lease(
+                config.DATA_DIR/'.media-lifecycle.lock',
+                wait_local=wait, timeout_s=remaining))
             break
-        except OperationLeaseError:
-            if not wait or time.monotonic() >= deadline:
+        except OperationLeaseError as exc:
+            if not exc.busy or not wait or time.monotonic() >= deadline:
                 stack.close()
                 raise
             time.sleep(0.01)

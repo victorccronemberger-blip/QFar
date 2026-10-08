@@ -194,7 +194,7 @@ class LibraryProtectionTests(unittest.TestCase):
 
             worker = threading.Thread(target=publish)
             real_clock = media_lifecycle.time.monotonic
-            publisher_clock = iter((0.0, 30.1))
+            publisher_clock = iter((0.0, 30.1, 30.2))
 
             def clock():
                 # Preparation owns the real media barrier. Expire only this
