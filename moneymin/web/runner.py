@@ -215,7 +215,7 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         maximum = int(payload.get("max_attempts") or 0)
         return {
             "level": "warning", "stage": "Recuperação", "title": "Nova tentativa agendada",
-            "detail": (f"{email} · tentativa {attempt + 1} de {maximum} em "
+            "detail": (f"{email} · tentativa {attempt} de {maximum} em "
                        f"{_fmt_wait(int(payload.get('delay_s') or 0))}"),
         }
     if kind == "account_excluded":
@@ -276,6 +276,13 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if kind == "account_evaluation_recovery":
         return {"level": "warning", "stage": "Avaliação", "title": "Retomando avaliação",
                 "detail": f"{email} · conferindo o mesmo recibo, sem reenviar o vídeo"}
+    if kind == "account_terminal_retry":
+        return {"level": "warning", "stage": "Recuperação",
+                "title": "Nova tentativa após falha confirmada",
+                "detail": (f"{email} · o Minute encerrou a sessão anterior como falha. "
+                           f"Nova sessão em {_fmt_wait(int(payload.get('delay_s') or 0))} "
+                           f"· tentativa {int(payload.get('attempt') or 0)} de "
+                           f"{int(payload.get('max_attempts') or 0)}")}
     if kind == "account_transport_recovery":
         return {"level": "warning", "stage": "Recuperação", "title": "Retomando o mesmo envio",
                 "detail": (f"{email} · tentativa {int(payload.get('attempt') or 0)} de "
@@ -739,7 +746,8 @@ class CampaignRunner:
                 self.current = (f"envios ativos: {pending} — "
                                 f"{_fmt_wait(elapsed)} decorridos…")
                 self.stage = "Envio"
-            elif kind in {"account_retry_tick", "account_transport_recovery_tick"}:
+            elif kind in {"account_retry_tick", "account_transport_recovery_tick",
+                          "account_terminal_retry_tick", "account_evaluation_recovery_tick"}:
                 self.current = ("recuperando envio — nova tentativa em "
                                 f"{_fmt_wait(int(payload.get('remaining_s') or 0))}…")
                 self.stage = "Recuperação"

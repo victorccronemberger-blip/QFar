@@ -113,6 +113,11 @@ __all__ = [
     "UploadResult",
     "enqueue_upload",
     "is_pending_transport",
+    "is_terminal_remote_failure",
+    "all_terminal_remote_failure",
+    "is_remote_recovery_candidate",
+    "validate_remote_recovery_receipt",
+    "mark_remote_terminal_failure",
     "pump_pending",
     "trim_video",
     "upload_session",
@@ -728,6 +733,264 @@ def get_upload(session: Any, upload_id: str) -> dict[str, Any]:
                           transient=False, phase="query", review_required=True) from None
     _validate_known_receipt(parsed, upload_id, "query")
     return parsed
+
+
+def _remote_recovery_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """Return strict journal identity fields used by remote receipt proofs."""
+    try:
+        sid, index = row.get("session_id"), row.get("chunk_index", 0)
+        expected_chunks = row.get("expected_chunk_count", 1)
+        _sidecar_filename(sid, index)
+        upload_id = _response_upload_id({"id": row.get("upload_id")})
+        recorded_at = _journal_recorded_at(row)
+        duration_ms = row.get("duration_ms")
+        email, org_key = row.get("account_email"), row.get("org_key")
+        task_id = row.get("task_id")
+        if (not journal_flags_valid(row)
+                or row.get("native_response_schema") is not True
+                or row.get("create_attempted") is not True
+                or row.get("register_first") is not True
+                or type(index) is not int or index < 0
+                or type(expected_chunks) is not int or expected_chunks < 1 or index >= expected_chunks
+                or type(duration_ms) is not int or duration_ms <= 0
+                or not isinstance(email, str) or not email.strip()
+                or not isinstance(org_key, str) or not org_key.strip()
+                or (task_id is not None and (not isinstance(task_id, str) or not task_id.strip()))
+                or row.get("log_id") != f"{sid}_{index}"
+                or row.get("filename") != f"{sid}_{index}.mp4"):
+            raise ValueError
+        return {
+            "upload_id": upload_id,
+            "session_id": sid,
+            "log_id": row["log_id"],
+            "recorded_at": recorded_at,
+            "duration_ms": duration_ms,
+            "org_key": org_key,
+            "email": email.strip().casefold(),
+            "task_id": task_id,
+        }
+    except (KeyError, TypeError, ValueError, UploadError):
+        raise UploadError("Identidade remota do recibo inválida; preservado para revisão.",
+                          transient=False, phase="query", review_required=True) from None
+
+
+def _session_resource_identity(session: Any, owner_resource_key: str | None = None) -> tuple[str, str]:
+    email = getattr(session, "email", None)
+    if not isinstance(email, str) or not email.strip():
+        raise UploadError("Sessão sem identidade confirmada para consultar recibo.",
+                          transient=False, phase="query", review_required=True)
+    email = email.strip().casefold()
+    if owner_resource_key is None:
+        me = getattr(session, "me", None)
+        if not callable(me):
+            raise UploadError("Identidade de usuário Minute indisponível para consultar recibo.",
+                              transient=False, phase="query", review_required=True)
+        try:
+            me = me()
+        except Exception:
+            raise UploadError("Identidade de usuário Minute não pôde ser confirmada.",
+                              transient=True, phase="query") from None
+        if (not isinstance(me, dict) or not isinstance(me.get("email"), str)
+                or me["email"].strip().casefold() != email):
+            raise UploadError("Identidade de usuário Minute divergente; recibo preservado.",
+                              transient=False, phase="query", review_required=True)
+        owner_resource_key = me.get("resourceKey")
+    if not isinstance(owner_resource_key, str) or not owner_resource_key.strip():
+        raise UploadError("Chave de usuário Minute ausente; recibo preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    return email, owner_resource_key.strip()
+
+
+def validate_remote_recovery_receipt(
+    row: dict[str, Any], receipt: Any, session: Any, *,
+    owner_resource_key: str | None = None,
+) -> str:
+    """Strictly bind an authenticated GET /uploads detail to its local row.
+
+    The returned state is intentionally limited to the API's documented
+    ``initiated``, ``uploaded``, ``completed`` and ``failed`` values. Unknown
+    states never authorize a blob transfer or completion request.
+    """
+    identity = _remote_recovery_identity(row)
+    session_email, resource_key = _session_resource_identity(session, owner_resource_key)
+    expected_id = {
+        "uploadId": identity["upload_id"],
+        "sessionId": identity["session_id"],
+        "logId": identity["log_id"],
+        "orgResourceKey": identity["org_key"],
+        "userResourceKey": resource_key,
+    }
+    required = set(expected_id) | {
+        "userEmail", "taskId", "taskName", "recordedAt", "createdAt", "durationMs",
+        "status", "orgName", "storageAccount",
+    }
+    if (not isinstance(receipt, dict) or not required.issubset(receipt)
+            or any(receipt.get(key) != value for key, value in expected_id.items())
+            or not isinstance(receipt.get("userEmail"), str)
+            or not isinstance(receipt.get("userResourceKey"), str)
+            or any(receipt.get(key) is not None and not isinstance(receipt.get(key), str)
+                   for key in ("taskId", "taskName", "orgName", "storageAccount"))
+            or not isinstance(receipt.get("recordedAt"), str)
+            or not isinstance(receipt.get("createdAt"), str)
+            or recorded_at_to_wall_ms(receipt["createdAt"]) is None):
+        raise UploadError("Resposta remota não corresponde ao recibo local; preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    receipt_email = receipt.get("userEmail")
+    if (not isinstance(receipt_email, str)
+            or receipt_email.strip().casefold() != identity["email"]
+            or receipt_email.strip().casefold() != session_email):
+        raise UploadError("Dono do recibo remoto diverge da sessão; preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    receipt_task = receipt.get("taskId")
+    if (receipt_task is not None and not isinstance(receipt_task, str)) or receipt_task != identity["task_id"]:
+        raise UploadError("Tarefa do recibo remoto diverge do registro local; preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    remote_recorded_at = receipt.get("recordedAt")
+    if (not isinstance(remote_recorded_at, str)
+            or recorded_at_to_wall_ms(remote_recorded_at)
+            != recorded_at_to_wall_ms(identity["recorded_at"])):
+        raise UploadError("Horário do recibo remoto diverge do registro local; preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    duration_ms = receipt.get("durationMs")
+    if type(duration_ms) is not int or duration_ms != identity["duration_ms"]:
+        raise UploadError("Duração do recibo remoto diverge do registro local; preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    status = receipt.get("status")
+    if not isinstance(status, str) or status not in {"initiated", "uploaded", "completed", "failed"}:
+        raise UploadError("Estado remoto do recibo não reconhecido; preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    if status == "completed" and not isinstance(receipt.get("meta"), dict):
+        raise UploadError("Recibo concluído sem metadados válidos; preservado para revisão.",
+                          transient=False, phase="query", review_required=True)
+    return status
+
+
+def _terminal_failure_marker(row: dict[str, Any]) -> dict[str, Any]:
+    identity = _remote_recovery_identity(row)
+    marker = row.get("remote_terminal_failure")
+    if not isinstance(marker, dict):
+        raise ValueError("remote terminal failure proof mismatch")
+    expected = {
+        "upload_id": identity["upload_id"],
+        "session_id": identity["session_id"],
+        "log_id": identity["log_id"],
+        "email": identity["email"],
+        "user_resource_key": marker.get("user_resource_key"),
+        "org_key": identity["org_key"],
+        "task_id": identity["task_id"],
+        "recorded_at": identity["recorded_at"],
+        "duration_ms": identity["duration_ms"],
+        "chunk_index": row.get("chunk_index", 0),
+        "expected_chunk_count": row.get("expected_chunk_count", 1),
+    }
+    if (type(marker.get("version")) is not int or marker.get("version") != 1
+            or marker.get("status") != "failed"
+            or row.get("finalized") is True or row.get("campaign_reconciled") is True
+            or type(marker.get("duration_ms")) is not int
+            or type(marker.get("chunk_index")) is not int
+            or type(marker.get("expected_chunk_count")) is not int
+            or not isinstance(marker.get("user_resource_key"), str)
+            or not marker["user_resource_key"].strip()
+            or any(marker.get(key) != value for key, value in expected.items())):
+        raise ValueError("remote terminal failure proof mismatch")
+    checked_at = marker.get("checked_at")
+    checked_ms = recorded_at_to_wall_ms(checked_at) if isinstance(checked_at, str) else None
+    if (checked_ms is None or format_recorded_at(checked_ms / 1000.0) != checked_at):
+        raise ValueError("remote terminal failure timestamp invalid")
+    return marker
+
+
+def is_terminal_remote_failure(row: Any) -> bool:
+    if not isinstance(row, dict) or row.get("state") != STATE_FAILED \
+            or row.get("phase") != "remote_terminal_failure":
+        return False
+    try:
+        _terminal_failure_marker(row)
+    except (TypeError, ValueError, UploadError):
+        return False
+    return True
+
+
+def mark_remote_terminal_failure(
+    row: dict[str, Any], receipt: Any, session: Any, *,
+    checked_at: str | None = None, owner_resource_key: str | None = None,
+) -> dict[str, Any]:
+    _session_email, resource_key = _session_resource_identity(session, owner_resource_key)
+    status = validate_remote_recovery_receipt(
+        row, receipt, session, owner_resource_key=resource_key)
+    if status != "failed":
+        raise UploadError("O recibo remoto não confirmou falha terminal.",
+                          transient=False, phase="query", review_required=True)
+    if (not isinstance(row.get("state"), str)
+            or row.get("state") not in {STATE_FAILED, STATE_RETRY_LATE, STATE_TRANSPORT, STATE_COMPLETING}
+            or row.get("finalized") is True or row.get("campaign_reconciled") is True):
+        raise UploadError("Falha remota não pode substituir um estado local confirmado.",
+                          transient=False, phase="query", review_required=True)
+    identity = _remote_recovery_identity(row)
+    checked_at = checked_at or _iso_now()
+    checked_ms = recorded_at_to_wall_ms(checked_at) if isinstance(checked_at, str) else None
+    if checked_ms is None or format_recorded_at(checked_ms / 1000.0) != checked_at:
+        raise UploadError("Horário da confirmação terminal inválido.",
+                          transient=False, phase="query", review_required=True)
+    row["remote_terminal_failure"] = {
+        "version": 1,
+        "status": "failed",
+        "upload_id": identity["upload_id"],
+        "session_id": identity["session_id"],
+        "log_id": identity["log_id"],
+        "email": identity["email"],
+        "user_resource_key": resource_key,
+        "org_key": identity["org_key"],
+        "task_id": identity["task_id"],
+        "recorded_at": identity["recorded_at"],
+        "duration_ms": identity["duration_ms"],
+        "chunk_index": row.get("chunk_index", 0),
+        "expected_chunk_count": row.get("expected_chunk_count", 1),
+        "checked_at": checked_at,
+    }
+    row["state"] = STATE_FAILED
+    row["phase"] = "remote_terminal_failure"
+    return row
+
+
+def all_terminal_remote_failure(rows: Any) -> bool:
+    if not isinstance(rows, list) or not rows:
+        return False
+    first = rows[0]
+    expected = first.get("expected_chunk_count", 1) if isinstance(first, dict) else None
+    if type(expected) is not int or expected < 1 or len(rows) != expected:
+        return False
+    if not all(isinstance(row, dict) and journal_flags_valid(row)
+               and is_terminal_remote_failure(row) for row in rows):
+        return False
+    indexes = [row.get("chunk_index", 0) for row in rows]
+    if any(type(index) is not int for index in indexes) or set(indexes) != set(range(expected)):
+        return False
+    for row in rows:
+        for key in ("account_email", "org_key", "session_id", "task_id", "campaign_context",
+                    "expected_chunk_count"):
+            if row.get(key, 0 if key == "chunk_index" else None) != first.get(
+                    key, 0 if key == "chunk_index" else None):
+                return False
+    resource_keys = {row["remote_terminal_failure"]["user_resource_key"] for row in rows}
+    return len({row.get("upload_id") for row in rows}) == expected and len(resource_keys) == 1
+
+
+def is_remote_recovery_candidate(row: Any) -> bool:
+    """Cheaply select native failed receipts requiring one authenticated GET.
+
+    This deliberately includes failed completion-stage rows, which cannot be
+    retried by the ordinary transport selector. It performs no file I/O.
+    """
+    if not isinstance(row, dict) or row.get("state") != STATE_FAILED:
+        return False
+    if row.get("phase") not in {"complete", "completing"}:
+        return is_pending_transport(row)
+    try:
+        _remote_recovery_identity(row)
+        return True
+    except UploadError:
+        return False
 
 
 def _require_completion_flags(suppress_per_chunk_catbear: bool,
@@ -3118,7 +3381,11 @@ def _pending_recovery_stage(item: dict[str, Any]) -> str:
     has_id = isinstance(upload_id, str) and bool(upload_id.strip())
     complete_phases = {"transport_done", "completing", "complete"}
     finalize_phases = {"awaiting_finalize", "finalize", "finalizing"}
-    if has_id and phase in complete_phases:
+    if is_terminal_remote_failure(item):
+        stage = "terminal_failed"
+    elif is_remote_recovery_candidate(item):
+        stage = "remote_probe"
+    elif has_id and phase in complete_phases:
         stage = "complete"
     elif has_id and item.get("finalize_requested") is True and (
             phase in finalize_phases or is_pending_finalization(item)
@@ -3181,7 +3448,8 @@ def pump_pending(
     if state is None:
         pending = [s for s in all_journals if (isinstance(s.get("state"), str) and s.get("state") in TRANSIENT_STATES)
                    or s.get("state") == STATE_LOSS or is_pending_finalization(s)
-                   or is_pending_evaluation(s) or is_pending_transport(s)]
+                   or is_pending_evaluation(s) or is_pending_transport(s)
+                   or is_remote_recovery_candidate(s) or is_terminal_remote_failure(s)]
     else:
         pending = [item for item in all_journals if item.get("state") == state]
     session_email = getattr(session, "email", None)
@@ -3201,23 +3469,74 @@ def pump_pending(
     if session_ids is not None:
         pending = [item for item in pending if item.get("session_id") in session_ids]
 
-    # Reject malformed selected journals before changing any checkpoint or
-    # calling a service. Coercion can turn bool/string counters into a valid
-    # chunk and resume a different operation than the persisted one.
+    # Validate all selected rows before checkpoints. Coercion can turn
+    # bool/string counters into a different operation than the persisted one.
     selected_chunks: set[tuple[str, int]] = set()
+    remote_probe_rows: list[dict[str, Any]] = []
     for item in pending:
         recovery_stage = _pending_recovery_stage(item)
-        if recovery_stage in {"sidecar", "video"} and account_email is None:
+        if recovery_stage in {"sidecar", "video", "remote_probe"} and account_email is None:
             raise UploadError("A retomada do transporte requer uma conta autenticada identificada.",
                               transient=False, phase="recovery")
-        if recovery_stage == "video":
-            _video_resume_payload(item, kwargs.get("profile"))
         index = item.get("chunk_index", 0)
         identity = (item["session_id"], index)
         if identity in selected_chunks:
             raise UploadError("Registros de retomada duplicados; os arquivos foram preservados para revisão.",
                               transient=False, phase="recovery")
         selected_chunks.add(identity)
+        if recovery_stage in {"sidecar", "video", "remote_probe"}:
+            remote_probe_rows.append(item)
+
+    # A native receipt can already be terminal remotely even if an older
+    # desktop journal still says transport/complete. Query each exact receipt
+    # before touching large video files or issuing SAS/PUT/complete/fail.
+    remote_resource_key: str | None = None
+    remote_results: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    if remote_probe_rows:
+        _session_email, remote_resource_key = _session_resource_identity(session)
+        for item in remote_probe_rows:
+            receipt = get_upload(session, str(item.get("upload_id") or ""))
+            status = validate_remote_recovery_receipt(
+                item, receipt, session, owner_resource_key=remote_resource_key)
+            remote_results.append((item, status, receipt))
+
+    for item, remote_status, receipt in remote_results:
+        if remote_status == "failed":
+            mark_remote_terminal_failure(
+                item, receipt, session, owner_resource_key=remote_resource_key)
+            save_sidecar(item)
+        elif remote_status == "initiated":
+            changed = item.get("state") == STATE_FAILED
+            if changed:
+                item["state"] = STATE_RETRY_LATE
+            if item.get("phase") in {"complete", "completing"}:
+                item.update(state=STATE_RETRY_LATE, phase="transport",
+                            transport_artifact="video")
+                changed = True
+            if item.get("transport_artifact") != "sidecar":
+                _video_resume_payload(item, kwargs.get("profile"))
+            if changed:
+                save_sidecar(item)
+        elif remote_status == "uploaded":
+            # `uploaded` proves the video PUT only. The original ZIP remains
+            # mandatory for a native receipt; validate it before recording a
+            # checkpoint or allowing the existing driver to continue.
+            zip_bound_row = dict(item)
+            zip_bound_row.update(transport_artifact="sidecar", conflict_action="complete")
+            _sidecar_resume_payload(zip_bound_row)
+            item["remote_recovery_receipt"] = dict(receipt)
+            item.update(state=STATE_RETRY_LATE, phase="sidecar_preflight",
+                        transport_artifact="sidecar", conflict_action="complete")
+            save_sidecar(item)
+        elif remote_status == "completed":
+            item["remote_recovery_receipt"] = dict(receipt)
+            item["raw_complete"] = {
+                "id": item["upload_id"],
+                "status": "completed",
+                "meta": receipt["meta"],
+            }
+            item.update(state=STATE_DONE, phase="done")
+            save_sidecar(item)
 
     # A sibling marked done/finalized can be absent from the pending filter.
     # Validate its receipt before spending another chunk's resume budget.
@@ -3236,6 +3555,9 @@ def pump_pending(
         sid = str(sidecar.get("session_id") or "")
         idx = int(sidecar.get("chunk_index") or 0)
         touched_sessions.add(sid)
+        if is_terminal_remote_failure(sidecar):
+            updated.append(sidecar)
+            continue
         resumes = int(sidecar.get("crash_resumes") or 0)
         if resumes >= MAX_CRASH_RESUMES:
             sidecar.update({

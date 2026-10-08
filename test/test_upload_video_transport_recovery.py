@@ -70,9 +70,35 @@ class VideoTransportRecoveryTests(unittest.TestCase):
 
         class Session:
             email = VideoTransportRecoveryTests.OWNER
+            remote_status = "initiated"
+
+            def me(inner):
+                return {"email": inner.email, "resourceKey": "fixture-user-resource"}
 
             def request(inner, method, path, body=None):
                 self.session_calls.append((method, path, body))
+                if path == f"/api/v1/uploads/{VideoTransportRecoveryTests.UPLOAD_ID}":
+                    detail = {
+                        "uploadId": VideoTransportRecoveryTests.UPLOAD_ID,
+                        "sessionId": self.row["session_id"],
+                        "logId": self.row["log_id"],
+                        "status": inner.remote_status,
+                        "durationMs": self.row["duration_ms"],
+                        "recordedAt": self.row["recorded_at"],
+                        "createdAt": self.row["recorded_at"],
+                        "userEmail": inner.email,
+                        "userResourceKey": "fixture-user-resource",
+                        "orgName": "Fixture org",
+                        "orgResourceKey": self.row["org_key"],
+                        "storageAccount": "fixture-storage",
+                        "taskId": self.row["task_id"],
+                        "taskName": "Fixture task",
+                        "meta": {},
+                    }
+                    mutate = getattr(inner, "remote_receipt_mutator", None)
+                    if callable(mutate):
+                        detail = mutate(detail)
+                    return 200, json.dumps(detail)
                 if path == "/api/v1/storage/sas/blobs":
                     return 200, json.dumps({"signed_urls": [
                         {"filename": item["filename"],
@@ -117,12 +143,13 @@ class VideoTransportRecoveryTests(unittest.TestCase):
                                        fail_on_error=False, profile=self.profile)
 
         self.assertEqual([path for _method, path, _body in self.session_calls], [
+            f"/api/v1/uploads/{self.UPLOAD_ID}",
             "/api/v1/storage/sas/blobs",
             f"/api/v1/uploads/{self.UPLOAD_ID}/complete",
             f"/api/v1/uploads/{self.UPLOAD_ID}/evaluate",
             f"/api/v1/organizations/fixture-org/sessions/{self.SID}/finalize",
         ])
-        sas_body = self.session_calls[0][2]
+        sas_body = self.session_calls[1][2]
         self.assertEqual({row["filename"] for row in sas_body["files"]}, {
             f"{self.SID}_0.mp4", f"{self.SID}_0.data.zip"})
         self.assertEqual(video_puts, [(video_puts[0][0], self.video_bytes,
@@ -173,7 +200,9 @@ class VideoTransportRecoveryTests(unittest.TestCase):
                 save.assert_not_called()
                 put_video.assert_not_called()
                 put_zip.assert_not_called()
-                self.assertEqual(self.session_calls, [])
+                expected_calls = ([] if label in {"phase", "permanent-failure"} else [
+                    ("GET", f"/api/v1/uploads/{self.UPLOAD_ID}", None)])
+                self.assertEqual(self.session_calls, expected_calls)
                 self.assertEqual(self.video.read_bytes(), before_video)
                 self.assertEqual(self.archive.read_bytes(), before_zip)
 
@@ -190,7 +219,9 @@ class VideoTransportRecoveryTests(unittest.TestCase):
                                        fail_on_error=False)
 
         put_video.assert_not_called()
-        self.assertEqual(zip_puts, [self.zip_bytes])
+        self.assertEqual(len(zip_puts), 1)
+        self.assertEqual(hashlib.sha256(zip_puts[0]).hexdigest(),
+                         hashlib.sha256(self.zip_bytes).hexdigest())
         self.assertEqual(rows[0]["upload_id"], self.UPLOAD_ID)
         self.assertIs(rows[0]["finalized"], True)
 
@@ -231,6 +262,103 @@ class VideoTransportRecoveryTests(unittest.TestCase):
         self.assertIs(second[0]["finalized"], True)
         self.assertFalse(any(method == "POST" and path == "/api/v1/uploads"
                              for method, path, _body in self.session_calls))
+
+    def test_remote_failed_receipt_is_terminal_and_never_retried(self):
+        self.persist()
+        self.session.remote_status = "failed"
+        with patch.object(upload, "_put_blob_file") as put_video, \
+             patch.object(upload, "_put_blob") as put_zip:
+            rows = upload.pump_pending(self.session, max_retries=1, retry_backoff=0,
+                                       fail_on_error=False, profile=self.profile)
+
+        row = rows[0]
+        self.assertEqual([path for _method, path, _body in self.session_calls], [
+            f"/api/v1/uploads/{self.UPLOAD_ID}"])
+        put_video.assert_not_called()
+        put_zip.assert_not_called()
+        self.assertEqual(row["state"], upload.STATE_FAILED)
+        self.assertEqual(row["phase"], "remote_terminal_failure")
+        self.assertEqual(row["error"], self.row["error"])
+        self.assertTrue(upload.is_terminal_remote_failure(row))
+        self.assertFalse(upload.is_pending_transport(row))
+
+    def test_failed_completion_stage_is_probed_before_any_completion(self):
+        self.persist(state=upload.STATE_FAILED, phase="complete",
+                     error="PATCH complete failed (400)")
+        self.session.remote_status = "failed"
+        with patch.object(upload, "_put_blob_file") as put_video, \
+             patch.object(upload, "_put_blob") as put_zip:
+            rows = upload.pump_pending(self.session, max_retries=1, retry_backoff=0,
+                                       fail_on_error=False, profile=self.profile)
+
+        paths = [path for _method, path, _body in self.session_calls]
+        self.assertEqual(paths, [f"/api/v1/uploads/{self.UPLOAD_ID}"])
+        put_video.assert_not_called()
+        put_zip.assert_not_called()
+        self.assertTrue(upload.is_terminal_remote_failure(rows[0]))
+        self.assertEqual(rows[0]["error"], "PATCH complete failed (400)")
+
+    def test_remote_receipt_mismatch_or_completed_without_meta_fails_closed(self):
+        faults = (
+            ("other-upload", lambda detail: {**detail, "uploadId": "other-upload"}),
+            ("other-owner-key", lambda detail: {**detail, "userResourceKey": "other-user"}),
+            ("unknown-status", lambda detail: {**detail, "status": "processing"}),
+            ("completed-no-meta", lambda detail: {**detail, "status": "completed", "meta": None}),
+        )
+        for label, mutate in faults:
+            with self.subTest(label=label):
+                self.persist()
+                self.session_calls.clear()
+                self.session.remote_receipt_mutator = mutate
+                with patch.object(upload, "save_sidecar") as save, \
+                     patch.object(upload, "_put_blob_file") as put_video, \
+                     patch.object(upload, "_put_blob") as put_zip:
+                    with self.assertRaises(upload.UploadError):
+                        upload.pump_pending(self.session, max_retries=1, retry_backoff=0,
+                                            fail_on_error=False, profile=self.profile)
+                self.assertEqual([path for _method, path, _body in self.session_calls], [
+                    f"/api/v1/uploads/{self.UPLOAD_ID}"])
+                save.assert_not_called()
+                put_video.assert_not_called()
+                put_zip.assert_not_called()
+                del self.session.remote_receipt_mutator
+
+    def test_uploaded_receipt_resumes_only_original_zip_before_complete(self):
+        self.persist(transport_artifact="video")
+        self.session.remote_status = "uploaded"
+        video_puts, zip_puts = [], []
+        with patch.object(device_profile, "_load_profile", return_value=self.profile), \
+             patch.object(upload, "_put_blob_file", side_effect=lambda *a, **k:
+                          video_puts.append(a) or 201), \
+             patch.object(upload, "_put_blob", side_effect=lambda url, payload, **kw:
+                          zip_puts.append(payload) or 201):
+            rows = upload.pump_pending(self.session, max_retries=1, retry_backoff=0,
+                                       fail_on_error=False, profile=self.profile)
+
+        paths = [path for _method, path, _body in self.session_calls]
+        self.assertEqual(paths[0], f"/api/v1/uploads/{self.UPLOAD_ID}")
+        self.assertIn("/api/v1/storage/sas/blobs", paths)
+        self.assertIn(f"/api/v1/uploads/{self.UPLOAD_ID}/complete", paths)
+        self.assertEqual(video_puts, [])
+        self.assertEqual(zip_puts, [self.zip_bytes])
+        self.assertTrue(rows[0]["finalized"])
+
+    def test_completed_receipt_skips_put_and_complete(self):
+        self.persist()
+        self.session.remote_status = "completed"
+        with patch.object(upload, "_put_blob_file") as put_video, \
+             patch.object(upload, "_put_blob") as put_zip:
+            rows = upload.pump_pending(self.session, max_retries=1, retry_backoff=0,
+                                       fail_on_error=False, profile=self.profile)
+
+        paths = [path for _method, path, _body in self.session_calls]
+        self.assertEqual(paths[0], f"/api/v1/uploads/{self.UPLOAD_ID}")
+        self.assertNotIn("/api/v1/storage/sas/blobs", paths)
+        self.assertNotIn(f"/api/v1/uploads/{self.UPLOAD_ID}/complete", paths)
+        self.assertTrue(any(path.endswith("/evaluate") for path in paths))
+        put_video.assert_not_called()
+        put_zip.assert_not_called()
+        self.assertTrue(rows[0]["finalized"])
 
 
 if __name__ == "__main__":

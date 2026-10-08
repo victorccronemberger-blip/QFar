@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from moneymin import campaign, minute_api
+from moneymin import campaign, minute_api, upload
 from moneymin.campaign_types import AccountSpec, CampaignConfig, CampaignLog, TaskSpec
 from moneymin.web import runner, server
 
@@ -48,6 +48,46 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.cleanup.assert_called_once()
         self.assertEqual(log["status"], "error")
 
+    def test_replaced_archive_cleanup_error_preserves_confirmed_batch_and_halts_acquisition(self):
+        candidates = [
+            {"clip_uid": uid, "dur_s": 300, "source": "ego4d"}
+            for uid in ("clip-a", "clip-b")
+        ]
+        prepared = []
+        sent = []
+
+        def prepare(clip, *_args, **_kwargs):
+            prepared.append(clip["clip_uid"])
+            return {"duration_ms": 300000,
+                    "video_path": str(self.root / f"{clip['clip_uid']}.mp4"),
+                    "imu_real": True}
+
+        original_send = self.send.side_effect
+
+        def send(item, account, *args, **kwargs):
+            sent.append((item["clip_uid"], account.email))
+            return original_send(item, account, *args, **kwargs)
+
+        self.prepare.side_effect = prepare
+        self.send.side_effect = send
+        with patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch("moneymin.recovery.reconcile_confirmed", return_value={
+                 "archive_cleanup_errors": [{"code": "terminal_archive_preserved"}],
+                 "archives_removed": 0, "archive_bytes_removed": 0}) as reconcile:
+            response = self.client.post("/api/campaigns", json={
+                **self.body, "cleanup_after_upload": True})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            snapshot, history = self.finish()
+
+        self.assertEqual(history["status"], "error")
+        self.assertEqual(prepared, ["clip-a"])
+        self.assertEqual(sent, [("clip-a", email) for email in self.emails])
+        self.assertEqual(snapshot["totals"]["ok_sends"], 2)
+        self.assertEqual(self.mark.call_count, 2)
+        reconcile.assert_called_once_with(refresh=False)
+        self.cleanup.assert_not_called()
+
     def test_skipped_account_does_not_become_a_confirmed_delivery(self):
         self.send.side_effect = lambda item, account, *a, **k: {
             "email": account.email, "ok": True, "skipped": True, "reason": "account_too_young"}
@@ -80,7 +120,8 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertTrue(all(account["recovered"] for account in history["items"][0]["accounts"]))
 
     def _run_transport_recovery_campaign(self, *, recovery_succeeds, stop_during_backoff=False,
-                                         mixed_owner=False, first_pass="transport"):
+                                         mixed_owner=False, first_pass="transport",
+                                         terminal_retry=False, account_max_attempts=3):
         candidates = [
             {"clip_uid": uid, "dur_s": 300, "source": "ego4d"}
             for uid in ("clip-a", "clip-b")
@@ -90,6 +131,8 @@ class CampaignEndToEndTests(unittest.TestCase):
         stop = threading.Event()
         pump_calls = []
         send_pairs = []
+        retry_links = []
+        retry_recorded_at = []
         profile = Mock()
         engine_errors = []
 
@@ -108,11 +151,35 @@ class CampaignEndToEndTests(unittest.TestCase):
             # that same seam so the campaign's recovery branch can use it.
             kwargs["session_cache"][account.email] = Mock(email=account.email)
             if clip_uid == "clip-a" and account.email == self.emails[0]:
+                retry_of = item.get("_retry_of_session_id")
+                if retry_of is not None:
+                    retry_links.append(retry_of)
+                    retry_recorded_at.append(kwargs.get("recorded_at"))
+                    rows.append({
+                        "session_id": "sid-b", "chunk_index": 0,
+                        "expected_chunk_count": 1, "account_email": account.email,
+                        "org_key": "org", "task_id": "task", "upload_id": "upload-b",
+                        "state": "done", "phase": "done", "finalized": True,
+                        "campaign_context": {"registry_key": item["registry_key"],
+                                             "clip_uid": clip_uid, "task_id": "task",
+                                             "retry_of_session_id": retry_of},
+                    })
+                    return {"email": account.email, "org_key": account.org_key,
+                            "ok": True, "finalized": True, "session_id": "sid-b",
+                            "uploads": ["upload-b"]}
                 if not rows:
+                    recorded_at = upload._iso_now()
                     row = {"session_id": "sid-a", "chunk_index": 0,
                            "expected_chunk_count": 1, "account_email": account.email,
                            "org_key": "org", "task_id": "task", "upload_id": "upload-a",
                            "state": "failed", "phase": "transport",
+                           "duration_ms": 300000, "recorded_at": recorded_at,
+                           "log_id": "sid-a_0", "filename": "sid-a_0.mp4",
+                           "create_attempted": True, "register_first": True,
+                           "native_response_schema": True, "finalized": False,
+                           "campaign_reconciled": False,
+                           "campaign_context": {"registry_key": item["registry_key"],
+                                                "clip_uid": clip_uid, "task_id": "task"},
                            "local_video_path": str(item["video_path"]),
                            "video_content_sha256": "fixture-sha256"}
                     rows.append(row)
@@ -142,6 +209,19 @@ class CampaignEndToEndTests(unittest.TestCase):
                                 "evaluation_required": True, "evaluation_verified": False,
                                 "evaluation_http_status": 429,
                                 "error": "Avaliação inconclusiva (HTTP 429); envio preservado para revisão."})
+            if len(pump_calls) == 1 and terminal_retry:
+                recorded_at = rows[0]["recorded_at"]
+                receipt = {"uploadId": "upload-a", "sessionId": "sid-a",
+                           "logId": "sid-a_0", "orgResourceKey": "org",
+                           "userResourceKey": "user-resource-a",
+                           "userEmail": self.emails[0], "taskId": "task",
+                           "taskName": "Furniture Assembly", "recordedAt": recorded_at,
+                           "createdAt": recorded_at, "durationMs": 300000,
+                           "status": "failed", "orgName": "Org",
+                           "storageAccount": "storage", "meta": {}}
+                upload.mark_remote_terminal_failure(
+                    rows[0], receipt, Mock(email=self.emails[0]),
+                    owner_resource_key="user-resource-a", checked_at=upload._iso_now())
             if recovery_succeeds and len(pump_calls) == 2:
                 rows[0].update({"state": "done", "phase": "done",
                                 "finalize_requested": True, "finalized": True,
@@ -162,7 +242,7 @@ class CampaignEndToEndTests(unittest.TestCase):
                 return campaign.run_campaign(
                     replace(cfg, realistic_timeline=False, allow_new_accounts=True,
                             shuffle_schedule=False, account_workers=1,
-                            account_max_attempts=3, account_retry_s=0,
+                            account_max_attempts=account_max_attempts, account_retry_s=0,
                             cleanup_after_upload=True), **kwargs)
             except Exception as exc:
                 engine_errors.append(f"{type(exc).__name__}: {exc}")
@@ -188,6 +268,7 @@ class CampaignEndToEndTests(unittest.TestCase):
                           side_effect=lambda row: row.get("phase") == "transport"), \
              patch.object(campaign, "_pump_account_pending", side_effect=pump), \
              patch.object(campaign, "_reconcile_uploads", side_effect=reconcile), \
+             patch.object(campaign, "_acknowledge_campaign_upload"), \
              patch.object(campaign.device_profile, "get_profile", return_value=profile), \
              patch.object(campaign, "_interruptible_sleep", side_effect=interruptible_sleep), \
              patch.object(campaign, "_tick_every", return_value=0):
@@ -200,10 +281,11 @@ class CampaignEndToEndTests(unittest.TestCase):
                 snapshot, history = self.finish()
             except AssertionError as exc:
                 raise AssertionError(f"{exc}; engine errors: {engine_errors}") from exc
-        return snapshot, history, rows, order, pump_calls, send_pairs, stop
+        return (snapshot, history, rows, order, pump_calls, send_pairs, stop,
+                retry_links, retry_recorded_at)
 
     def test_transport_recovery_reuses_receipt_then_continues_after_cleanup(self):
-        snapshot, history, rows, order, pump_calls, send_pairs, _stop = \
+        snapshot, history, rows, order, pump_calls, send_pairs, _stop, _retry_links, _retry_recorded = \
             self._run_transport_recovery_campaign(recovery_succeeds=True)
         self.assertEqual(history["status"], "done")
         self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a", "clip-b"])
@@ -223,7 +305,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(snapshot["totals"]["ok_sends"], 4)
 
     def test_transport_recovery_resumes_pending_finalize_on_same_receipt(self):
-        _snapshot, history, rows, order, pump_calls, send_pairs, _stop = \
+        _snapshot, history, rows, order, pump_calls, send_pairs, _stop, _retry_links, _retry_recorded = \
             self._run_transport_recovery_campaign(recovery_succeeds=True,
                                                   first_pass="finalize")
         self.assertEqual(history["status"], "done")
@@ -237,7 +319,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertLess(first_cleanup, order.index(("prepare", "clip-b")))
 
     def test_transport_recovery_resumes_pending_complete_on_same_receipt(self):
-        _snapshot, history, rows, order, pump_calls, send_pairs, _stop = \
+        _snapshot, history, rows, order, pump_calls, send_pairs, _stop, _retry_links, _retry_recorded = \
             self._run_transport_recovery_campaign(recovery_succeeds=True,
                                                   first_pass="complete")
         self.assertEqual(history["status"], "done")
@@ -251,7 +333,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertLess(first_cleanup, order.index(("prepare", "clip-b")))
 
     def test_transport_recovery_does_not_retry_http_429_or_clear_pending_receipt(self):
-        snapshot, history, rows, _order, pump_calls, send_pairs, _stop = \
+        snapshot, history, rows, _order, pump_calls, send_pairs, _stop, _retry_links, _retry_recorded = \
             self._run_transport_recovery_campaign(recovery_succeeds=False, first_pass="429")
         self.assertEqual(history["status"], "error")
         self.assertEqual(len(history["items"]), 1)
@@ -266,8 +348,50 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.cleanup.assert_not_called()
         self.assertEqual(snapshot["totals"]["ok_sends"], 1)
 
+    def test_terminal_remote_failure_allows_one_linked_fresh_sid_within_total_budget(self):
+        snapshot, history, rows, order, pump_calls, send_pairs, _stop, retry_links, retry_recorded_at = \
+            self._run_transport_recovery_campaign(recovery_succeeds=False,
+                                                  terminal_retry=True)
+        self.assertEqual(history["status"], "done")
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a", "clip-b"])
+        self.assertEqual(len(pump_calls), 1)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 2)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[1])), 1)
+        self.assertEqual(retry_links, ["sid-a"])
+        self.assertEqual(retry_recorded_at, [None])
+        self.assertEqual(rows[0]["phase"], "remote_terminal_failure")
+        self.assertEqual(rows[1]["session_id"], "sid-b")
+        self.assertEqual(rows[1]["campaign_context"]["retry_of_session_id"], "sid-a")
+        account = AccountSpec(self.emails[0], "org")
+        item = {"clip_uid": "clip-a", "registry_key": rows[0]["campaign_context"]["registry_key"]}
+        self.assertEqual(campaign._terminal_retry_parent(rows, account, item, "task"), "sid-a")
+        with patch.object(campaign.sent_registry, "recovery_reset_checker",
+                          return_value=lambda *_args: False), \
+             patch.object(campaign.sent_registry, "mark_sent_many") as mark_many, \
+             patch.object(campaign, "_acknowledge_campaign_upload") as acknowledge:
+            self.assertIsNone(campaign._reconcile_uploads([rows[0]], account, item, "task"))
+        mark_many.assert_not_called()
+        acknowledge.assert_not_called()
+        self.assertEqual(order.count(("cleanup",)), 2)
+        self.assertEqual(snapshot["totals"]["ok_sends"], 4)
+
+    def test_terminal_remote_failure_with_spent_budget_preserves_media_and_stops(self):
+        snapshot, history, rows, _order, pump_calls, send_pairs, _stop, retry_links, _retry_recorded = \
+            self._run_transport_recovery_campaign(
+                recovery_succeeds=False, terminal_retry=True, account_max_attempts=2)
+        self.assertEqual(history["status"], "error")
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a"])
+        self.assertEqual(len(pump_calls), 1)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 1)
+        self.assertEqual(retry_links, [])
+        self.assertEqual(rows[0]["phase"], "remote_terminal_failure")
+        self.assertTrue(any("orçamento de tentativas acabou" in str(account.get("error"))
+                            for account in history["items"][0]["accounts"]))
+        self.cleanup.assert_not_called()
+        self.assertEqual(snapshot["totals"]["ok_sends"], 1)
+
     def test_exhausted_transport_recovery_preserves_pending_and_blocks_next_clip(self):
-        snapshot, history, rows, _order, pump_calls, send_pairs, _stop = \
+        snapshot, history, rows, _order, pump_calls, send_pairs, _stop, _retry_links, _retry_recorded = \
             self._run_transport_recovery_campaign(recovery_succeeds=False)
         self.assertEqual(history["status"], "error")
         self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a"])
@@ -284,7 +408,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(snapshot["totals"]["ok_sends"], 1)
 
     def test_transport_recovery_stops_during_backoff_without_new_send(self):
-        _snapshot, history, _rows, _order, pump_calls, send_pairs, stopped = \
+        _snapshot, history, _rows, _order, pump_calls, send_pairs, stopped, _retry_links, _retry_recorded = \
             self._run_transport_recovery_campaign(recovery_succeeds=False,
                                                   stop_during_backoff=True)
         self.assertTrue(stopped.is_set())
@@ -293,7 +417,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a"])
 
     def test_mixed_owner_transport_journal_is_not_recovered(self):
-        _snapshot, history, rows, _order, pump_calls, send_pairs, _stop = \
+        _snapshot, history, rows, _order, pump_calls, send_pairs, _stop, _retry_links, _retry_recorded = \
             self._run_transport_recovery_campaign(recovery_succeeds=False, mixed_owner=True)
         self.assertEqual(history["status"], "error")
         self.assertEqual(pump_calls, [])

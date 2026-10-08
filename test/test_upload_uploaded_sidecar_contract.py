@@ -30,9 +30,25 @@ class UploadedSidecarTests(unittest.TestCase):
         self.sid = 'uploaded-original'
 
     def send(self, *, sas_status=200, zip_status=201, sidecar=True, register_first=True):
+        test_case = self
         class Session(fixtures.FakeSession):
             email = 'fixture@example.invalid'
+            def me(self):
+                return {'email': self.email, 'resourceKey': 'fixture-user-resource'}
             def request(self, method, path, body=None):
+                if method == 'GET' and path.startswith('/api/v1/uploads/'):
+                    self.calls.append((method, path, body))
+                    row = upload.load_sidecar(test_case.sid, 0)
+                    return 200, json.dumps({
+                        'uploadId': row['upload_id'], 'sessionId': row['session_id'],
+                        'logId': row['log_id'], 'status': 'initiated',
+                        'durationMs': row['duration_ms'], 'recordedAt': row['recorded_at'],
+                        'createdAt': row['recorded_at'], 'userEmail': self.email,
+                        'userResourceKey': 'fixture-user-resource',
+                        'orgName': 'Fixture org', 'orgResourceKey': row['org_key'],
+                        'storageAccount': 'fixture-storage', 'taskId': row.get('task_id'),
+                        'taskName': 'Fixture task', 'meta': {},
+                    })
                 if path.endswith('/evaluate') or path.endswith('/finalize'):
                     self.calls.append((method, path, body))
                     self.events.append('evaluate' if path.endswith('/evaluate') else 'finalize')
@@ -206,7 +222,8 @@ class UploadedSidecarTests(unittest.TestCase):
         with patch.object(upload.config, 'recording_limits', return_value={
                 'min_duration_ms': 90_000, 'max_duration_ms': 1_800_000}):
             rows = upload.pump_pending(session, max_retries=1, retry_backoff=0, fail_on_error=False)
-        self.assertEqual(session.calls, [])
+        self.assertEqual([path for _method, path, _body in session.calls],
+                         ['/api/v1/uploads/known-upload'])
         self.assertEqual(rows[0]['state'], upload.STATE_FAILED)
         self.assertEqual(rows[0]['upload_id'], 'known-upload')
         self.assertIn('preflight', rows[0]['error'])

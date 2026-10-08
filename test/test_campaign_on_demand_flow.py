@@ -80,6 +80,8 @@ class OnDemandCampaignTests(unittest.TestCase):
         self.prefetch.assert_not_called()
 
     def test_transient_evaluation_reuses_receipt_and_continues_after_confirmation(self):
+        # The fixture exercises one initial upload plus one receipt recovery.
+        self.cfg.account_max_attempts = 2
         journals = []
         events = []
         def deliver(item, account, *args, **kwargs):
@@ -394,7 +396,10 @@ class OnDemandCampaignTests(unittest.TestCase):
                     patch.object(campaign, "_ego_clip_inputs", return_value=(clip, {})), \
                     patch.object(campaign, "_cleanup_uploaded_item",
                                  side_effect=REAL_CLEANUP_UPLOADED_ITEM), \
-                    patch("moneymin.recovery.reconcile_confirmed", return_value=[]):
+                    patch("moneymin.recovery.reconcile_confirmed", return_value={
+                        "archive_cleanup_errors": [], "archives_removed": 0,
+                        "archive_bytes_removed": 0,
+                    }):
                 prefetch.start(clip)
                 self.assertTrue(entered.wait(3))
 
@@ -481,7 +486,10 @@ class OnDemandCampaignTests(unittest.TestCase):
                     with patch.object(campaign, "_ClipPrefetch", return_value=prefetch), \
                             patch.object(campaign, "_cleanup_uploaded_item",
                                          side_effect=REAL_CLEANUP_UPLOADED_ITEM), \
-                            patch("moneymin.recovery.reconcile_confirmed", return_value=[]), \
+                            patch("moneymin.recovery.reconcile_confirmed", return_value={
+                                "archive_cleanup_errors": [], "archives_removed": 0,
+                                "archive_bytes_removed": 0,
+                            }), \
                             sleep_patch:
                         log = campaign.run_campaign(self.cfg, should_stop=stopped.is_set,
                                                     progress=progress)

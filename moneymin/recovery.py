@@ -20,8 +20,9 @@ _UNREAD_PUBLICATION = object()
 def media_cleanup_protection() -> dict:
     """Read every authoritative journal, including hidden/acknowledged rows.
 
-    Unfinished groups and original source reservations survive cleanup. A bad
-    store is an error, never an empty protection list. No journal is rewritten.
+    Unfinished groups and original source reservations survive cleanup. Only
+    a complete group with verified remote failure stops reserving its assets.
+    A bad store is an error, never an empty protection list. No journal is rewritten.
     """
     from . import campaign_start_store, original_capture
     directory = upload.sidecars_dir()
@@ -31,6 +32,11 @@ def media_cleanup_protection() -> dict:
     for rows in groups:
         if any(not journal_flags_valid(row) for row in rows):
             raise ValueError('Registros de envio inválidos impedem a limpeza segura.')
+        # Terminal remote failure releases this group's reservation without
+        # crediting delivery or removing its diagnostic journals. Every other
+        # group is still visited, including consumers of the same bytes.
+        if upload.all_terminal_remote_failure(rows):
+            continue
         # Local ACK is not enough to discard bytes before the immutable
         # attempt/history has a corresponding published group.
         releasable = (_complete_chunk_group(rows) and all(
@@ -58,7 +64,14 @@ def media_cleanup_protection() -> dict:
                             hashes.add(digest)
                     except (KeyError,TypeError,ValueError):
                         raise ValueError('Vínculo de conteúdo inválido impede a limpeza segura.') from None
-                for key in ('video_path', 'sidecar_data_path'):
+                for key in ('video_content_sha256', 'sidecar_sha256'):
+                    digest = row.get(key)
+                    if digest is not None:
+                        if (not isinstance(digest, str) or len(digest) != 64
+                                or any(char not in '0123456789abcdef' for char in digest)):
+                            raise ValueError('Vínculo de mídia inválido impede a limpeza segura.')
+                        hashes.add(digest)
+                for key in ('video_path', 'local_video_path', 'sidecar_data_path'):
                     value = row.get(key)
                     if value is not None:
                         if not isinstance(value,str) or not value or not Path(value).is_absolute():
@@ -181,6 +194,8 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
                                   and row.get("campaign_context") == first.get("campaign_context")
                                   for row in rows))
     confirmed = delivery_identity_valid and delivery_confirmed
+    terminal_failed = (delivery_identity_valid
+                       and upload.all_terminal_remote_failure(rows))
     # A history reset releases only confirmed deliveries. An interrupted
     # session stays visible and reserved even when its old history was reset.
     if delivery_confirmed and (not identified or delivery_identity_valid) and (reset_checker or sent_registry.recovery_was_reset)(
@@ -198,9 +213,10 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
         state = row.get("state")
         return ((isinstance(state, str)
                  and state in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"})
-                or is_pending_evaluation(row) or upload.is_pending_transport(row))
+                or is_pending_evaluation(row) or upload.is_pending_transport(row)
+                or upload.is_remote_recovery_candidate(row))
 
-    resumable = (delivery_identity_valid and not confirmed and complete_group
+    resumable = (delivery_identity_valid and not confirmed and not terminal_failed and complete_group
                  and all(resumable_row(row)
                          and (row.get("finalized") is not True or journal_delivery_confirmed(row))
                          and row.get("task_id") == first.get("task_id")
@@ -209,6 +225,7 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
                  and any((isinstance(row.get("state"), str)
                           and row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS})
                          or upload.is_pending_transport(row)
+                         or upload.is_remote_recovery_candidate(row)
                          or is_pending_finalization(row) or is_pending_evaluation(row) for row in rows))
     if resumable:
         for row in rows:
@@ -217,9 +234,15 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
             if (not (isinstance(row.get("state"), str)
                      and row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"})
                     and not upload.is_pending_transport(row)
+                    and not upload.is_remote_recovery_candidate(row)
                     and not is_pending_finalization(row) and not is_pending_evaluation(row)):
                 continue
             try:
+                if upload.is_remote_recovery_candidate(row):
+                    # Inspection can confirm a terminal server receipt even
+                    # after transfer attempts were exhausted. It transfers no
+                    # media and never manufactures another session here.
+                    continue
                 upload._pending_recovery_stage(row)
                 if row.get("crash_resumes", 0) >= upload.MAX_CRASH_RESUMES:
                     resumable = False
@@ -231,7 +254,9 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
         "email": email, "session_id": sid,
         "clip_uid": context.get("clip_uid") if identified else None,
         "delivery_clip_uids": delivery_uids,
-        "status": "confirmed" if confirmed else "pending" if resumable else "needs_review",
+        "status": ("confirmed" if confirmed else "archived_failed" if terminal_failed
+                   else "pending" if resumable else "needs_review"),
+        "terminal_remote_failure": bool(terminal_failed),
         "blocks_campaign": not delivery_identity_valid,
         "can_resume": bool(resumable),
         "chunks_found": len(rows), "chunks_expected": expected if type(expected) is int else None,
@@ -239,7 +264,8 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
         "publication_pending": publication_pending,
         "detail": ("Envio finalizado e índice reconciliado; falta conferir o registro correspondente no Histórico. Os recibos foram preservados."
                    if publication_pending else "Finalização registrada; falta reconciliar a lista local.") if confirmed else
-                  "Envio interrompido; preserve a sessão existente antes de tentar novamente." if resumable else
+                  "O Minute encerrou este envio como falho. O diagnóstico foi preservado; uma nova campanha pode tentar este conteúdo com uma nova sessão." if terminal_failed else
+                  "Envio interrompido; a retomada consulta o recibo antes de transferir mídia. Recibos encerrados serão preservados e deixarão de reservar o conteúdo." if resumable else
                   "Registro incompleto ou sem retomada automática; preserve os arquivos e revise o histórico.",
     }
 
@@ -275,6 +301,14 @@ def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
     """Reserve uncertain clips across categories without claiming delivery."""
     excluded: dict[str, set[str]] = {}
     for item in items:
+        # _describe publishes this flag only after validating every receipt's
+        # remote evidence. A partial or resumable group remains reserved.
+        found, expected = item.get('chunks_found'), item.get('chunks_expected')
+        if (item.get('terminal_remote_failure') is True
+                and type(found) is int and type(expected) is int
+                and found == expected and expected > 0
+                and item.get('can_resume') is False):
+            continue
         if item.get("clip_uid"):
             # This field is produced from immutable journal lineage by
             # _describe. Generic history/candidate aliases are not consulted.
@@ -283,6 +317,121 @@ def campaign_exclusions(items: list[dict]) -> dict[str, list[str]]:
                 if isinstance(uid, str) and uid:
                     excluded.setdefault(uid, set()).add(item["email"])
     return {uid: sorted(emails) for uid, emails in excluded.items()}
+
+
+@campaign_state_operation
+def release_replaced_terminal_archives(groups=None) -> dict:
+    """Release exact old ZIPs after a linked replacement is durably confirmed.
+
+    The optional snapshot is only an inexpensive admission hint. All journals,
+    publications and other consumers are read again under the cleanup barrier.
+    Diagnostic JSON records remain authoritative and are never deleted here.
+    """
+    import hashlib
+    import json
+    import stat
+    from .campaign_evidence import publication_index, publication_registered
+    from .media_lifecycle import _managed_path
+
+    result = {'archives_removed': 0, 'archive_bytes_removed': 0,
+              'archive_cleanup_errors': [], 'archives_retained': 0}
+    if groups is not None and not any(upload.all_terminal_remote_failure(rows) for rows in groups):
+        return result
+    with media_state_lease(wait=True, timeout_s=30):
+        directory = upload.sidecars_dir()
+        current = _groups(directory, include_reconciled=True)
+        terminal = {rows[0]['session_id']: rows for rows in current
+                    if upload.all_terminal_remote_failure(rows)}
+        if not terminal:
+            return result
+        replaced = {}
+        publications = _UNREAD_PUBLICATION
+        for rows in current:
+            first = rows[0]
+            context = first.get('campaign_context')
+            parent = context.get('retry_of_session_id') if isinstance(context, dict) else None
+            old_rows = terminal.get(parent) if isinstance(parent, str) else None
+            if (old_rows is None or parent == first['session_id']
+                    or not _complete_chunk_group(rows)
+                    or not all(journal_delivery_confirmed(row)
+                               and row.get('campaign_reconciled') is True
+                               and all(row.get(key) == first.get(key) for key in (
+                                   'account_email', 'org_key', 'session_id', 'task_id', 'campaign_context'))
+                               for row in rows)):
+                continue
+            old = old_rows[0]
+            old_context = old.get('campaign_context')
+            if (not isinstance(old_context, dict)
+                    or any(not isinstance(context.get(key), str) or not context[key]
+                           or context[key] != old_context.get(key) for key in ('clip_uid', 'registry_key'))
+                    or any(first.get(key) != old.get(key) for key in ('account_email', 'org_key', 'task_id'))):
+                continue
+            durations = [row.get('duration_ms') for row in (*rows, *old_rows)]
+            if (any(type(value) is not int or value <= 0 for value in durations)
+                    or sum(row['duration_ms'] for row in rows)
+                    != sum(row['duration_ms'] for row in old_rows)):
+                continue
+            if publications is _UNREAD_PUBLICATION:
+                publications = publication_index()
+            if publication_registered(rows, publications):
+                replaced[parent] = rows
+        if not replaced:
+            return result
+
+        protection = media_cleanup_protection()
+        guards = {Path(value).resolve() for value in protection['paths']}
+        for sid in sorted(replaced):
+            for row in terminal[sid]:
+                index = row.get('chunk_index', 0)
+                archive = (directory / upload._sidecar_filename(sid, index)).with_suffix('.data.zip')
+                try:
+                    archive, _root = _managed_path(archive, (directory,))
+                    if not archive.exists():
+                        continue
+                    declared = row.get('sidecar_data_path')
+                    digest, size = row.get('sidecar_sha256'), row.get('sidecar_size_bytes')
+                    if (not isinstance(declared, str) or not Path(declared).is_absolute()
+                            or Path(declared) != archive
+                            or not isinstance(digest, str) or len(digest) != 64
+                            or any(char not in '0123456789abcdef' for char in digest)
+                            or type(size) is not int or size <= 0):
+                        raise ValueError('archive binding invalid')
+                    if guards.intersection((archive, *archive.parents)) or digest in protection['sha256']:
+                        result['archives_retained'] += 1
+                        continue
+                    before = archive.stat()
+                    if not stat.S_ISREG(before.st_mode) or before.st_size != size:
+                        raise ValueError('archive size invalid')
+                    actual = hashlib.sha256()
+                    with archive.open('rb') as stream:
+                        for block in iter(lambda: stream.read(1024 * 1024), b''):
+                            actual.update(block)
+                    after = archive.stat()
+                    if (actual.hexdigest() != digest
+                            or (before.st_size, before.st_mtime_ns, before.st_ino)
+                            != (after.st_size, after.st_mtime_ns, after.st_ino)):
+                        raise ValueError('archive content changed')
+                    # Keep the exact receipt generation used above. This also
+                    # detects a writer that did not observe the media barrier.
+                    for expected_row in (*terminal[sid], *replaced[sid]):
+                        path = directory / upload._sidecar_filename(
+                            expected_row['session_id'], expected_row.get('chunk_index', 0))
+                        persisted = upload._read_sidecar_file(path)
+                        if not isinstance(persisted, dict):
+                            raise ValueError('receipt disappeared')
+                        persisted = {**persisted, 'chunk_index': persisted.get('chunk_index', 0)}
+                        if json.dumps(persisted, sort_keys=True) != json.dumps(expected_row, sort_keys=True):
+                            raise ValueError('receipt changed')
+                    upload._remove_sidecar_archive(sid, index)
+                    if archive.exists():
+                        raise OSError('archive cleanup refused')
+                    result['archives_removed'] += 1
+                    result['archive_bytes_removed'] += size
+                except (OSError, ValueError):
+                    result['archives_retained'] += 1
+                    result['archive_cleanup_errors'].append({
+                        'code': 'terminal_archive_preserved', 'session_id': sid, 'chunk_index': index})
+    return result
 
 
 @campaign_state_operation
@@ -371,11 +520,12 @@ def reconcile_confirmed(*, refresh=True) -> dict:
                 continue
             save_json(directory / upload._sidecar_filename(row["session_id"], row["chunk_index"]),
                       {**row, "campaign_reconciled": True})
+    archive_cleanup = release_replaced_terminal_archives(groups)
     return {"reconciled": len(confirmed), "reconciled_sessions": [
         {"email": rows[0]["account_email"], "session_id": rows[0]["session_id"],
          "clip_uid": (rows[0].get("campaign_context") or contexts[
              (rows[0]["session_id"], rows[0]["account_email"])])["clip_uid"]}
-        for rows in confirmed], **(snapshot() if refresh else {})}
+        for rows in confirmed], **archive_cleanup, **(snapshot() if refresh else {})}
 
 
 @campaign_state_operation
@@ -491,10 +641,20 @@ class RecoveryRunner:
                                     on_stage=on_stage)
             owned = [item for item in result['items'] if item['email'] == email
                      and (session_id is None or item['session_id'] == session_id)]
-            remains = any(item['status'] != 'confirmed' or not item.get('index_reconciled') for item in owned)
-            terminal = {"state": "pending" if remains else "done", "email": email, "error": None,
+            remains = any(item['status'] not in {'confirmed', 'archived_failed'}
+                          or (item['status'] == 'confirmed' and not item.get('index_reconciled'))
+                          for item in owned)
+            cleanup_errors = result.get('archive_cleanup_errors') or []
+            terminal = {"state": "pending" if remains or cleanup_errors else "done", "email": email,
+                        "error": ("Envios confirmados foram preservados, mas a limpeza de ZIPs antigos "
+                                  "não terminou. Os arquivos foram mantidos; confira o diagnóstico.")
+                                 if cleanup_errors else None,
                         "result": {"reconciled": result.get("reconciled", 0),
                                    "reconciled_sessions": result.get("reconciled_sessions", []),
+                                   "archives_removed": result.get("archives_removed", 0),
+                                   "archive_bytes_removed": result.get("archive_bytes_removed", 0),
+                                   "archives_retained": result.get("archives_retained", 0),
+                                   "archive_cleanup_errors": cleanup_errors,
                                    "publication_pending": sum(item.get('publication_pending') is True for item in owned)}}
         except Exception as exc:
             category = self._error_category(exc, stage)

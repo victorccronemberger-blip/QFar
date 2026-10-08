@@ -34,6 +34,7 @@ class WireFixtures(unittest.TestCase):
         self.stack.enter_context(patch.multiple(config, DATA_DIR=self.root / 'state',
             MEDIA_DATA_DIR=self.root / 'library', SECRETS_DIR=self.root / 'secrets', VIDEOS_DIR=self.root / 'recordings'))
         self.journals = self.root / 'journals'
+        self.journals.mkdir(parents=True, exist_ok=True)
         self.stack.enter_context(patch.object(upload, 'sidecars_dir', return_value=self.journals))
         self.stack.enter_context(patch('socket.socket.connect', side_effect=AssertionError('Network forbidden')))
         self.stack.enter_context(patch.object(campaign.Session, 'from_email', side_effect=AssertionError('Auth forbidden')))

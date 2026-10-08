@@ -3,9 +3,40 @@ import unittest
 from unittest.mock import Mock, patch
 
 from moneymin.web import runner
+from moneymin import recovery
 
 
 class CampaignErrorPresentationTests(unittest.TestCase):
+    def test_recovery_exposes_cleanup_failure_without_undoing_confirmation(self):
+        operation = recovery.RecoveryRunner()
+        receipt = {'email': 'fixture@example.invalid', 'session_id': 'fixture-session',
+                   'status': 'confirmed', 'index_reconciled': True}
+        failure = {'code': 'terminal_archive_preserved', 'session_id': 'old', 'chunk_index': 0}
+        with patch.object(recovery, 'resume_account', return_value={
+                'items': [receipt], 'reconciled': 1, 'archives_removed': 0,
+                'archive_bytes_removed': 0, 'archives_retained': 1,
+                'archive_cleanup_errors': [failure]}):
+            operation._run(receipt['email'], lambda _email: 'fixture-org', receipt['session_id'])
+        state = operation.snapshot()
+        self.assertEqual(state['state'], 'pending')
+        self.assertIn('Envios confirmados', state['error'])
+        self.assertEqual(state['result']['reconciled'], 1)
+        self.assertEqual(state['result']['archive_cleanup_errors'], [failure])
+
+    def test_terminal_retry_reports_new_session_and_exact_remaining_attempt(self):
+        event = runner._public_event('account_terminal_retry', {
+            'email': 'fixture@example.invalid', 'attempt': 3,
+            'max_attempts': 5, 'delay_s': 10})
+        self.assertEqual(event['stage'], 'Recuperação')
+        self.assertIn('encerrou a sessão anterior', event['detail'])
+        self.assertIn('Nova sessão', event['detail'])
+        self.assertIn('tentativa 3 de 5', event['detail'])
+        self.assertNotIn('mesmo envio', event['title'])
+        scheduled = runner._public_event('account_retry', {
+            'email': 'fixture@example.invalid', 'attempt': 2,
+            'max_attempts': 5, 'delay_s': 10})
+        self.assertIn('tentativa 2 de 5', scheduled['detail'])
+
     def test_incomplete_batch_does_not_misclassify_as_video_preparation(self):
         message = runner.friendly_campaign_error(
             "RuntimeError: lote incompleto após todas as tentativas; a campanha "

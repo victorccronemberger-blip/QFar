@@ -4490,6 +4490,7 @@ void MainWindow::openRecovery() {
       if (item.value("can_resume").toBool()) resumable.insert(item.value("email").toString());
       const QString status = item.value("status").toString() == "confirmed" ?
                              (item.value("publication_pending").toBool() ? QStringLiteral("Confirmado; revisar histórico") : QStringLiteral("Confirmado; reconciliar")) :
+                             item.value("status").toString() == "archived_failed" ? QStringLiteral("Encerrado como falho no Minute") :
                              item.value("status").toString() == "pending" ? QStringLiteral("Envio pendente") : QStringLiteral("Revisar histórico");
       const QStringList values{item.value("email").toString(), item.value("clip_uid").toString(QStringLiteral("Não identificado")), item.value("session_id").toString(), status};
       for (int column = 0; column < values.size(); ++column) {
@@ -4498,7 +4499,9 @@ void MainWindow::openRecovery() {
         value->setToolTip(values[column] + QStringLiteral("\n") + item.value("detail").toString()
             + (item.value("blocks_campaign").toBool(true)
                ? QStringLiteral("\nBloqueia novas campanhas nesta conta até identificar o clipe.")
-               : QStringLiteral("\nSomente este clipe fica reservado. A conta pode enviar outros conteúdos.")));
+               : item.value("terminal_remote_failure").toBool()
+                 ? QStringLiteral("\nEste recibo não reserva mais o clipe; uma nova campanha pode tentar o conteúdo.")
+                 : QStringLiteral("\nSomente este clipe fica reservado. A conta pode enviar outros conteúdos.")));
         table->setItem(row, column, value);
       }
     }
@@ -4572,8 +4575,8 @@ void MainWindow::openRecovery() {
     }
     if (email.isEmpty() || !guard || _campaignResetPending || _recoveryCommandPending) return;
     if (QMessageBox::question(guard, QStringLiteral("Retomar envios existentes"),
-        (sessionId.isEmpty() ? QStringLiteral("Retomar os envios interrompidos de %1? Esta ação pode transferir mídia pendente e concluir as sessões existentes no serviço.").arg(email)
-         : QStringLiteral("Retomar somente a sessão %1 de %2? As demais sessões serão preservadas. Esta ação pode concluir o envio existente no serviço.").arg(sessionId, email)),
+        (sessionId.isEmpty() ? QStringLiteral("Verificar e retomar os envios interrompidos de %1? O recibo será consultado antes de transferir mídia. Envios encerrados como falhos serão preservados, liberando o conteúdo para uma nova campanha.").arg(email)
+         : QStringLiteral("Verificar e retomar somente a sessão %1 de %2? O recibo será consultado primeiro. Se o Minute já o encerrou como falho, não haverá transferência; o diagnóstico será preservado e o conteúdo ficará disponível para uma nova campanha.").arg(sessionId, email)),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
     if (_campaignResetPending || _recoveryCommandPending) return;
     _recoveryCommandPending = true;

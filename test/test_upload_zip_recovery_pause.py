@@ -29,13 +29,24 @@ class ZipRecoveryPauseTests(unittest.TestCase):
              'org_key':'fixture-org','task_id':'fixture-task','log_id':sid+'_0','filename':sid+'_0.mp4',
              'upload_id':'fixture-upload','state':upload.STATE_RETRY_LATE,'phase':'transport',
              'recorded_at':'2026-10-04T07:55:00.000Z','local_video_path':str(f.video),'size_bytes':21,'duration_ms':60000,
-             'register_first':True,'native_response_schema':True,'suppress_per_chunk_catbear':True,
+             'register_first':True,'native_response_schema':True,'create_attempted':True,
+             'suppress_per_chunk_catbear':True,
              'transport_artifact':'sidecar','conflict_action':'complete','sidecar_data_path':str(archive.resolve()),
              'sidecar_size_bytes':len(payload),'sidecar_sha256':hashlib.sha256(payload).hexdigest(),
              'finalize_requested':True,'finalized':False,'evaluation_required':True,'evaluation_verified':False}
         upload.save_sidecar(row); f.video.unlink()
         class Session(SasSession):
+            def me(self):
+                return {'email': self.email, 'resourceKey': 'fixture-user-resource'}
             def request(self,method,path,body=None):
+                if method=='GET' and path=='/api/v1/uploads/fixture-upload':
+                    return 200,json.dumps({'uploadId':row['upload_id'],'sessionId':row['session_id'],
+                        'logId':row['log_id'],'status':'initiated','durationMs':row['duration_ms'],
+                        'recordedAt':row['recorded_at'],'createdAt':row['recorded_at'],
+                        'userEmail':self.email,'userResourceKey':'fixture-user-resource',
+                        'orgName':'Fixture org','orgResourceKey':row['org_key'],
+                        'storageAccount':'fixture-storage','taskId':row['task_id'],
+                        'taskName':'Fixture task','meta':{}})
                 if path.endswith('/evaluate'):
                     self.calls.append((method,path,body)); self.events.append('evaluate')
                     return 200,json.dumps({'upload_id':'fixture-upload','checks':[{'id':'inert','label':'Declared inert quality','status':'pass','detail':None}]})

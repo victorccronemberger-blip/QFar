@@ -83,7 +83,11 @@ from .task_catalog import (
     TASK_NAME_PT,
     TASK_TO_SCENARIO,
 )
-from .upload import UploadError, pump_pending, upload_session, list_sidecars, save_sidecar, is_pending_transport
+from .upload import (
+    UploadError, all_terminal_remote_failure,
+    pump_pending, upload_session, list_sidecars, save_sidecar,
+    is_pending_transport, is_remote_recovery_candidate,
+)
 from .upload_types import (
     STATE_COMPLETING, STATE_RETRY_LATE, journal_delivery_confirmed,
     is_pending_evaluation, is_pending_finalization,
@@ -2185,8 +2189,14 @@ def _cleanup_stopped_prepared_media(
     prefetch_items = prefetch.cleanup_candidates()
     prefetch.shutdown()
     from . import recovery
-    recovery.reconcile_confirmed(refresh=False)
+    reconciled = recovery.reconcile_confirmed(refresh=False)
     results = []
+    if reconciled.get("archives_removed") or reconciled.get("archive_cleanup_errors"):
+        results.append({"files": int(reconciled.get("archives_removed") or 0),
+                        "bytes": int(reconciled.get("archive_bytes_removed") or 0),
+                        "errors": ["Limpeza de ZIP antigo não terminou; arquivo preservado."
+                                   for _error in reconciled.get("archive_cleanup_errors") or []],
+                        "protected": int(reconciled.get("archives_retained") or 0)})
     if cleanup_candidate:
         clip = clip or {}
         results.append(_cleanup_uploaded_item(item, work_dir) if item is not None
@@ -2409,6 +2419,66 @@ def _legacy_upload_contexts(wanted: set[tuple[str, str]], journals: list[dict] |
     return found
 
 
+def _terminal_retry_parent(rows: list[dict[str, Any]], account: AccountSpec,
+                           item: dict[str, Any], task_id: str) -> str | None:
+    """Return the unique leaf of validated terminal receipts for this delivery."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        sid = row.get("session_id")
+        if isinstance(sid, str) and sid:
+            groups.setdefault(sid, []).append(row)
+
+    reset_checker = sent_registry.recovery_reset_checker()
+    terminal: dict[str, dict[str, Any]] = {}
+    for sid, chunks in groups.items():
+        first = next((row for row in chunks
+                      if isinstance(row.get("account_email"), str)
+                      and row["account_email"].strip().casefold()
+                      == account.email.strip().casefold()), None)
+        if first is None or not all(
+                isinstance(row.get("account_email"), str)
+                and row["account_email"].strip().casefold() == account.email.strip().casefold()
+                and row.get("org_key") == account.org_key
+                and row.get("task_id") == task_id
+                and row.get("campaign_context") == first.get("campaign_context")
+                for row in chunks):
+            continue
+        context = first.get("campaign_context")
+        if (not isinstance(context, dict)
+                or context.get("task_id") not in (None, task_id)
+                or context.get("clip_uid") != item.get("clip_uid")
+                or not isinstance(context.get("registry_key"), str)
+                or not context["registry_key"]):
+            continue
+        parent = context.get("retry_of_session_id")
+        if parent is not None and (not isinstance(parent, str) or not parent or parent == sid):
+            raise UploadError(
+                "Vínculo da tentativa terminal inválido; preserve os registros para revisão.",
+                transient=False, phase="recovery", review_required=True)
+        expected = first.get("expected_chunk_count", 1)
+        indices = [row.get("chunk_index", 0) for row in chunks]
+        structurally_complete = (
+            re.fullmatch(r"[A-Za-z0-9_-]{1,160}", sid) is not None
+            and type(expected) is int and expected > 0 and len(chunks) == expected
+            and all(type(index) is int and index >= 0 for index in indices)
+            and set(indices) == set(range(expected)))
+        if (structurally_complete and all_terminal_remote_failure(chunks)
+                and not reset_checker(sid, context["registry_key"],
+                                      context.get("history_name", ""))):
+            terminal[sid] = context
+
+    if not terminal:
+        return None
+    referenced = {context.get("retry_of_session_id") for context in terminal.values()
+                  if isinstance(context.get("retry_of_session_id"), str)}
+    leaves = sorted(set(terminal) - referenced)
+    if len(leaves) != 1:
+        raise UploadError(
+            "Há mais de uma tentativa terminal sem vínculo; preserve os recibos para revisão.",
+            transient=False, phase="recovery", review_required=True)
+    return leaves[0]
+
+
 def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
                        item: dict[str, Any], task_id: str) -> dict[str, Any] | None:
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -2478,16 +2548,23 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
         key = item.get("registry_key") if same else context["registry_key"]
         expected = first.get("expected_chunk_count", 1)
         indices = [row.get("chunk_index") for row in chunks]
-        complete = (re.fullmatch(r"[A-Za-z0-9_-]{1,160}", sid) is not None
+        structurally_complete = (re.fullmatch(r"[A-Za-z0-9_-]{1,160}", sid) is not None
                     and type(expected) is int and expected > 0 and len(chunks) == expected
                     and all(type(index) is int and index >= 0 for index in indices)
                     and set(indices) == set(range(expected))
-                    and all(owned(row) and journal_delivery_confirmed(row)
+                    and all(owned(row)
                             and type(row.get("expected_chunk_count", 1)) is int
                             and row.get("expected_chunk_count", 1) == expected
                             and row.get("task_id") == first.get("task_id")
                             and row.get("campaign_context") == first.get("campaign_context")
                             for row in chunks))
+        # A GET-validated terminal failure is not a delivery. Only a complete,
+        # ownership-consistent group is ignored here; mixed or partial groups
+        # remain pending and continue to block a new session.
+        if structurally_complete and all_terminal_remote_failure(chunks):
+            continue
+        complete = (structurally_complete
+                    and all(journal_delivery_confirmed(row) for row in chunks))
         if complete and reset_checker(
                 sid, context["registry_key"], context.get("history_name", "")):
             continue
@@ -2654,14 +2731,28 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                 result["recovered_uploads"] = len(recovered)
         else:
             recovered = []
-        journals = list_sidecars() if recover_pending else []
+        # A reviewed reservation list can omit the global pump. It cannot
+        # replace the authoritative receipts when linking a terminal retry or
+        # checking whether a newer session already consumed this content.
+        journals = list_sidecars()
         # pump_pending returns journals that the next disk read usually also
         # contains. Remove only identical overlap between those two sources;
         # conflicting duplicates within persisted data must remain detectable.
         reconciliation_rows = [*journals, *(row for row in recovered if row not in journals)]
-        reconciliation = _reconcile_uploads(reconciliation_rows, account, item, task_id) if recover_pending else None
+        reconciliation = _reconcile_uploads(reconciliation_rows, account, item, task_id)
         if reconciliation is not None:
             return reconciliation
+        retry_parent = _terminal_retry_parent(reconciliation_rows, account, item, task_id)
+        requested_parent = item.get("_retry_of_session_id")
+        if requested_parent is not None:
+            if (not isinstance(requested_parent, str) or not requested_parent
+                    or retry_parent != requested_parent):
+                raise UploadError(
+                    "A tentativa terminal de origem não corresponde aos recibos validados.",
+                    transient=False, phase="recovery", review_required=True)
+        if retry_parent is not None:
+            item = dict(item)
+            item["_retry_of_session_id"] = retry_parent
         policy_limits = (
             sess.recording_policy.limits()
             if getattr(sess, "recording_policy", None) is not None
@@ -2854,6 +2945,9 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                     on_progress=on_progress,
                     campaign_context={"registry_key": item["registry_key"], "clip_uid": item["clip_uid"],
                                       "task_id": task_id,
+                                      **({"retry_of_session_id": item["_retry_of_session_id"]}
+                                         if isinstance(item.get("_retry_of_session_id"), str)
+                                         else {}),
                                       **({"history_name": item['_history_name']}
                                          if item.get('_history_name') else {}),
                                       **({"content_provenance": result["source_provenance"]}
@@ -3827,6 +3921,7 @@ def _run_campaign(
                 upload_idx: int,
                 account: AccountSpec,
                 scheduled_recorded_at: str | None = None,
+                retry_of_session_id: str | None = None,
                 clip_uid: str = clip_info["clip_uid"],
                 task_scenario: str = tsk.scenario,
                 task_id: str = tsk.task_id,
@@ -3843,8 +3938,12 @@ def _run_campaign(
                           phase=phase, state=state, attempt=attempt,
                           **details)  # noqa: B023 — kwargs pertence ao callback
 
+                account_item = upload_item
+                if retry_of_session_id is not None:
+                    account_item = dict(upload_item)
+                    account_item["_retry_of_session_id"] = retry_of_session_id
                 return upload_to_account(
-                    upload_item, account, task_id, config.timeout_blob,
+                    account_item, account, task_id, config.timeout_blob,
                     config.evaluate, config.finalize,
                     on_progress=_account_progress,
                     unique_video=bool(config.unique_video),
@@ -3855,11 +3954,12 @@ def _run_campaign(
             def _safe_send_account(upload_idx: int,
                                    account: AccountSpec,
                                    scheduled_recorded_at: str | None = None,
+                                   retry_of_session_id: str | None = None,
                                    ) -> dict[str, Any]:
                 """Isola qualquer falha inesperada, inclusive no modo sequencial."""
                 try:
                     return _send_account(
-                        upload_idx, account, scheduled_recorded_at)
+                        upload_idx, account, scheduled_recorded_at, retry_of_session_id)
                 except Exception as exc:  # noqa: BLE001 — uma conta não mata o lote
                     return {"email": account.email, "org_key": account.org_key,
                             "ok": False,
@@ -3872,63 +3972,46 @@ def _run_campaign(
             ) -> dict[str, Any]:
                 """Repete a sessão inteira até a conta concluir ou a campanha parar."""
                 max_attempts = max(1, int(config.account_max_attempts or 1))
+                operations_used = 0
+                retry_of_session_id: str | None = None
                 last_result: dict[str, Any] = {
                     "email": account.email, "org_key": account.org_key,
                     "ok": False, "error": "envio não iniciado",
                 }
-                for attempt in range(1, max_attempts + 1):
+
+                def _backoff(kind: str, operation: int) -> bool:
+                    delay = min(max(0.0, float(config.account_retry_s))
+                                * (2 ** max(0, operation - 2)), 120.0)
+                    _emit(kind, email=account.email, attempt=operation,
+                          max_attempts=max_attempts, delay_s=delay)
+                    return _interruptible_sleep(
+                        delay, should_stop, partial(_emit, email=account.email),
+                        kind=f"{kind}_tick", tick_every=_tick_every(delay))
+
+                while operations_used < max_attempts:
                     if should_stop and should_stop():
                         return {**last_result, "stopped": True}
+                    if operations_used and _backoff(
+                            "account_terminal_retry" if retry_of_session_id else "account_retry",
+                            operations_used + 1):
+                        return {**last_result, "stopped": True}
+                    operations_used += 1
                     last_result = _safe_send_account(
-                        upload_idx, account, scheduled_recorded_at)
-                    last_result["campaign_attempts"] = attempt
+                        upload_idx, account,
+                        scheduled_recorded_at if retry_of_session_id is None else None,
+                        retry_of_session_id)
+                    last_result["campaign_attempts"] = operations_used
                     if last_result.get("ok"):
                         return last_result
-                    # The uploaded video already has a receipt. Retry only its
-                    # unavailable evaluation/finalization, never the send. Keep
-                    # one bounded recovery pass before the storage guard.
                     sid = last_result.get("session_id")
-                    if (config.cleanup_after_upload and config.evaluate and config.finalize
-                            and sid and account.email in sessions
-                            and not (should_stop and should_stop())):
-                        try:
-                            owned = [row for row in list_sidecars()
-                                     if row.get("session_id") == sid]
-                            if owned and all(
-                                    row.get("account_email") == account.email
-                                    and row.get("org_key") == account.org_key
-                                    and row.get("task_id") == tsk.task_id
-                                    and row.get("evaluation_http_status") != 429
-                                    and "(HTTP 429)" not in str(row.get("error") or "")
-                                    and is_pending_evaluation(row) for row in owned):
-                                _emit("account_evaluation_recovery", email=account.email)
-                                def recovery_progress(phase: str, state: str, attempt: int,
-                                                      **details: Any) -> None:
-                                    _emit("account_progress", clip_uid=clip_info["clip_uid"],
-                                          task=tsk.scenario, email=account.email,
-                                          phase=phase, state=state, attempt=attempt, **details)
-                                _pump_account_pending(
-                                    sessions[account.email], account.email, account.org_key,
-                                    session_ids={sid}, on_progress=recovery_progress)
-                                rows = [row for row in list_sidecars()
-                                        if row.get("session_id") == sid]
-                                recovered = _reconcile_uploads(rows, account, item, tsk.task_id)
-                                if recovered and recovered.get("ok"):
-                                    return {**last_result, **recovered, "evaluation_recovered": True}
-                        except Exception as exc:
-                            # Preserve the receipt and let the normal terminal
-                            # guard report the unresolved delivery. No new SID.
-                            _log(f"  recuperação da avaliação preservada ({type(exc).__name__})")
                     if last_result.get("restriction_confirmed") or _is_disabled_error(last_result.get("error")):
-                        # Restrição confirmada não deve provocar novas tentativas.
                         return last_result
-                    # A transport receipt is a reservation, not permission to
-                    # create another upload. Resume that exact journal within
-                    # the remaining account budget before the storage guard.
+
                     if (sid and config.cleanup_after_upload and config.evaluate and config.finalize
                             and account.email in sessions):
                         transport_resume_started = False
-                        for resume_attempt in range(attempt + 1, max_attempts + 1):
+                        terminal_failure = False
+                        while operations_used < max_attempts:
                             if should_stop and should_stop():
                                 return {**last_result, "stopped": True}
                             owned = [row for row in list_sidecars()
@@ -3936,78 +4019,82 @@ def _run_campaign(
                             if (not owned or not all(
                                     row.get("account_email") == account.email
                                     and row.get("org_key") == account.org_key
-                                    and row.get("task_id") == tsk.task_id for row in owned)
-                                    or not any(is_pending_transport(row) or (
-                                        transport_resume_started
-                                        and (is_pending_evaluation(row) or is_pending_finalization(row)
-                                             or (row.get("state") in {STATE_COMPLETING, STATE_RETRY_LATE}
-                                                 and row.get("phase") in {
-                                                     "transport_done", "completing", "complete",
-                                                     "awaiting_finalize", "finalize", "finalizing"}))
-                                        and row.get("evaluation_http_status") != 429
-                                        and "(HTTP 429)" not in str(row.get("error") or ""))
-                                        for row in owned)):
+                                    and row.get("task_id") == tsk.task_id for row in owned)):
                                 break
-                            transport_resume_started = True
-                            retry_s = min(max(0.0, float(config.account_retry_s))
-                                          * (2 ** (resume_attempt - 2)), 120.0)
-                            _emit("account_transport_recovery", email=account.email,
-                                  attempt=resume_attempt, max_attempts=max_attempts,
-                                  delay_s=retry_s)
-                            if _interruptible_sleep(
-                                    retry_s, should_stop, partial(_emit, email=account.email),
-                                    kind="account_transport_recovery_tick",
-                                    tick_every=_tick_every(retry_s)):
+                            eval_pending = all(
+                                is_pending_evaluation(row)
+                                and row.get("evaluation_http_status") != 429
+                                and "(HTTP 429)" not in str(row.get("error") or "")
+                                for row in owned)
+                            transport_pending = any(
+                                is_pending_transport(row) or is_remote_recovery_candidate(row)
+                                for row in owned)
+                            post_transport_pending = (transport_resume_started and any(
+                                is_pending_evaluation(row) or is_pending_finalization(row)
+                                or (row.get("state") in {STATE_COMPLETING, STATE_RETRY_LATE}
+                                    and row.get("phase") in {
+                                        "transport_done", "completing", "complete",
+                                        "awaiting_finalize", "finalize", "finalizing"})
+                                for row in owned)
+                                and all(row.get("evaluation_http_status") != 429
+                                        and "(HTTP 429)" not in str(row.get("error") or "")
+                                        for row in owned))
+                            if not (transport_pending or eval_pending or post_transport_pending):
+                                break
+                            evaluation_recovery = eval_pending and not transport_pending
+                            if _backoff("account_evaluation_recovery" if evaluation_recovery
+                                        else "account_transport_recovery", operations_used + 1):
                                 return {**last_result, "stopped": True}
+                            operations_used += 1
+                            transport_resume_started = True
                             try:
-                                def transport_recovery_progress(phase: str, state: str,
-                                                                attempt: int, **details: Any) -> None:
+                                def recovery_progress(phase: str, state: str,
+                                                      attempt: int, **details: Any) -> None:
                                     _emit("account_progress", clip_uid=clip_info["clip_uid"],
                                           task=tsk.scenario, email=account.email,
                                           phase=phase, state=state, attempt=attempt, **details)
                                 _pump_account_pending(
                                     sessions[account.email], account.email, account.org_key,
                                     session_ids={sid}, profile=device_profile.get_profile(account.email),
-                                    on_progress=transport_recovery_progress)
+                                    on_progress=recovery_progress)
                                 rows = [row for row in list_sidecars()
                                         if row.get("session_id") == sid]
                                 recovered = _reconcile_uploads(rows, account, item, tsk.task_id)
-                                last_result["campaign_attempts"] = resume_attempt
+                                last_result["campaign_attempts"] = operations_used
                                 if recovered and recovered.get("ok"):
-                                    return {**last_result, **recovered, "transport_recovered": True}
+                                    return {**last_result, **recovered,
+                                            ("evaluation_recovered" if evaluation_recovery
+                                             else "transport_recovered"): True}
+                                if (rows and all(
+                                        row.get("account_email") == account.email
+                                        and row.get("org_key") == account.org_key
+                                        and row.get("task_id") == tsk.task_id for row in rows)
+                                        and all_terminal_remote_failure(rows)):
+                                    terminal_failure = True
+                                    retry_of_session_id = sid
+                                    last_result["terminal_failure_session_id"] = sid
+                                    last_result["error"] = "A falha terminal do recibo foi confirmada."
+                                    break
                                 errors = [row.get("error") for row in rows if row.get("error")]
                                 if errors:
                                     last_result["error"] = str(errors[0])
                             except Exception as exc:
                                 _log(f"  retomada do recibo preservada ({type(exc).__name__})")
-                                break
+                                return last_result
+                        if terminal_failure and operations_used < max_attempts:
+                            continue
+                        if terminal_failure:
+                            last_result["error"] = (
+                                "Falha terminal confirmada, mas o orçamento de tentativas acabou; "
+                                "o recibo e a mídia foram preservados.")
                         return last_result
-                    # Não recrie uma sessão cujo envio pode ter sido aceito.
-                    # A recuperação desse estado pertence ao journal persistido.
-                    if (last_result.get("retryable") is not True
-                            or last_result.get("session_id") or last_result.get("uploads")):
+
+                    # A receipt without a validated terminal GET remains a
+                    # reservation. Never create a second SID for uncertainty.
+                    if sid or last_result.get("uploads"):
                         return last_result
-                    if should_stop and should_stop():
+                    if last_result.get("retryable") is not True:
                         return last_result
-                    if attempt < max_attempts:
-                        retry_s = min(
-                            max(0.0, float(config.account_retry_s))
-                            * (2 ** (attempt - 1)),
-                            120.0,
-                        )
-                        err = str(last_result.get("error") or "falhou")[:220]
-                        _log(f"      [retry] {account.email}: tentativa "
-                             f"{attempt}/{max_attempts} falhou ({err}) — nova "
-                             f"tentativa em {retry_s:.0f}s")
-                        _emit("account_retry", email=account.email,
-                              attempt=attempt, max_attempts=max_attempts,
-                              delay_s=retry_s,
-                              error=last_result.get("error"))
-                        if _interruptible_sleep(
-                                retry_s, should_stop, _emit,
-                                kind="account_retry_tick",
-                                tick_every=_tick_every(retry_s)):
-                            return last_result
                 return last_result
 
             def _record_account(
@@ -4281,12 +4368,19 @@ def _run_campaign(
                     _log("  armazenamento: mídia preservada para a recuperação do envio anterior")
                 elif config.cleanup_after_upload and all_pending_succeeded:
                     from . import recovery
-                    recovery.reconcile_confirmed(refresh=False)
+                    reconciled = recovery.reconcile_confirmed(refresh=False)
+                    if reconciled.get("archive_cleanup_errors"):
+                        raise RuntimeError(
+                            "Limpeza incompleta dos ZIPs de tentativas substituídas; "
+                            "os envios confirmados e os diagnósticos foram preservados. "
+                            "A campanha não adquiriu outro vídeo.")
                     cleanup = _cleanup_uploaded_item(
                         item,
                         work_dir,
                         protected_paths=prefetch.protected_paths(),
                     )
+                    cleanup["files"] += int(reconciled.get("archives_removed") or 0)
+                    cleanup["bytes"] += int(reconciled.get("archive_bytes_removed") or 0)
                     _emit(
                         "storage_cleanup",
                         clip_uid=clip_info["clip_uid"],
