@@ -112,6 +112,7 @@ __all__ = [
     "UploadError",
     "UploadResult",
     "enqueue_upload",
+    "is_pending_transport",
     "pump_pending",
     "trim_video",
     "upload_session",
@@ -566,14 +567,23 @@ def _http_upload_error(
 
 
 def _status_from_exception(exc: BaseException) -> int | None:
-    raw = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-    if raw is not None:
+    # curl_cffi exposes libcurl transport errors (for example CURLE_COULDNT_RESOLVE_HOST=6)
+    # through ``code``. They are not HTTP responses and must remain retryable
+    # network failures. Only actual HTTP status ranges are accepted here.
+    for raw in (getattr(exc, "status_code", None), getattr(exc, "code", None)):
+        if raw is None:
+            continue
         try:
-            return int(raw)
+            status = int(raw)
         except (TypeError, ValueError):
-            pass
+            continue
+        if status == -1 or 100 <= status <= 599:
+            return status
     match = re.search(r"\((\d{3})\)", str(exc))
-    return int(match.group(1)) if match else None
+    if not match:
+        return None
+    status = int(match.group(1))
+    return status if 100 <= status <= 599 else None
 
 def _with_retry(
     fn: Callable[[], Any],
@@ -924,8 +934,14 @@ def _sidecar_resume_payload(item: dict[str, Any]) -> bytes:
     size, duration = item.get("size_bytes"), item.get("duration_ms")
     archive_size, archive_hash = item.get("sidecar_size_bytes"), item.get("sidecar_sha256")
     owner, org = item.get("account_email"), item.get("org_key")
-    if (item.get("transport_artifact") != "sidecar"
-            or item.get("conflict_action") != "complete"
+    artifact = item.get("transport_artifact")
+    sidecar_receipt = (artifact == "sidecar"
+                       and item.get("conflict_action") == "complete")
+    video_receipt = (artifact in (None, "video")
+                     and item.get("phase") in {
+                         "sidecar_preflight", "sas", "sas_ready", "sas_reminted", "transport"}
+                     and item.get("create_attempted") is True)
+    if (not (sidecar_receipt or video_receipt)
             or _journal_flag(item, "register_first") is not True
             or type(size) is not int or size <= 0
             or type(duration) is not int or duration <= 0
@@ -948,6 +964,138 @@ def _sidecar_resume_payload(item: dict[str, Any]) -> bytes:
         raise error
     _validate_sidecar_zip(payload, log_id=f"{sid}_{index}", duration_ms=duration)
     return payload
+
+
+_CURL_TRANSPORT_RETRY_CODES = frozenset({6, 28, 52, 56})
+_CURL_ERROR_CODE = re.compile(r"(?:curl|libcurl)\s*:\s*\((\d+)\)", re.IGNORECASE)
+
+
+def is_pending_transport(item: Any) -> bool:
+    """Cheaply recognize a known-receipt video transport that can be resumed.
+
+    File hashes and the exact archived ZIP are revalidated by the transport
+    driver before its first checkpoint or network call. A legacy failed row is
+    eligible only for known transient libcurl codes; arbitrary failed CREATE,
+    SAS, and HTTP rows remain manual-review cases.
+    """
+    if not isinstance(item, dict):
+        return False
+    state = item.get("state")
+    if state not in {STATE_TRANSPORT, STATE_RETRY_LATE, STATE_FAILED}:
+        return False
+    phase = item.get("phase")
+    artifact = item.get("transport_artifact")
+    if artifact not in (None, "video", "sidecar"):
+        return False
+    sidecar_only = artifact == "sidecar"
+    if state == STATE_FAILED:
+        # Only historical DNS/connection failures in the known PUT phase are
+        # safe to revive. Failed SAS or other permanent stages need review.
+        if phase != "transport":
+            return False
+        match = _CURL_ERROR_CODE.search(str(item.get("error") or ""))
+        if not match or int(match.group(1)) not in _CURL_TRANSPORT_RETRY_CODES:
+            return False
+    elif phase not in {"sidecar_preflight", "sas", "sas_ready", "sas_reminted", "transport"}:
+        return False
+    elif phase != "transport" and artifact not in {"video", "sidecar"}:
+        return False
+    try:
+        if (not journal_flags_valid(item) or item.get("create_attempted") is not True
+                or item.get("register_first") is not True
+                or item.get("native_response_schema") is not True
+                # Empty is the normal register-first receipt (no 409 conflict).
+                or item.get("conflict_action") not in (None, "", "complete")
+                or (sidecar_only and item.get("conflict_action") != "complete")):
+            return False
+        sid, index = item.get("session_id"), item.get("chunk_index", 0)
+        _sidecar_filename(sid, index)
+        _response_upload_id({"id": item.get("upload_id")})
+        _journal_recorded_at(item)
+        if (not isinstance(item.get("account_email"), str) or not item["account_email"].strip()
+                or not isinstance(item.get("org_key"), str) or not item["org_key"].strip()
+                or type(item.get("expected_chunk_count")) is not int
+                or item["expected_chunk_count"] < 1
+                or type(item.get("size_bytes")) is not int or item["size_bytes"] <= 0
+                or type(item.get("duration_ms")) is not int or item["duration_ms"] <= 0
+                or type(item.get("sidecar_size_bytes")) is not int
+                or item["sidecar_size_bytes"] <= 0
+                or not isinstance(item.get("sidecar_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", item["sidecar_sha256"]) is None):
+            return False
+        if not sidecar_only and (
+                not isinstance(item.get("video_content_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", item["video_content_sha256"]) is None
+                or not isinstance(item.get("local_video_path"), str)
+                or not item["local_video_path"].strip()):
+            return False
+        if item.get("log_id") != f"{sid}_{index}" or item.get("filename") != f"{sid}_{index}.mp4":
+            return False
+    except (TypeError, ValueError, UploadError):
+        return False
+    return True
+
+
+def _video_resume_payload(item: dict[str, Any], profile: DeviceProfile | None) -> tuple[Path, bytes]:
+    """Validate the immutable MP4/ZIP/profile binding before resuming both PUTs."""
+    error = UploadError("MP4, perfil ou ZIP original inválido; preserve os arquivos para revisão.",
+                        transient=False, phase="recovery", review_required=True)
+    if item.get("transport_artifact") == "sidecar" or not is_pending_transport(item):
+        raise error
+    try:
+        video = Path(item["local_video_path"])
+        if video.is_symlink():
+            raise error
+        video = video.resolve(strict=True)
+        if not video.is_file() or video.stat().st_size != item["size_bytes"]:
+            raise error
+        _verify_video_content_digest(video, item["video_content_sha256"])
+        payload = _sidecar_resume_payload(item)
+        metadata = _validate_sidecar_zip(
+            payload, log_id=str(item["log_id"]), duration_ms=item["duration_ms"])
+        session_meta = metadata.get("session")
+        chunk_meta = metadata.get("chunk")
+        if (metadata.get("createdAt") != _journal_recorded_at(item)
+                or not isinstance(session_meta, dict)
+                or session_meta.get("id") != item["session_id"]
+                or not isinstance(chunk_meta, dict)
+                or chunk_meta.get("index") != item["chunk_index"]):
+            raise error
+        owner = str(item["account_email"]).strip().casefold()
+        if profile is None:
+            from . import device_profile
+            profile = device_profile._load_profile(owner, migrate=False)
+        if (profile is None or not isinstance(getattr(profile, "email", None), str)
+                or profile.email.strip().casefold() != owner):
+            raise error
+        _validate_journal_owner(item, owner)
+        device = metadata.get("device")
+        platform = metadata.get("platform")
+        video_meta = metadata.get("video")
+        cameras = metadata.get("cameras")
+        if (device != profile.sidecar_device_meta()
+                or platform != profile.sidecar_platform_meta()
+                or not isinstance(video_meta, dict)
+                or type(video_meta.get("width")) is not int or video_meta["width"] <= 0
+                or type(video_meta.get("height")) is not int or video_meta["height"] <= 0
+                or not isinstance(cameras, list) or len(cameras) != 1
+                or not isinstance(cameras[0], dict)):
+            raise error
+        from . import sidecar as sidecar_module
+        calibration = profile.calib
+        camera = cameras[0]
+        expected_intrinsics = sidecar_module._scale_camera_intrinsics(
+            video_meta["width"], video_meta["height"], cal=calibration)
+        if (camera.get("intrinsics") != expected_intrinsics
+                or camera.get("name") != f"camera_logical_{calibration.get('logicalCameraId') or '3'}"
+                or camera.get("rolling_shutter_readout_s")
+                != float(calibration.get("readoutS") or 0.0105)):
+            raise error
+    except UploadError:
+        raise
+    except (OSError, TypeError, ValueError, KeyError, AttributeError):
+        raise error from None
+    return video, payload
 
 
 @campaign_state_operation
@@ -1383,17 +1531,30 @@ def _upload_single_chunk(
         raise UploadError("Contrato de resposta inválido; use um valor booleano.",
                           transient=False, phase="preflight")
     resume_row = _resume_sidecar_row
+    resume_artifact: str | None = None
     if resume_row is not None:
+        resume_artifact = ("sidecar" if resume_row.get("transport_artifact") == "sidecar"
+                           else "video" if is_pending_transport(resume_row) else None)
+        if resume_artifact not in {"sidecar", "video"}:
+            raise _existing_receipt_error()
         _native_response_schema = _journal_flag(resume_row, "native_response_schema")
         _validate_journal_owner(resume_row, _upload_owner(session, profile))
-        if resume_row.get("video_content_sha256") is not None:
+        if resume_artifact == "video" and resume_row.get("video_content_sha256") is not None:
             persisted_digest = resume_row["video_content_sha256"]
             if _expected_video_sha256 is not None and persisted_digest != _expected_video_sha256:
                 raise UploadError("O hash do conteúdo difere do registro; preserve os recibos para revisão.",
                                   transient=False, phase="preflight", review_required=True)
             _expected_video_sha256 = persisted_digest
             _verify_video_content_digest(video_path, _expected_video_sha256)
-        sidecar_data = _sidecar_resume_payload(resume_row)
+        if resume_artifact == "video":
+            bound_video, sidecar_data = _video_resume_payload(resume_row, profile)
+            try:
+                if Path(video_path).resolve(strict=True) != bound_video:
+                    raise _existing_receipt_error()
+            except (OSError, ValueError):
+                raise _existing_receipt_error() from None
+        else:
+            sidecar_data = _sidecar_resume_payload(resume_row)
         if (resume_row.get("session_id") != session_id
                 or resume_row.get("chunk_index", 0) != chunk_index
                 or resume_row.get("org_key") != org_key
@@ -1435,6 +1596,7 @@ def _upload_single_chunk(
         "sidecar_preflight" if resume_row is not None else "preflight",
         local_video_path=str(video_path.resolve()),
         size_bytes=file_size, duration_ms=duration_ms,
+        **({"transport_artifact": "video"} if resume_artifact == "video" else {}),
     )
     if resume_row is None and not video_path.exists():
         return ChunkResult(
@@ -1517,7 +1679,8 @@ def _upload_single_chunk(
     create_data: dict[str, Any] = {"id": upload_id} if resume_row is not None else {}
     create_attempts = 1
     conflict_action = "complete" if resume_row is not None else ""
-    transport_sidecar_only = resume_row is not None
+    transport_sidecar_only = resume_artifact == "sidecar"
+    transport_resume = resume_row is not None
 
     # --- 2. POST /api/v1/storage/sas/blobs --------------------------------
     sas_progress_attempt = 0
@@ -1884,13 +2047,13 @@ def _upload_single_chunk(
                 raw_create=create_data, state=failure_state,
                 attempts=create_attempts, error=str(exc),
             )
-        if conflict_action != "complete" or transport_sidecar_only:
+        if conflict_action != "complete" or transport_sidecar_only or transport_resume:
             sas_failure = _request_sas_stage()
             if sas_failure is not None:
                 return sas_failure
 
     put_attempts = 1
-    if conflict_action != "complete" or transport_sidecar_only:
+    if conflict_action != "complete" or transport_sidecar_only or transport_resume:
         try:
             _, put_attempts = _with_retry(
                 _transport_resilient, max_retries=max_retries,
@@ -1904,6 +2067,8 @@ def _upload_single_chunk(
             _checkpoint(
                 failure_state, "transport_review" if exc.review_required else "transport", upload_id=upload_id,
                 error=str(exc), attempts=put_attempts,
+                **({"transport_artifact": resume_artifact or "video"}
+                   if transport_resume else {}),
             )
             # Só uma falha permanente deve encerrar o registro no servidor.
             if (register_first and upload_id and fail_on_error
@@ -2961,8 +3126,12 @@ def _pending_recovery_stage(item: dict[str, Any]) -> str:
         stage = "finalize"
     elif has_id and item.get("transport_artifact") == "sidecar" and phase in {
             "registered", "sas", "sas_ready", "sas_reminted", "transport", "sidecar_preflight"}:
+        if item.get("state") == STATE_FAILED and not is_pending_transport(item):
+            raise _existing_receipt_error()
         _sidecar_resume_payload(item)
         stage = "sidecar"
+    elif is_pending_transport(item):
+        stage = "video"
     else:
         if receipt or phase in complete_phases | finalize_phases:
             # A post-transport state without a receipt cannot safely become
@@ -3012,7 +3181,7 @@ def pump_pending(
     if state is None:
         pending = [s for s in all_journals if (isinstance(s.get("state"), str) and s.get("state") in TRANSIENT_STATES)
                    or s.get("state") == STATE_LOSS or is_pending_finalization(s)
-                   or is_pending_evaluation(s)]
+                   or is_pending_evaluation(s) or is_pending_transport(s)]
     else:
         pending = [item for item in all_journals if item.get("state") == state]
     session_email = getattr(session, "email", None)
@@ -3038,9 +3207,11 @@ def pump_pending(
     selected_chunks: set[tuple[str, int]] = set()
     for item in pending:
         recovery_stage = _pending_recovery_stage(item)
-        if recovery_stage == "sidecar" and account_email is None:
-            raise UploadError("A retomada do ZIP requer uma conta autenticada identificada.",
+        if recovery_stage in {"sidecar", "video"} and account_email is None:
+            raise UploadError("A retomada do transporte requer uma conta autenticada identificada.",
                               transient=False, phase="recovery")
+        if recovery_stage == "video":
+            _video_resume_payload(item, kwargs.get("profile"))
         index = item.get("chunk_index", 0)
         identity = (item["session_id"], index)
         if identity in selected_chunks:
@@ -3134,14 +3305,20 @@ def pump_pending(
                 updated.append(sidecar)
                 continue
 
-            if _pending_recovery_stage(sidecar) == "sidecar":
+            recovery_stage = _pending_recovery_stage(sidecar)
+            if recovery_stage in {"sidecar", "video"}:
                 def _save_zip_checkpoint(**updates: Any) -> None:
                     sidecar.update(updates)
                     sidecar["updated_at"] = _iso_now()
                     save_sidecar(sidecar)
 
+                resume_profile = kwargs.get("profile")
+                if recovery_stage == "video":
+                    resume_video, _resume_zip = _video_resume_payload(sidecar, resume_profile)
+                else:
+                    resume_video = Path(str(sidecar.get("local_video_path") or ""))
                 chunk = _upload_single_chunk(
-                    session=session, video_path=Path(str(sidecar.get("local_video_path") or "")),
+                    session=session, video_path=resume_video,
                     org_key=sidecar["org_key"], session_id=sid, chunk_index=idx,
                     task_id=sidecar.get("task_id"), content_type="video/mp4",
                     timeout_blob=kwargs.get("timeout_blob", 300),
@@ -3152,7 +3329,9 @@ def pump_pending(
                     register_first=True, sidecar=True,
                     fail_on_error=kwargs.get("fail_on_error", True),
                     checkpoint=_save_zip_checkpoint, _resume_sidecar_row=sidecar,
-                    on_progress=on_progress,
+                    on_progress=on_progress, profile=resume_profile,
+                    **({"_expected_video_sha256": sidecar["video_content_sha256"]}
+                       if recovery_stage == "video" else {}),
                 )
                 if chunk.state == STATE_DONE:
                     sidecar.update(state=STATE_COMPLETING if sidecar.get("finalize_requested") else STATE_DONE,

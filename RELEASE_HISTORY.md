@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **131 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **132 releases públicas**, atualizado em **08/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.79](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.79). Destaques: A parada libera mídia preparada ainda sem envio, aguardando o preparo encerrar e preservando arquivos referenciados por pendências.
+Versão atual: [v2.0.80](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.80). Destaques: Falhas transitórias no transporte são recuperadas no mesmo recibo, sem abrir outro envio nem acumular novos recortes.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.80](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.80) | 08/10/2026 | Distingue códigos de rede curl de status HTTP e retoma MP4 e ZIP persistidos no mesmo recibo. A campanha limita tentativas, mostra a recuperação e só libera o próximo recorte após confirmar e limpar o lote. Preserva mídia pendente, contas banidas separadas e execução sem meta de horas. | [Desde v2.0.79](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.79...v2.0.80) |
 | [v2.0.79](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.79) | 07/10/2026 | Parada de campanha libera mídia preparada sem envio quando a limpeza automática está ativa. Aguarda o preparo antes de limpar e preserva recibos e arquivos pendentes. Mantém autenticação pela conta, campanha sem meta obrigatória e aquisição sob demanda. | [Desde v2.0.77](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.77...v2.0.79) |
 | [v2.0.77](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.77) | 07/10/2026 | Validação, categorias e operações autenticadas da campanha respeitam a conexão atribuída à identidade. Criação da sessão fica dentro da rota; falhas não caem silenciosamente para conexão direta. Inclui reconciliação em lote, proteção da gravação concorrente e inventário Nymeria compartilhado. | [Desde v2.0.76](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.76...v2.0.77) |
 | [v2.0.76](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.76) | 07/10/2026 | Reconciliação compartilha contexto e reset entre sessões, mantendo validação antes de confirmar recibos. Início da campanha aguarda recuperação em andamento mesmo com a janela fechada; leitura prolongada oferece nova consulta manual. Preserva retomada sem reenvio, mídia sob demanda e campanha sem meta obrigatória. | [Desde v2.0.75](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.75...v2.0.76) |

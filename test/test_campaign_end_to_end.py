@@ -79,6 +79,230 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual(snapshot["totals"]["ok_sends"], 2)
         self.assertTrue(all(account["recovered"] for account in history["items"][0]["accounts"]))
 
+    def _run_transport_recovery_campaign(self, *, recovery_succeeds, stop_during_backoff=False,
+                                         mixed_owner=False, first_pass="transport"):
+        candidates = [
+            {"clip_uid": uid, "dur_s": 300, "source": "ego4d"}
+            for uid in ("clip-a", "clip-b")
+        ]
+        rows = []
+        order = []
+        stop = threading.Event()
+        pump_calls = []
+        send_pairs = []
+        profile = Mock()
+        engine_errors = []
+
+        def prepare(clip, *_args, **_kwargs):
+            order.append(("prepare", clip["clip_uid"]))
+            path = self.root / f"{clip['clip_uid']}.mp4"
+            path.write_bytes(b"inert fixture media")
+            return {"clip_uid": clip["clip_uid"], "duration_ms": 300000,
+                    "video_path": str(path), "imu_real": True}
+
+        def send(item, account, *args, **kwargs):
+            clip_uid = item["clip_uid"]
+            send_pairs.append((clip_uid, account.email))
+            order.append(("send", clip_uid, account.email))
+            # The real upload wrapper owns the account's Session cache. Populate
+            # that same seam so the campaign's recovery branch can use it.
+            kwargs["session_cache"][account.email] = Mock(email=account.email)
+            if clip_uid == "clip-a" and account.email == self.emails[0]:
+                if not rows:
+                    row = {"session_id": "sid-a", "chunk_index": 0,
+                           "expected_chunk_count": 1, "account_email": account.email,
+                           "org_key": "org", "task_id": "task", "upload_id": "upload-a",
+                           "state": "failed", "phase": "transport",
+                           "local_video_path": str(item["video_path"]),
+                           "video_content_sha256": "fixture-sha256"}
+                    rows.append(row)
+                    if mixed_owner:
+                        rows.append({**row, "account_email": self.emails[1],
+                                     "org_key": "foreign-org", "upload_id": "foreign-upload"})
+                return {"email": account.email, "org_key": account.org_key,
+                        "ok": False, "session_id": "sid-a", "uploads": ["upload-a"],
+                        "error": "PUT Blob falhou (6): temporário"}
+            return {"email": account.email, "org_key": account.org_key,
+                    "ok": True, "finalized": True}
+
+        def pump(session, account_email, org_key, **kwargs):
+            pump_calls.append((session, account_email, org_key, dict(kwargs)))
+            order.append(("pump", set(kwargs.get("session_ids") or ())))
+            self.assertEqual(account_email, self.emails[0])
+            self.assertEqual(org_key, "org")
+            self.assertEqual(kwargs.get("session_ids"), {"sid-a"})
+            self.assertEqual(getattr(session, "email", None), self.emails[0])
+            if len(pump_calls) == 1 and first_pass in {"finalize", "complete"}:
+                rows[0].update({"state": "completing", "phase": first_pass,
+                                "finalize_requested": True, "finalized": False,
+                                "evaluation_required": False, "evaluation_verified": False})
+            elif len(pump_calls) == 1 and first_pass == "429":
+                rows[0].update({"state": "quarantine", "phase": "evaluation_review",
+                                "finalize_requested": True, "finalized": False,
+                                "evaluation_required": True, "evaluation_verified": False,
+                                "evaluation_http_status": 429,
+                                "error": "Avaliação inconclusiva (HTTP 429); envio preservado para revisão."})
+            if recovery_succeeds and len(pump_calls) == 2:
+                rows[0].update({"state": "done", "phase": "done",
+                                "finalize_requested": True, "finalized": True,
+                                "evaluation_required": False, "evaluation_verified": False})
+            return list(rows)
+
+        def reconcile(selected_rows, account, item, task_id):
+            order.append(("reconcile", account.email, item["clip_uid"]))
+            if (account.email == self.emails[0] and item["clip_uid"] == "clip-a"
+                    and selected_rows and selected_rows[0].get("finalized") is True):
+                return {"email": account.email, "org_key": account.org_key,
+                        "ok": True, "finalized": True, "session_id": "sid-a",
+                        "uploads": ["upload-a"]}
+            return None
+
+        def run(cfg, **kwargs):
+            try:
+                return campaign.run_campaign(
+                    replace(cfg, realistic_timeline=False, allow_new_accounts=True,
+                            shuffle_schedule=False, account_workers=1,
+                            account_max_attempts=3, account_retry_s=0,
+                            cleanup_after_upload=True), **kwargs)
+            except Exception as exc:
+                engine_errors.append(f"{type(exc).__name__}: {exc}")
+                raise
+
+        def interruptible_sleep(*_args, **_kwargs):
+            if stop_during_backoff:
+                stop.set()
+                self.instance._stop.set()
+                return True
+            return False
+
+        self.prepare.side_effect = prepare
+        self.send.side_effect = send
+        self.cleanup.side_effect = lambda *a, **k: (
+            order.append(("cleanup",)) or {"files": 1, "bytes": 10,
+                                           "errors": [], "protected": 0})
+        with patch.object(runner, "run_campaign", side_effect=run), \
+             patch.object(campaign, "_compatible_task_clips", return_value=candidates), \
+             patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, object())), \
+             patch.object(campaign, "list_sidecars", side_effect=lambda: list(rows)), \
+             patch.object(campaign, "is_pending_transport",
+                          side_effect=lambda row: row.get("phase") == "transport"), \
+             patch.object(campaign, "_pump_account_pending", side_effect=pump), \
+             patch.object(campaign, "_reconcile_uploads", side_effect=reconcile), \
+             patch.object(campaign.device_profile, "get_profile", return_value=profile), \
+             patch.object(campaign, "_interruptible_sleep", side_effect=interruptible_sleep), \
+             patch.object(campaign, "_tick_every", return_value=0):
+            response = self.client.post("/api/campaigns", json={**self.body, "count": 2,
+                                                                  "cleanup_after_upload": True})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json().get("started", True), True,
+                             response.get_json())
+            try:
+                snapshot, history = self.finish()
+            except AssertionError as exc:
+                raise AssertionError(f"{exc}; engine errors: {engine_errors}") from exc
+        return snapshot, history, rows, order, pump_calls, send_pairs, stop
+
+    def test_transport_recovery_reuses_receipt_then_continues_after_cleanup(self):
+        snapshot, history, rows, order, pump_calls, send_pairs, _stop = \
+            self._run_transport_recovery_campaign(recovery_succeeds=True)
+        self.assertEqual(history["status"], "done")
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a", "clip-b"])
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 1)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[1])), 1)
+        self.assertEqual(send_pairs.count(("clip-b", self.emails[0])), 1)
+        self.assertEqual(send_pairs.count(("clip-b", self.emails[1])), 1)
+        self.assertEqual(len(pump_calls), 2)
+        self.assertEqual([call[3]["session_ids"] for call in pump_calls],
+                         [{"sid-a"}, {"sid-a"}])
+        self.assertTrue(all(call[3]["profile"] is not None for call in pump_calls))
+        self.assertTrue(rows[0]["finalized"])
+        first_cleanup = order.index(("cleanup",))
+        self.assertLess(order.index(("reconcile", self.emails[0], "clip-a")), first_cleanup)
+        self.assertLess(order.index(("send", "clip-a", self.emails[1])), first_cleanup)
+        self.assertLess(first_cleanup, order.index(("prepare", "clip-b")))
+        self.assertEqual(snapshot["totals"]["ok_sends"], 4)
+
+    def test_transport_recovery_resumes_pending_finalize_on_same_receipt(self):
+        _snapshot, history, rows, order, pump_calls, send_pairs, _stop = \
+            self._run_transport_recovery_campaign(recovery_succeeds=True,
+                                                  first_pass="finalize")
+        self.assertEqual(history["status"], "done")
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a", "clip-b"])
+        self.assertEqual(len(pump_calls), 2)
+        self.assertEqual([call[3]["session_ids"] for call in pump_calls],
+                         [{"sid-a"}, {"sid-a"}])
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 1)
+        self.assertTrue(rows[0]["finalized"])
+        first_cleanup = order.index(("cleanup",))
+        self.assertLess(first_cleanup, order.index(("prepare", "clip-b")))
+
+    def test_transport_recovery_resumes_pending_complete_on_same_receipt(self):
+        _snapshot, history, rows, order, pump_calls, send_pairs, _stop = \
+            self._run_transport_recovery_campaign(recovery_succeeds=True,
+                                                  first_pass="complete")
+        self.assertEqual(history["status"], "done")
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a", "clip-b"])
+        self.assertEqual(len(pump_calls), 2)
+        self.assertEqual([call[3]["session_ids"] for call in pump_calls],
+                         [{"sid-a"}, {"sid-a"}])
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 1)
+        self.assertTrue(rows[0]["finalized"])
+        first_cleanup = order.index(("cleanup",))
+        self.assertLess(first_cleanup, order.index(("prepare", "clip-b")))
+
+    def test_transport_recovery_does_not_retry_http_429_or_clear_pending_receipt(self):
+        snapshot, history, rows, _order, pump_calls, send_pairs, _stop = \
+            self._run_transport_recovery_campaign(recovery_succeeds=False, first_pass="429")
+        self.assertEqual(history["status"], "error")
+        self.assertEqual(len(history["items"]), 1)
+        self.assertEqual(len(pump_calls), 1)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 1)
+        self.assertNotIn(("clip-b", self.emails[0]), send_pairs)
+        self.assertEqual(rows[0]["state"], "quarantine")
+        self.assertEqual(rows[0]["phase"], "evaluation_review")
+        self.assertEqual(rows[0]["evaluation_http_status"], 429)
+        self.assertFalse(rows[0]["finalized"])
+        self.assertTrue((self.root / "clip-a.mp4").is_file())
+        self.cleanup.assert_not_called()
+        self.assertEqual(snapshot["totals"]["ok_sends"], 1)
+
+    def test_exhausted_transport_recovery_preserves_pending_and_blocks_next_clip(self):
+        snapshot, history, rows, _order, pump_calls, send_pairs, _stop = \
+            self._run_transport_recovery_campaign(recovery_succeeds=False)
+        self.assertEqual(history["status"], "error")
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a"])
+        self.assertEqual(len(pump_calls), 2)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 1)
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[1])), 1)
+        self.assertNotIn(("clip-b", self.emails[0]), send_pairs)
+        self.assertNotIn(("clip-b", self.emails[1]), send_pairs)
+        self.assertEqual(rows[0]["session_id"], "sid-a")
+        self.assertEqual(rows[0]["upload_id"], "upload-a")
+        self.assertEqual(rows[0]["phase"], "transport")
+        self.assertTrue((self.root / "clip-a.mp4").is_file())
+        self.cleanup.assert_not_called()
+        self.assertEqual(snapshot["totals"]["ok_sends"], 1)
+
+    def test_transport_recovery_stops_during_backoff_without_new_send(self):
+        _snapshot, history, _rows, _order, pump_calls, send_pairs, stopped = \
+            self._run_transport_recovery_campaign(recovery_succeeds=False,
+                                                  stop_during_backoff=True)
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(pump_calls, [])
+        self.assertEqual(send_pairs, [("clip-a", self.emails[0])])
+        self.assertEqual([item["clip_uid"] for item in history["items"]], ["clip-a"])
+
+    def test_mixed_owner_transport_journal_is_not_recovered(self):
+        _snapshot, history, rows, _order, pump_calls, send_pairs, _stop = \
+            self._run_transport_recovery_campaign(recovery_succeeds=False, mixed_owner=True)
+        self.assertEqual(history["status"], "error")
+        self.assertEqual(pump_calls, [])
+        self.assertEqual(rows[0]["phase"], "transport")
+        self.assertEqual(rows[1]["account_email"], self.emails[1])
+        self.assertEqual(rows[1]["org_key"], "foreign-org")
+        self.assertEqual(send_pairs.count(("clip-a", self.emails[0])), 1)
+        self.assertNotIn(("clip-b", self.emails[0]), send_pairs)
+
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -124,7 +348,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertFalse(self.instance._thread.is_alive(), "campanha não encerrou")
         snap = self.client.get("/api/campaigns/current").get_json()
         logs = list(self.root.glob("campaign_*.json"))
-        self.assertEqual(len(logs), 1)
+        self.assertEqual(len(logs), 1, snap)
         return snap, json.loads(logs[0].read_text(encoding="utf-8"))
 
     def test_success_matches_polling_and_persisted_history(self):

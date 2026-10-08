@@ -194,20 +194,29 @@ def _describe(rows: list[dict], legacy_contexts: dict | None = None, reset_check
         if publication_index is _UNREAD_PUBLICATION:
             publication_index = read_publications()
         publication_pending = not publication_registered(rows, publication_index)
+    def resumable_row(row: dict) -> bool:
+        state = row.get("state")
+        return ((isinstance(state, str)
+                 and state in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"})
+                or is_pending_evaluation(row) or upload.is_pending_transport(row))
+
     resumable = (delivery_identity_valid and not confirmed and complete_group
-                 and all((row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
-                          or is_pending_evaluation(row))
+                 and all(resumable_row(row)
                          and (row.get("finalized") is not True or journal_delivery_confirmed(row))
                          and row.get("task_id") == first.get("task_id")
                          and row.get("campaign_context") == first.get("campaign_context")
                          for row in rows)
-                 and any(row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS}
+                 and any((isinstance(row.get("state"), str)
+                          and row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS})
+                         or upload.is_pending_transport(row)
                          or is_pending_finalization(row) or is_pending_evaluation(row) for row in rows))
     if resumable:
         for row in rows:
             if row.get("state") == "done" and row.get("finalized") is True:
                 continue
-            if (row.get("state") not in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"}
+            if (not (isinstance(row.get("state"), str)
+                     and row.get("state") in upload.TRANSIENT_STATES | {upload.STATE_LOSS, "done"})
+                    and not upload.is_pending_transport(row)
                     and not is_pending_finalization(row) and not is_pending_evaluation(row)):
                 continue
             try:

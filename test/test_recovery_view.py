@@ -46,6 +46,43 @@ class RecoveryViewTests(unittest.TestCase):
         self.save({**row, "error": "Avaliação reprovada: quality."})
         self.assertFalse(recovery.snapshot()['items'][0]['can_resume'])
 
+    def test_legacy_failed_curl_receipt_is_visible_and_resumable_without_reading_video(self):
+        from moneymin.web import server
+
+        base = {**self.row, "state": upload.STATE_FAILED, "phase": "transport",
+                "finalized": False, "finalize_requested": True,
+                "evaluation_required": True, "evaluation_verified": False,
+                "create_attempted": True, "register_first": True,
+                "native_response_schema": True, "suppress_per_chunk_catbear": True,
+                "recorded_at": "2026-10-08T04:10:30.988Z",
+                "log_id": "session1_0", "filename": "session1_0.mp4",
+                "local_video_path": str(self.root / "missing-original.mp4"),
+                "size_bytes": 341869114, "duration_ms": 341866,
+                "video_content_sha256": "a" * 64,
+                "sidecar_data_path": str(self.root / "session1_0.data.zip"),
+                "sidecar_size_bytes": 128, "sidecar_sha256": "b" * 64,
+                "error": "PUT Blob falhou (6): curl: (6) DNS fixture"}
+        with patch.object(server, "RUNNER", SimpleNamespace(running=False)), \
+             patch.object(upload, "_video_resume_payload",
+                          side_effect=AssertionError("enumeration must not read or hash MP4")):
+            self.save(base)
+            client = server.create_app(for_testing=True).test_client()
+            response = client.get("/api/recovery")
+            self.assertEqual(response.status_code, 200)
+            item = response.get_json()["items"][0]
+            self.assertEqual(item["status"], "pending")
+            self.assertTrue(item["can_resume"])
+
+            for error in ("PUT Blob falhou (403): forbidden",
+                          "PUT Blob failed without a classified transport code"):
+                with self.subTest(error=error):
+                    self.save({**base, "error": error})
+                    response = client.get("/api/recovery")
+                    self.assertEqual(response.status_code, 200)
+                    item = response.get_json()["items"][0]
+                    self.assertEqual(item["status"], "needs_review")
+                    self.assertFalse(item["can_resume"])
+
     def assert_history_pending(self, result, count=1):
         # An index ACK without its historical publication remains visible.
         self.assertEqual(len(result["items"]), count)

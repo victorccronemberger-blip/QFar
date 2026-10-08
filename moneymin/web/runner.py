@@ -98,6 +98,8 @@ def friendly_campaign_error(value: Any) -> str:
         return "O serviço limitou novas tentativas. Aguarde alguns minutos e tente novamente."
     if any(term in text for term in ("timeout", "timed out", "tempo esgotado")):
         return "O serviço demorou mais que o esperado. O QMoney pode tentar novamente."
+    if "could not resolve host" in text or "couldn't resolve host" in text:
+        return "Não foi possível resolver o endereço do armazenamento. O recibo e a mídia foram preservados para retomada."
     if any(term in text for term in (
             "connection", "network", "name resolution", "dns", "remote end",
             "falha de rede", "conexão")):
@@ -274,6 +276,11 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if kind == "account_evaluation_recovery":
         return {"level": "warning", "stage": "Avaliação", "title": "Retomando avaliação",
                 "detail": f"{email} · conferindo o mesmo recibo, sem reenviar o vídeo"}
+    if kind == "account_transport_recovery":
+        return {"level": "warning", "stage": "Recuperação", "title": "Retomando o mesmo envio",
+                "detail": (f"{email} · tentativa {int(payload.get('attempt') or 0)} de "
+                           f"{int(payload.get('max_attempts') or 0)} em "
+                           f"{_fmt_wait(int(payload.get('delay_s') or 0))}; recibo e mídia preservados")}
     if kind == "account_deferred":
         return {"level": "warning", "stage": "Acesso", "title": "Conta fora desta execução",
                 "detail": f"{email} · falhou antes do envio; as demais contas continuam. O cadastro foi preservado."}
@@ -732,7 +739,7 @@ class CampaignRunner:
                 self.current = (f"envios ativos: {pending} — "
                                 f"{_fmt_wait(elapsed)} decorridos…")
                 self.stage = "Envio"
-            elif kind == "account_retry_tick":
+            elif kind in {"account_retry_tick", "account_transport_recovery_tick"}:
                 self.current = ("recuperando envio — nova tentativa em "
                                 f"{_fmt_wait(int(payload.get('remaining_s') or 0))}…")
                 self.stage = "Recuperação"

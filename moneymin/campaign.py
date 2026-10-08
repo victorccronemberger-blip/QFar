@@ -83,8 +83,11 @@ from .task_catalog import (
     TASK_NAME_PT,
     TASK_TO_SCENARIO,
 )
-from .upload import UploadError, pump_pending, upload_session, list_sidecars, save_sidecar
-from .upload_types import journal_delivery_confirmed, is_pending_evaluation
+from .upload import UploadError, pump_pending, upload_session, list_sidecars, save_sidecar, is_pending_transport
+from .upload_types import (
+    STATE_COMPLETING, STATE_RETRY_LATE, journal_delivery_confirmed,
+    is_pending_evaluation, is_pending_finalization,
+)
 
 _SESSION_TYPE = Session
 
@@ -3918,6 +3921,66 @@ def _run_campaign(
                             _log(f"  recuperação da avaliação preservada ({type(exc).__name__})")
                     if last_result.get("restriction_confirmed") or _is_disabled_error(last_result.get("error")):
                         # Restrição confirmada não deve provocar novas tentativas.
+                        return last_result
+                    # A transport receipt is a reservation, not permission to
+                    # create another upload. Resume that exact journal within
+                    # the remaining account budget before the storage guard.
+                    if (sid and config.cleanup_after_upload and config.evaluate and config.finalize
+                            and account.email in sessions):
+                        transport_resume_started = False
+                        for resume_attempt in range(attempt + 1, max_attempts + 1):
+                            if should_stop and should_stop():
+                                return {**last_result, "stopped": True}
+                            owned = [row for row in list_sidecars()
+                                     if row.get("session_id") == sid]
+                            if (not owned or not all(
+                                    row.get("account_email") == account.email
+                                    and row.get("org_key") == account.org_key
+                                    and row.get("task_id") == tsk.task_id for row in owned)
+                                    or not any(is_pending_transport(row) or (
+                                        transport_resume_started
+                                        and (is_pending_evaluation(row) or is_pending_finalization(row)
+                                             or (row.get("state") in {STATE_COMPLETING, STATE_RETRY_LATE}
+                                                 and row.get("phase") in {
+                                                     "transport_done", "completing", "complete",
+                                                     "awaiting_finalize", "finalize", "finalizing"}))
+                                        and row.get("evaluation_http_status") != 429
+                                        and "(HTTP 429)" not in str(row.get("error") or ""))
+                                        for row in owned)):
+                                break
+                            transport_resume_started = True
+                            retry_s = min(max(0.0, float(config.account_retry_s))
+                                          * (2 ** (resume_attempt - 2)), 120.0)
+                            _emit("account_transport_recovery", email=account.email,
+                                  attempt=resume_attempt, max_attempts=max_attempts,
+                                  delay_s=retry_s)
+                            if _interruptible_sleep(
+                                    retry_s, should_stop, partial(_emit, email=account.email),
+                                    kind="account_transport_recovery_tick",
+                                    tick_every=_tick_every(retry_s)):
+                                return {**last_result, "stopped": True}
+                            try:
+                                def transport_recovery_progress(phase: str, state: str,
+                                                                attempt: int, **details: Any) -> None:
+                                    _emit("account_progress", clip_uid=clip_info["clip_uid"],
+                                          task=tsk.scenario, email=account.email,
+                                          phase=phase, state=state, attempt=attempt, **details)
+                                _pump_account_pending(
+                                    sessions[account.email], account.email, account.org_key,
+                                    session_ids={sid}, profile=device_profile.get_profile(account.email),
+                                    on_progress=transport_recovery_progress)
+                                rows = [row for row in list_sidecars()
+                                        if row.get("session_id") == sid]
+                                recovered = _reconcile_uploads(rows, account, item, tsk.task_id)
+                                last_result["campaign_attempts"] = resume_attempt
+                                if recovered and recovered.get("ok"):
+                                    return {**last_result, **recovered, "transport_recovered": True}
+                                errors = [row.get("error") for row in rows if row.get("error")]
+                                if errors:
+                                    last_result["error"] = str(errors[0])
+                            except Exception as exc:
+                                _log(f"  retomada do recibo preservada ({type(exc).__name__})")
+                                break
                         return last_result
                     # Não recrie uma sessão cujo envio pode ter sido aceito.
                     # A recuperação desse estado pertence ao journal persistido.
