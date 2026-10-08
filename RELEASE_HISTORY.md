@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **134 releases públicas**, atualizado em **08/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **135 releases públicas**, atualizado em **08/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.82](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.82). Destaques: Leituras concorrentes de recibos aguardam a trava local e distinguem contenção temporária de registros inválidos.
+Versão atual: [v2.0.83](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.83). Destaques: A consulta de categorias troca automaticamente uma conta indisponível por outra selecionada, preserva falhas inconclusivas e arquiva banimentos confirmados.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.83](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.83) | 08/10/2026 | A primeira conta restrita deixa de bloquear as categorias e o início da campanha para todas as demais. A consulta tenta outra conta selecionada com limite e identidade verificada; arquiva somente banimentos confirmados. Preserva falhas locais do catálogo, retomada e limpeza após confirmação. | [Desde v2.0.82](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.82...v2.0.83) |
 | [v2.0.82](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.82) | 08/10/2026 | Evita interromper uma conta antes do envio quando a leitura concorrente de milhares de recibos disputa a trava local. Mantém prazo limitado, diagnóstico temporário e proteção de registros inválidos. Preserva entregas confirmadas e a limpeza após confirmação. | [Desde v2.0.81](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.81...v2.0.82) |
 | [v2.0.81](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.81) | 08/10/2026 | Confere estado, identidade e proprietário do recibo antes de retomar a transferência. Falhas encerradas e verificadas deixam de reservar o conteúdo, preservam seus diagnósticos e permitem nova tentativa pela campanha com nova sessão vinculada. Protege arquivos compartilhados com outras pendências. | [Desde v2.0.80](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.80...v2.0.81) |
 | [v2.0.80](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.80) | 08/10/2026 | Distingue códigos de rede curl de status HTTP e retoma MP4 e ZIP persistidos no mesmo recibo. A campanha limita tentativas, mostra a recuperação e só libera o próximo recorte após confirmar e limpar o lote. Preserva mídia pendente, contas banidas separadas e execução sem meta de horas. | [Desde v2.0.79](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.79...v2.0.80) |

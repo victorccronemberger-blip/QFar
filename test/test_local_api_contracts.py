@@ -224,15 +224,25 @@ class LocalApiSelectedContractTests(unittest.TestCase):
     def test_task_dependency_errors_do_not_export_exception_or_email_in_response_or_log(self):
         marker = "FIXTURE_PRIVATE_CANARY https://fixture.invalid/?sig=FIXTURE_PRIVATE_CANARY"
         email = "fixture-private-email@example.invalid"
-        for error, code in ((server.AuthError(marker), "task_auth_failed"),
-                            (RuntimeError(marker), "task_catalog_unavailable"),
-                            (OSError(marker), "task_catalog_unavailable")):
+        with patch.object(server.Session, "from_email", side_effect=server.AuthError(marker)), \
+             self.assertLogs("moneymin.web.server", level="WARNING") as logs:
+            response = self.client.get("/api/tasks", query_string={"email": email}, headers=self.headers)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["code"], "catalog_account_unavailable")
+        self.assertEqual(response.get_json()["issue"]["email"], email)
+        self.assertEqual(response.get_json()["issue"]["code"], "unknown")
+        for private in (marker, "FIXTURE_PRIVATE_CANARY"):
+            self.assertNotIn(private, response.get_data(as_text=True))
+            self.assertNotIn(private, str(logs.output))
+        self.assertNotIn(email, str(logs.output))
+
+        for error in (RuntimeError(marker), OSError(marker)):
             with self.subTest(error=type(error).__name__), \
                  patch.object(server.Session, "from_email", side_effect=error), \
                  self.assertLogs("moneymin.web.server", level="WARNING") as logs:
                 response = self.client.get("/api/tasks", query_string={"email": email}, headers=self.headers)
             self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.get_json()["code"], code)
+            self.assertEqual(response.get_json()["code"], "task_catalog_unavailable")
             for private in (marker, email, "FIXTURE_PRIVATE_CANARY"):
                 self.assertNotIn(private, response.get_data(as_text=True))
                 self.assertNotIn(private, str(logs.output))

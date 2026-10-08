@@ -22,6 +22,23 @@ def require_not_banned(email: str) -> None:
 
 _DROP = object()
 
+# These documents establish deliveries, media ownership or admission/reset
+# decisions. A restriction removes usable account access, not the identity
+# recorded by those decisions. Keep even unreadable documents byte-for-byte:
+# their readers must remain able to diagnose an interrupted/corrupt operation.
+_AUTHORITATIVE_STATE_NAMES = frozenset({
+    "start_requests.json", "campaign_start_requests.json",
+    "original_capture_reservations.json", "sent_videos.json",
+    "sent_reset_history.json", "sidecar_migration.json",
+})
+
+
+def _is_authoritative_state(path: Path, roots: set[Path]) -> bool:
+    return (path.name in _AUTHORITATIVE_STATE_NAMES
+            or path.name.startswith("campaign_")
+            or path.name.endswith((".managed.json", ".source.json"))
+            or any(path.is_relative_to(root / "data" / "sidecars") for root in roots))
+
 
 def _has_delivery_reference(value) -> bool:
     if isinstance(value, dict):
@@ -77,7 +94,7 @@ def purge_local_records(emails: set[str]) -> None:
         # Delivery records retain ownership and pending-media references even
         # when their account no longer has usable access. Never turn removal
         # into a reset of campaign/recovery evidence.
-        if path.name.startswith("campaign_") or path.name == "sidecar_migration.json":
+        if _is_authoritative_state(path, roots):
             continue
         if path.name.startswith("token_") and path.suffix == ".json":
             continue
@@ -90,6 +107,8 @@ def purge_local_records(emails: set[str]) -> None:
                     # rewritten; unreadable legacy files stay intact as before.
                     rows = decode_jsonl_history(path.read_bytes())
                 except JsonlSyntaxError:
+                    continue
+                if _has_delivery_reference(rows):
                     continue
                 clean = _scrub(rows, emails)
                 if clean != rows:
@@ -108,8 +127,7 @@ def purge_local_records(emails: set[str]) -> None:
                 value = decode_json_history_document(raw)
             except JsonlSyntaxError:
                 continue
-            if (any(path.is_relative_to(root / "recovery") for root in roots)
-                    and _has_delivery_reference(value)):
+            if _has_delivery_reference(value):
                 continue
             clean = _scrub(value, emails)
             if clean is _DROP:

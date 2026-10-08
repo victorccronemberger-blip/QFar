@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from moneymin import config
+from moneymin.minute_api import AuthError
 from moneymin.web import server
 from moneymin.web.catalog_loader import CatalogLoader
 
@@ -236,6 +237,113 @@ class TasksJobPollingTests(unittest.TestCase):
         self.assertEqual(self.resolve.call_count, 2)
         self.assertEqual(self.session.all_tasks.call_count, 2)
         self.assertEqual(self.catalog.call_count, 2)
+
+    def test_remote_restriction_is_a_safe_account_failure_and_archives_only_after_success(self):
+        self.session.all_tasks.side_effect = AuthError(
+            "restricted account response with private details", code="restricted")
+        archived = []
+
+        def archive(email, result):
+            archived.append((email, copy.deepcopy(result)))
+            result["permanently_removed"] = True
+
+        with patch.object(server, "_archive_checked_ban", side_effect=archive):
+            started = self.client.get("/api/tasks", query_string=self.query)
+            self.assertEqual(started.status_code, 202, started.get_json())
+            self.finish_worker()
+            failed = self.poll(started.json["job_id"])
+
+        self.assertEqual(failed.status_code, 400, failed.get_json())
+        self.assertEqual(failed.json["code"], "catalog_account_unavailable")
+        self.assertEqual(failed.json["issue"]["email"], self.query["email"])
+        self.assertEqual(failed.json["issue"]["code"], "restricted")
+        self.assertTrue(failed.json["issue"]["restriction_confirmed"])
+        self.assertTrue(failed.json["permanently_removed"])
+        self.assertNotIn("private details", failed.get_data(as_text=True))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0][0], self.query["email"])
+        self.assertEqual(archived[0][1]["status"], "disabled")
+        self.assertEqual(self.catalog.call_count, 0)
+
+    def test_confirmed_restriction_is_not_claimed_removed_if_archive_fails(self):
+        self.sessions.side_effect = AuthError("restricted", code="restricted")
+        with patch.object(server, "_archive_checked_ban",
+                          side_effect=OSError("fixture-private archive path")) as archive:
+            started = self.client.get("/api/tasks", query_string=self.query)
+            self.assertEqual(started.status_code, 202, started.get_json())
+            self.finish_worker()
+            failed = self.poll(started.json["job_id"])
+
+        self.assertEqual(failed.status_code, 400, failed.get_json())
+        self.assertEqual(failed.json["code"], "catalog_account_unavailable")
+        self.assertTrue(failed.json["issue"]["restriction_confirmed"])
+        self.assertNotIn("permanently_removed", failed.json)
+        self.assertTrue(failed.json["removal_failed"])
+        self.assertEqual(failed.json["archive_issue"]["code"], "local_archive_failed")
+        self.assertNotIn("fixture-private", failed.get_data(as_text=True))
+        archive.assert_called_once()
+        self.catalog.assert_not_called()
+
+    def test_transient_remote_failure_does_not_archive_or_claim_permanent_removal(self):
+        self.sessions.side_effect = AuthError("fixture private network detail", code="network")
+        with patch.object(server, "_archive_checked_ban") as archive:
+            started = self.client.get("/api/tasks", query_string=self.query)
+            self.assertEqual(started.status_code, 202, started.get_json())
+            self.finish_worker()
+            failed = self.poll(started.json["job_id"])
+
+        self.assertEqual(failed.status_code, 400, failed.get_json())
+        self.assertEqual(failed.json["code"], "catalog_account_unavailable")
+        self.assertEqual(failed.json["issue"]["code"], "network")
+        self.assertNotIn("permanently_removed", failed.json)
+        self.assertNotIn("fixture private network detail", failed.get_data(as_text=True))
+        archive.assert_not_called()
+        self.catalog.assert_not_called()
+
+    def test_local_catalog_failure_is_not_misreported_as_account_unavailable(self):
+        def fail_local(*_args, **_kwargs):
+            self.entered.set()
+            if not self.release.wait(5):
+                raise AssertionError("fixture local catalog worker was not released")
+            raise AuthError("restricted local fixture", code="restricted")
+
+        self.catalog.side_effect = fail_local
+        with patch.object(server, "_archive_checked_ban") as archive:
+            job = self.start_job()
+            self.finish_worker()
+            failed = self.poll(job)
+
+        self.assertEqual(failed.status_code, 400, failed.get_json())
+        self.assertNotEqual(failed.json.get("code"), "catalog_account_unavailable")
+        self.assertNotIn("permanently_removed", failed.json)
+        archive.assert_not_called()
+
+    def test_synchronous_remote_restriction_uses_same_safe_account_contract(self):
+        self.sessions.side_effect = AuthError("restricted", code="restricted")
+        query = {key: value for key, value in self.query.items() if key != "async"}
+
+        def archive(_email, result):
+            result["permanently_removed"] = True
+
+        with patch.object(server, "_archive_checked_ban", side_effect=archive):
+            failed = self.client.get("/api/tasks", query_string=query)
+
+        self.assertEqual(failed.status_code, 400, failed.get_json())
+        self.assertEqual(failed.json["code"], "catalog_account_unavailable")
+        self.assertTrue(failed.json["issue"]["restriction_confirmed"])
+        self.assertTrue(failed.json["permanently_removed"])
+        self.catalog.assert_not_called()
+
+    def test_synchronous_local_failure_keeps_catalog_error_contract(self):
+        self.catalog.side_effect = AuthError("restricted local fixture", code="restricted")
+        query = {key: value for key, value in self.query.items() if key != "async"}
+        with patch.object(server, "_archive_checked_ban") as archive:
+            failed = self.client.get("/api/tasks", query_string=query)
+
+        self.assertEqual(failed.status_code, 400, failed.get_json())
+        self.assertEqual(failed.json["code"], "task_catalog_unavailable")
+        self.assertNotIn("permanently_removed", failed.json)
+        archive.assert_not_called()
 
 
 if __name__ == "__main__":

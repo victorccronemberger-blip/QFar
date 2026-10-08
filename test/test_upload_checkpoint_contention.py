@@ -239,7 +239,7 @@ class UploadCheckpointContentionTests(unittest.TestCase):
 
         entered, release = threading.Event(), threading.Event()
         readers_ready = threading.Barrier(4)
-        errors, observed = [], []
+        errors, observed, retryable_readers = [], [], []
 
         def holder():
             try:
@@ -254,6 +254,11 @@ class UploadCheckpointContentionTests(unittest.TestCase):
             try:
                 readers_ready.wait(timeout=5)
                 observed.append(upload.list_sidecars())
+            except upload.UploadError as error:
+                if error.retryable and error.phase == 'recovery':
+                    retryable_readers.append(error)
+                else:
+                    errors.append(error)
             except BaseException as error:
                 errors.append(error)
 
@@ -276,11 +281,25 @@ class UploadCheckpointContentionTests(unittest.TestCase):
                     self.assertFalse(thread.is_alive())
 
         self.assertEqual(errors, [])
+        # A cold disk scan can legitimately keep the coherent reader busy
+        # longer than another reader's unchanged 30s acquisition budget. The
+        # public contract is a retryable recovery error, never an empty/partial
+        # store or a larger wait budget. After the active readers finish, retry
+        # each refused caller exactly once, as pre-CREATE campaign retries do.
+        self.assertLessEqual(len(retryable_readers), 3)
+        for error in retryable_readers:
+            self.assertIs(error.transient, True)
+            self.assertEqual(error.phase, 'recovery')
+            observed.append(upload.list_sidecars())
         self.assertEqual(len(observed), 3)
+        expected_rows = [{'session_id': f'bulk-session-{index:05d}',
+                          'chunk_index': 0, 'state': 'done'} for index in range(total)]
         for snapshot in observed:
-            self.assertEqual(len(snapshot), total)
-            self.assertEqual(snapshot[0]['session_id'], 'bulk-session-00000')
-            self.assertEqual(snapshot[-1]['session_id'], f'bulk-session-{total - 1:05d}')
+            self.assertEqual(snapshot, expected_rows)
+        for row in expected_rows:
+            sid = row['session_id']
+            expected = json.dumps(row).encode('utf8')
+            self.assertEqual((journal_dir / upload._sidecar_filename(sid, 0)).read_bytes(), expected)
 
     def test_successful_transport_waits_for_reader_without_repeating_http(self):
         sid = 'transport-session'

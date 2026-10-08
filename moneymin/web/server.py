@@ -2131,7 +2131,17 @@ def _ban_accounts(issues: list[dict]) -> None:
     """Registra primeiro a restrição, depois remove o acesso local permanentemente."""
     if not issues or any(i.get("restriction_confirmed") is not True for i in issues):
         raise ValueError("A remoção exige restrição confirmada pela plataforma.")
-    with _PERSISTENCE_LOCK:
+    # The legacy journal migration needs the still-present token to establish
+    # ownership. Hold the shared campaign-state lease before persistence locks,
+    # matching the global state/store lock order used by uploads and cleanup.
+    with campaign_state_lease(), _PERSISTENCE_LOCK:
+        from .. import upload
+
+        # Migration is read-only with respect to remote services and is
+        # deliberately before the ban archive, token removal, and account purge.
+        # Any corrupt/ambiguous legacy source aborts the ban before access data
+        # or its recovery evidence is changed.
+        upload.sidecars_dir()
         path = config.DATA_DIR / "banned_accounts.json"
         archive = banned_store.load(path, {"schema": 1, "accounts": []})
         if (not isinstance(archive, dict) or not isinstance(archive.get("accounts"), list)
@@ -2164,15 +2174,27 @@ def _ban_accounts(issues: list[dict]) -> None:
 
 def _reconcile_account_bans() -> list[str]:
     """Archive confirmed diagnoses left in the active store by older versions."""
-    with _PERSISTENCE_LOCK:
+    def current_candidates():
         health = _load_account_health_history()
         registrations = registration_state.load()
         removed = _removed_accounts()
-        candidates = {email: issue for email in (health.keys() | registrations.keys()) - removed
-                      if (issue := account_health.confirmed_ban(
-                          email, health.get(email, {}), registrations.get(email)))}
+        return {
+            email: issue for email in (health.keys() | registrations.keys()) - removed
+            if (issue := account_health.confirmed_ban(
+                email, health.get(email, {}), registrations.get(email)))
+        }, registrations
+
+    # Keep the common account-list request cheap and independent of a pending
+    # reset when there is nothing to reconcile.
+    with _PERSISTENCE_LOCK:
+        candidates, _registrations = current_candidates()
         if not candidates:
             return []
+
+    # Re-read under the lock order used by _ban_accounts. A health check may
+    # have cleared or refreshed a stale restriction since the first snapshot.
+    with campaign_state_lease(), _PERSISTENCE_LOCK:
+        candidates, registrations = current_candidates()
         owners = set(token_store.records(config.tokens_dir()))
         owners.update(email for email in registrations
                       if credential_store.record_path(config.SECRETS_DIR, email).exists())
@@ -2187,6 +2209,31 @@ def _archive_checked_ban(email: str, result: dict) -> None:
     if issue:
         _ban_accounts([issue])
         result["permanently_removed"] = True
+
+
+def _catalog_account_failure(email: str, error: Exception) -> tuple[dict, int]:
+    """Report a remote catalog-access failure without conflating local indexing."""
+    issue = account_issue(email, error, stage="Carregamento remoto de categorias")
+    body = {"error": issue["reason"] + " " + issue["action"],
+            "code": "catalog_account_unavailable", "issue": issue}
+    if issue.get("restriction_confirmed") is True:
+        archived = {"email": email, "status": "disabled", "issue": issue}
+        try:
+            _archive_checked_ban(email, archived)
+        except Exception as exc:
+            # Keep the safe account diagnosis, but claim permanent removal only
+            # after the existing archive path confirms it completed.
+            body["removal_failed"] = True
+            body["archive_issue"] = {
+                "code": "local_archive_failed",
+                "stage": "Arquivamento local",
+                "reason": "O arquivo local da restrição não foi concluído.",
+                "detail": type(exc).__name__,
+            }
+            body["error"] += " O arquivamento local não foi concluído; a remoção não foi confirmada."
+        if archived.get("permanently_removed") is True:
+            body["permanently_removed"] = True
+    return body, 400
 
 
 def _preflight_fingerprint(emails: list[str], *, _include_cached_org: bool = True) -> str:
@@ -3407,17 +3454,20 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 return jsonify(result), status
 
             def load(progress):
-                try:
-                    progress("Conferindo acesso e categorias da conta…")
-                    with _ACCOUNT_OPERATION_LOCK:
-                        if ORG_MIGRATION.running or _BULK_REGISTER_STATE.get("state") == "running":
-                            return {"error": "Aguarde a operação de contas em andamento."}, 409
+                progress("Conferindo acesso e categorias da conta…")
+                with _ACCOUNT_OPERATION_LOCK:
+                    if ORG_MIGRATION.running or _BULK_REGISTER_STATE.get("state") == "running":
+                        return {"error": "Aguarde a operação de contas em andamento."}, 409
+                    try:
                         with _identity_route(email):
                             sess = Session.from_email(email)
                             org_key = _resolve_org(email, session=sess)
                             remote_tasks = sess.all_tasks(org_key)
-                    # Local indexing does not hold account authentication or
-                    # mutation locks. Polling requests never wait on this work.
+                    except Exception as exc:
+                        return _catalog_account_failure(email, exc)
+                # Local indexing does not hold account authentication or
+                # mutation locks. Polling requests never wait on this work.
+                try:
                     progress("Preparando catálogo para a duração e o conteúdo selecionados…")
                     tasks = campaign.available_tasks(
                         email, org_key, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
@@ -3427,7 +3477,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                             "dataset": dataset_provider, "content_mode": content_mode,
                             "scenarios_pt": campaign.SCENARIO_PT}, 200
                 except Exception as exc:
-                    issue = account_issue(email, exc, stage="Carregamento de categorias")
+                    issue = account_issue(email, exc, stage="Preparação local do catálogo")
                     return {"error": issue["reason"] + " " + issue["action"], "issue": issue}, 400
 
             result, status = task_catalog.get(
@@ -3435,25 +3485,38 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 refresh=request.args.get("refresh") == "1")
             return jsonify(result), status
         try:
-            # Uma Session só: _resolve_org + catálogo. Dois refresh seguidos
-            # no Firebase invalidam o refreshToken e o GET vira 400.
+            # Uma Session só: resolve a organização e consulta o acesso remoto
+            # dentro da rota da conta; o preparo local fica fora dela.
+            # The synchronous endpoint already owns _ACCOUNT_OPERATION_LOCK
+            # through before_request; acquiring it again here would deadlock.
             with _identity_route(email):
                 sess = Session.from_email(email)
                 org_key = _resolve_org(email, session=sess)
-                tasks = campaign.available_tasks(
-                    email, org_key, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                    include_unavailable=True, dataset_provider=dataset_provider,
-                    content_mode=content_mode,
-                    session=sess)
+                remote_tasks = sess.all_tasks(org_key)
+        except json.JSONDecodeError:
+            app.logger.warning("GET /api/tasks: catalog_account_unavailable")
+            result, status = _catalog_account_failure(email, AuthError(
+                "Resposta remota inválida.", code="invalid_response"))
+            return jsonify(result), status
+        except AuthError as exc:
+            # Keep account identity in the typed response issue, never in logs.
+            app.logger.warning("GET /api/tasks: catalog_account_unavailable")
+            result, status = _catalog_account_failure(email, exc)
+            return jsonify(result), status
+        except (RuntimeError, OSError, ValueError):
+            app.logger.warning("GET /api/tasks: task_catalog_unavailable")
+            return jsonify({"error": "Não foi possível carregar as categorias. Confira o acesso da conta e a biblioteca local.",
+                            "code": "task_catalog_unavailable"}), 400
+        try:
+            tasks = campaign.available_tasks(
+                email, org_key, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                include_unavailable=True, dataset_provider=dataset_provider,
+                content_mode=content_mode, remote_tasks=remote_tasks)
         except json.JSONDecodeError:
             return jsonify({
                 "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
                 "code": "task_response_invalid",
             }), 400
-        except AuthError:
-            app.logger.warning("GET /api/tasks: task_auth_failed")
-            return jsonify({"error": "Não foi possível validar o acesso da conta. Reconecte a conta e tente novamente.",
-                            "code": "task_auth_failed"}), 400
         except (RuntimeError, OSError, ValueError):
             app.logger.warning("GET /api/tasks: task_catalog_unavailable")
             return jsonify({"error": "Não foi possível carregar as categorias. Confira o acesso da conta e a biblioteca local.",

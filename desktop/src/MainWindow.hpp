@@ -128,6 +128,9 @@ private:
   void loadCampaignBalances();
   void saveCampaignDraft();
   void loadTasks();
+  QStringList selectedCampaignAccountEmails() const;
+  QString campaignCatalogSelectionKey() const;
+  void refreshCampaignAccountsAfterPermanentRemoval(const QString& email);
   void startCampaign();
   void updateCampaignActions();
   bool campaignResetBlocked() const;
@@ -382,6 +385,8 @@ private:
   QSet<QString> _campaignSelectedTaskIds;
   bool _campaignTaskSelectionTouched{};
   QSet<QString> _campaignDraftAccounts;
+  QSet<QString> _campaignPermanentlyRemovedAccounts;
+  int _campaignAccountRefreshGeneration{};
   bool _campaignDraftLoaded{};
   bool _campaignAccountsLoaded{};
   int _campaignDraftQuantity{1};
@@ -423,6 +428,10 @@ private:
   bool _taskRequestPending{};
   QString _taskCatalogSelection;
   QString _taskCatalogJobId;
+  QString _taskCatalogFallbackSelection;
+  QString _taskCatalogFallbackAnchor;
+  QSet<QString> _taskCatalogFallbackAttempted;
+  bool _taskCatalogFallbackExhausted{};
   bool _taskCatalogAutomaticPoll{};
   bool _taskCatalogForceRefresh{};
   bool _taskCatalogTimedOut{};

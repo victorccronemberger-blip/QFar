@@ -53,6 +53,7 @@ public:
 #include "campaign_on_demand_qa.inc"
 #include "catalog_timeout_qa.inc"
 #include "catalog_progress_qa.inc"
+#include "campaign_catalog_account_fallback_qa.inc"
   static void campaignCloseSmoke(MainWindow& window, bool requestQuit = false) {
     auto* server = new QTcpServer(&window);
     if (!server->listen(QHostAddress::LocalHost)) { qApp->exit(190); return; }
@@ -1881,6 +1882,26 @@ int main(int argc, char** argv) {
   }
   if (app.arguments().contains("--catalog-progress-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::catalogProgressSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--catalog-account-fallback-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignCatalogAccountFallbackSmoke(window, true); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--catalog-account-inconclusive-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignCatalogAccountFallbackSmoke(window, false); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--catalog-account-unrelated-error-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignCatalogAccountFallbackSmoke(window, false, true); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--catalog-account-double-removal-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignCatalogAccountFallbackSmoke(window, false, false, true); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--catalog-account-archive-failure-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::campaignCatalogAccountFallbackSmoke(window, false, false, false, true); });
     return app.exec();
   }
   if (app.arguments().contains("--mail-cleanup-smoke")) {

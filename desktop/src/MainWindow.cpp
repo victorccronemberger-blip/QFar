@@ -1783,7 +1783,12 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_contentMode, &QComboBox::currentIndexChanged, this,
           [this] { _taskReload.start(); });
   auto* reloadTasks = new QPushButton(QStringLiteral("Recarregar categorias"));
+  reloadTasks->setObjectName(QStringLiteral("campaignReloadTasks"));
   connect(reloadTasks, &QPushButton::clicked, this, [this] {
+    _taskCatalogFallbackSelection.clear();
+    _taskCatalogFallbackAnchor.clear();
+    _taskCatalogFallbackAttempted.clear();
+    _taskCatalogFallbackExhausted = false;
     _taskCatalogForceRefresh = true;
     loadTasks();
   });
@@ -5152,6 +5157,10 @@ void MainWindow::invalidateCampaignUiRequests() {
   _taskRequestPending = false;
   _taskCatalogJobId.clear();
   _taskCatalogSelection.clear();
+  _taskCatalogFallbackSelection.clear();
+  _taskCatalogFallbackAnchor.clear();
+  _taskCatalogFallbackAttempted.clear();
+  _taskCatalogFallbackExhausted = false;
   _taskCatalogAutomaticPoll = false;
   _taskCatalogForceRefresh = false;
   _operationPolling = false;
@@ -5298,8 +5307,10 @@ void MainWindow::loadCampaignData() {
   _campaignStart->setEnabled(false);
   _campaignReset->setEnabled(false);
   const quint64 epoch = _campaignUiEpoch;
-  _api.get(QStringLiteral("/api/accounts"), [this, epoch](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (epoch != _campaignUiEpoch) return;
+  const int accountRefreshGeneration = ++_campaignAccountRefreshGeneration;
+  _api.get(QStringLiteral("/api/accounts"), [this, epoch, accountRefreshGeneration](
+      bool ok, const QJsonDocument& doc, const QString& error) {
+    if (epoch != _campaignUiEpoch || accountRefreshGeneration != _campaignAccountRefreshGeneration) return;
     if (!ok) return showError(QStringLiteral("Falha ao carregar contas"), error);
     _campaignAccountsLoaded = true;
     QSet<QString> selectedBefore;
@@ -5311,10 +5322,11 @@ void MainWindow::loadCampaignData() {
     _campaignAccounts->clear();
     for (const auto value : doc.object().value(QStringLiteral("accounts")).toArray()) {
       const auto account = value.toObject();
+      const QString email = account.value(QStringLiteral("email")).toString().trimmed();
+      if (_campaignPermanentlyRemovedAccounts.contains(email.toCaseFolded())) continue;
       auto* item = new QListWidgetItem(account.value(QStringLiteral("email")).toString());
       item->setSizeHint(QSize(0, 38));
       item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-      const QString email = account.value(QStringLiteral("email")).toString();
       const bool selected = hadAccounts ? selectedBefore.contains(email)
           : _campaignDraftLoaded ? _campaignDraftAccounts.contains(email) : true;
       item->setCheckState(selected ? Qt::Checked : Qt::Unchecked);
@@ -5343,6 +5355,115 @@ void MainWindow::loadCampaignData() {
   pollCampaign();
 }
 
+QStringList MainWindow::selectedCampaignAccountEmails() const {
+  QStringList selected;
+  if (!_campaignAccounts) return selected;
+  for (int i = 0; i < _campaignAccounts->count(); ++i) {
+    const auto* item = _campaignAccounts->item(i);
+    if (item->checkState() != Qt::Checked) continue;
+    const QString email = item->data(Qt::UserRole).toString().trimmed();
+    if (!email.isEmpty()) selected.append(email);
+  }
+  return selected;
+}
+
+QString MainWindow::campaignCatalogSelectionKey() const {
+  QStringList selection = selectedCampaignAccountEmails();
+  for (auto& email : selection) email = email.toCaseFolded();
+  selection << _dataset->currentData().toString()
+            << _contentMode->currentData().toString()
+            << QString::number(_minDuration->value())
+            << QString::number(_maxDuration->value());
+  return selection.join(QChar(0x1f));
+}
+
+void MainWindow::refreshCampaignAccountsAfterPermanentRemoval(const QString& email) {
+  const QString removed = email.trimmed().toCaseFolded();
+  if (removed.isEmpty()) return;
+  _campaignPermanentlyRemovedAccounts.insert(removed);
+  const int refreshGeneration = ++_campaignAccountRefreshGeneration;
+
+  _campaignDraftAccounts.remove(email);
+  for (auto it = _campaignDraftAccounts.begin(); it != _campaignDraftAccounts.end();) {
+    if (it->toCaseFolded() == removed) it = _campaignDraftAccounts.erase(it);
+    else ++it;
+  }
+  {
+    const QSignalBlocker blocker(_campaignAccounts);
+    for (int i = _campaignAccounts->count() - 1; i >= 0; --i) {
+      if (_campaignAccounts->item(i)->data(Qt::UserRole).toString().trimmed().toCaseFolded() == removed)
+        delete _campaignAccounts->takeItem(i);
+    }
+  }
+  _campaignAccountsLoaded = true;
+  _campaignAccountCount->setMaximum(qMax(1, _campaignAccounts->count()));
+  _campaignAccountCount->setEnabled(_campaignAccounts->count() > 0);
+  _campaignDrawAccounts->setEnabled(_campaignAccounts->count() > 0);
+  updateCampaignAccountCount();
+  saveCampaignDraft();
+  updateCampaignActions();
+
+  const quint64 epoch = _campaignUiEpoch;
+  const int backendGeneration = _operationBackendGeneration;
+  _api.get(QStringLiteral("/api/accounts"),
+      [this, removed, epoch, backendGeneration, refreshGeneration](
+          bool ok, const QJsonDocument& doc, const QString&) {
+    if (epoch != _campaignUiEpoch || backendGeneration != _operationBackendGeneration || !_backendReady
+        || refreshGeneration != _campaignAccountRefreshGeneration)
+      return;
+    const auto accountValues = doc.object().value(QStringLiteral("accounts")).toArray();
+    if (!ok || !doc.object().value(QStringLiteral("accounts")).isArray()) {
+      setStatus(QStringLiteral("A conta confirmada como removida saiu da seleção. A lista de contas não pôde ser atualizada agora."));
+      return;
+    }
+    QSet<QString> owners;
+    for (const auto value : accountValues) {
+      const QString owner = value.toObject().value(QStringLiteral("email")).toString().trimmed();
+      const QString key = owner.toCaseFolded();
+      if (key.isEmpty() || owners.contains(key)) {
+        setStatus(QStringLiteral("A conta removida saiu da seleção. A lista atual de contas veio inconsistente e foi preservada."));
+        return;
+      }
+      owners.insert(key);
+    }
+
+    QSet<QString> selected;
+    QHash<QString, QPair<QString, QString>> presentation;
+    for (int i = 0; i < _campaignAccounts->count(); ++i) {
+      const auto* item = _campaignAccounts->item(i);
+      const QString key = item->data(Qt::UserRole).toString().trimmed().toCaseFolded();
+      if (item->checkState() == Qt::Checked) selected.insert(key);
+      presentation.insert(key, {item->text(), item->toolTip()});
+    }
+    {
+      const QSignalBlocker blocker(_campaignAccounts);
+      _campaignAccounts->clear();
+      for (const auto value : accountValues) {
+        const auto account = value.toObject();
+        const QString owner = account.value(QStringLiteral("email")).toString().trimmed();
+        const QString key = owner.toCaseFolded();
+        if (key == removed || _campaignPermanentlyRemovedAccounts.contains(key)) continue;
+        auto* item = new QListWidgetItem(owner, _campaignAccounts);
+        item->setSizeHint(QSize(0, 38));
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+        item->setData(Qt::UserRole, owner);
+        item->setCheckState(selected.contains(key) ? Qt::Checked : Qt::Unchecked);
+        item->setHidden(!owner.contains(_campaignAccountSearch->text().trimmed(), Qt::CaseInsensitive));
+        const auto old = presentation.value(key);
+        if (!old.first.isEmpty()) item->setText(old.first);
+        if (!old.second.isEmpty()) item->setToolTip(old.second);
+      }
+    }
+    _campaignAccountsLoaded = true;
+    _campaignAccountCount->setMaximum(qMax(1, _campaignAccounts->count()));
+    _campaignAccountCount->setEnabled(_campaignAccounts->count() > 0);
+    _campaignDrawAccounts->setEnabled(_campaignAccounts->count() > 0);
+    updateCampaignAccountCount();
+    saveCampaignDraft();
+    updateCampaignActions();
+  });
+}
+
 void MainWindow::loadTasks() {
   const bool automaticPoll = _taskCatalogAutomaticPoll;
   _taskCatalogAutomaticPoll = false;
@@ -5355,14 +5476,45 @@ void MainWindow::loadTasks() {
     _campaignStart->setEnabled(false);
     return;
   }
+  const bool forceRefresh = _taskCatalogForceRefresh;
+  const QStringList selectedAccounts = selectedCampaignAccountEmails();
+  const QString fallbackSelection = campaignCatalogSelectionKey();
+  if (forceRefresh || _taskCatalogFallbackSelection != fallbackSelection) {
+    _taskCatalogFallbackSelection = fallbackSelection;
+    _taskCatalogFallbackAttempted.clear();
+    _taskCatalogFallbackAnchor.clear();
+    _taskCatalogFallbackExhausted = false;
+  }
   QString account;
-  for (int i = 0; i < _campaignAccounts->count(); ++i) {
-    if (_campaignAccounts->item(i)->checkState() == Qt::Checked) {
-      account = _campaignAccounts->item(i)->data(Qt::UserRole).toString();
-      break;
+  if (!_taskCatalogFallbackAnchor.isEmpty()) {
+    for (const auto& candidate : selectedAccounts) {
+      if (candidate.compare(_taskCatalogFallbackAnchor, Qt::CaseInsensitive) == 0
+          && !_taskCatalogFallbackAttempted.contains(candidate.toCaseFolded())) {
+        account = candidate;
+        break;
+      }
     }
   }
   if (account.isEmpty()) {
+    for (const auto& candidate : selectedAccounts) {
+      if (!_taskCatalogFallbackAttempted.contains(candidate.toCaseFolded())) {
+        account = candidate;
+        break;
+      }
+    }
+  }
+  if (account.isEmpty()) {
+    if (!selectedAccounts.isEmpty() && _taskCatalogFallbackExhausted) {
+      const QSignalBlocker blocker(_campaignTasks);
+      _campaignTasks->clear();
+      _taskRecords = {};
+      auto* failure = new QListWidgetItem(QStringLiteral(
+          "Falha ao carregar categorias nas contas selecionadas. As contas sem restrição confirmada continuam selecionadas; use Recarregar categorias para tentar novamente."),
+          _campaignTasks);
+      failure->setFlags(Qt::NoItemFlags);
+      _campaignStart->setEnabled(false);
+      return;
+    }
     const QSignalBlocker blocker(_campaignTasks);
     _campaignTasks->clear();
     _taskRecords = {};
@@ -5403,10 +5555,18 @@ void MainWindow::loadTasks() {
   else if (_taskCatalogForceRefresh) path += QStringLiteral("&refresh=1");
   _taskCatalogForceRefresh = false;
   _taskRequestPending = true;
-  _api.get(path, [this, generation](bool ok, const QJsonDocument& doc,
-                                   const QString& error) {
+  _api.get(path, [this, generation, account, selectedAccounts, fallbackSelection](
+                 bool ok, const QJsonDocument& doc, const QString& error) {
     _taskRequestPending = false;
     if (generation != _taskLoadGeneration || _taskReload.isActive()) {
+      loadTasks();
+      return;
+    }
+    if (fallbackSelection != campaignCatalogSelectionKey()
+        || std::none_of(selectedAccounts.cbegin(), selectedAccounts.cend(),
+                        [&account](const QString& selected) {
+                          return selected.compare(account, Qt::CaseInsensitive) == 0;
+                        })) {
       loadTasks();
       return;
     }
@@ -5421,6 +5581,66 @@ void MainWindow::loadTasks() {
     const bool liveTimeout = !ok && code == QStringLiteral("catalog_work_pending")
         && body.value(QStringLiteral("loading")).toBool() && boundJob;
     if (!ok && !liveTimeout) {
+      const QJsonObject issue = body.value(QStringLiteral("issue")).toObject();
+      const QString issueEmail = issue.value(QStringLiteral("email")).toString().trimmed();
+      const QString issueCode = issue.value(QStringLiteral("code")).toString().trimmed();
+      const QString issueStage = issue.value(QStringLiteral("stage")).toString();
+      const bool boundAccountIssue = code == QStringLiteral("catalog_account_unavailable")
+          && issueEmail.compare(account, Qt::CaseInsensitive) == 0
+          && !issueCode.isEmpty()
+          && issueStage == QStringLiteral("Carregamento remoto de categorias");
+      if (boundAccountIssue) {
+        _taskCatalogFallbackAttempted.insert(account.toCaseFolded());
+        QString archiveWarning;
+        if (body.value(QStringLiteral("removal_failed")).toBool()) {
+          const QJsonObject archiveIssue = body.value(QStringLiteral("archive_issue")).toObject();
+          const QString archiveCode = archiveIssue.value(QStringLiteral("code")).toString();
+          const QString archiveStage = archiveIssue.value(QStringLiteral("stage")).toString();
+          const QString archiveReason = archiveIssue.value(QStringLiteral("reason")).toString();
+          if (archiveCode == QStringLiteral("local_archive_failed")
+              && archiveStage == QStringLiteral("Arquivamento local") && !archiveReason.isEmpty()) {
+            archiveWarning = QStringLiteral("Restrição remota confirmada, mas o arquivamento local não foi concluído. A conta permanece na lista e precisa de revisão.");
+            for (int i = 0; i < _campaignAccounts->count(); ++i) {
+              auto* item = _campaignAccounts->item(i);
+              if (item->data(Qt::UserRole).toString().compare(account, Qt::CaseInsensitive) != 0) continue;
+              const QString previous = item->toolTip().trimmed();
+              item->setToolTip((previous.isEmpty() ? QString() : previous + QLatin1Char('\n')) + archiveWarning);
+              break;
+            }
+          }
+        }
+        if (body.value(QStringLiteral("permanently_removed")).isBool()
+            && body.value(QStringLiteral("permanently_removed")).toBool()) {
+          refreshCampaignAccountsAfterPermanentRemoval(account);
+          _taskCatalogFallbackSelection = campaignCatalogSelectionKey();
+          _taskCatalogFallbackAttempted.remove(account.toCaseFolded());
+        }
+        QString nextAccount;
+        for (const auto& candidate : selectedCampaignAccountEmails()) {
+          if (!_taskCatalogFallbackAttempted.contains(candidate.toCaseFolded())) {
+            nextAccount = candidate;
+            break;
+          }
+        }
+        if (!nextAccount.isEmpty()) {
+          _taskCatalogFallbackAnchor = nextAccount;
+          setStatus(archiveWarning.isEmpty()
+              ? QStringLiteral("Não foi possível consultar o catálogo de %1. Tentando a próxima conta selecionada: %2.")
+                    .arg(account, nextAccount)
+              : archiveWarning + QStringLiteral(" Tentando a próxima conta selecionada: %1.").arg(nextAccount));
+          loadTasks();
+          return;
+        }
+        _taskCatalogFallbackAnchor.clear();
+        _taskCatalogFallbackExhausted = true;
+        auto* failure = new QListWidgetItem(QStringLiteral(
+            "Falha ao carregar categorias nas contas selecionadas. As contas sem restrição confirmada continuam selecionadas; use Recarregar categorias para tentar novamente."),
+            _campaignTasks);
+        failure->setFlags(Qt::NoItemFlags);
+        _campaignStart->setEnabled(false);
+        setStatus(QStringLiteral("A consulta do catálogo falhou para todas as contas selecionadas restantes."));
+        return;
+      }
       if (body.value(QStringLiteral("error_code")).toString() != QStringLiteral("request_outcome_unknown"))
         _taskCatalogJobId.clear();
       auto* failure = new QListWidgetItem(QStringLiteral("Falha: ") + error, _campaignTasks);
@@ -5472,6 +5692,8 @@ void MainWindow::loadTasks() {
     }
     _taskCatalogJobId.clear();
     _taskCatalogTimedOut = false;
+    _taskCatalogFallbackAnchor = account;
+    _taskCatalogFallbackExhausted = false;
     _taskRecords = doc.object().value(QStringLiteral("tasks")).toArray();
     int compatible = 0;
     for (const auto value : _taskRecords) {
