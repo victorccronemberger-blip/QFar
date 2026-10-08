@@ -8975,6 +8975,7 @@ void MainWindow::submitPendingRegistrationRequest() {
           _bulkRegisterDomain->setEnabled(true);
           _bulkRegisterCount->setEnabled(true);
           _bulkRegisterStatus->setText(QStringLiteral("Não enviei o cadastro porque não consegui confirmar o estado anterior do serviço. Os dados digitados foram mantidos. ") + detail);
+          setStatus(_bulkRegisterStatus->text());
           setAccountTransferBusy(_accountTransferBusy);
           return;
         }
@@ -8987,6 +8988,7 @@ void MainWindow::submitPendingRegistrationRequest() {
           _bulkRegisterDomain->setEnabled(true);
           _bulkRegisterCount->setEnabled(true);
           _bulkRegisterStatus->setText(QStringLiteral("Já existe uma criação em andamento no serviço. Aguarde antes de iniciar outra."));
+          setStatus(_bulkRegisterStatus->text());
           setAccountTransferBusy(_accountTransferBusy);
           beginRegistrationPolling();
           return;
@@ -9036,6 +9038,7 @@ void MainWindow::submitPendingRegistrationRequest() {
       _bulkRegisterStatus->setText(unknown
           ? QStringLiteral("A resposta do cadastro não chegou. Mantive os dados e vou confirmar a solicitação antes de continuar.")
           : QStringLiteral("A solicitação ainda não foi confirmada. Mantive os dados e vou consultar o serviço antes de tentar novamente."));
+      setStatus(_bulkRegisterStatus->text());
       if (!_bulkRegisterPolling) beginRegistrationPolling();
       else _bulkRegisterPoll.setInterval(3000);
       return;
@@ -9094,6 +9097,7 @@ void MainWindow::rejectPendingRegistrationRequest(const QString& error) {
   _bulkRegisterDomain->setEnabled(true);
   _bulkRegisterCount->setEnabled(true);
   _bulkRegisterStatus->setText(QStringLiteral("Solicitação recusada: ") + safeError);
+  setStatus(_bulkRegisterStatus->text());
   setAccountTransferBusy(_accountTransferBusy);
 }
 
@@ -9158,6 +9162,7 @@ void MainWindow::pollBulkRegister() {
     if (!ok) {
       _bulkRegisterPoll.setInterval(3000);
       _bulkRegisterStatus->setText(QStringLiteral("Conexão interrompida. Tentando recuperar o progresso… ") + error);
+      setStatus(_bulkRegisterStatus->text());
       return;
     }
     _bulkRegisterPoll.setInterval(900);
@@ -9165,6 +9170,7 @@ void MainWindow::pollBulkRegister() {
     const QString state = root.value(QStringLiteral("state")).toString();
     if (state != "idle" && state != "running" && state != "stopping" && state != "done" && state != "failed") {
       _bulkRegisterStatus->setText(QStringLiteral("Progresso inválido · dados anteriores preservados. Tentando recuperar…"));
+      setStatus(_bulkRegisterStatus->text());
       _bulkRegisterPoll.setInterval(3000); return;
     }
     const QString statusRequestId = root.value(QStringLiteral("request_id")).toString();
@@ -9180,12 +9186,15 @@ void MainWindow::pollBulkRegister() {
                     && !_bulkRegisterBaselineRequestId.isEmpty()));
         if (unchangedBaseline) {
           _bulkRegisterStatus->setText(QStringLiteral("O estado do serviço permanece igual ao observado antes do envio. Reenviando o mesmo identificador para confirmar com segurança…"));
+          setStatus(_bulkRegisterStatus->text());
           retryPendingRegistrationRequest();
         } else if (!_bulkRegisterOwnRequestAccepted) {
           _bulkRegisterBaselineInvalid = true;
           _bulkRegisterStatus->setText(QStringLiteral("O estado do serviço mudou desde antes do envio e não corresponde a esta solicitação. Mantive os dados bloqueados; não vou reenviar automaticamente."));
+          setStatus(_bulkRegisterStatus->text());
         } else {
           _bulkRegisterStatus->setText(QStringLiteral("O serviço ainda não confirmou o resultado deste cadastro. Mantive os dados bloqueados e continuarei consultando sem misturar outro lote."));
+          setStatus(_bulkRegisterStatus->text());
         }
         return;
       }
@@ -9195,6 +9204,7 @@ void MainWindow::pollBulkRegister() {
       if (!_bulkRegisterPendingRequestId.isEmpty()) {
         _bulkRegisterPoll.setInterval(3000);
         _bulkRegisterStatus->setText(QStringLiteral("O serviço ainda não confirmou o resultado deste cadastro. Mantive os dados bloqueados e continuarei consultando."));
+        setStatus(_bulkRegisterStatus->text());
         return;
       }
       _bulkRegisterPoll.stop();
@@ -9204,6 +9214,7 @@ void MainWindow::pollBulkRegister() {
       _bulkRegisterCount->setEnabled(true);
       _bulkRegisterStatus->setText(QStringLiteral(
           "O serviço não possui um lote em andamento. Confira as contas salvas antes de iniciar outro cadastro."));
+      setStatus(_bulkRegisterStatus->text());
       loadAccounts();
       _bulkRegisterPreflightReady = false;
       setAccountTransferBusy(_accountTransferBusy);
@@ -9222,7 +9233,8 @@ void MainWindow::pollBulkRegister() {
         || !validCount(root.value("created")) || !validCount(root.value("failed"))
         || !root.value("results").isArray()
         || completed > total || created + failed != completed || results.size() != completed) {
-      _bulkRegisterStatus->setText(QStringLiteral("Progresso inconsistente · dados anteriores preservados.")); return;
+      _bulkRegisterStatus->setText(QStringLiteral("Progresso inconsistente · dados anteriores preservados."));
+      setStatus(_bulkRegisterStatus->text()); return;
     }
     QSet<QString> resultOwners;
     int confirmedCreated = 0;
@@ -9243,6 +9255,7 @@ void MainWindow::pollBulkRegister() {
     }
     if (!validResults || confirmedCreated != created) {
       _bulkRegisterStatus->setText(QStringLiteral("Resultados inconsistentes · dados anteriores preservados."));
+      setStatus(_bulkRegisterStatus->text());
       _bulkRegisterPoll.setInterval(3000); return;
     }
     _bulkRegisterProgress->setRange(0, qMax(1, total));
@@ -9359,6 +9372,7 @@ void MainWindow::pollBulkRegister() {
                                             : QStringLiteral("Concluído: %1 criada(s), %2 pendência(s) de %3."))
                 .arg(created).arg(failed).arg(total));
       }
+      setStatus(_bulkRegisterStatus->text());
       loadAccounts();
       _bulkRegisterPreflightReady = false;
       setAccountTransferBusy(_accountTransferBusy);
@@ -9374,6 +9388,7 @@ void MainWindow::pollBulkRegister() {
       _bulkRegisterStatus->setText(
           QStringLiteral("%1 — %2/%3 concluído(s).")
               .arg(label).arg(completed).arg(total));
+      setStatus(_bulkRegisterStatus->text());
     }
   });
 }

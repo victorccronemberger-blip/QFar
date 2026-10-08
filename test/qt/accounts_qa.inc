@@ -154,15 +154,16 @@ static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
   const bool oldTerminal=args.contains("--accounts-outcome-old-terminal");
   const bool notAdmitted=args.contains("--accounts-outcome-not-admitted");
   const bool conflict=args.contains("--accounts-outcome-definitive-conflict");
-  struct Flow { QString state="idle",requestId;QStringList ids;int posts=0,statusReads=0;bool changedToForeign=false; };
+  const bool pollRecovery=args.contains("--accounts-outcome-poll-recovery");
+  struct Flow { QString state="idle",requestId;QStringList ids;int posts=0,statusReads=0,pollFailures=0;bool changedToForeign=false,recoveryObserved=false; };
   auto flow=std::make_shared<Flow>();
   if(oldTerminal){flow->state="done";flow->requestId="previous-batch";}
   if(notAdmitted){flow->state="failed";flow->requestId.clear();}
   auto* server=new QTcpServer(&window);
   if(!server->listen(QHostAddress::LocalHost)){qApp->exit(271);return;}
-  QObject::connect(server,&QTcpServer::newConnection,server,[server,flow,beforeAdmission,afterAdmission,foreign,oldTerminal,notAdmitted,conflict]{
+  QObject::connect(server,&QTcpServer::newConnection,server,[server,flow,beforeAdmission,afterAdmission,foreign,oldTerminal,notAdmitted,conflict,pollRecovery]{
     auto* socket=server->nextPendingConnection();
-    QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow,beforeAdmission,afterAdmission,foreign,oldTerminal,notAdmitted,conflict]{
+    QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow,beforeAdmission,afterAdmission,foreign,oldTerminal,notAdmitted,conflict,pollRecovery]{
       const auto input=socket->property("input").toByteArray()+socket->readAll();socket->setProperty("input",input);
       const int split=input.indexOf("\r\n\r\n");if(split<0||socket->property("answered").toBool())return;
       const QRegularExpression length("Content-Length: (\\d+)",QRegularExpression::CaseInsensitiveOption);
@@ -178,6 +179,7 @@ static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
           {"created",done?1:0},{"failed",0},{"results",done?QJsonArray{QJsonObject{{"email","new@example.invalid"},
             {"created",true},{"steps",QJsonObject{}},{"error",QJsonValue()}}}:QJsonArray{}},
           {"current_email",done?QString():QStringLiteral("new@example.invalid")},{"current_step",done?QString():QStringLiteral("Criando")}};
+        if(pollRecovery&&flow->posts&&flow->pollFailures==0){++flow->pollFailures;httpStatus=503;out={{"error","Consulta temporariamente indisponível."}};}
       } else if(input.startsWith("GET /api/accounts ")) out={{"accounts",QJsonArray{}}};
       else if(input.startsWith("GET /api/accounts/migration ")) out={{"state","idle"}};
       else if(input.startsWith("POST /api/accounts/register?async=1 ")){
@@ -204,7 +206,12 @@ static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
   window._bulkRegisterTable->setRowCount(1);window._bulkRegisterTable->setItem(0,0,new QTableWidgetItem("prior-result"));
   window.addAccount(true);
   auto* timer=new QTimer(&window);
-  QObject::connect(timer,&QTimer::timeout,&window,[&window,flow,foreign,beforeAdmission,afterAdmission,oldTerminal,notAdmitted,conflict]{
+  QObject::connect(timer,&QTimer::timeout,&window,[&window,flow,foreign,beforeAdmission,afterAdmission,oldTerminal,notAdmitted,conflict,pollRecovery]{
+    if(pollRecovery&&flow->pollFailures&&flow->statusReads==2
+        &&window._bulkRegisterStatus->text().contains(QStringLiteral("Conexão interrompida"))){
+      if(window._status->text()!=window._bulkRegisterStatus->text()){qApp->exit(284);return;}
+      flow->recoveryObserved=true;
+    }
     if(foreign&&flow->changedToForeign){
       if(flow->posts!=1||window._accountPassword->text()!=QStringLiteral("fixture-only-password")
           ||window._bulkRegisterTable->rowCount()!=1||window._bulkRegisterTable->item(0,0)->text()!=QStringLiteral("prior-result")
@@ -213,16 +220,19 @@ static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
     }
     if((notAdmitted||conflict)&&window._bulkRegisterPendingRequestId.isEmpty()){
       if(window._accountPassword->text()!=QStringLiteral("fixture-only-password")||window._bulkRegisterPolling
+          ||window._status->text()!=window._bulkRegisterStatus->text()
           ||window._bulkRegisterTable->rowCount()!=1||window._bulkRegisterTable->item(0,0)->text()!=QStringLiteral("prior-result")){qApp->exit(274);return;}
       if(notAdmitted&&flow->statusReads!=1){qApp->exit(275);return;}
       qApp->exit(0);return;
     }
     if(flow->state=="done"&&!window._bulkRegisterPolling&&window._bulkRegisterPendingRequestId.isEmpty()){
-      if(window._accountPassword->text()!=QString()||flow->ids.isEmpty()){qApp->exit(276);return;}
+      if(window._accountPassword->text()!=QString()||flow->ids.isEmpty()
+          ||window._status->text()!=window._bulkRegisterStatus->text()){qApp->exit(276);return;}
       for(const auto& id:flow->ids)if(id.isEmpty()||id!=flow->ids.first()){qApp->exit(277);return;}
       if(beforeAdmission&&flow->posts<2){qApp->exit(278);return;}
       if(afterAdmission&&flow->posts!=1){qApp->exit(279);return;}
       if(oldTerminal&&flow->posts<2){qApp->exit(280);return;}
+      if(pollRecovery&&(!flow->recoveryObserved||flow->posts!=1)){qApp->exit(285);return;}
       qApp->exit(0);
     }
   });
@@ -243,7 +253,7 @@ static void accountsRegistrationNativePreview(MainWindow& window) {
       if(match.hasMatch()&&input.size()-split-4<match.captured(1).toInt())return;
       socket->setProperty("answered",true);QJsonObject out{{"ok",true}};int status=200;
       const QJsonObject good{{"ok",true}};
-      if(input.startsWith("POST /api/campaigns/drain "))out={{"ok",true},{"ready",true}};
+      if(input.startsWith("POST /api/campaigns/drain "))out={{"ok",true},{"draining",true},{"ready",true}};
       else if(input.startsWith("GET /api/accounts "))out={{"accounts",accountsFixture()}};
       else if(input.startsWith("GET /api/accounts/migration "))out={{"state","idle"}};
       else if(input.startsWith("GET /api/accounts/proxies "))out={{"proxies",QJsonArray{QJsonObject{{"id","preview-proxy"},{"label","203.0.113.10:8080"}}}}};
@@ -270,6 +280,10 @@ static void accountsRegistrationNativePreview(MainWindow& window) {
   window.renderAccounts(accountsFixture());
   window._backendState->setText(QStringLiteral("● Prévia isolada · serviço fictício local"));
   window.checkBulkRegisterDomain();
+  if(qApp->arguments().contains("--registration-native-close-smoke")) {
+    QTimer::singleShot(250,&window,&QWidget::close);
+    QTimer::singleShot(2500,&window,[]{qApp->exit(283);});
+  }
   QTimer::singleShot(10*60*1000,&window,&QWidget::close);
 }
 
@@ -281,6 +295,7 @@ static void accountsQaSmoke(MainWindow& window) {
       ||qApp->arguments().contains("--accounts-outcome-foreign-batch")
       ||qApp->arguments().contains("--accounts-outcome-old-terminal")
       ||qApp->arguments().contains("--accounts-outcome-not-admitted")
+      ||qApp->arguments().contains("--accounts-outcome-poll-recovery")
       ||qApp->arguments().contains("--accounts-outcome-definitive-conflict")){
     accountsRegistrationOutcomeSmoke(window);return;
   }
