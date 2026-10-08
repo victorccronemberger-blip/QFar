@@ -31,7 +31,7 @@ def test_successful_signup_is_not_repeated_when_its_checkpoint_fails(setup, monk
     assert credential_store.lookup(config.SECRETS_DIR, EMAIL, strict=True) == PASSWORD
     checkpoint = registration_state.load()[EMAIL]
     assert checkpoint['steps']['save_partial']['status'] == 'ok'
-    assert 'crowtado_signup' not in checkpoint['steps']
+    assert checkpoint['steps']['crowtado_signup']['remote_effect_possible'] is True
 
 
 @pytest.mark.parametrize('step_name', ['ban_check', 'minute_register', 'validate'])
@@ -86,7 +86,7 @@ def test_duplicate_login_checkpoint_failure_is_not_reported_as_remote_login_fail
     remote['login'].assert_called_once()
     minute_register.assert_not_called()
     checkpoint = registration_state.load()[EMAIL]
-    assert 'crowtado_signup' not in checkpoint['steps']
+    assert checkpoint['steps']['crowtado_signup']['remote_effect_possible'] is True
     assert credential_store.lookup(config.SECRETS_DIR, EMAIL, strict=True) == PASSWORD
 
 
@@ -128,7 +128,7 @@ def test_synchronous_signup_checkpoint_failure_returns_json_and_saved_steps(setu
     assert result['ok'] is False and result['partial'] is True
     assert result['code'] == 'local_registration_storage_failure'
     assert result['steps']['save_partial']['status'] == 'ok'
-    assert 'crowtado_signup' not in result['steps']
+    assert result['steps']['crowtado_signup']['remote_effect_possible'] is True
     assert 'retome o mesmo e-mail' in result['error']
     assert 'FICTIONAL-PRIVATE-STORAGE-DETAIL' not in response.get_data(as_text=True)
     remote['criar_conta'].assert_called_once()

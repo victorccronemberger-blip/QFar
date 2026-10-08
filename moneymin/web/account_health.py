@@ -25,12 +25,12 @@ def confirmed_ban(email: str, check: dict, registration: dict | None = None) -> 
                 issue.get("code") == "restricted" and
                 issue.get("restriction_confirmed") is True and
                 current.get("restriction_kind") != "payout"):
-            return {**issue, "email": email, "provider": name}
+            return {**issue, "checked_at": current.get("checked_at", ""), "email": email, "provider": name}
     registration = registration or {}
     for step_name, step in registration.get("steps", {}).items():
         if step.get("code") != "restricted":
             continue
-        name = "minute" if step_name in {"minute_register", "validate"} else "crowtado"
+        name = "minute" if step_name in {"minute_identity", "minute_register", "validate"} else "crowtado"
         current = provider(check, name)
         try:
             cleared = (current.get("status") == "active" and
@@ -39,7 +39,8 @@ def confirmed_ban(email: str, check: dict, registration: dict | None = None) -> 
         except (KeyError, TypeError, ValueError):
             cleared = False
         if not cleared:
-            return {"email": email, "provider": name, "code": "restricted",
+            evidence = {key: step[key] for key in ("provider_error_code", "http_status", "phase", "remote_effect_possible") if key in step}
+            return {**evidence, "checked_at": registration.get("updated_at", ""), "email": email, "provider": name, "code": "restricted",
                     "restriction_confirmed": True, "stage": "Cadastro · " + name.title(),
                     "reason": name.title() + " confirmou banimento durante o cadastro."}
     return None

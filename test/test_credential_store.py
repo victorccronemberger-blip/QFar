@@ -69,7 +69,7 @@ class CredentialStoreTests(unittest.TestCase):
                  patch.object(server.crowtado, "preencher_demografia"), \
                  patch.object(server.crowtado, "vincular_minute"), \
                  patch.object(server.crowtado, "login"), \
-                 patch.object(minute_api, "register", side_effect=register), \
+                 patch.object(minute_api, "register_identity", side_effect=register), \
                  patch.object(minute_api, "login"), \
                  patch.object(server.Session, "from_email", return_value=session):
                 result = server._full_register_account(email, password, identity)

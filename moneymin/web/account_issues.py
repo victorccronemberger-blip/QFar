@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import math
 
 
 def account_issue(email: str, error: Exception, *, stage: str = "Validação do acesso") -> dict:
@@ -31,6 +32,12 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
         if "crowtado" in stage.casefold():
             reason = "A Crowtado confirmou uma restrição de acesso desta conta."
             action = "Confira a conta no site e contate o suporte da Crowtado. Trocar a senha não remove essa restrição."
+    elif explicit == "account_locked":
+        code, reason = "account_locked", "O provedor informou bloqueio do acesso; isso não confirma banimento."
+        action = "Aguarde o prazo informado pelo provedor; se não houver prazo, consulte o suporte. A conta e as credenciais foram preservadas."
+    elif explicit == "access_paused":
+        code, reason = "access_paused", "O acesso está pausado na organização Minute."
+        action = "Confira o estado no Minute e consulte o suporte. A conta foi preservada para nova verificação."
     elif explicit == "version":
         code, reason = "version", "A versão do aplicativo precisa ser atualizada."
         action = "Atualize o QMoney. Este diagnóstico não indica problema com a conta."
@@ -106,9 +113,23 @@ def account_issue(email: str, error: Exception, *, stage: str = "Validação do 
     blocked = getattr(error, "blocked_reason", None)
     if blocked in ("user", "device", "uber-device"):
         detail += f" · X-Blocked-Reason: {blocked}"
-    return dict(email=email, code=code, stage=stage, reason=reason, action=action, detail=detail,
+    result = dict(email=email, code=code, stage=stage, reason=reason, action=action, detail=detail,
                 restriction_confirmed=explicit == "restricted",
-                retryable=code in {"timeout", "network", "service", "rate_limit", "invalid_response"})
+                retryable=code in {"timeout", "network", "service", "rate_limit", "invalid_response", "account_locked", "access_paused"})
+    cooldown = getattr(error, "retry_after_seconds", None)
+    if type(cooldown) in (int, float) and math.isfinite(cooldown) and cooldown >= 0:
+        cooldown = math.ceil(cooldown)
+        result["retry_after_seconds"] = cooldown
+        result["action"] += f" Aguarde pelo menos {cooldown} segundo(s)."
+    provider_code = getattr(error, "provider_error_code", None)
+    if provider_code in {"user_banned", "user_locked", "user_account_disabled", "user_disabled",
+                         "form_identifier_not_found", "form_password_incorrect", "form_identifier_exists"}:
+        result["provider_error_code"] = provider_code
+    if type(status) is int and 400 <= status <= 599:
+        result["http_status"] = status
+    if blocked in ("user", "device", "uber-device"):
+        result["blocked_reason"] = blocked
+    return result
 
 
 def issue_text(issue: dict) -> str:

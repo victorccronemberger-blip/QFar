@@ -25,7 +25,7 @@ class RegistrationValidationTests(unittest.TestCase):
         self.crowtado_login = self.context.enter_context(patch.object(server.crowtado, "login"))
         self.demographics = self.context.enter_context(patch.object(server.crowtado, "preencher_demografia"))
         self.link = self.context.enter_context(patch.object(server.crowtado, "vincular_minute"))
-        self.register = self.context.enter_context(patch.object(minute_api, "register"))
+        self.register = self.context.enter_context(patch.object(minute_api, "register_identity"))
         self.login = self.context.enter_context(patch.object(minute_api, "login"))
         self.session = Mock()
         self.session.ensure_auth.return_value = {"organizations": [

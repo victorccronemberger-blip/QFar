@@ -33,6 +33,7 @@ class TokenIdentityTests(unittest.TestCase):
         self.stack.enter_context(patch.object(config, "SECRETS_DIR", self.secrets))
         self.stack.enter_context(patch.object(config, "DATA_DIR", self.data))
         self.stack.enter_context(patch.object(minute_api, "_request", side_effect=AssertionError("unexpected provider call")))
+        self.stack.enter_context(patch.object(minute_api, "_request_detailed", side_effect=AssertionError("unexpected detailed provider call")))
         self.stack.enter_context(patch("moneymin.account_bans.require_not_banned"))
 
     def write(self, path, value):
@@ -41,7 +42,8 @@ class TokenIdentityTests(unittest.TestCase):
         return path.read_bytes()
 
     def login(self, email, *, uid="uid-b", password="  password exact  "):
-        with patch.object(minute_api, "_request", return_value=(200, json.dumps(record(email, uid)))) as provider:
+        response = minute_api.HttpResponse(200, json.dumps(record(email, uid)), {})
+        with patch.object(minute_api, "_request_detailed", return_value=response) as provider:
             value = minute_api.login(email, password)
         self.assertEqual(provider.call_args.kwargs["body"]["password"], password)
         return value
@@ -97,20 +99,23 @@ class TokenIdentityTests(unittest.TestCase):
         for payload in (b"{broken", json.dumps(record(B, "uid-b")).encode(), b'{"idToken":"fake"}'):
             with self.subTest(payload=payload):
                 primary.write_bytes(payload)
-                with patch.object(minute_api, "_request") as provider:
+                with patch.object(minute_api, "_request") as provider, \
+                     patch.object(minute_api, "_request_detailed") as detailed_provider:
                     for action in (lambda: minute_api.Session.from_email(A),
                                    lambda: minute_api.login(A, "password"),
                                    lambda: minute_api.register(A, "password")):
                         with self.assertRaises(minute_api.AuthError):
                             action()
                     provider.assert_not_called()
+                    detailed_provider.assert_not_called()
                 self.assertEqual(primary.read_bytes(), payload)
                 self.assertNotIn(A, token_store.records(self.secrets))
 
     def test_provider_wrong_missing_or_invalid_owner_never_persists(self):
         for value in (record(A), {k: v for k, v in record(B, "uid-b").items() if k != "email"},
                       {**record(B, "uid-b"), "email": [B]}):
-            with self.subTest(value=value), patch.object(minute_api, "_request", return_value=(200, json.dumps(value))):
+            response = minute_api.HttpResponse(200, json.dumps(value), {})
+            with self.subTest(value=value), patch.object(minute_api, "_request_detailed", return_value=response):
                 with self.assertRaises(minute_api.AuthError):
                     minute_api.login(B, "password")
                 self.assertFalse(config.token_path(B).exists())
@@ -118,7 +123,8 @@ class TokenIdentityTests(unittest.TestCase):
     def test_login_same_owner_changed_uid_preserves_existing_primary(self):
         primary = config.token_path(A)
         before = self.write(primary, record())
-        with patch.object(minute_api, "_request", return_value=(200, json.dumps(record(A, "wrong-uid")))):
+        with patch.object(minute_api, "_request_detailed", return_value=minute_api.HttpResponse(
+                200, json.dumps(record(A, "wrong-uid")), {})):
             with self.assertRaises(minute_api.AuthError):
                 minute_api.login(A, "password")
         self.assertEqual(primary.read_bytes(), before)

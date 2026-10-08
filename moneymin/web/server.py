@@ -96,7 +96,7 @@ from ..campaign import AccountSpec, CampaignConfig, TaskSpec
 from ..minute_api import AuthError, Session, login
 from ..secure_store import SecureStoreError, load_secure_settings, save_secure_settings
 from .account_issues import account_issue, issue_text
-from . import wallet, registration_state, account_health
+from . import wallet, registration_state, account_health, registration_limits
 from .catalog_loader import CatalogLoader
 from .library_runner import LibraryPreparationRunner
 from .org_migration import OrgMigrationRunner
@@ -668,12 +668,13 @@ _STEP_LABELS = {
     "save_partial": "proteger credencial local",
     "demographics": "demografia Crowtado",
     "minute_register": "registro Minute",
+    "minute_identity": "confirmação do cadastro Minute",
     "link_minute": "vincular Minute na Crowtado",
     "validate": "validação pós-criação",
 }
 _STEP_ORDER = [
     "proxy", "ban_check", "save_partial", "crowtado_signup",
-    "demographics", "minute_register", "link_minute", "validate",
+    "demographics", "minute_identity", "minute_register", "link_minute", "validate",
 ]
 _CROWTADO_SIGNUP_RETRIES = 2
 _CROWTADO_SIGNUP_RETRY_DELAY_S = 5.0
@@ -915,6 +916,13 @@ def _validate_minute_membership(email: str) -> str:
 
 def _full_register_account(email: str, password: str, identity_data: dict[str, Any],
                            *, on_step: Any = None, resume: bool = False) -> dict[str, Any]:
+    blocked = registration_limits.check_all()
+    if blocked:
+        provider, remaining = blocked
+        previous = registration_state.load().get(email.strip().casefold(), {})
+        return {"steps": previous.get("steps", {}), "code": "rate_limit", "not_admitted": True,
+                "retry_after_seconds": remaining, "partial": bool(previous),
+                "error": f"{provider.title()} limitou o cadastro. Aguarde {remaining} segundo(s)."}
     from .. import registration_proxy
     from contextlib import ExitStack
     scope = ExitStack()
@@ -963,7 +971,7 @@ def _register_account_steps(
     import time
 
     from .. import crowtado, account_bans as bans, registration_proxy
-    from ..minute_api import register as minute_register, login as minute_login
+    from ..minute_api import register_identity as minute_register, login as minute_login
 
     logger = logging.getLogger("moneymin.register")
     # Do not overwrite the checkpoint or secret of an already connected account
@@ -978,6 +986,15 @@ def _register_account_steps(
     steps: dict[str, dict[str, str]] = dict(previous.get("steps", {}))
     step_start: dict[str, float] = {}
 
+    blocked = registration_limits.check_all()
+    if blocked:
+        provider, remaining = blocked
+        return {"steps": steps, "error": f"Aguarde {remaining} segundo(s) antes de acessar {provider.title()} novamente; o provedor limitou o cadastro.", "partial": bool(previous)}
+
+    for step in steps.values():
+        if step.get("retry_at", 0) > time.time():
+            return {"steps": steps, "error": "O prazo informado pelo provedor ainda não terminou. Aguarde antes de retomar a mesma conta.", "partial": True}
+
     def confirmed(name):
         return resume and steps.get(name, {}).get("status") in ("ok", "skip")
 
@@ -986,6 +1003,36 @@ def _register_account_steps(
         code = getattr(exc, "account_issue_code", None)
         if isinstance(code, str):
             result["code"] = code
+        effect = getattr(exc, "remote_effect_possible", None)
+        if type(effect) is bool:
+            result["remote_effect_possible"] = effect
+        for key in ("retry_after_seconds", "http_status"):
+            value = getattr(exc, key, None)
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                result[key] = math.ceil(value)
+        if "retry_after_seconds" in result:
+            result["retry_at"] = int(time.time()) + result["retry_after_seconds"]
+        if code == "rate_limit":
+            provider = "minute" if isinstance(exc, AuthError) else "crowtado"
+            wait = result.get("retry_after_seconds", registration_limits.DEFAULT_COOLDOWN_SECONDS)
+            result["retry_after_seconds"] = wait
+            result["retry_at"] = math.ceil(time.time()) + wait
+            try:
+                wait = registration_limits.defer(provider, wait)
+            except (OSError, JsonStateError):
+                # Preserve the observed deadline in this account's durable
+                # checkpoint as well. The limits module also retains it in RAM
+                # if the filesystem cannot confirm either publication.
+                result["detail"] += " Não foi possível confirmar o arquivo de espera; o limite observado permanece em vigor."
+            else:
+                result["retry_after_seconds"] = wait
+                result["retry_at"] = math.ceil(time.time()) + wait
+        phase = getattr(exc, "phase", None)
+        if phase in {"browser_setup", "signup_submission", "email_verification", "signup_confirmation"}:
+            result["phase"] = phase
+        provider_code = getattr(exc, "provider_error_code", None)
+        if provider_code in registration_state.PROVIDER_ERROR_CODES:
+            result["provider_error_code"] = provider_code
         return result
 
     def finish(result):
@@ -1044,17 +1091,29 @@ def _register_account_steps(
     _notify("crowtado_signup")
     crowtado_signup_ok = confirmed("crowtado_signup")
     crowtado_login_confirmed = False
+    if not crowtado_signup_ok and steps.get("crowtado_signup", {}).get("remote_effect_possible") is True:
+        # A crash or uncertain response after submit must never create again.
+        try:
+            crowtado.login(email, password)
+        except Exception as exc:
+            result = failure(exc)
+            result["remote_effect_possible"] = True
+            _record_step("crowtado_signup", result)
+            return finish({"steps": steps, "error": "O cadastro anterior continua sem confirmação. Confira a mesma conta no site; nenhum novo cadastro foi enviado."})
+        _record_step("crowtado_signup", _step_skip("cadastro anterior confirmado pelo login"))
+        crowtado_signup_ok = crowtado_login_confirmed = True
     last_error: str = ""
     for attempt in range(1, _CROWTADO_SIGNUP_RETRIES + 1):
         if crowtado_signup_ok:
             break
+        _record_step("crowtado_signup", {"status": "fail", "detail": "Envio iniciado; aguarda confirmação.", "remote_effect_possible": True})
         try:
             if identity_data.get("use_referral") is False:
                 crowtado.criar_conta(email, password, ref="")
             else:
                 crowtado.criar_conta(email, password)
         except Exception as exc:
-            if getattr(exc, "account_issue_code", None) == "restricted":
+            if getattr(exc, "account_issue_code", None) in {"restricted", "account_locked", "rate_limit"}:
                 _record_step("crowtado_signup", failure(exc))
                 return finish({"steps": steps, "error": f"crowtado: {exc}"})
             error_msg = str(exc)
@@ -1073,7 +1132,10 @@ def _register_account_steps(
                 try:
                     crowtado.login(email, password)
                 except Exception as login_exc:
-                    _record_step("crowtado_signup", failure(login_exc))
+                    duplicate_failure = failure(login_exc)
+                    duplicate_failure["remote_effect_possible"] = True
+                    duplicate_failure["provider_error_code"] = "form_identifier_exists"
+                    _record_step("crowtado_signup", duplicate_failure)
                     return finish({"steps": steps, "error": f"crowtado: {login_exc}"})
                 # A local checkpoint error is not a remote login error.
                 _record_step("crowtado_signup", _step_skip("conta já existia; login OK"))
@@ -1081,6 +1143,12 @@ def _register_account_steps(
                 crowtado_login_confirmed = True
                 break
             last_error = error_msg
+            if getattr(exc, "remote_effect_possible", None) is not False:
+                result = failure(exc)
+                result["remote_effect_possible"] = True
+                _record_step("crowtado_signup", result)
+                return finish({"steps": steps, "error": "O envio Crowtado ficou sem confirmação. Retome a mesma conta para verificar o acesso; não será repetida a criação."})
+            _record_step("crowtado_signup", failure(exc))
             if attempt < _CROWTADO_SIGNUP_RETRIES:
                 logger.info("[register] %s — Crowtado falhou (tentativa %d/%d)",
                              email, attempt, _CROWTADO_SIGNUP_RETRIES)
@@ -1121,11 +1189,21 @@ def _register_account_steps(
         try:
             # O código é explícito para que nenhuma alteração de default consiga
             # cadastrar uma conta Crowtado em organização diferente.
-            if confirmed("minute_register"):
+            if confirmed("minute_register") or confirmed("minute_identity") or steps.get("minute_identity", {}).get("remote_effect_possible") is True:
                 minute_login(email, password)
                 existed = True
             else:
-                minute_register(email, password, config.INVITE_CODE)
+                _record_step("minute_identity", {"status": "fail", "detail": "Envio iniciado; aguarda confirmação.", "remote_effect_possible": True})
+                try:
+                    minute_register(email, password, config.INVITE_CODE)
+                except Exception as exc:
+                    result = failure(exc)
+                    if result.get("remote_effect_possible") is not False:
+                        result["remote_effect_possible"] = True
+                    _record_step("minute_identity", result)
+                    raise
+                _record_step("minute_identity", _step_ok("Cadastro Minute aceito; acesso ainda será verificado."))
+                minute_login(email, password)
         except RuntimeError as exc:
             # Apenas uma resposta explícita de e-mail duplicado permite recuperação.
             detail = str(exc).casefold()
@@ -1136,6 +1214,8 @@ def _register_account_steps(
                 raise
             minute_login(email, password)
             existed = True
+        if not confirmed("minute_identity"):
+            _record_step("minute_identity", _step_skip("identidade confirmada pelo acesso"))
         _validate_minute_membership(email)
     except Exception as exc:
         _record_step("minute_register", failure(exc))
@@ -1862,7 +1942,7 @@ def _check_minute_health(email: str) -> dict[str, Any]:
             if not isinstance(quality, dict) or quality.get("userState") not in ("active", "on_hold", "inactive"):
                 raise AuthError("Estado de qualidade Minute incompleto", code="invalid_response")
             if quality["userState"] in ("on_hold", "inactive"):
-                raise AuthError("A organização alvo restringiu o acesso Minute", code="restricted")
+                raise AuthError("A organização alvo pausou o acesso Minute", code="access_paused")
             result = {
                 "email": email, "status": "active", "status_label": "Acesso verificado",
                 "org_key": org_key, "expires_at": session.data.get("expires_at", 0),
@@ -1871,8 +1951,8 @@ def _check_minute_health(email: str) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 — qualquer falha ambígua é inconclusiva
             issue = account_issue(email, exc, stage="Verificação Minute")
             issue["provider"] = "minute"
-            if issue["retryable"] and attempt < 2:
-                time.sleep(2.0 if issue["code"] == "rate_limit" else 0.5)
+            if issue["retryable"] and issue["code"] not in {"rate_limit", "account_locked", "access_paused"} and attempt < 2:
+                time.sleep(0.5)
                 continue
             status, label = {
                 "restricted": ("disabled", "Banida · Minute"),
@@ -1913,8 +1993,8 @@ def _check_crowtado_health(email: str) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 — missing evidence never confirms clearance
             issue = account_issue(email, exc, stage="Verificação Crowtado")
             issue["provider"] = "crowtado"
-            if issue["retryable"] and attempt < 2:
-                time.sleep(2.0 if issue["code"] == "rate_limit" else 0.5)
+            if issue["retryable"] and issue["code"] not in {"rate_limit", "account_locked", "access_paused"} and attempt < 2:
+                time.sleep(0.5)
                 continue
             status, label = {"restricted": ("disabled", "Banida · login recusado"),
                              "authentication": ("needs_reauth", "Reconectar Crowtado"),
@@ -2172,10 +2252,33 @@ def _ban_accounts(issues: list[dict]) -> None:
             email = account_transfer.email_key(issue.get("email"))
             previous = records.get(email, {})
             banned_at = previous.get("banned_at") or previous.get("removed_at") or time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            records[email] = {"email": email, "password": passwords.get(email) or previous.get("password"),
+            records[email] = {**previous, "email": email, "password": passwords.get(email) or previous.get("password"),
                               "banned_at": banned_at, "removed_at": previous.get("removed_at") or banned_at,
                               "reason": issue.get("reason", "Restrição confirmada pela plataforma."),
                               "stage": issue.get("stage", "Envio"), "restriction_confirmed": True}
+            diagnostic = dict(previous.get("diagnostic", {})) if isinstance(previous.get("diagnostic"), dict) else {}
+            for key, allowed in (("provider", {"crowtado", "minute"}), ("code", {"restricted"}),
+                                 ("provider_error_code", registration_state.PROVIDER_ERROR_CODES),
+                                 ("phase", {"browser_setup", "signup_submission", "email_verification", "signup_confirmation"}),
+                                 ("blocked_reason", {"user", "device", "uber-device"})):
+                value = issue.get(key)
+                if isinstance(value, str) and value in allowed:
+                    diagnostic[key] = value
+            if type(issue.get("http_status")) is int and 400 <= issue["http_status"] <= 599:
+                diagnostic["http_status"] = issue["http_status"]
+            if type(issue.get("remote_effect_possible")) is bool:
+                diagnostic["remote_effect_possible"] = issue["remote_effect_possible"]
+            observed_at = issue.get("checked_at")
+            if isinstance(observed_at, str):
+                try:
+                    datetime.datetime.fromisoformat(observed_at)
+                except ValueError:
+                    pass
+                else:
+                    diagnostic.setdefault("first_observed_at", observed_at)
+                    diagnostic["last_observed_at"] = observed_at
+            if diagnostic:
+                records[email]["diagnostic"] = diagnostic
         archive["accounts"] = list(records.values())
         banned_store.save(path, archive)
         for issue in issues:
@@ -2781,7 +2884,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                 for name, step in registration["steps"].items():
                     if step.get("code") != "restricted":
                         continue
-                    service = "minute" if name == "minute_register" else "crowtado"
+                    service = "minute" if name in {"minute_identity", "minute_register"} else "crowtado"
                     check = account_health.provider(account["last_check"], service)
                     try:
                         newer = (check.get("status") == "active" and
@@ -3139,6 +3242,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
                             "code": "local_registration_storage_failure",
                             "error": "O armazenamento local não confirmou o progresso do cadastro. Confira a conta incompleta e retome o mesmo e-mail; as credenciais e etapas já salvas foram preservadas."}), 503
         ok = result["error"] is None
+        if result.get("code") == "rate_limit":
+            return jsonify({"ok": False, "email": email, **result}), 429
         return jsonify({"ok": ok, "email": email, "partial": result.get("partial", False), "steps": result["steps"],
                          "error": result["error"]}), 200 if ok else 400
 
@@ -3173,6 +3278,12 @@ def create_app(*, for_testing: bool = False) -> Flask:
     @app.get("/api/accounts/bulk-register/preflight")
     def bulk_register_preflight():
         """Valida todas as dependências antes de iniciar a criação em lote."""
+        blocked = registration_limits.check_all()
+        if blocked:
+            provider, remaining = blocked
+            return jsonify({"ready": False, "checks": {"registration_limit": {
+                "ok": False, "detail": f"{provider.title()} limitou o cadastro. Aguarde {remaining} segundo(s)."}},
+                "retry_after_seconds": remaining})
         from .. import registration_proxy
         selection = request.args.get("proxy_id", "")
         try:
@@ -3281,6 +3392,13 @@ def create_app(*, for_testing: bool = False) -> Flask:
         if domain not in {row["domain"] for row in _registration_domains()}:
             return jsonify({"error": "Selecione um domínio catch-all configurado nas integrações."}), 400
 
+        blocked = registration_limits.check_all()
+        if blocked:
+            provider, remaining = blocked
+            return jsonify({"error": f"{provider.title()} limitou o cadastro. Aguarde {remaining} segundo(s) antes de iniciar ou retomar.",
+                            "code": "rate_limit", "retry_after_seconds": remaining,
+                            "not_admitted": True}), 429
+
         existing_emails = {
             account["email"].lower()
             for account in _list_accounts()
@@ -3388,12 +3506,21 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     _BULK_REGISTER_STATE["failed"] = failures
                     _BULK_REGISTER_STATE["results"] = list(results)
                     _save_registration_batch()
+                if not ok and any(
+                        step.get("code") in {"rate_limit", "account_locked", "restricted"}
+                        or step.get("remote_effect_possible") is True
+                        for step in result["steps"].values()):
+                    with _BULK_REGISTER_LOCK:
+                        _BULK_REGISTER_STATE.update(state="failed", error="Lote interrompido para verificar a conta atual e respeitar a resposta do provedor. Nenhuma próxima conta foi iniciada. " + (result["error"] or ""))
+                    return False
             return True
         def _worker() -> None:
             terminal = {"state": "failed", "error": "Cadastro interrompido."}
             try:
                 if _run_batch():
                     terminal = {"state": "done"}
+                else:
+                    terminal = {"state": "failed", "error": _BULK_REGISTER_STATE.get("error", "Cadastro interrompido.")}
             except (OSError, JsonStateError):
                 terminal = {
                     "state": "failed",

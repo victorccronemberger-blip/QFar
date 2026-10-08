@@ -133,7 +133,9 @@ def test_unknown_minute_quality_is_inconclusive_with_other_service_still_checked
 def test_minute_quality_restriction_is_provider_specific(local, quality):
     local[0].checked_quality_state.return_value = {"userState": quality}
     row = server._check_account_health(EMAIL)
-    assert row["restricted_providers"] == ["minute"]
+    assert row["restricted_providers"] == []
+    assert row["providers"]["minute"]["issue"]["code"] == "access_paused"
+    assert account_health.confirmed_ban(EMAIL, row) is None
     assert row["providers"]["crowtado"]["status"] == "active"
 
 

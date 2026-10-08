@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 if(DEFINED ENV{QMONEY_VERSION} AND NOT "$ENV{QMONEY_VERSION}" STREQUAL "")
   set(QMONEY_VERSION "$ENV{QMONEY_VERSION}")
 else()
-set(QMONEY_VERSION "2.0.88")
+set(QMONEY_VERSION "2.0.89")
 endif()
 project(QMoney VERSION ${QMONEY_VERSION} LANGUAGES CXX)
 
@@ -158,6 +158,7 @@ if(QMONEY_BUILD_VISUAL_PREVIEW)
   add_test(NAME accounts_outcome_foreign_batch COMMAND operation_preview --accounts-qa-smoke --accounts-outcome-foreign-batch)
   add_test(NAME accounts_outcome_old_terminal_baseline COMMAND operation_preview --accounts-qa-smoke --accounts-outcome-old-terminal)
   add_test(NAME accounts_outcome_not_admitted COMMAND operation_preview --accounts-qa-smoke --accounts-outcome-not-admitted)
+  add_test(NAME accounts_outcome_rate_limit COMMAND operation_preview --accounts-qa-smoke --accounts-outcome-rate-limit)
   add_test(NAME accounts_definitive_conflict COMMAND operation_preview --accounts-qa-smoke --accounts-outcome-definitive-conflict)
   add_test(NAME accounts_registration_native_close COMMAND operation_preview --accounts-qa-smoke --registration-native-preview --registration-native-close-smoke)
   add_test(NAME accounts_outcome_poll_recovery COMMAND operation_preview --accounts-qa-smoke --accounts-outcome-poll-recovery)
@@ -167,7 +168,7 @@ if(QMONEY_BUILD_VISUAL_PREVIEW)
   set_tests_properties(account_services_independent PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
   set_tests_properties(accounts_qa_lifecycle PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 20)
   set_tests_properties(accounts_creation_busy_guard accounts_outcome_before_admission accounts_outcome_after_admission
-    accounts_outcome_foreign_batch accounts_outcome_old_terminal_baseline accounts_outcome_not_admitted accounts_definitive_conflict
+    accounts_outcome_foreign_batch accounts_outcome_old_terminal_baseline accounts_outcome_not_admitted accounts_outcome_rate_limit accounts_definitive_conflict
     accounts_catalog_auto_idle accounts_catalog_auto_restored_done
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
   set_tests_properties(operation_qa_lifecycle PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)

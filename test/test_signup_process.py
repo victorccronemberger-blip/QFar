@@ -26,8 +26,10 @@ class SignupProcessTests(unittest.TestCase):
              patch.object(crowtado, "_chrome_exe", return_value="test-chrome"), \
              patch.object(crowtado, "_wait_port", side_effect=crowtado.CrowtadoError("startup failed")), \
              patch("subprocess.Popen", return_value=process):
-            with self.assertRaisesRegex(crowtado.CrowtadoError, "startup failed"):
+            with self.assertRaisesRegex(crowtado.CrowtadoError, "startup failed") as raised:
                 crowtado.criar_conta("test@example.invalid", "test-only")
+        self.assertEqual(raised.exception.phase, "browser_setup")
+        self.assertFalse(raised.exception.remote_effect_possible)
 
     def test_failure_waits_for_browser_exit(self):
         process = Mock()

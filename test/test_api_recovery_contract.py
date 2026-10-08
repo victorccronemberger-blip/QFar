@@ -17,7 +17,8 @@ class AuthContractTests(unittest.TestCase):
         for payload in cases:
             with self.subTest(payload=payload), \
                  mock.patch("moneymin.account_bans.require_not_banned"), \
-                 mock.patch.object(api, "_request", return_value=(200, json.dumps(payload))), \
+                 mock.patch.object(api, "_request_detailed", return_value=api.HttpResponse(
+                     200, json.dumps(payload), {})), \
                  mock.patch.object(api, "save_json") as save:
                 with self.assertRaises(api.AuthError) as error:
                     api.login("test@example.com", "secret")

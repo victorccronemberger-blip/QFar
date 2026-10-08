@@ -18,6 +18,7 @@ Exemplo:
 from __future__ import annotations
 
 import base64
+from email.utils import parsedate_to_datetime
 import json
 import os
 import re
@@ -103,9 +104,86 @@ _REFRESH_URL = f"https://securetoken.googleapis.com/v1/token?key={config.FIREBAS
 class AuthError(RuntimeError):
     """Falha de autenticação (token ausente, expirado sem refresh válido, etc.)."""
 
-    def __init__(self, message: str, *, code: str | None = None):
+    def __init__(self, message: str, *, code: str | None = None,
+                 http_status: int | None = None,
+                 retry_after_seconds: float | None = None):
         super().__init__(message)
         self.account_issue_code = code
+        self.http_status = http_status
+        self.retry_after_seconds = retry_after_seconds
+        self.remote_effect_possible = False
+
+
+def _retry_after_seconds(headers: dict[str, str] | None) -> float | None:
+    """Parse Retry-After without retaining arbitrary response headers."""
+    value = next((str(item) for key, item in (headers or {}).items()
+                  if str(key).casefold() == "retry-after"), "").strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value) if re.fullmatch(r"\d+(?:\.\d+)?", value) else (
+            parsedate_to_datetime(value).timestamp() - time.time())
+        return max(0.0, seconds) if seconds < float("inf") else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+_MINUTE_DUPLICATE_MARKERS = {
+    "email_exists", "email_already_exists", "form_identifier_exists",
+    "email_already_in_use", "email_already_taken",
+    "email_already_exists_message", "email_is_already_taken",
+}
+
+
+def _minute_duplicate_marker(body: str) -> str | None:
+    """Accept only known duplicate codes or exact legacy phrases."""
+    phrase_markers = {
+        "email already exists", "email address already exists",
+        "email is already taken", "email address is already taken",
+        "email address is taken", "email already in use",
+        "email address is already in use", "account already exists",
+        "conta ja existe", "e mail ja existe", "email ja existe",
+        "e mail ja esta em uso", "email ja esta em uso",
+        "endereco de e mail ja esta em uso",
+    }
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+    values: list[tuple[str, str]] = []
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        payload = None
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = str(key).casefold()
+                if isinstance(item, str) and normalized_key in {
+                        "code", "error_code", "error", "detail", "message"}:
+                    values.append((normalized_key, item))
+                elif isinstance(item, (dict, list)):
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    if payload is None:
+        values.append(("body", body))
+    elif isinstance(payload, str):
+        values.append(("body", payload))
+    else:
+        visit(payload)
+
+    for key, raw in values:
+        value = normalize(raw)
+        code = value.replace(" ", "_")
+        if key in {"code", "error_code", "error", "body"} and code in _MINUTE_DUPLICATE_MARKERS:
+            return "EMAIL_EXISTS"
+        if value in phrase_markers:
+            return "EMAIL_EXISTS"
+    return None
 
 
 def validate_task_catalog(rows: Any) -> list[dict[str, Any]]:
@@ -169,8 +247,12 @@ def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False,
             code = "authentication"
         elif message == "TOO_MANY_ATTEMPTS_TRY_LATER":
             code = "rate_limit"
-    error = AuthError(f"{stage}: resposta HTTP {status}; verificação não concluída.", code=code)
-    error.http_status = status
+    error = AuthError(
+        f"{stage}: resposta HTTP {status}; verificação não concluída.",
+        code=code,
+        http_status=status,
+        retry_after_seconds=_retry_after_seconds(headers) if status == 429 else None,
+    )
     error.profile_read = profile_read
     # Only known protocol markers may reach logs/UI; never retain response
     # bodies, authentication headers or arbitrary remote strings here.
@@ -489,13 +571,15 @@ def _password_login_data(email: str, password: str) -> dict[str, Any]:
     """Validate the provider's demonstrated owner before any token persistence."""
     from .account_bans import require_not_banned
     require_not_banned(email)
-    status, body = _request(
+    response = _request_detailed(
         _SIGNIN_URL,
         "POST",
         body={"email": email, "password": password, "returnSecureToken": True},
     )
+    status, body = response.status, response.text
     if status != 200:
-        raise _auth_failure(status, body, "Login", firebase=True)
+        raise _auth_failure(status, body, "Login", firebase=True,
+                            headers=response.headers)
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -528,21 +612,11 @@ def login(email: str, password: str) -> dict[str, Any]:
         return data
 
 
-def register(email: str, password: str, code: str | None = None) -> dict[str, Any]:
-    """Registra uma nova conta via /auth/web-register e já faz login.
+def register_identity(email: str, password: str, code: str | None = None) -> None:
+    """Confirma somente a criação remota Minute, sem autenticar nem salvar token.
 
-    O endpoint cria o usuário no Firebase, grava no banco e entra na org do
-    código de convite — tudo no servidor. Em seguida autentica com a senha
-    para gravar `secrets/token_<email>.json`, igual ao comando `login`.
-
-    Usa os headers de identidade do perfil da conta (X-Device-Id Android
-    `android.ssaid:...` + UA Android) e envia o `device_id` no corpo — o
-    schema WebRegisterRequest da spec tem o campo dedicado e a conta nasce
-    associada a UM aparelho.
-
-    O código é validado contra a política da conta; Crowtado aceita somente o
-    convite doméstico atual e Claru mantém seu convite próprio. Devolve o dict
-    do token. Levanta RuntimeError se o registro remoto falhar.
+    A separação deixa o chamador persistir o checkpoint do POST antes do login,
+    que é uma operação distinta e pode falhar depois da criação confirmada.
     """
     from .account_bans import require_not_banned
     from .org_policy import target_invite
@@ -560,7 +634,7 @@ def register(email: str, password: str, code: str | None = None) -> dict[str, An
         )
     profile = device_profile.get_profile(email)
     headers = profile.headers(include_location=False)
-    status, body = _request(
+    response = _request_detailed(
         config.BASE_URL + "/api/v1/auth/web-register",
         "POST",
         headers=headers,
@@ -571,8 +645,31 @@ def register(email: str, password: str, code: str | None = None) -> dict[str, An
             "device_id": profile.device_id,
         },
     )
+    status, body = response.status, response.text
+    if status in (429, 408, -1) or status >= 500:
+        error = _auth_failure(status, body, "Registro Minute",
+                              headers=response.headers)
+        # Explicit HTTP rejections are not admission. A transport loss,
+        # timeout or server failure after POST may follow a remote creation.
+        error.remote_effect_possible = status in (-1, 408) or status >= 500
+        raise error
     if status not in (200, 201):
-        raise RuntimeError(f"registro falhou ({status}): {body[:300]}")
+        duplicate = _minute_duplicate_marker(body)
+        if duplicate is not None:
+            error = AuthError(f"Registro Minute: {duplicate} (HTTP {status}).",
+                              code="duplicate", http_status=status)
+        else:
+            error = _auth_failure(status, body, "Registro Minute",
+                                  headers=response.headers)
+            if status not in (401, 403, 429):
+                error.account_issue_code = "invalid_response"
+        error.remote_effect_possible = 200 <= status < 300
+        raise error
+
+
+def register(email: str, password: str, code: str | None = None) -> dict[str, Any]:
+    """Registra uma nova conta e autentica para persistir o acesso (legado)."""
+    register_identity(email, password, code)
     return login(email, password)
 
 

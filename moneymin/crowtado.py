@@ -56,47 +56,150 @@ class CrowtadoError(RuntimeError):
     """Falha de login ou consulta no crowtado."""
 
     def __init__(self, message: str, *, code: str | None = None, http_status: int | None = None,
-                 retry_after_seconds: float | None = None):
+                 retry_after_seconds: float | None = None, phase: str | None = None,
+                 remote_effect_possible: bool | None = None,
+                 provider_error_code: str | None = None):
         super().__init__(message)
         self.account_issue_code = code
         self.http_status = http_status
         self.retry_after_seconds = retry_after_seconds
+        self.phase = phase
+        self.remote_effect_possible = remote_effect_possible
+        self.provider_error_code = provider_error_code
 
 
 def _retry_after_seconds(headers) -> float | None:
     """Read the provider's cooldown without retaining response headers."""
-    value = headers.get("Retry-After") if headers is not None else None
+    value = None
+    if headers is not None:
+        try:
+            value = headers.get("Retry-After")
+            if value is None:
+                value = next((item for key, item in headers.items()
+                              if str(key).casefold() == "retry-after"), None)
+        except (AttributeError, TypeError):
+            return None
     if not value:
         return None
     try:
-        seconds = float(value) if re.fullmatch(r"\d+", value.strip()) else (
-            parsedate_to_datetime(value).timestamp() - time.time())
+        seconds = float(value) if re.fullmatch(r"\d+", str(value).strip()) else (
+            parsedate_to_datetime(str(value)).timestamp() - time.time())
         return max(1.0, seconds) if 0 <= seconds < float("inf") else None
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def _finite_nonnegative_seconds(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return seconds if 0 <= seconds < float("inf") else None
+
+
+def _provider_retry_after(body: Any) -> float | None:
+    errors = body.get("errors", []) if isinstance(body, dict) else []
+    if not isinstance(errors, list):
+        return None
+    for item in errors:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("meta")
+        if not isinstance(meta, dict):
+            continue
+        seconds = _finite_nonnegative_seconds(meta.get("lockout_expires_in_seconds"))
+        if seconds is not None:
+            return seconds
+    return None
+
+
+_SAFE_PROVIDER_ERROR_CODES = frozenset({
+    "user_banned", "user_locked", "user_account_disabled", "user_disabled",
+    "form_identifier_not_found", "form_password_incorrect", "form_identifier_exists",
+})
+
+
+def _safe_provider_error_code(body: Any) -> str | None:
+    errors = body.get("errors", []) if isinstance(body, dict) else []
+    if not isinstance(errors, list):
+        return None
+    for item in errors:
+        code = item.get("code") if isinstance(item, dict) else None
+        if isinstance(code, str) and code in _SAFE_PROVIDER_ERROR_CODES:
+            return code
+    return None
 
 
 def _remote_error(stage: str, status: int, body: Any) -> CrowtadoError:
     errors = body.get("errors", []) if isinstance(body, dict) else []
     errors = errors if isinstance(errors, list) else []
     codes = {str(item.get("code")) for item in errors if isinstance(item, dict)}
-    restricted = codes & {"user_banned", "user_locked", "user_account_disabled", "user_disabled"}
-    code = ("restricted" if restricted else "crowtado_account_missing" if "form_identifier_not_found" in codes else
+    banned = codes & {"user_banned", "user_account_disabled", "user_disabled"}
+    locked = "user_locked" in codes
+    code = ("restricted" if banned else "account_locked" if locked else
+            "crowtado_account_missing" if "form_identifier_not_found" in codes else
             "authentication" if codes & {"form_password_incorrect", "form_password_pwned", "session_invalid"}
             or status == 401 else
             "rate_limit" if status == 429 else
             "service" if status >= 500 else
             "forbidden" if status == 403 else "invalid_response")
-    message = ("A Crowtado confirmou restrição desta conta. Fale com o suporte"
-               if restricted else stage)
-    return CrowtadoError(f"{message} (HTTP {status})", code=code, http_status=status)
+    message = ("A Crowtado confirmou que esta conta está banida ou desativada. Fale com o suporte"
+               if banned else "A Crowtado bloqueou o acesso desta conta"
+               if locked else stage)
+    retry_after = _provider_retry_after(body) if locked else None
+    if locked and retry_after is not None:
+        message += f". Tente novamente em {int(retry_after + 0.999)} segundos"
+    return CrowtadoError(f"{message} (HTTP {status})", code=code, http_status=status,
+                         retry_after_seconds=retry_after,
+                         provider_error_code=_safe_provider_error_code(body))
+
+
+def _signup_response_error(url: str, status: int, payload: Any, headers: Any,
+                           phase: str) -> CrowtadoError | None:
+    """Reduce a Clerk signup response to safe status metadata only."""
+    try:
+        if "/v1/client/sign_ups" not in urllib.parse.urlparse(url).path or status < 400:
+            return None
+        error = _remote_error("O cadastro Crowtado foi recusado", status, payload)
+        errors = payload.get("errors", []) if isinstance(payload, dict) else []
+        codes = {str(row.get("code")) for row in errors if isinstance(row, dict)} if isinstance(errors, list) else set()
+        if "form_identifier_exists" in codes:
+            error = CrowtadoError("Esta conta já existe no Crowtado.", code="account_exists", http_status=status,
+                                  provider_error_code="form_identifier_exists")
+        if error.account_issue_code == "rate_limit":
+            error.retry_after_seconds = _retry_after_seconds(headers)
+        error.phase = phase
+        error.remote_effect_possible = True
+        return error
+    except Exception:
+        # Do not retain provider payloads if a response is malformed.
+        return None
+
+
+def _signup_response_error_from_response(response: Any, phase: str) -> CrowtadoError | None:
+    """Extract only the signup response metadata needed for safe classification."""
+    try:
+        url = response.url
+        status = int(response.status)
+        if "/v1/client/sign_ups" not in urllib.parse.urlparse(url).path or status < 400:
+            return None
+        headers = response.headers
+    except Exception:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    return _signup_response_error(url, status, payload, headers, phase)
 
 
 def can_use_browser_fallback(error: Exception) -> bool:
     # Repeating a rejected password, rate limit or outage in Chrome only
     # duplicates requests and hides the original diagnosis.
     return getattr(error, "account_issue_code", None) not in {
-        "authentication", "crowtado_account_missing", "rate_limit", "service",
+        "authentication", "crowtado_account_missing", "rate_limit", "service", "account_locked",
         "network", "timeout", "tls", "email_verification", "mail_authentication", "restricted", "device",
     }
 
@@ -239,8 +342,14 @@ def _check_login_user_flags(payload: Any, session_id: str) -> None:
         for flag in ("banned", "locked"):
             if flag in user and type(user[flag]) is not bool:
                 raise CrowtadoError("A Crowtado retornou um estado de conta inválido; verifique novamente.", code="invalid_response")
-            if user.get(flag) is True:
-                raise CrowtadoError("A Crowtado confirmou banimento ou bloqueio desta conta. Fale com o suporte.", code="restricted")
+        if user.get("banned") is True:
+            raise CrowtadoError("A Crowtado confirmou que esta conta está banida. Fale com o suporte.", code="restricted")
+        if user.get("locked") is True:
+            retry_after = _finite_nonnegative_seconds(user.get("lockout_expires_in_seconds"))
+            message = "A Crowtado bloqueou o acesso desta conta"
+            if retry_after is not None:
+                message += f". Tente novamente em {int(retry_after + 0.999)} segundos"
+            raise CrowtadoError(message + ".", code="account_locked", retry_after_seconds=retry_after)
 
 
 def _login_locked(email: str, password: str) -> CrowtadoSession:
@@ -1076,6 +1185,8 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
 
     from .hostinger_mail import max_uid, wait_for_code
 
+    phase = "browser_setup"
+    remote_effect_possible = False
     CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
     import socket
     with socket.socket() as s:
@@ -1096,6 +1207,20 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
             ctx = browser.contexts[0]
             ctx.clear_cookies()  # sessão da conta anterior (batch) não vaza
             page = ctx.new_page()
+            signup_response_error: CrowtadoError | None = None
+
+            def observe_signup_response(response) -> None:
+                nonlocal signup_response_error
+                try:
+                    candidate = _signup_response_error_from_response(response, phase)
+                    if candidate is not None:
+                        signup_response_error = candidate
+                except Exception:
+                    # Response bodies can contain user data. A diagnostic hook
+                    # must never retain or surface them if parsing fails.
+                    return
+
+            page.on("response", observe_signup_response)
             signup_url = f"{SITE_BASE}/sign-up"
             if ref:
                 signup_url += "?" + urllib.parse.urlencode({"ref": ref})
@@ -1134,11 +1259,15 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
             page.fill("#emailAddress-field", email)
             page.fill("#password-field", senha)
             uid_base = max_uid(email)
+            phase = "signup_submission"
+            remote_effect_possible = True
             page.click("button.cl-formButtonPrimary")
 
             destino = None
             for _ in range(12):
                 page.wait_for_timeout(3000)
+                if signup_response_error is not None:
+                    raise signup_response_error
                 if "verify" in page.url:
                     destino = "verify"
                     break
@@ -1148,13 +1277,14 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
                 err = page.evaluate(
                     "(document.querySelector('.cl-formFieldErrorText')||{}).innerText || ''")
                 if err:
-                    raise CrowtadoError(f"form de sign-up recusou: {err}")
+                    raise CrowtadoError("O formulário do Crowtado recusou o cadastro.",
+                                        code="invalid_response")
             if destino is None:
-                raise CrowtadoError(
-                    f"sign-up não avançou (url={page.url.split('?')[0]}) — "
-                    f"captcha/Turnstile pode ter reprovado o navegador")
+                raise CrowtadoError("O cadastro não avançou; confira os dados e tente novamente.",
+                                    code="signup_not_advanced")
 
             if destino == "verify":
+                phase = "email_verification"
                 code = wait_for_code(email, sender="crowtado.com",
                                      min_uid=uid_base, timeout=timeout_email)
                 if page.query_selector('input[id^="digit-"]'):
@@ -1164,18 +1294,27 @@ def criar_conta(email: str, senha: str, ref: str = DEFAULT_REF,
                     page.locator('input[data-input-otp]').press_sequentially(code, delay=80)
 
             # sucesso = saiu do fluxo de sign-up (cai no dashboard)
+            phase = "signup_confirmation"
             for _ in range(20):
                 page.wait_for_timeout(1500)
+                if signup_response_error is not None:
+                    raise signup_response_error
                 if "/sign-up" not in page.url:
                     break
             else:
-                raise CrowtadoError("código aceito mas a conta não saiu do sign-up "
-                                    f"(url={page.url.split('?')[0]})")
+                raise CrowtadoError("A verificação terminou, mas o cadastro não foi confirmado.",
+                                    code="signup_unconfirmed")
             browser.close()
-    except CrowtadoError:
+    except CrowtadoError as exc:
+        if exc.phase is None:
+            exc.phase = phase
+        if exc.remote_effect_possible is None:
+            exc.remote_effect_possible = remote_effect_possible
         raise
     except Exception as exc:  # noqa: BLE001 — Playwright quebra de N jeitos
-        raise CrowtadoError(f"criação de conta falhou: {type(exc).__name__}: {exc}") from exc
+        raise CrowtadoError("Não foi possível concluir o cadastro do Crowtado.",
+                            code="signup_error", phase=phase,
+                            remote_effect_possible=remote_effect_possible) from None
     finally:
         # terminate() só solicita o encerramento. Aguarde a liberação do
         # perfil antes de permitir o cadastro seguinte usar o mesmo diretório.

@@ -35,7 +35,7 @@ def setup(tmp_path, monkeypatch):
         monkeypatch.setattr(server.crowtado, name, method)
     token = {"email": EMAIL, "idToken": "fixture-token", "refreshToken": "fixture-refresh", "expires_at": time.time() + 3600}
     register = Mock(side_effect=lambda email, password, code: token_store.save(secrets, email, {**token, "email": email}))
-    monkeypatch.setattr(minute_api, "register", register)
+    monkeypatch.setattr(minute_api, "register_identity", register)
     monkeypatch.setattr(minute_api, "login", Mock())
     session = Mock(data=token)
     session.ensure_auth.return_value = {"organizations": [{"resourceKey": config.ORG_KEY, "disabled": False}]}
@@ -115,7 +115,9 @@ def test_initial_progress_write_failure_does_not_start_remote_work_or_lock_futur
 def test_incomplete_account_visible_password_recoverable_resume_skips_confirmed_creation(setup):
     app, body, remote, minute_register, root = setup
     client = app.test_client()
-    minute_register.side_effect = RuntimeError("HTTP 503")
+    rejected = minute_api.AuthError("HTTP 503", code="service")
+    rejected.remote_effect_possible = False
+    minute_register.side_effect = rejected
     assert client.post("/api/accounts/register?async=1", json=body).status_code == 200
     failed = await_terminal(client)
     assert failed["results"][0]["partial"] is True
@@ -213,7 +215,7 @@ def test_bad_journal_preserved_and_blocks_creation(setup):
     remote["criar_conta"].assert_not_called()
 
 
-@pytest.mark.parametrize("code", ["user_banned", "user_locked", "user_account_disabled", "user_disabled"])
+@pytest.mark.parametrize("code", ["user_banned", "user_account_disabled", "user_disabled"])
 def test_explicit_clerk_restriction_is_archived_and_prevents_minute_creation_on_resume(setup, code):
     app, body, remote, minute_register, *_ = setup
     error = server.crowtado._remote_error("Login Crowtado", 403, {"errors": [{"code": code, "long_message": "sensitive-remote-detail"}]})
@@ -265,7 +267,9 @@ def test_resume_own_signup_retries_minute_without_repeating_crowtado_or_site_ste
     app, body, remote, minute_register, root = setup
     client = app.test_client()
     save_token = minute_register.side_effect
-    minute_register.side_effect = RuntimeError("temporary failure")
+    rejected = minute_api.AuthError("temporary failure", code="service")
+    rejected.remote_effect_possible = False
+    minute_register.side_effect = rejected
     client.post("/api/accounts/register?async=1", json=body)
     assert await_terminal(client)["failed"] == 1
     minute_register.side_effect = save_token

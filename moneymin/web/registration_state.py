@@ -9,14 +9,20 @@ from ..atomic_io import JsonStateError, load_json_state, save_json
 
 _LOCK = threading.RLock()
 STEPS = {"proxy", "ban_check", "save_partial", "crowtado_signup", "demographics",
-         "minute_register", "link_minute", "validate"}
+         "minute_identity", "minute_register", "link_minute", "validate"}
+PROVIDER_ERROR_CODES = {"user_banned", "user_locked", "user_account_disabled", "user_disabled",
+                        "form_identifier_not_found", "form_password_incorrect", "form_identifier_exists"}
 
 
 def validate_steps(steps) -> dict:
     if (type(steps) is not dict or any(
-            key not in STEPS or type(step) is not dict or set(step) - {"status", "detail", "code"}
+            key not in STEPS or type(step) is not dict or set(step) - {"status", "detail", "code", "remote_effect_possible", "retry_after_seconds", "retry_at", "http_status", "phase", "provider_error_code"}
             or not isinstance(step.get("status"), str) or step["status"] not in {"ok", "skip", "fail", "manual"}
             or ("code" in step and not isinstance(step["code"], str))
+            or ("remote_effect_possible" in step and type(step["remote_effect_possible"]) is not bool)
+            or any(k in step and (type(step[k]) is not int or step[k] < 0) for k in ("retry_after_seconds", "retry_at", "http_status"))
+            or ("phase" in step and step["phase"] not in {"browser_setup", "signup_submission", "email_verification", "signup_confirmation"})
+            or ("provider_error_code" in step and step["provider_error_code"] not in PROVIDER_ERROR_CODES)
             or not isinstance(step.get("detail", ""), str)
             for key, step in steps.items())):
         raise JsonStateError("O histórico de cadastros está inválido; preserve o arquivo antes de continuar.")
