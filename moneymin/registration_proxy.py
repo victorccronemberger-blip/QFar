@@ -18,12 +18,21 @@ from . import config, secure_store
 _LOCK = threading.RLock()
 _ENDPOINT = ContextVar("registration_proxy_endpoint", default=None)
 _SECRETS = ContextVar("registration_proxy_secrets", default=())
+_ACCOUNT_OWNER = ContextVar("registration_proxy_account_owner", default=None)
 MAX_BYTES = 256 * 1024
 MAX_PROXIES = 500
 
 
 def endpoint() -> str | None:
     return _ENDPOINT.get()
+
+
+class AccountRouteError(RuntimeError):
+    """Safe, phase-tagged proxy setup/cleanup failure."""
+
+    def __init__(self, phase: str):
+        self.phase = phase
+        super().__init__("Não foi possível usar a rota atribuída à conta.")
 
 
 def redact(value: str, password: str = "") -> str:
@@ -201,21 +210,95 @@ class TunnelBridge:
 
 @contextmanager
 def route(proxy):
+    owner_token = _ACCOUNT_OWNER.set(None)
     if proxy is None:
         token = _ENDPOINT.set(None)
+        primary_error = None
         try:
             yield None
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            _ENDPOINT.reset(token)
+            cleanup_error = None
+            for cleanup in (lambda: _ENDPOINT.reset(token),
+                            lambda: _ACCOUNT_OWNER.reset(owner_token)):
+                try:
+                    cleanup()
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+            if cleanup_error is not None and primary_error is None:
+                raise cleanup_error
         return
-    bridge = TunnelBridge(proxy)
+    try:
+        bridge = TunnelBridge(proxy)
+    except BaseException:
+        _ACCOUNT_OWNER.reset(owner_token)
+        raise
     token = _ENDPOINT.set(bridge.address)
     secrets = _SECRETS.set((proxy["username"], proxy["password"]))
+    primary_error = None
     try:
         yield bridge.address
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        _SECRETS.reset(secrets)
-        _ENDPOINT.reset(token); bridge.close()
+        cleanup_error = None
+        for cleanup in (lambda: _SECRETS.reset(secrets),
+                        lambda: _ENDPOINT.reset(token),
+                        bridge.close,
+                        lambda: _ACCOUNT_OWNER.reset(owner_token)):
+            try:
+                cleanup()
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None and primary_error is None:
+            raise cleanup_error
+
+
+@contextmanager
+def account_route(email: str):
+    """Route an operation through the email's assigned proxy, reentrantly.
+
+    Reuse is limited to the same normalized account in this context. Raw
+    ``route`` scopes deliberately clear this owner marker so they cannot
+    inherit an unrelated identity's route.
+    """
+    if not isinstance(email, str) or not email.strip():
+        raise ValueError("Identidade da rota inválida.")
+    owner = email.strip().casefold()
+    if _ACCOUNT_OWNER.get() == owner:
+        yield endpoint()
+        return
+    try:
+        proxy = assign(email, "")
+    except Exception:
+        raise AccountRouteError("setup") from None
+    manager = route(proxy)
+    try:
+        address = manager.__enter__()
+    except Exception:
+        raise AccountRouteError("setup") from None
+    token = _ACCOUNT_OWNER.set(owner)
+    primary_error = None
+    try:
+        yield address
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error = None
+        try:
+            _ACCOUNT_OWNER.reset(token)
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            manager.__exit__(None, None, None)
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+        if cleanup_error is not None and primary_error is None:
+            raise AccountRouteError("cleanup") from None
 
 
 def check_exit_ip() -> str:

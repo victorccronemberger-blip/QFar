@@ -2,6 +2,7 @@
 import threading
 import time
 import unittest
+import uuid
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
@@ -14,6 +15,7 @@ class AsyncPreflightTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.entered, self.release, self.finished = (threading.Event() for _ in range(3))
+        self.real_resolve = server._resolve_org
         self.runner = self.stack.enter_context(patch.object(server, "RUNNER", Mock(running=False)))
         self.stack.enter_context(patch.object(server, "HOLO_CACHE_RUNNER", Mock(running=False)))
         self.stack.enter_context(patch.object(server, "_list_accounts", return_value=[{"email": "fixture@example.invalid"}]))
@@ -23,7 +25,8 @@ class AsyncPreflightTests(unittest.TestCase):
             {"id": "task", "name": "Task", "scenario": "task", "clip_count": 1, "available_for_duration": True}]))
         self.stack.enter_context(patch.object(server.readiness, "campaign_readiness", return_value={"ready": True, "checks": []}))
         self.stack.enter_context(patch.object(server, "_storage_snapshot", return_value={"free_bytes": 20 * 1024**3}))
-        self.resolve = self.stack.enter_context(patch.object(server, "_resolve_org", side_effect=self.slow_access))
+        self._resolve_patch = patch.object(server, "_resolve_org", side_effect=self.slow_access)
+        self.resolve = self.stack.enter_context(self._resolve_patch)
         self.client = server.create_app(for_testing=True).test_client()
         self.body = {"accounts": ["fixture@example.invalid"], "tasks": [{"task_id": "task"}], "dataset": "ego4d"}
         self.url = "/api/campaigns/preflight?async=1&request_id=" + "a" * 32
@@ -80,6 +83,46 @@ class AsyncPreflightTests(unittest.TestCase):
         self.assertIsNone(response.json["preflight_id"])
         self.assertEqual(response.json["account_issues"][0]["code"], "authentication")
         self.assertNotIn("private-token", response.get_data(as_text=True))
+        self.runner.start.assert_not_called()
+
+    def test_preflight_org_validation_uses_assigned_identity_route(self):
+        from moneymin import registration_proxy
+
+        self.url = "/api/campaigns/preflight?async=1&request_id=" + uuid.uuid4().hex
+        assigned = {"id": "assigned", "host": "proxy.invalid", "port": 1234,
+                    "username": "fixture-user", "password": "fixture-secret"}
+        observed = []
+
+        class FakeBridge:
+            def __init__(self, proxy):
+                self.proxy = proxy
+                self.address = "http://127.0.0.1:preflight"
+
+            def close(self):
+                pass
+
+        session = Mock(email="fixture@example.invalid")
+        def ensure_auth():
+            observed.append(registration_proxy.endpoint())
+            return {"organizations": [{"resourceKey": server.config.ORG_KEY}]}
+        session.ensure_auth.side_effect = ensure_auth
+        with patch.object(server, "_resolve_org", self.real_resolve), \
+             patch.object(server.Session, "from_email", return_value=session), \
+             patch.object(registration_proxy, "assign", return_value=assigned) as assign, \
+             patch.object(registration_proxy, "TunnelBridge", FakeBridge), \
+             patch.object(server.org_policy, "ensure_membership", return_value=server.config.ORG_KEY), \
+             patch.object(server, "_cache_org_key"):
+            response = self.finish()
+
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertTrue(response.json["ok"], response.json)
+        # Org validation and catalog loading are separate worker phases, each
+        # gets the same account's assigned route. Nested work within a phase
+        # reuses that phase's route rather than assigning again.
+        self.assertEqual(assign.call_count, 2)
+        self.assertEqual([item.args for item in assign.call_args_list], [
+            ("fixture@example.invalid", ""), ("fixture@example.invalid", "")])
+        self.assertEqual(observed, ["http://127.0.0.1:preflight"])
         self.runner.start.assert_not_called()
 
     def test_clip_review_uses_catalog_without_reading_sensor_sources(self):

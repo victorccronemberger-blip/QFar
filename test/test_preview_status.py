@@ -84,6 +84,37 @@ class PreviewStatusTests(unittest.TestCase):
         })
         self.assertEqual(payload["sessions"]["errors"], 1)
 
+    def test_route_cleanup_error_after_session_get_does_not_duplicate_processed_ids(self) -> None:
+        from contextlib import contextmanager
+        from moneymin import registration_proxy
+
+        with tempfile.TemporaryDirectory(prefix="qmoney-preview-route-cleanup-") as tmp:
+            path = self._log(Path(tmp) / "campaign.json", [
+                {"email": "user@example.com", "org_key": "org", "session_id": "one"},
+                {"email": "user@example.com", "org_key": "org", "session_id": "two"},
+            ])
+
+            @contextmanager
+            def route_then_fail_cleanup(_email):
+                yield "http://127.0.0.1:assigned"
+                raise RuntimeError("private-cleanup-detail")
+
+            def session_result(_email, _org, sid, *, session):
+                return {"session_id": sid, "status": "processing", "total_files": 1}
+
+            with mock.patch.object(server, "_log_path", return_value=path), \
+                 mock.patch.object(server.Session, "from_email", return_value=object()), \
+                 mock.patch.object(server.campaign, "session_result", side_effect=session_result), \
+                 mock.patch.object(registration_proxy, "account_route", route_then_fail_cleanup):
+                response = self.client.post("/api/logs/campaign.json/status")
+
+        payload = response.get_json()
+        rows = payload["results"]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row["session_id"] for row in rows], ["one", "two"])
+        self.assertEqual(payload["sessions"]["total"], 2)
+        self.assertNotIn("private-cleanup-detail", response.get_data(as_text=True))
+
     def test_terminal_preview_error_is_not_marked_retryable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmoney-preview-terminal-") as tmp:
             path = self._log(Path(tmp) / "campaign.json", [{

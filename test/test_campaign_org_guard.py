@@ -10,6 +10,7 @@ from moneymin.web import server
 class CampaignOrgGuardTests(unittest.TestCase):
     def test_cached_new_org_does_not_bypass_live_membership(self):
         sess = mock.Mock()
+        sess.email = "crow@example.com"
         sess.ensure_auth.return_value = {
             "organizations": [{"resourceKey": config.HUB_ORG_KEY}],
         }
@@ -21,6 +22,129 @@ class CampaignOrgGuardTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 server._resolve_org("crow@example.com", session=sess)
         save.assert_not_called()
+
+    def test_resolve_org_uses_assigned_route_and_restores_nested_identity_route(self):
+        from moneymin import registration_proxy
+
+        assigned = {"id": "assigned", "host": "assigned.invalid", "port": 1001,
+                    "username": "user-a", "password": "secret-a"}
+        outer = {"id": "outer", "host": "outer.invalid", "port": 1002,
+                 "username": "user-b", "password": "secret-b"}
+        bridges = []
+
+        class FakeBridge:
+            def __init__(self, proxy):
+                self.proxy = proxy
+                self.address = f"http://127.0.0.1:{len(bridges) + 1}"
+                bridges.append(self)
+
+            def close(self):
+                pass
+
+        session = mock.Mock(email="crow@example.com")
+        session.ensure_auth.return_value = {"organizations": []}
+
+        def from_email(email):
+            self.assertEqual(email, "crow@example.com")
+            self.assertEqual(registration_proxy.endpoint(), "http://127.0.0.1:2")
+            return session
+
+        def membership(_session, _email, _orgs):
+            self.assertEqual(registration_proxy.endpoint(), "http://127.0.0.1:2")
+            return config.ORG_KEY
+
+        with mock.patch.object(registration_proxy, "TunnelBridge", FakeBridge), \
+             mock.patch.object(registration_proxy, "assign", return_value=assigned) as assign, \
+             mock.patch.object(server, "Session") as sessions, \
+             mock.patch.object(server.org_policy, "ensure_membership", side_effect=membership), \
+             mock.patch.object(server, "_cache_org_key"):
+            sessions.from_email.side_effect = from_email
+            with registration_proxy.route(outer):
+                outer_endpoint = registration_proxy.endpoint()
+                self.assertEqual(outer_endpoint, "http://127.0.0.1:1")
+                self.assertEqual(server._resolve_org("crow@example.com"), config.ORG_KEY)
+                self.assertEqual(registration_proxy.endpoint(), outer_endpoint)
+            self.assertIsNone(registration_proxy.endpoint())
+
+        assign.assert_called_once_with("crow@example.com", "")
+        self.assertIs(bridges[0].proxy, outer)
+        self.assertIs(bridges[1].proxy, assigned)
+        sessions.from_email.assert_called_once_with("crow@example.com")
+        session.ensure_auth.assert_called_once_with()
+
+    def test_resolve_org_route_failure_does_not_use_direct_connection(self):
+        from moneymin import registration_proxy
+
+        session = mock.Mock(email="crow@example.com")
+        with mock.patch.object(registration_proxy, "assign", return_value={"id": "assigned"}), \
+             mock.patch.object(registration_proxy, "TunnelBridge", side_effect=OSError("private-proxy-secret")):
+            with self.assertRaises(AuthError) as raised:
+                server._resolve_org("crow@example.com", session=session)
+        self.assertEqual(raised.exception.account_issue_code, "network")
+        self.assertNotIn("private-proxy-secret", str(raised.exception))
+        session.ensure_auth.assert_not_called()
+        self.assertIsNone(registration_proxy.endpoint())
+
+    def test_resolve_org_reuses_same_identity_route_without_reassigning(self):
+        from moneymin import registration_proxy
+
+        assigned = {"id": "assigned", "host": "assigned.invalid", "port": 1001,
+                    "username": "user-a", "password": "secret-a"}
+        bridges = []
+
+        class FakeBridge:
+            def __init__(self, proxy):
+                self.proxy = proxy
+                self.address = "http://127.0.0.1:identity"
+                bridges.append(self)
+
+            def close(self):
+                pass
+
+        session = mock.Mock(email="crow@example.com")
+        session.ensure_auth.return_value = {"organizations": []}
+        with mock.patch.object(registration_proxy, "TunnelBridge", FakeBridge), \
+             mock.patch.object(registration_proxy, "assign", return_value=assigned) as assign, \
+             mock.patch.object(server.org_policy, "ensure_membership", return_value=config.ORG_KEY), \
+             mock.patch.object(server, "_cache_org_key"):
+            with server._identity_route("crow@example.com"):
+                endpoint = registration_proxy.endpoint()
+                self.assertEqual(server._resolve_org("crow@example.com", session=session), config.ORG_KEY)
+                self.assertEqual(registration_proxy.endpoint(), endpoint)
+
+        assign.assert_called_once_with("crow@example.com", "")
+        self.assertEqual(len(bridges), 1)
+        self.assertIs(bridges[0].proxy, assigned)
+
+    def test_identity_route_preserves_auth_error_when_cleanup_fails(self):
+        from contextlib import contextmanager
+        from moneymin import registration_proxy
+
+        @contextmanager
+        def broken_cleanup(_email):
+            try:
+                yield "http://127.0.0.1:assigned"
+            finally:
+                raise RuntimeError("private-cleanup-detail")
+
+        with mock.patch.object(registration_proxy, "account_route", broken_cleanup):
+            with self.assertRaises(AuthError) as raised:
+                with server._identity_route("crow@example.com"):
+                    raise AuthError("Conta restrita.", code="restricted")
+
+        self.assertEqual(raised.exception.account_issue_code, "restricted")
+        self.assertNotIn("private-cleanup-detail", str(raised.exception))
+
+    def test_resolve_org_rejects_session_for_another_email_before_routing(self):
+        from moneymin import registration_proxy
+
+        session = mock.Mock(email="different@example.com")
+        with mock.patch.object(registration_proxy, "assign") as assign:
+            with self.assertRaises(AuthError) as raised:
+                server._resolve_org("crow@example.com", session=session)
+        self.assertEqual(raised.exception.account_issue_code, "identity")
+        assign.assert_not_called()
+        session.ensure_auth.assert_not_called()
 
     def test_campaign_does_not_start_when_one_account_fails_org_validation(self):
         runner = mock.Mock(running=False)

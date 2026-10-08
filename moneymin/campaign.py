@@ -86,6 +86,8 @@ from .task_catalog import (
 from .upload import UploadError, pump_pending, upload_session, list_sidecars, save_sidecar
 from .upload_types import journal_delivery_confirmed, is_pending_evaluation
 
+_SESSION_TYPE = Session
+
 __all__ = [
     "AccountSpec",
     "BOOSTED_TASKS",
@@ -128,6 +130,52 @@ _ACCOUNT_ENCODE_RESERVATION_LOCK = threading.Lock()
 # hardware desta estação comporta seis conexões sem disparar todas as contas
 # de uma vez. Todas as contas entram no lote; só N voam em cada onda.
 DEFAULT_MAX_ACCOUNT_WORKERS = 6
+
+
+class _AccountRouteError(AuthError):
+    """Safe account-route failure; never includes proxy host credentials."""
+
+    def __init__(self, phase: str):
+        self.route_phase = phase
+        super().__init__("Não foi possível usar a rota de conexão atribuída à conta.",
+                         code="network")
+
+
+@contextmanager
+def account_registration_route(email: str) -> Iterator[None]:
+    """Use an account's assigned proxy for one bounded remote operation."""
+    from . import registration_proxy
+
+    try:
+        route = registration_proxy.account_route(email)
+        route.__enter__()
+    except Exception as exc:
+        raise _AccountRouteError(getattr(exc, "phase", "setup")) from None
+    primary_error = None
+    try:
+        yield
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            route.__exit__(None, None, None)
+        except Exception as exc:
+            if primary_error is None:
+                raise _AccountRouteError(getattr(exc, "phase", "cleanup")) from None
+
+
+def _bind_session_email(session: Any, email: str) -> None:
+    """Reject a real cached Session owned by another normalized identity."""
+    if isinstance(session, _SESSION_TYPE):
+        session.with_email(email)
+
+
+def _pump_account_pending(session: Any, account_email: str, required_org_key: str,
+                          **kwargs: Any) -> list[dict[str, Any]]:
+    with account_registration_route(account_email):
+        return pump_pending(session, account_email=account_email,
+                            required_org_key=required_org_key, **kwargs)
 
 
 def max_account_workers() -> int:
@@ -2529,24 +2577,27 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
         if sess is None and session_cache is not None:
             sess = session_cache.get(account.email)
         if sess is None:
-            sess = Session.from_email(account.email)
-            # _live only means the Firebase token was refreshed. It does not
-            # prove that Minute permits this account/organization to upload.
-            sess.ensure_auth(org_key=account.org_key)
+            with account_registration_route(account.email):
+                sess = Session.from_email(account.email)
+                _bind_session_email(sess, account.email)
+                # _live only means the Firebase token was refreshed. It does not
+                # prove that Minute permits this account/organization to upload.
+                sess.ensure_auth(org_key=account.org_key)
             if session_cache is not None:
                 session_cache[account.email] = sess
-        elif not getattr(sess, "_live", False):
-            # Gate de org (quality-screen/userState + disabled) + version gate.
-            sess.ensure_auth(org_key=account.org_key)
         else:
-            sess.warmup()
+            _bind_session_email(sess, account.email)
+            with account_registration_route(account.email):
+                if not getattr(sess, "_live", False):
+                    # Gate de org (quality-screen/userState + disabled) + version gate.
+                    sess.ensure_auth(org_key=account.org_key)
+                else:
+                    sess.warmup()
         result["org_key"] = account.org_key
         profile = device_profile.get_profile(account.email)
         if recover_pending and not getattr(sess, "_moneymin_pending_pumped", False):
-            recovered = pump_pending(
-                sess, account_email=account.email, required_org_key=account.org_key,
-                on_progress=on_progress,
-            )
+            recovered = _pump_account_pending(
+                sess, account.email, account.org_key, on_progress=on_progress)
             sess._moneymin_pending_pumped = True
             if recovered:
                 result["recovered_uploads"] = len(recovered)
@@ -2733,31 +2784,47 @@ def upload_to_account(item: dict[str, Any], account: AccountSpec,
                     item, session_id, task_id, account.org_key, lineage_chunks)
             except ValueError as exc:
                 raise UploadError(str(exc), transient=False, phase="prepare") from exc
-        res = upload_session(
-            sess, chunk_paths if len(chunk_paths) > 1 else chunk_paths[0],
-            account.org_key,
-            task_id=task_id, session_id=session_id,
-            recorded_at=chunk_recorded if len(chunk_recorded) > 1 else recorded_at,
-            sidecar=True,
-            sidecar_data=chunk_zips if len(chunk_zips) > 1 else chunk_zips[0],
-            normalize=False, register_first=True,
-            persist_sidecar=True,
-            evaluate=evaluate, finalize=finalize,
-            timeout_blob=timeout_blob,
-            profile=profile,
-            suppress_per_chunk_catbear=True,
-            on_progress=on_progress,
-            campaign_context={"registry_key": item["registry_key"], "clip_uid": item["clip_uid"],
-                              "task_id": task_id,
-                              **({"history_name": item['_history_name']}
-                                 if item.get('_history_name') else {}),
-                              **({"content_provenance": result["source_provenance"]}
-                                 if item.get("source") in {"ego4d", "nymeria"} else {})}
-                              if item.get("registry_key") and item.get("clip_uid") else None,
-            **({"expected_video_sha256": [row["video"]["sha256"]
-                                           for row in result["source_provenance"]["chunks"]]}
-               if item.get("source") in {"ego4d", "nymeria"} else {}),
-        )
+        try:
+            res = None
+            with account_registration_route(account.email):
+                res = upload_session(
+                    sess, chunk_paths if len(chunk_paths) > 1 else chunk_paths[0],
+                    account.org_key,
+                    task_id=task_id, session_id=session_id,
+                    recorded_at=chunk_recorded if len(chunk_recorded) > 1 else recorded_at,
+                    sidecar=True,
+                    sidecar_data=chunk_zips if len(chunk_zips) > 1 else chunk_zips[0],
+                    normalize=False, register_first=True,
+                    persist_sidecar=True,
+                    evaluate=evaluate, finalize=finalize,
+                    timeout_blob=timeout_blob,
+                    profile=profile,
+                    suppress_per_chunk_catbear=True,
+                    on_progress=on_progress,
+                    campaign_context={"registry_key": item["registry_key"], "clip_uid": item["clip_uid"],
+                                      "task_id": task_id,
+                                      **({"history_name": item['_history_name']}
+                                         if item.get('_history_name') else {}),
+                                      **({"content_provenance": result["source_provenance"]}
+                                         if item.get("source") in {"ego4d", "nymeria"} else {})}
+                                      if item.get("registry_key") and item.get("clip_uid") else None,
+                    **({"expected_video_sha256": [row["video"]["sha256"]
+                                                   for row in result["source_provenance"]["chunks"]]}
+                       if item.get("source") in {"ego4d", "nymeria"} else {}),
+                )
+        except _AccountRouteError as exc:
+            if exc.route_phase == "setup":
+                # Nothing entered the Minute upload operation. Permit the
+                # existing bounded retry to use a fresh session identity.
+                result.pop("session_id", None)
+                raise
+            if res is None:
+                raise
+            # The remote call already returned its receipt. A teardown error
+            # cannot undo a finalized delivery or justify creating a new SID.
+            result["warning"] = (
+                "A operação remota retornou; não foi possível encerrar a rota atribuída."
+            )
         result["session_id"] = res.session_id
         result["finalized"] = res.finalized
         result["finalize_status"] = res.finalize_status
@@ -3737,8 +3804,8 @@ def _run_campaign(
                                     _emit("account_progress", clip_uid=clip_info["clip_uid"],
                                           task=tsk.scenario, email=account.email,
                                           phase=phase, state=state, attempt=attempt, **details)
-                                pump_pending(sessions[account.email],
-                                    account_email=account.email, required_org_key=account.org_key,
+                                _pump_account_pending(
+                                    sessions[account.email], account.email, account.org_key,
                                     session_ids={sid}, on_progress=recovery_progress)
                                 rows = [row for row in list_sidecars()
                                         if row.get("session_id") == sid]
@@ -4146,9 +4213,12 @@ def session_result(
     session: Session | None = None,
 ) -> dict[str, Any]:
     """Consulta o estado de uma sessão (preview + quality scores) numa conta."""
-    sess = session or Session.from_email(email)
-    http_status, body = sess.get(
-        f"/api/v1/organizations/{org_key}/sessions/{session_id}")
+    _bind_session_email(session, email)
+    with account_registration_route(email):
+        sess = session or Session.from_email(email)
+        _bind_session_email(sess, email)
+        http_status, body = sess.get(
+            f"/api/v1/organizations/{org_key}/sessions/{session_id}")
     import json as _json
     if http_status != 200:
         raise RuntimeError(
@@ -5050,12 +5120,15 @@ def available_tasks(email: str, org_key: str, *, min_dur_s: float = 60,
     """
     if remote_tasks is None:
         sess = session
-        if sess is None:
-            sess = Session.from_email(email)
-            sess.ensure_auth(org_key=org_key)
-        elif not getattr(sess, "_live", False):
-            sess.ensure_auth(org_key=org_key)
-        tasks = sess.all_tasks(org_key)
+        _bind_session_email(sess, email)
+        with account_registration_route(email):
+            if sess is None:
+                sess = Session.from_email(email)
+                _bind_session_email(sess, email)
+                sess.ensure_auth(org_key=org_key)
+            elif not getattr(sess, "_live", False):
+                sess.ensure_auth(org_key=org_key)
+            tasks = sess.all_tasks(org_key)
     else:
         tasks = remote_tasks
     tasks = validate_task_catalog(tasks)

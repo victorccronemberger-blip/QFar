@@ -63,6 +63,133 @@ def test_rotation_is_per_account_and_resume_keeps_its_proxy(pool):
     assert proxies.assign("direct@example.invalid", "") is None
 
 
+def test_account_route_reuses_only_same_identity_and_restores_nested_routes(pool, monkeypatch):
+    proxies.import_text(TXT)
+    a = proxies.assign("a@example.invalid", "auto")
+    b = proxies.assign("b@example.invalid", "auto")
+    bridges = []
+
+    class FakeBridge:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            self.address = f"http://127.0.0.1:{len(bridges) + 1}"
+            self.closed = False
+            bridges.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(proxies, "TunnelBridge", FakeBridge)
+    with proxies.account_route("A@example.invalid"):
+        outer = proxies.endpoint()
+        assert proxies._ACCOUNT_OWNER.get() == "a@example.invalid"
+        with proxies.account_route(" a@EXAMPLE.invalid "):
+            assert proxies.endpoint() == outer
+            assert len(bridges) == 1
+        with proxies.account_route("b@example.invalid"):
+            assert proxies.endpoint() != outer
+            assert bridges[-1].proxy["id"] == b["id"]
+            assert proxies._ACCOUNT_OWNER.get() == "b@example.invalid"
+        assert proxies.endpoint() == outer
+        assert proxies._ACCOUNT_OWNER.get() == "a@example.invalid"
+
+        # A raw route clears the owner marker so a nested account cannot
+        # silently inherit the outer account's proxy.
+        with proxies.route(b):
+            assert proxies._ACCOUNT_OWNER.get() is None
+            raw_endpoint = proxies.endpoint()
+            with proxies.account_route("b@example.invalid"):
+                assert proxies.endpoint() != raw_endpoint
+                assert bridges[-1].proxy["id"] == b["id"]
+            assert proxies.endpoint() == raw_endpoint
+            assert proxies._ACCOUNT_OWNER.get() is None
+        with proxies.route(None):
+            assert proxies.endpoint() is None
+            assert proxies._ACCOUNT_OWNER.get() is None
+            with proxies.account_route("a@example.invalid"):
+                assert proxies.endpoint() != outer
+                assert proxies._ACCOUNT_OWNER.get() == "a@example.invalid"
+            assert proxies.endpoint() is None
+            assert proxies._ACCOUNT_OWNER.get() is None
+        assert proxies.endpoint() == outer
+    assert proxies.endpoint() is None
+    assert proxies._ACCOUNT_OWNER.get() is None
+    assert all(bridge.closed for bridge in bridges)
+    assert a["id"] != b["id"]
+
+
+def test_account_route_owner_does_not_cross_threads(pool, monkeypatch):
+    proxies.import_text(TXT)
+    proxies.assign("a@example.invalid", "auto")
+    bridges = []
+
+    class FakeBridge:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            self.address = f"http://127.0.0.1:{len(bridges) + 1}"
+            bridges.append(self)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(proxies, "TunnelBridge", FakeBridge)
+    observed = []
+    with proxies.account_route("a@example.invalid"):
+        outer = proxies.endpoint()
+
+        def routed_thread():
+            assert proxies._ACCOUNT_OWNER.get() is None
+            with proxies.account_route("a@example.invalid"):
+                observed.append((proxies._ACCOUNT_OWNER.get(), proxies.endpoint()))
+
+        thread = threading.Thread(target=routed_thread)
+        thread.start()
+        thread.join(3)
+        assert not thread.is_alive()
+        assert proxies.endpoint() == outer
+    assert observed == [("a@example.invalid", bridges[1].address)]
+    assert len(bridges) == 2
+
+
+def test_account_route_setup_and_cleanup_failures_are_safe_and_restore_context(pool, monkeypatch):
+    proxies.import_text(TXT)
+    proxies.assign("a@example.invalid", "auto")
+
+    def broken_assign(*_args):
+        raise ValueError("private-proxy-secret")
+
+    monkeypatch.setattr(proxies, "assign", broken_assign)
+    with pytest.raises(proxies.AccountRouteError) as assignment:
+        with proxies.account_route("a@example.invalid"):
+            raise AssertionError("assignment must fail before entering route")
+    assert assignment.value.phase == "setup"
+    assert "private-proxy-secret" not in str(assignment.value)
+    assert proxies.endpoint() is None
+    assert proxies._ACCOUNT_OWNER.get() is None
+
+    proxy = {"id": "fixture", "host": "proxy.invalid", "port": 1080,
+             "username": "fixture-user", "password": "fixture-secret"}
+
+    class ClosingFailure:
+        address = "http://127.0.0.1:9999"
+
+        def __init__(self, _proxy):
+            pass
+
+        def close(self):
+            raise OSError("private-proxy-secret")
+
+    monkeypatch.setattr(proxies, "assign", lambda *_args: proxy)
+    monkeypatch.setattr(proxies, "TunnelBridge", ClosingFailure)
+    with pytest.raises(proxies.AccountRouteError) as cleanup:
+        with proxies.account_route("a@example.invalid"):
+            assert proxies.endpoint() == ClosingFailure.address
+    assert cleanup.value.phase == "cleanup"
+    assert "private-proxy-secret" not in str(cleanup.value)
+    assert proxies.endpoint() is None
+    assert proxies._ACCOUNT_OWNER.get() is None
+
+
 def test_unavailable_selection_and_corrupt_pool_fail_closed(pool):
     with pytest.raises(ValueError):
         proxies.validate_selection("auto")
@@ -147,10 +274,13 @@ def test_curl_uses_scoped_proxy_and_overrides_no_proxy(monkeypatch):
 
 def test_routing_is_isolated_from_other_threads():
     token = proxies._ENDPOINT.set("http://127.0.0.1:8080")
+    owner_token = proxies._ACCOUNT_OWNER.set("outer@example.invalid")
     observed = []
-    thread = threading.Thread(target=lambda: observed.append(proxies.endpoint()))
+    thread = threading.Thread(target=lambda: observed.append(
+        (proxies.endpoint(), proxies._ACCOUNT_OWNER.get())))
     try:
         thread.start(); thread.join(3)
-        assert observed == [None] and proxies.endpoint().endswith(":8080")
+        assert observed == [(None, None)] and proxies.endpoint().endswith(":8080")
     finally:
         proxies._ENDPOINT.reset(token)
+        proxies._ACCOUNT_OWNER.reset(owner_token)

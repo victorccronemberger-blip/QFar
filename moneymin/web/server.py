@@ -76,6 +76,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -1767,17 +1768,54 @@ def _list_accounts() -> list[dict[str, Any]]:
     return out
 
 
+@contextmanager
+def _identity_route(email: str):
+    """Use an account-owned route and sanitize failures before they reach UI."""
+    from .. import registration_proxy
+    manager = registration_proxy.account_route(email)
+    try:
+        manager.__enter__()
+    except (OSError, RuntimeError, ValueError):
+        raise AuthError("Não foi possível abrir a conexão atribuída a esta conta.",
+                        code="network") from None
+    try:
+        yield
+    except BaseException:
+        # Preserve the operation's diagnostic (for example `restricted`) if
+        # tunnel cleanup also fails while unwinding this identity route.
+        try:
+            manager.__exit__(*sys.exc_info())
+        except BaseException:
+            pass
+        raise
+    else:
+        try:
+            manager.__exit__(None, None, None)
+        except (OSError, RuntimeError, ValueError):
+            raise AuthError("Não foi possível encerrar a conexão atribuída a esta conta.",
+                            code="network") from None
+
+
 def _resolve_org(email: str, session: Session | None = None) -> str:
     """Resolve (e cacheia) a org_key pela política da conta, não pela 1ª org."""
     # Validar sempre, inclusive quando a organização já está no cache. O HUB
     # devolve /users/me = 200 para contas desativadas; ensure_auth inspeciona o
     # campo `disabled` e impede que a campanha comece com uma conta bloqueada.
-    sess = session or Session.from_email(email)
-    profile = sess.ensure_auth()
-    orgs = [org for org in (profile.get("organizations") or []) if isinstance(org, dict)]
-    org_key = org_policy.ensure_membership(sess, email, orgs)
-    _cache_org_key(email, org_key)
-    return org_key
+    requested_email = token_store.email_key(email)
+    if session is not None and token_store.email_key(getattr(session, "email", None)) != requested_email:
+        raise AuthError("A sessão Minute não corresponde à conta solicitada.", code="identity")
+    # Resolve membership with the proxy already assigned to this identity.
+    # Session.from_email refreshes immediately, so it must be inside the route.
+    # ContextVar tokens restore an outer route when this helper is nested.
+    with _identity_route(email):
+        sess = session or Session.from_email(email)
+        if token_store.email_key(getattr(sess, "email", None)) != requested_email:
+            raise AuthError("A sessão Minute não corresponde à conta solicitada.", code="identity")
+        profile = sess.ensure_auth()
+        orgs = [org for org in (profile.get("organizations") or []) if isinstance(org, dict)]
+        org_key = org_policy.ensure_membership(sess, email, orgs)
+        _cache_org_key(email, org_key)
+        return org_key
 
 
 def _check_minute_health(email: str) -> dict[str, Any]:
@@ -3374,9 +3412,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     with _ACCOUNT_OPERATION_LOCK:
                         if ORG_MIGRATION.running or _BULK_REGISTER_STATE.get("state") == "running":
                             return {"error": "Aguarde a operação de contas em andamento."}, 409
-                        sess = Session.from_email(email)
-                        org_key = _resolve_org(email, session=sess)
-                        remote_tasks = sess.all_tasks(org_key)
+                        with _identity_route(email):
+                            sess = Session.from_email(email)
+                            org_key = _resolve_org(email, session=sess)
+                            remote_tasks = sess.all_tasks(org_key)
                     # Local indexing does not hold account authentication or
                     # mutation locks. Polling requests never wait on this work.
                     progress("Preparando catálogo para a duração e o conteúdo selecionados…")
@@ -3398,13 +3437,14 @@ def create_app(*, for_testing: bool = False) -> Flask:
         try:
             # Uma Session só: _resolve_org + catálogo. Dois refresh seguidos
             # no Firebase invalidam o refreshToken e o GET vira 400.
-            sess = Session.from_email(email)
-            org_key = _resolve_org(email, session=sess)
-            tasks = campaign.available_tasks(
-                email, org_key, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                include_unavailable=True, dataset_provider=dataset_provider,
-                content_mode=content_mode,
-                session=sess)
+            with _identity_route(email):
+                sess = Session.from_email(email)
+                org_key = _resolve_org(email, session=sess)
+                tasks = campaign.available_tasks(
+                    email, org_key, min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                    include_unavailable=True, dataset_provider=dataset_provider,
+                    content_mode=content_mode,
+                    session=sess)
         except json.JSONDecodeError:
             return jsonify({
                 "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
@@ -3414,7 +3454,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
             app.logger.warning("GET /api/tasks: task_auth_failed")
             return jsonify({"error": "Não foi possível validar o acesso da conta. Reconecte a conta e tente novamente.",
                             "code": "task_auth_failed"}), 400
-        except (RuntimeError, OSError):
+        except (RuntimeError, OSError, ValueError):
             app.logger.warning("GET /api/tasks: task_catalog_unavailable")
             return jsonify({"error": "Não foi possível carregar as categorias. Confira o acesso da conta e a biblioteca local.",
                             "code": "task_catalog_unavailable"}), 400
@@ -4362,12 +4402,13 @@ def create_app(*, for_testing: bool = False) -> Flask:
         try:
             if email not in {token_store.email_key(row["email"]) for row in _list_accounts()}:
                 raise OriginalAdmissionError("original_account_unavailable")
-            session = Session.from_email(email)
-            if token_store.email_key(session.email) != email:
-                raise OriginalAdmissionError("original_account_unavailable")
-            org_key = _resolve_org(email, session=session)
-            session.ensure_auth(org_key=org_key)
-            return session, org_key
+            with _identity_route(email):
+                session = Session.from_email(email)
+                if token_store.email_key(session.email) != token_store.email_key(email):
+                    raise OriginalAdmissionError("original_account_unavailable")
+                org_key = _resolve_org(email, session=session)
+                session.ensure_auth(org_key=org_key)
+                return session, org_key
         except OriginalAdmissionError:
             raise
         except (AuthError, ValueError, OSError, RuntimeError):
@@ -4375,7 +4416,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
 
     def original_tasks(session, org_key):
         try:
-            source = session.all_tasks(org_key)
+            with _identity_route(session.email):
+                source = session.all_tasks(org_key)
             if not isinstance(source, list) or len(source) > 4096:
                 raise ValueError
             result, ids = [], set()
@@ -4405,10 +4447,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
         try:
             # Shared with direct delivery: exact original CREATE bodies and
             # real policy reads, without CREATE, PUT or journal effects.
-            validate_original_capture_session_policy(plan, session)
-            if not isinstance(session.recording_policy, RecordingPolicy):
-                raise ValueError
-            return session.recording_policy.limits()
+            with _identity_route(session.email):
+                validate_original_capture_session_policy(plan, session)
+                if not isinstance(session.recording_policy, RecordingPolicy):
+                    raise ValueError
+                return session.recording_policy.limits()
         except (AuthError, ValueError, OSError, RuntimeError):
             raise OriginalAdmissionError("original_policy_unavailable") from None
 
@@ -4696,7 +4739,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     index = futures[future]
                     try:
                         resolved[index] = AccountSpec(emails[index], future.result())
-                    except (AuthError, RuntimeError, OSError) as exc:
+                    except (AuthError, RuntimeError, OSError, ValueError) as exc:
                         account_issues.append(account_issue(emails[index], exc))
             accounts = [account for account in resolved if account is not None]
 
@@ -4709,17 +4752,18 @@ def create_app(*, for_testing: bool = False) -> Flask:
             catalog_owner = None
             for account in accounts:
                 try:
-                    catalog = campaign.available_tasks(
-                        account.email, account.org_key,
-                        min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                        include_unavailable=True, dataset_provider=provider,
-                        content_mode=content_mode)
+                    with _identity_route(account.email):
+                        catalog = campaign.available_tasks(
+                            account.email, account.org_key,
+                            min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                            include_unavailable=True, dataset_provider=provider,
+                            content_mode=content_mode)
                     if not isinstance(catalog, list) or any(not isinstance(item, dict) for item in catalog):
                         raise RuntimeError("resposta de categorias inválida")
                     catalog_loaded = True
                     catalog_owner = account.email
                     break
-                except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+                except (AuthError, RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
                     issue = account_issue(account.email, exc, stage="Carregamento das categorias")
                     account_issues.append(issue)
                     catalog = []
@@ -4745,9 +4789,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
             selected_ids = {str(item.get("id")) for item in selected}
             def _check_account_tasks(account: AccountSpec) -> tuple[str, set[str] | Exception]:
                 try:
-                    sess = Session.from_email(account.email)
-                    sess.ensure_auth()
-                    account_tasks = sess.all_tasks(account.org_key)
+                    with _identity_route(account.email):
+                        sess = Session.from_email(account.email)
+                        sess.ensure_auth()
+                        account_tasks = sess.all_tasks(account.org_key)
                     if not isinstance(account_tasks, list) or any(
                             not isinstance(item, dict) for item in account_tasks):
                         raise RuntimeError("resposta de categorias inválida")
@@ -4755,7 +4800,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                         str(item.get("id")) for item in account_tasks
                         if item.get("id")
                     }
-                except (AuthError, RuntimeError, OSError) as exc:
+                except (AuthError, RuntimeError, OSError, ValueError) as exc:
                     return account.email, exc
                 return account.email, selected_ids - account_ids
 
@@ -5118,18 +5163,19 @@ def create_app(*, for_testing: bool = False) -> Flask:
             # e selecionar vídeos de outra categoria. O catálogo atual da conta é a
             # fonte de verdade.
             try:
-                available = campaign.available_tasks(
-                    accounts[0].email, accounts[0].org_key,
-                    min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                    include_unavailable=True, dataset_provider=dataset_provider,
-                    content_mode=content_mode)
+                with _identity_route(accounts[0].email):
+                    available = campaign.available_tasks(
+                        accounts[0].email, accounts[0].org_key,
+                        min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                        include_unavailable=True, dataset_provider=dataset_provider,
+                        content_mode=content_mode)
                 if not isinstance(available, list) or any(not isinstance(item, dict) for item in available):
                     raise RuntimeError("resposta de categorias inválida")
             except json.JSONDecodeError:
                 return jsonify({
                     "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
                 }), 400
-            except (AuthError, RuntimeError, OSError) as exc:
+            except (AuthError, RuntimeError, OSError, ValueError) as exc:
                 msg = str(exc)
                 if "Expecting value" in msg:
                     msg = "a API devolveu resposta vazia (não-JSON). Tente de novo."
@@ -5178,9 +5224,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
 
         def _preflight(account: AccountSpec) -> tuple[str, set[str] | str]:
             try:
-                sess = Session.from_email(account.email)
-                sess.ensure_auth()
-                account_tasks = sess.all_tasks(account.org_key)
+                with _identity_route(account.email):
+                    sess = Session.from_email(account.email)
+                    sess.ensure_auth()
+                    account_tasks = sess.all_tasks(account.org_key)
                 if not isinstance(account_tasks, list) or any(
                         not isinstance(task, dict) for task in account_tasks):
                     raise RuntimeError("resposta de categorias inválida")
@@ -5188,7 +5235,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     str(task.get("id")) for task in account_tasks
                     if task.get("id")
                 }
-            except (AuthError, RuntimeError, OSError) as exc:
+            except (AuthError, RuntimeError, OSError, ValueError) as exc:
                 return account.email, f"preflight falhou para {account.email}: {exc}"
             missing_tasks = selected_ids - account_task_ids
             return account.email, missing_tasks
@@ -5550,27 +5597,31 @@ def create_app(*, for_testing: bool = False) -> Flask:
                           for _, sid, expected in invalid)
             if not valid:
                 return output
+            processed: set[tuple[str, str]] = set()
             try:
-                sess = Session.from_email(email)
-            except (AuthError, RuntimeError, OSError) as exc:
+                with _identity_route(email):
+                    sess = Session.from_email(email)
+                    for org, sid, expected in valid:
+                        try:
+                            result = campaign.session_result(
+                                email, org, sid, session=sess)
+                            result["expected_files"] = expected
+                            output.append(result)
+                            processed.add((org, sid))
+                        except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+                            issue = account_issue(email, exc, stage="Consulta de sessões Minute")
+                            output.append({"session_id": sid, "email": email,
+                                           "status": "erro: consulta indisponível", "code": "session_status_unavailable",
+                                           "issue": issue,
+                                           "expected_files": expected})
+                            processed.add((org, sid))
+            except (AuthError, RuntimeError, OSError, ValueError) as exc:
                 issue = account_issue(email, exc, stage="Consulta de sessões Minute")
                 return output + [
                     {"session_id": sid, "email": email,
                      "status": "erro: acesso indisponível", "code": "session_access_unavailable",
                      "issue": issue, "expected_files": expected}
-                    for _, sid, expected in valid]
-            for org, sid, expected in valid:
-                try:
-                    result = campaign.session_result(
-                        email, org, sid, session=sess)
-                    result["expected_files"] = expected
-                    output.append(result)
-                except (AuthError, RuntimeError, OSError, json.JSONDecodeError) as exc:
-                    issue = account_issue(email, exc, stage="Consulta de sessões Minute")
-                    output.append({"session_id": sid, "email": email,
-                                   "status": "erro: consulta indisponível", "code": "session_status_unavailable",
-                                   "issue": issue,
-                                   "expected_files": expected})
+                    for org, sid, expected in valid if (org, sid) not in processed]
             return output
 
         results: list[dict[str, Any]] = []
