@@ -2242,8 +2242,12 @@ def _cleanup_confirmed_account_media(
 
 # --- envio para uma conta -----------------------------------------------------
 
-def _acknowledge_campaign_upload(session_id: str) -> None:
-    for row in list_sidecars():
+def _acknowledge_campaign_upload(session_id: str, rows: list[dict[str, Any]] | None = None) -> None:
+    # Callers that already validated a complete group can avoid rescanning the
+    # entire sidecar store. Standalone post-upload acknowledgments still take a
+    # fresh validated listing.
+    for source in list_sidecars() if rows is None else rows:
+        row = dict(source)
         if row.get("session_id") == session_id:
             row["campaign_reconciled"] = True
             save_sidecar(row)
@@ -2330,11 +2334,17 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
     # for another clip must receive the same integrity check as this item.
     contexts: dict[str, Any] = {}
     lineages: dict[str, dict[str, Any]] = {}
-    for sid, chunks in groups.items():
-        first = next((row for row in chunks if owned(row)), None)
-        if first is None or sent_registry.recovery_was_reset(sid, ""):
-            continue
-        context = first.get("campaign_context") or _legacy_upload_context(sid, account.email)
+    owned_groups = [(sid, chunks, first) for sid, chunks in groups.items()
+                    if (first := next((row for row in chunks if owned(row)), None)) is not None]
+    reset_checker = sent_registry.recovery_reset_checker() if owned_groups else None
+    active_groups = [(sid, chunks, first) for sid, chunks, first in owned_groups
+                     if not reset_checker(sid, "", "")]
+    missing_contexts = {(sid, account.email) for sid, _chunks, first in active_groups
+                        if not first.get("campaign_context")}
+    legacy_contexts = (_legacy_upload_contexts(missing_contexts, rows)
+                       if missing_contexts else {})
+    for sid, chunks, first in active_groups:
+        context = first.get("campaign_context") or legacy_contexts.get((sid, account.email))
         contexts[sid] = context
         lineage = context.get("content_provenance") if isinstance(context, dict) else None
         if lineage is not None:
@@ -2353,9 +2363,9 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
                     "Vínculo de conteúdo da retomada inválido; preserve os registros.",
                     transient=False, phase="recovery", review_required=True) from exc
     matched = None
-    for sid, chunks in groups.items():
-        first = next((row for row in chunks if owned(row)), None)
-        if first is None or sid not in contexts:
+    acknowledgments = []
+    for sid, chunks, first in owned_groups:
+        if sid not in contexts:
             continue
         context = contexts[sid]
         if (not isinstance(context, dict)
@@ -2379,13 +2389,13 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
                             and row.get("task_id") == first.get("task_id")
                             and row.get("campaign_context") == first.get("campaign_context")
                             for row in chunks))
-        if complete and sent_registry.recovery_was_reset(sid, context["registry_key"], context.get("history_name", "")):
+        if complete and reset_checker(
+                sid, context["registry_key"], context.get("history_name", "")):
             continue
         if complete and all(row.get("campaign_reconciled") is True for row in chunks):
             continue
         if complete:
-            sent_registry.mark_sent(key or context["registry_key"], context["clip_uid"], account.email)
-            _acknowledge_campaign_upload(sid)
+            acknowledgments.append((sid, key or context["registry_key"], context["clip_uid"], chunks))
         if same and (matched is None or not complete):
             matched = {"email": account.email, "ok": complete, "finalized": complete,
                        "org_key": account.org_key,
@@ -2397,6 +2407,14 @@ def _reconcile_uploads(rows: list[dict[str, Any]], account: AccountSpec,
                 # its original digest or turn a plan into evidence of delivery.
                 matched['content_provenance'] = lineages[sid]
                 matched['content_receipt_confirmed']=complete
+    # All owned sessions, including unrelated clips, have now been checked.
+    # Only after that full pass may receipts update the sent index or journals.
+    if acknowledgments:
+        sent_registry.mark_sent_many([
+            (scenario, clip_uid, account.email)
+            for _sid, scenario, clip_uid, _chunks in acknowledgments])
+        for sid, _scenario, _clip_uid, chunks in acknowledgments:
+            _acknowledge_campaign_upload(sid, chunks)
     return matched
 
 
@@ -2835,10 +2853,11 @@ def run_campaign(
             # A custom exception may forbid private attributes. Recording
             # progress is best effort and must preserve the original failure.
             pass
-        log.status = "error"
-        log.issues.append({"kind": "campaign_error", "error": f"{type(exc).__name__}: {exc}"})
         try:
-            log.save()
+            with log._save_lock:
+                log.status = "error"
+                log.issues.append({"kind": "campaign_error", "error": f"{type(exc).__name__}: {exc}"})
+                log.save()
         except OSError as save_error:
             exc.add_note(f"Não foi possível salvar a falha da campanha: {save_error}")
         raise
@@ -3024,11 +3043,13 @@ def _run_campaign(
                 "ok" if payload.get("ok") else "failed")
             sends[key] += 1
         elif kind == "campaign_stopped":
-            log.status = "stopped"
+            with log._save_lock:
+                log.status = "stopped"
         elif (kind in ("task_error", "task_empty", "task_exhausted", "task_shortfall", "goal_shortfall")
               or (kind == "clip_prepare_done" and not payload.get("ok"))):
-            log.issues.append({"kind": kind, **payload})
-            log.save()
+            with log._save_lock:
+                log.issues.append({"kind": kind, **payload})
+                log.save()
         if progress:
             progress(kind, payload)
 
@@ -3521,15 +3542,16 @@ def _run_campaign(
 
             def _persist_item_results() -> None:
                 nonlocal persisted_item
-                item["accounts"] = [account_results[a.email] for a in config.accounts
-                                    if a.email in account_results]
-                if persisted_item is None:
-                    persisted_item = {k: v for k, v in item.items()
-                                      if k not in ("imu_csv", "frames_csv", "probe", "_cleanup_paths", "_history_name")}
-                    log.add_item(persisted_item)
-                else:
-                    persisted_item["accounts"] = item["accounts"]
-                log.save()
+                with log._save_lock:
+                    item["accounts"] = [account_results[a.email] for a in config.accounts
+                                        if a.email in account_results]
+                    if persisted_item is None:
+                        persisted_item = {k: v for k, v in item.items()
+                                          if k not in ("imu_csv", "frames_csv", "probe", "_cleanup_paths", "_history_name")}
+                        log.add_item(persisted_item)
+                    else:
+                        persisted_item["accounts"] = item["accounts"]
+                    log.save()
             for account in task_accounts:
                 if should_stop and should_stop():
                     _log("  [!] campanha interrompida pelo usuário")

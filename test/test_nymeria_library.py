@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import concurrent.futures
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -276,6 +278,82 @@ class NymeriaLibraryTests(unittest.TestCase):
         (self.root / "sequence_one/narration/atomic_action.csv").write_text(
             "start_time,end_time,Describe my atomic actions\n1000,1005,C is holding a shirt.\n", "utf8")
         self.assertEqual(library.summary(self.root)["atomic_action_count"], 1)
+
+    def test_inventory_build_is_singleflight_across_concurrent_readers(self):
+        library.sync_catalog(self.root)
+        library._clear_inventory_cache()
+        entered_builder = threading.Event()
+        release_builder = threading.Event()
+        second_started = threading.Event()
+        calls = 0
+        original = library._sequence_item
+
+        def build(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            entered_builder.set()
+            if not release_builder.wait(5):
+                raise AssertionError("test did not release the inventory builder")
+            return original(*args, **kwargs)
+
+        def request_inventory(second=False):
+            if second:
+                second_started.set()
+            return library.inventory(self.root)
+
+        with patch.object(library, "_sequence_item", side_effect=build):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(request_inventory)
+                self.assertTrue(entered_builder.wait(5))
+                second = pool.submit(request_inventory, True)
+                self.assertTrue(second_started.wait(5))
+                release_builder.set()
+                self.assertEqual(first.result(timeout=5)["total"], 1)
+                self.assertEqual(second.result(timeout=5)["total"], 1)
+        self.assertEqual(calls, 1)
+
+    def test_inventory_and_summary_share_one_load_and_one_inventory(self):
+        library.sync_catalog(self.root)
+        with patch.object(library, "_load", wraps=library._load) as load, \
+                patch.object(library, "_inventory_items", wraps=library._inventory_items) as items:
+            combined = library.inventory_with_summary(self.root, query="sequence", limit=1)
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(items.call_count, 1)
+        self.assertEqual(combined["total"], 1)
+        self.assertEqual(combined["summary"]["sequence_count"], 1)
+        self.assertEqual(combined["items"], library.inventory(self.root, query="sequence", limit=1)["items"])
+
+    def test_measured_inventory_shares_rules_and_sdk_identity_per_build(self):
+        self.add_sequence("sequence_two")
+        self.publish()
+        library.sync_catalog(self.root)
+        sequences = library._load(self.root)["sequences"]
+        sdk = (("test-sdk.dll", (1, 2, 3)),)
+        rules = "test-rules-digest"
+        for sid, groups in sequences.items():
+            directory = self.root / sid
+            (directory / "recording_head/data").mkdir(parents=True, exist_ok=True)
+            (directory / "recording_head/data/data.vrs").write_bytes(b"video")
+            (directory / "recording_head/data/motion.vrs").write_bytes(b"motion")
+            marker = self.root / "_catalog/measured" / (sid + ".json")
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({
+                "source_stats": [list(library.nymeria._stat(directory / name)) for name in
+                                 ("metadata.json", "recording_head/data/data.vrs",
+                                  "recording_head/data/motion.vrs",
+                                  *("narration/" + name for name in library.nymeria._ANNOTATIONS))],
+                "asset_identity": library._asset_identity(groups),
+                "rules_sha256": rules,
+                "sdk_signature": [[name, list(identity)] for name, identity in sdk],
+                "measured_duration_s": 455,
+            }), "utf8")
+        library._clear_inventory_cache()
+        with patch.object(library.nymeria, "_rules_digest", return_value=rules) as rules_digest, \
+                patch.object(library.nymeria, "_sdk_signature", return_value=sdk) as sdk_signature:
+            items = library._inventory_items(self.root, sequences)
+        self.assertEqual(rules_digest.call_count, 1)
+        self.assertEqual(sdk_signature.call_count, 1)
+        self.assertEqual({item["state"] for item in items}, {"measured"})
 
     def test_plan_can_pause_without_erasing_catalog_and_duplicate_tasks_do_not_multiply_capacity(self):
         library.sync_catalog(self.root)

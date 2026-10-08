@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **128 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **129 releases públicas**, atualizado em **07/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.75](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.75). Destaques: Recuperação filtra a sessão escolhida antes de analisar históricos e compartilha índices, evitando varreduras repetidas em instalações com muitos registros antigos.
+Versão atual: [v2.0.76](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.76). Destaques: Reconciliação da campanha resolve históricos em lote; a interface acompanha a recuperação e impede início concorrente mesmo ao fechar sua janela.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.76](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.76) | 07/10/2026 | Reconciliação compartilha contexto e reset entre sessões, mantendo validação antes de confirmar recibos. Início da campanha aguarda recuperação em andamento mesmo com a janela fechada; leitura prolongada oferece nova consulta manual. Preserva retomada sem reenvio, mídia sob demanda e campanha sem meta obrigatória. | [Desde v2.0.75](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.75...v2.0.76) |
 | [v2.0.75](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.75) | 07/10/2026 | Recuperação seleciona conta e sessão antes da análise histórica. Resolve contextos e índices uma vez por operação, mantendo validação de todos os journals e proteção de identidade e mídia. Preserva retomada da avaliação sem reenvio e revisão de falhas não transitórias. | [Desde v2.0.74](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.74...v2.0.75) |
 | [v2.0.74](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.74) | 07/10/2026 | Repete avaliações indisponíveis no mesmo recibo e permite retomar esses registros antigos sem create/PUT. Campanha tenta recuperar o recibo atual antes de interromper o lote. Falha classificada antes do recibo não interrompe as demais contas nem arquiva o cadastro. Preserva qualidade, recibos e limite de aquisição de mídia. | [Desde v2.0.73](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.73...v2.0.74) |
 | [v2.0.73](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.73) | 07/10/2026 | Consulta de saldos respeita a espera da Crowtado, repete somente leituras e permite cancelar. Limite persistente mantém outras contas pendentes sem sobrescrever saldos. Identifica token Hostinger recusado e esclarece como renovar o acesso. Preserva campanhas sem meta obrigatória, saques e limpeza de mídia. | [Desde v2.0.72](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.72...v2.0.73) |

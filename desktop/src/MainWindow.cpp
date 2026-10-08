@@ -4338,6 +4338,8 @@ void MainWindow::setStatus(const QString& text) {
 
 void MainWindow::openRecovery() {
   if (_campaignResetPending) return;
+  if (_recoveryWorkerWatch) _recoveryWorkerWatch->stop();
+  _recoveryWorkerWatchPolls = 0;
   auto* dialog = new QDialog(this);
   dialog->setObjectName(QStringLiteral("campaignRecoveryDialog"));
   dialog->setAttribute(Qt::WA_DeleteOnClose);
@@ -4399,7 +4401,9 @@ void MainWindow::openRecovery() {
   });
   layout->addWidget(resumePanel);
   auto* poll = new QTimer(dialog);
+  poll->setObjectName(QStringLiteral("recoveryPoll"));
   poll->setInterval(1500);
+  auto pollCount = std::make_shared<int>(0);
   auto* buttons = new QHBoxLayout;
   auto* retry = new QPushButton(QStringLiteral("Tentar novamente"), dialog);
   retry->setObjectName(QStringLiteral("recoveryRetry"));
@@ -4418,9 +4422,17 @@ void MainWindow::openRecovery() {
   buttons->addWidget(reconcile);
   layout->addLayout(buttons);
   const QPointer<QDialog> guard(dialog);
-  const auto render = [this, guard, table, summary, reconcile, resume, resumeAccount, poll, retry, copyDiagnostic, failed, resumePanel, reconciliationHint, filterRecovery](bool ok, const QJsonDocument& document, const QString& error) {
+  const auto render = [this, guard, table, summary, reconcile, resume, resumeAccount, poll, pollCount, retry, copyDiagnostic, failed, resumePanel, reconciliationHint, filterRecovery](bool ok, const QJsonDocument& document, const QString& error) {
     if (!guard) return;
     retry->setEnabled(true);
+    const auto data = document.object();
+    const auto worker = data.value(QStringLiteral("worker")).toObject();
+    const QString workerState = worker.value(QStringLiteral("state")).toString();
+    if (!workerState.isEmpty()) {
+      _recoveryWorkerRunning = workerState == QStringLiteral("running");
+      guard->setProperty("recoveryBusy", _recoveryWorkerRunning);
+      updateCampaignActions();
+    }
     if (!ok) {
       poll->stop();
       table->hide();
@@ -4429,6 +4441,10 @@ void MainWindow::openRecovery() {
       reconciliationHint->hide();
       reconcile->hide();
       summary->setText(error);
+      if (data.value(QStringLiteral("code")).toString() == QStringLiteral("catalog_work_pending")
+          && data.value(QStringLiteral("loading")).toBool()) {
+        summary->setText(QStringLiteral("A leitura ainda está em andamento no serviço. O acompanhamento automático foi pausado; tente novamente para consultar o mesmo trabalho."));
+      }
       reconcile->setEnabled(false);
       resume->setEnabled(false);
       resumeAccount->setEnabled(false);
@@ -4446,15 +4462,24 @@ void MainWindow::openRecovery() {
     reconcile->show();
     copyDiagnostic->hide();
     guard->setProperty("recoveryDiagnostic", QByteArray());
-    const auto data = document.object();
     if (data.value(QStringLiteral("loading")).toBool()) {
       summary->setText(data.value(QStringLiteral("message")).toString());
       reconcile->setEnabled(false);
       resume->setEnabled(false);
-      retry->setEnabled(false);
-      poll->start();
+      const int budget = qMax(1, guard->property("recoveryPollBudget").toInt() > 0
+          ? guard->property("recoveryPollBudget").toInt() : 300);
+      ++*pollCount;
+      if (*pollCount >= budget) {
+        poll->stop();
+        retry->setEnabled(true);
+        summary->setText(QStringLiteral("A leitura ainda está em andamento no serviço. O acompanhamento automático foi pausado; tente novamente para consultar o mesmo trabalho."));
+      } else {
+        retry->setEnabled(false);
+        poll->start();
+      }
       return;
     }
+    *pollCount = 0;
     const auto items = data.value("items").toArray();
     const QString selectedAccount = resumeAccount->currentText();
     resumeAccount->clear();
@@ -4486,8 +4511,8 @@ void MainWindow::openRecovery() {
     accountNames.sort();
     resumeAccount->addItems(accountNames);
     if (accountNames.contains(selectedAccount)) resumeAccount->setCurrentText(selectedAccount);
-    const auto worker = data.value("worker").toObject();
     const bool running = worker.value("state").toString() == "running";
+    _recoveryWorkerRunning = running;
     guard->setProperty("recoveryBusy", running);
     updateCampaignActions();
     if (running) {
@@ -4514,8 +4539,9 @@ void MainWindow::openRecovery() {
     resume->setEnabled(!running && !accountNames.isEmpty());
     resumeAccount->setEnabled(!running);
   };
-  const auto fetch = [this, guard, wallet, render](bool force) {
+  const auto fetch = [this, guard, wallet, render, pollCount](bool force) {
     if (!guard || guard->property("readingRecovery").toBool()) return;
+    if (force) *pollCount = 0;
     guard->setProperty("readingRecovery", true);
     _api.get(force ? QStringLiteral("/api/recovery?async=1&refresh=1") : QStringLiteral("/api/recovery?async=1"), [guard, wallet, render](bool ok, const QJsonDocument& document, const QString& error) {
       if (!guard) return;
@@ -4558,9 +4584,16 @@ void MainWindow::openRecovery() {
     _api.post(QStringLiteral("/api/recovery/resume"), request,
               [this, guard, summary, resume, refresh](bool ok, const QJsonDocument&, const QString& error) {
       _recoveryCommandPending = false;
+      const bool uncertain = !ok;
+      if (ok || uncertain) _recoveryWorkerRunning = true;
+      if (!guard && _recoveryWorkerRunning) watchRecoveryWorker();
       updateCampaignActions();
       if (!guard) return;
-      if (!ok) { summary->setText(error); resume->setEnabled(true); }
+      if (!ok) {
+        summary->setText(error);
+        resume->setEnabled(!uncertain);
+        if (uncertain) refresh();
+      }
       else refresh();
     });
   });
@@ -4577,8 +4610,52 @@ void MainWindow::openRecovery() {
       updateCampaignActions();
     });
   });
-  connect(dialog, &QObject::destroyed, this, [this] { if (!_closing) updateCampaignActions(); });
+  connect(dialog, &QObject::destroyed, this, [this] {
+    if (_closing) return;
+    if (_recoveryWorkerRunning) watchRecoveryWorker();
+    updateCampaignActions();
+  });
   dialog->show();
+}
+
+void MainWindow::watchRecoveryWorker() {
+  if (!_recoveryWorkerRunning || _closing) return;
+  if (!_recoveryWorkerWatch) {
+    _recoveryWorkerWatch = new QTimer(this);
+    _recoveryWorkerWatch->setObjectName(QStringLiteral("recoveryWorkerWatch"));
+    _recoveryWorkerWatch->setInterval(1500);
+    connect(_recoveryWorkerWatch, &QTimer::timeout, this, [this] {
+      if (!_recoveryWorkerRunning || _closing) {
+        _recoveryWorkerWatch->stop();
+        return;
+      }
+      // Keep the UI lock conservative if status cannot be confirmed. A later
+      // open of Recovery provides the manual retry path.
+      if (_recoveryWorkerWatchPolls >= 1200) {
+        _recoveryWorkerWatch->stop();
+        return;
+      }
+      if (_recoveryStatusRequestPending) return;
+      ++_recoveryWorkerWatchPolls;
+      _recoveryStatusRequestPending = true;
+      _api.get(QStringLiteral("/api/recovery?async=1"), [this](bool ok,
+          const QJsonDocument& document, const QString&) {
+        _recoveryStatusRequestPending = false;
+        if (!ok) return;
+        const QString state = document.object().value(QStringLiteral("worker")).toObject()
+            .value(QStringLiteral("state")).toString();
+        if (state.isEmpty()) return;
+        _recoveryWorkerRunning = state == QStringLiteral("running");
+        if (!_recoveryWorkerRunning) {
+          _recoveryWorkerWatch->stop();
+          _recoveryWorkerWatchPolls = 0;
+        }
+        updateCampaignActions();
+      });
+    });
+  }
+  _recoveryWorkerWatchPolls = 0;
+  _recoveryWorkerWatch->start();
 }
 
 void MainWindow::openCommandPalette() {
@@ -5197,7 +5274,8 @@ void MainWindow::updateCampaignActions() {
         && !item->data(Qt::UserRole).toString().isEmpty();
   }
   const bool busy = _campaignActive || _campaignPreflightPending || _campaignStartPending
-      || _campaignStartUncertain || _campaignResetPending || _campaignOriginalDialogPending;
+      || _campaignStartUncertain || _campaignResetPending || _campaignOriginalDialogPending
+      || _recoveryCommandPending || _recoveryWorkerRunning;
   const bool balancesReady = !_campaignAccountMode->currentData().toString().startsWith(QStringLiteral("balance_"))
       || _campaignBalancesLoaded;
   _campaignStart->setEnabled(!busy && accounts && tasks && balancesReady

@@ -168,8 +168,8 @@ class ReconciliationProvenanceTests(WireFixtures):
 
     def assert_invalid_without_effects(self):
         before = {path: path.read_bytes() for path in self.journals.iterdir()}
-        with patch.object(campaign.sent_registry, 'recovery_was_reset', return_value=False), \
-             patch.object(campaign.sent_registry, 'mark_sent') as mark:
+        with patch.object(campaign.sent_registry, 'recovery_reset_checker', return_value=lambda *_: False), \
+             patch.object(campaign.sent_registry, 'mark_sent_many') as mark:
             with self.assertRaises(upload.UploadError) as raised:
                 campaign._reconcile_uploads(upload.list_sidecars(), self.account,
                     {'clip_uid': 'fixture-clip', 'registry_key': 'fixture-key'}, 'fixture-task')
@@ -181,8 +181,8 @@ class ReconciliationProvenanceTests(WireFixtures):
     def test_valid_binding_is_preserved_and_acknowledged(self):
         lineage = self.lineage('valid-session')
         self.complete_journal('valid-session', lineage=lineage)
-        with patch.object(campaign.sent_registry, 'recovery_was_reset', return_value=False), \
-             patch.object(campaign.sent_registry, 'mark_sent') as mark:
+        with patch.object(campaign.sent_registry, 'recovery_reset_checker', return_value=lambda *_: False), \
+             patch.object(campaign.sent_registry, 'mark_sent_many') as mark:
             result = campaign._reconcile_uploads(upload.list_sidecars(), self.account,
                 {'clip_uid': 'fixture-clip', 'registry_key': 'fixture-key'}, 'fixture-task')
         self.assertTrue(result['ok'])

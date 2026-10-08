@@ -3850,8 +3850,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
     @app.get("/api/library/nymeria")
     def get_nymeria_library():
         try:
-            result = nymeria_library.inventory(limit=1)
-            result["summary"] = nymeria_library.summary()
+            result = nymeria_library.inventory_with_summary(limit=1)
             result["task_names"] = library_task_catalog.library_task_names()
             result["task_catalog_source"] = "local_snapshot_requires_campaign_preflight"
         except (OSError, ValueError, RuntimeError):
@@ -3867,8 +3866,8 @@ def create_app(*, for_testing: bool = False) -> Flask:
             offset = int(request.args.get("offset", 0))
             if len(query) > 200 or not 1 <= limit <= 100 or not 0 <= offset <= 100000:
                 raise ValueError
-            result = nymeria_library.inventory(query=query, state=state, limit=limit, offset=offset)
-            result["summary"] = nymeria_library.summary()
+            result = nymeria_library.inventory_with_summary(query=query, state=state,
+                                                             limit=limit, offset=offset)
             result["task_names"] = library_task_catalog.library_task_names()
             result["task_catalog_source"] = "local_snapshot_requires_campaign_preflight"
         except (OSError, ValueError, RuntimeError):

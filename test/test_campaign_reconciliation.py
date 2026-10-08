@@ -40,9 +40,77 @@ class CampaignReconciliationTests(unittest.TestCase):
         self.assertTrue(result["recovered"])
         self.assertEqual(result["session_id"], "old-session")
         self.assertEqual(sent_registry.sent_emails("key", "clip"), {self.account.email})
-        self.assertTrue(self.rows[0]["campaign_reconciled"])
+        self.assertTrue(self.save.call_args.args[0]["campaign_reconciled"])
         self.new.assert_not_called()
         self.upload.assert_not_called()
+
+    def test_reconciliation_batches_legacy_context_and_reset_reads(self):
+        sessions = ("legacy-one", "legacy-two", "legacy-three")
+        self.rows[:] = [{key: value for key, value in self.rows[0].items()
+                         if key != "campaign_context"} | {"session_id": sid}
+                        for sid in sessions]
+        contexts = {(sid, self.account.email): {
+            "registry_key": "key", "clip_uid": "clip", "task_id": "task"}
+            for sid in sessions}
+        checker = Mock(return_value=False)
+        with patch.object(campaign, "_legacy_upload_contexts",
+                          wraps=lambda wanted, evidence: contexts) as legacy_contexts, \
+             patch.object(campaign, "_legacy_upload_context",
+                          side_effect=AssertionError("per-session legacy scan")), \
+             patch.object(sent_registry, "recovery_reset_checker", return_value=checker) as reset_snapshot, \
+             patch.object(campaign, "list_sidecars",
+                          side_effect=AssertionError("per-session journal scan")) as journal_scan, \
+             patch.object(sent_registry, "mark_sent_many",
+                          wraps=sent_registry.mark_sent_many) as mark_many, \
+             patch.object(sent_registry, "mark_sent",
+                          side_effect=AssertionError("per-session registry write")), \
+             patch.object(sent_registry, "load", wraps=sent_registry.load) as index_load:
+            result = campaign._reconcile_uploads(
+                self.rows, self.account, self.item, "task")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["session_id"], "legacy-one")
+        legacy_contexts.assert_called_once()
+        wanted, evidence = legacy_contexts.call_args.args
+        self.assertEqual(wanted, {(sid, self.account.email) for sid in sessions})
+        self.assertEqual({row["session_id"] for row in evidence}, set(sessions))
+        reset_snapshot.assert_called_once()
+        self.assertEqual(checker.call_count, len(sessions) * 2)
+        journal_scan.assert_not_called()
+        mark_many.assert_called_once_with([("key", "clip", self.account.email)] * len(sessions))
+        index_load.assert_called_once()
+        self.assertEqual(self.save.call_count, len(sessions))
+
+    def test_legacy_reconciliation_still_validates_every_owned_lineage_before_ack(self):
+        good = {key: value for key, value in self.rows[0].items()
+                if key != "campaign_context"}
+        good["session_id"] = "good-session"
+        invalid = {**good, "session_id": "invalid-session", "task_id": "other-task"}
+        from moneymin.content_provenance import canonical_digest
+        good_lineage = {"session_id": "good-session", "task_id": "task",
+                        "org_key": self.account.org_key}
+        good_lineage["delivery_binding_sha256"] = canonical_digest(good_lineage)
+        self.rows[:] = [good, invalid]
+        contexts = {
+            ("good-session", self.account.email): {
+                "registry_key": "key", "clip_uid": "clip", "task_id": "task",
+                "content_provenance": good_lineage},
+            ("invalid-session", self.account.email): {
+                "registry_key": "other-key", "clip_uid": "other-clip", "task_id": "other-task",
+                "content_provenance": {"session_id": "invalid-session",
+                                        "task_id": "other-task", "org_key": self.account.org_key,
+                                        "delivery_binding_sha256": "wrong"}},
+        }
+        # Even a later, unrelated receipt with a bad binding must be detected
+        # before the earlier valid receipt can update the sent registry.
+        with patch.object(campaign, "_legacy_upload_contexts", return_value=contexts), \
+             patch.object(sent_registry, "recovery_reset_checker", return_value=lambda *_: False), \
+             patch.object(sent_registry, "mark_sent_many") as mark, \
+             patch.object(campaign, "_acknowledge_campaign_upload") as acknowledge:
+            with self.assertRaises(upload.UploadError):
+                campaign._reconcile_uploads(self.rows, self.account, self.item, "task")
+        mark.assert_not_called()
+        acknowledge.assert_not_called()
 
     def test_incomplete_or_unfinalized_session_blocks_new_upload(self):
         for updates in ({"finalized": False}, {"expected_chunk_count": 2}, {"state": "retry-late"}):

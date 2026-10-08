@@ -100,6 +100,7 @@ private:
   void openMailCleanup();
   void openCommandPalette();
   void openRecovery();
+  void watchRecoveryWorker();
   QString _pendingAccountFocus;
   QString _pendingHistoryFocus;
   void renderOperation(const QJsonObject& snapshot);
@@ -450,6 +451,10 @@ private:
   int _campaignPollRevision{};
   quint64 _campaignUiEpoch{};
   bool _recoveryCommandPending{};
+  bool _recoveryWorkerRunning{};
+  bool _recoveryStatusRequestPending{};
+  int _recoveryWorkerWatchPolls{};
+  QTimer* _recoveryWorkerWatch{};
   bool _campaignResetRunnerBusy{};
 
   QComboBox* _cacheProvider{};

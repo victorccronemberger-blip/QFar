@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 import threading
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -22,6 +23,8 @@ class RecoveryViewTests(unittest.TestCase):
         for mocked in (patch.object(config, "DATA_DIR", self.root),
                        patch.object(config, "MEDIA_DATA_DIR", self.root),
                        patch.object(upload, "sidecars_dir", return_value=self.journals),
+                       patch("moneymin.registration_proxy.assign", return_value=None),
+                       patch("moneymin.registration_proxy.route", side_effect=lambda proxy: nullcontext(proxy)),
                        patch("socket.socket.connect", side_effect=AssertionError("network forbidden"))):
             mocked.start()
             self.addCleanup(mocked.stop)
@@ -591,6 +594,80 @@ class RecoveryViewTests(unittest.TestCase):
             recovery.resume_account('one@example.com', lambda email: 'org', session_id='session1')
         self.assertEqual(pump.call_args.kwargs['session_ids'], {'session1'})
         self.assertEqual((self.journals / 'old-session.json').read_bytes(), before)
+
+    def test_resume_uses_assigned_identity_proxy_for_org_auth_and_pending_uploads(self):
+        self.save({**self.row, "state": "completing", "phase": "awaiting_finalize",
+                   "upload_id": "existing-upload", "finalized": False,
+                   "finalize_requested": True})
+        assigned = {"id": "fixture-proxy", "host": "proxy.invalid", "port": 1234,
+                    "username": "fixture-user", "password": "fixture-secret"}
+        active = False
+
+        @contextmanager
+        def routed(proxy):
+            nonlocal active
+            self.assertIs(proxy, assigned)
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+        def resolve(_email):
+            self.assertTrue(active, "organization resolution escaped the assigned route")
+            return "org"
+
+        session = Mock()
+        def ensure_auth(*, org_key):
+            self.assertTrue(active, "Minute authentication escaped the assigned route")
+            self.assertEqual(org_key, "org")
+
+        session.ensure_auth.side_effect = ensure_auth
+        def pump(*_args, **_kwargs):
+            self.assertTrue(active, "pending upload escaped the assigned route")
+            return []
+
+        with patch("moneymin.registration_proxy.assign", return_value=assigned) as assign, \
+             patch("moneymin.registration_proxy.route", side_effect=routed) as route, \
+             patch.object(recovery.campaign.Session, "from_email", return_value=session), \
+             patch.object(upload, "pump_pending", side_effect=pump) as pump_pending, \
+             patch.object(recovery, "reconcile_confirmed", return_value={"items": []}):
+            recovery.resume_account("one@example.com", resolve)
+
+        assign.assert_called_once_with("one@example.com", "")
+        route.assert_called_once_with(assigned)
+        self.assertEqual(pump_pending.call_args.kwargs["session_ids"], {"session1"})
+        self.assertFalse(active)
+
+    def test_resume_does_not_fall_back_to_direct_when_assigned_route_fails(self):
+        self.save({**self.row, "state": "completing", "phase": "awaiting_finalize",
+                   "upload_id": "existing-upload", "finalized": False,
+                   "finalize_requested": True})
+        with patch("moneymin.registration_proxy.assign", return_value={"id": "assigned"}), \
+             patch("moneymin.registration_proxy.route", side_effect=RuntimeError("proxy-secret-url")), \
+             patch.object(recovery.campaign.Session, "from_email") as from_email, \
+             patch.object(upload, "pump_pending") as pump:
+            with self.assertRaisesRegex(RuntimeError, "proxy-secret-url"):
+                recovery.resume_account("one@example.com", Mock())
+        from_email.assert_not_called()
+        pump.assert_not_called()
+
+    def test_worker_reports_safe_auth_stage_and_category_without_exception_text(self):
+        from moneymin.minute_api import AuthError
+
+        def fail_at_auth(_email, _resolve, **kwargs):
+            kwargs["on_stage"]("minute_authentication")
+            raise AuthError("private-token-and-signed-url", code="service")
+
+        worker = recovery.RecoveryRunner()
+        with patch.object(recovery, "resume_account", side_effect=fail_at_auth):
+            worker._run("one@example.com", lambda _email: "org")
+        state = worker.snapshot()
+        self.assertEqual(state["state"], "error")
+        self.assertEqual(state["error_stage"], "minute_authentication")
+        self.assertEqual(state["error_category"], "minute_service")
+        self.assertIn("autenticação Minute", state["error"])
+        self.assertNotIn("private-token-and-signed-url", json.dumps(state))
 
     def test_worker_keeps_failure_private_and_leaves_journals(self):
         self.save({**self.row, "state": "completing", "finalized": False})

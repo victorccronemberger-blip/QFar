@@ -30,10 +30,16 @@ from .media_lifecycle import (cleanup_operation, cleanup_managed_media,
 _GROUPS = ("metadata_json", "narration", "timesync_and_imu", "recording_head_data_data_vrs")
 _IDENTITY = re.compile(r"[A-Za-z0-9_-]+\Z")
 _LOCK = threading.RLock()
+_INVENTORY_LOCK = threading.RLock()
 _PLAN_CACHE = {}
 _INVENTORY_CACHE = {}
 _EVENT_CACHE = {}
 _CATALOG_INPUT_CACHE = {}
+
+
+def _clear_inventory_cache():
+    with _INVENTORY_LOCK:
+        _INVENTORY_CACHE.clear()
 
 
 class NymeriaCancelled(RuntimeError):
@@ -138,7 +144,7 @@ def import_manifest(path, root=None, *, summarize=True):
         destination = _path(base, "_catalog", "download_urls.json")
         _write_json(destination, value)
         _PLAN_CACHE.clear()
-        _INVENTORY_CACHE.clear()
+        _clear_inventory_cache()
         _EVENT_CACHE.clear()
         _CATALOG_INPUT_CACHE.clear()
     return summary(base) if summarize else {"sequence_count": len(value["sequences"])}
@@ -472,7 +478,7 @@ def sync_catalog(root=None, progress=None, max_workers=12, should_stop=None):
         report["phase"] = "catalog_synced" if not report["errors"] else "catalog_partial"
         _write_json(state, report)
         _PLAN_CACHE.clear()
-        _INVENTORY_CACHE.clear()
+        _clear_inventory_cache()
         _EVENT_CACHE.clear()
         _CATALOG_INPUT_CACHE.clear()
         nymeria.clear_caches()
@@ -481,7 +487,7 @@ def sync_catalog(root=None, progress=None, max_workers=12, should_stop=None):
         return result
 
 
-def _sequence_item(root, sid, groups):
+def _sequence_item(root, sid, groups, *, rules_digest=None, sdk_signature=None):
     directory = _path(root, sid)
     metadata = _path(root, sid, "metadata.json")
     value = {}
@@ -523,9 +529,12 @@ def _sequence_item(root, sid, groups):
                         *("narration/" + name for name in nymeria._ANNOTATIONS))]
             if (measured.get("source_stats") != current
                     or measured.get("asset_identity") != _asset_identity(groups)
-                    or measured.get("rules_sha256") != nymeria._rules_digest()
+                    or measured.get("rules_sha256") != (
+                        rules_digest if rules_digest is not None else nymeria._rules_digest())
                     or measured.get("sdk_signature") != [[name, list(marker)]
-                        for name, marker in nymeria._sdk_signature() if isinstance(marker, tuple)]):
+                        for name, marker in (sdk_signature if sdk_signature is not None
+                                             else nymeria._sdk_signature())
+                        if isinstance(marker, tuple)]):
                 measured = None
         except (OSError, ValueError, AttributeError):
             measured = None
@@ -558,22 +567,30 @@ def _inventory_items(base, sequences):
         paths.append(base / "_catalog/measured" / (sid + ".json"))
         paths.append(base / "_catalog/archives" / sid / "timesync_and_imu.zip")
         paths.append(base / "_catalog/archive_index" / (sid + ".json"))
-    key = (str(base), tuple(nymeria._stat(path) for path in paths),
-           nymeria._rules_digest(), nymeria._sdk_signature())
-    cached = _INVENTORY_CACHE.get(key)
-    if cached is not None:
-        return cached
-    items = [_sequence_item(base, sid, groups) for sid, groups in sequences.items()]
-    if len(_INVENTORY_CACHE) >= 4:
-        _INVENTORY_CACHE.clear()
-    _INVENTORY_CACHE[key] = items
-    return items
+    with _INVENTORY_LOCK:
+        rules_digest = nymeria._rules_digest()
+        sdk_signature = nymeria._sdk_signature()
+        key = (str(base), tuple(nymeria._stat(path) for path in paths), rules_digest, sdk_signature)
+        cached = _INVENTORY_CACHE.get(key)
+        if cached is not None:
+            return cached
+        items = [_sequence_item(base, sid, groups, rules_digest=rules_digest,
+                                sdk_signature=sdk_signature)
+                 for sid, groups in sequences.items()]
+        if len(_INVENTORY_CACHE) >= 4:
+            _INVENTORY_CACHE.clear()
+        _INVENTORY_CACHE[key] = items
+        return items
 
 
 def summary(root=None):
     base = _root(root)
     sequences = _load(base)["sequences"]
     items = _inventory_items(base, sequences)
+    return _inventory_summary(base, sequences, items)
+
+
+def _inventory_summary(base, sequences, items):
     counts = {name: sum(item["state"] == name for item in items)
               for name in ("missing", "cataloged", "downloaded", "measured", "partial", "no_annotations")}
     disk = base
@@ -599,11 +616,30 @@ def inventory(root=None, query="", state="all", limit=50, offset=0):
         raise ValueError("Filtros Nymeria inválidos.")
     base = _root(root)
     sequences = _load(base)["sequences"]
-    items = sorted(_inventory_items(base, sequences), key=lambda item: item["seq_id"])
+    return _inventory_result(base, sequences, query, state, limit, offset)
+
+
+def _inventory_result(base, sequences, query, state, limit, offset, items=None):
+    items = sorted(_inventory_items(base, sequences) if items is None else items,
+                   key=lambda item: item["seq_id"])
     terms = query.casefold().split()
     items = [item for item in items if (state == "all" or item["state"] == state)
              and all(term in (item["seq_id"] + " " + item["script"]).casefold() for term in terms)]
     return {"total": len(items), "offset": offset, "limit": limit, "items": items[offset:offset + limit]}
+
+
+def inventory_with_summary(root=None, query="", state="all", limit=50, offset=0):
+    """Return the regular inventory and summary from one source snapshot."""
+    if (not isinstance(query, str) or len(query) > 200
+            or state not in {"all", "missing", "cataloged", "downloaded", "measured", "partial", "no_annotations"}
+            or type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0):
+        raise ValueError("Filtros Nymeria inválidos.")
+    base = _root(root)
+    sequences = _load(base)["sequences"]
+    items = _inventory_items(base, sequences)
+    result = _inventory_result(base, sequences, query, state, limit, offset, items)
+    result["summary"] = _inventory_summary(base, sequences, items)
+    return result
 
 
 def _catalog_label_rules(events, rules):
@@ -874,7 +910,7 @@ def acquire_sequences(seq_ids, root=None, progress=None, should_stop=None, min_f
                          "asset_identity": _asset_identity(groups)})
             results.append(result)
         _PLAN_CACHE.clear()
-        _INVENTORY_CACHE.clear()
+        _clear_inventory_cache()
         return {"ok": True, "sequences": results, "summary": summary(base),
                 "space_quote": {"source_download_bytes": required, "extraction_bytes": extraction,
                                 "min_free_bytes": min_free_bytes, "disk_free_bytes": free}}
@@ -935,7 +971,7 @@ def cleanup_sequence_sources(seq_id, root=None, *, protected_paths=(), protectio
             except OSError as exc:
                 result['errors'].append(f'{measured.name}: {type(exc).__name__}')
         _PLAN_CACHE.clear()
-        _INVENTORY_CACHE.clear()
+        _clear_inventory_cache()
         nymeria.clear_caches()
     result['seq_id'] = seq_id
     return result

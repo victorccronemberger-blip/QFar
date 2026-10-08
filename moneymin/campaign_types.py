@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,6 +20,18 @@ MIN_ACCOUNT_AGE_DAYS = 2.0
 # Chaves de item que guardam caminhos de arquivo — gravadas relativas ao ROOT
 # no log salvo (portátil, sem vazar diretórios do usuário).
 _PATH_KEYS = ("video_path", "imu_path")
+
+
+def _save_campaign_json(destination: Path, payload: dict[str, Any]) -> None:
+    """Retry brief Windows sharing violations without hiding persistent denial."""
+    for attempt in range(3):
+        try:
+            save_json(destination, payload)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) != 32 or attempt == 2:
+                raise
+            time.sleep(0.02 * (attempt + 1))
 
 
 def _relpath(value: Any) -> Any:
@@ -112,41 +125,45 @@ class CampaignLog:
     status: str = "running"
     start_request_id: str | None = None
     _path: Path | None = field(default=None, init=False, repr=False)
+    _save_lock: Any = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def add_item(self, item: dict[str, Any]) -> None:
-        self.items.append(item)
+        with self._save_lock:
+            self.items.append(item)
 
     def to_dict(self) -> dict[str, Any]:
-        result = {
-            "started_at": self.started_at,
-            "accounts": self.accounts,
-            # Runtime lineage paths are private verification carriers. Public
-            # content_provenance/source_provenance contain only names/hashes.
-            "items": [{k: v for k, v in item.items()
-                       if k not in ("_content_inputs", "_content_candidate")}
-                      for item in self.items],
-            "issues": self.issues,
-            "status": self.status,
-        }
-        if self.start_request_id is not None:
-            result['start_request_id'] = self.start_request_id
-        return result
+        with self._save_lock:
+            result = {
+                "started_at": self.started_at,
+                "accounts": self.accounts,
+                # Runtime lineage paths are private verification carriers. Public
+                # content_provenance/source_provenance contain only names/hashes.
+                "items": [{k: v for k, v in item.items()
+                           if k not in ("_content_inputs", "_content_candidate")}
+                          for item in self.items],
+                "issues": self.issues,
+                "status": self.status,
+            }
+            if self.start_request_id is not None:
+                result['start_request_id'] = self.start_request_id
+            return result
 
     @campaign_state_operation
     def save(self, path: Path | None = None) -> Path:
-        destination = path or self._path
-        if destination is None:
-            destination = config.DATA_DIR / f"campaign_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}.json"
-        self._path = destination
-        payload = self.to_dict()
-        # Cópia sanitizada: os itens em memória seguem com caminhos absolutos
-        # (o motor os usa durante a campanha); só o JSON gravado é relativizado.
-        payload["items"] = [
-            {k: (_relpath(v) if k in _PATH_KEYS else v) for k, v in item.items()}
-            for item in payload["items"]
-        ]
-        save_json(destination, payload)
-        return destination
+        with self._save_lock:
+            destination = path or self._path
+            if destination is None:
+                destination = config.DATA_DIR / f"campaign_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}.json"
+            self._path = destination
+            payload = self.to_dict()
+            # Cópia sanitizada: os itens em memória seguem com caminhos absolutos
+            # (o motor os usa durante a campanha); só o JSON gravado é relativizado.
+            payload["items"] = [
+                {k: (_relpath(v) if k in _PATH_KEYS else v) for k, v in item.items()}
+                for item in payload["items"]
+            ]
+            _save_campaign_json(destination, payload)
+            return destination
 
 
 __all__ = [

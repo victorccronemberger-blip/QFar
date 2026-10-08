@@ -370,8 +370,14 @@ def reconcile_confirmed(*, refresh=True) -> dict:
 
 
 @campaign_state_operation
-def resume_account(email: str, resolve_org, *, session_id: str | None = None) -> dict:
+def resume_account(email: str, resolve_org, *, session_id: str | None = None,
+                   on_stage=None) -> dict:
     """Resume only reviewed, existing sessions of one authenticated account."""
+    def stage(value: str) -> None:
+        if callable(on_stage):
+            on_stage(value)
+
+    stage("journal_review")
     # Validate the complete journal store before filtering, but avoid describing
     # unrelated sessions. A description can resolve legacy history and confirm
     # a publication; those indexes are expensive and should be shared for the
@@ -398,17 +404,36 @@ def resume_account(email: str, resolve_org, *, session_id: str | None = None) ->
             selected.append(rows)
     if not selected:
         raise ValueError("Nenhuma sessão desta conta permite retomada automática.")
-    org_key = resolve_org(email)
-    if any(rows[0]["org_key"] != org_key for rows in selected):
-        raise ValueError("A organização atual não corresponde aos envios pendentes.")
-    session = campaign.Session.from_email(email)
-    session.ensure_auth(org_key=org_key)
-    upload.pump_pending(session, account_email=email, required_org_key=org_key,
-                        session_ids={rows[0]["session_id"] for rows in selected})
+    from . import registration_proxy
+    stage("proxy_assignment")
+    proxy = registration_proxy.assign(email, "")
+    # Match the account's assigned identity route for every remote step. A
+    # route setup failure aborts this operation; it never retries direct.
+    with registration_proxy.route(proxy):
+        stage("organization_check")
+        org_key = resolve_org(email)
+        if any(rows[0]["org_key"] != org_key for rows in selected):
+            raise ValueError("A organização atual não corresponde aos envios pendentes.")
+        stage("minute_authentication")
+        session = campaign.Session.from_email(email)
+        session.ensure_auth(org_key=org_key)
+        stage("pending_uploads")
+        upload.pump_pending(session, account_email=email, required_org_key=org_key,
+                            session_ids={rows[0]["session_id"] for rows in selected})
+    stage("receipt_reconciliation")
     return reconcile_confirmed()
 
 
 class RecoveryRunner:
+    _STAGE_LABELS = {
+        "journal_review": "revisão dos registros locais",
+        "proxy_assignment": "seleção da conexão atribuída à conta",
+        "organization_check": "confirmação da organização Minute",
+        "minute_authentication": "autenticação Minute",
+        "pending_uploads": "retomada dos envios existentes",
+        "receipt_reconciliation": "reconciliação dos recibos",
+    }
+
     def __init__(self):
         self._lock = threading.Lock()
         self._state = {"state": "idle", "email": None, "error": None}
@@ -446,9 +471,15 @@ class RecoveryRunner:
                 raise
 
     def _run(self, email, resolve_org, session_id=None):
+        stage = "journal_review"
+
+        def on_stage(value):
+            nonlocal stage
+            stage = value if value in self._STAGE_LABELS else "journal_review"
+
         try:
-            result = (resume_account(email, resolve_org, session_id=session_id) if session_id is not None
-                      else resume_account(email, resolve_org))
+            result = resume_account(email, resolve_org, session_id=session_id,
+                                    on_stage=on_stage)
             owned = [item for item in result['items'] if item['email'] == email
                      and (session_id is None or item['session_id'] == session_id)]
             remains = any(item['status'] != 'confirmed' or not item.get('index_reconciled') for item in owned)
@@ -456,8 +487,44 @@ class RecoveryRunner:
                         "result": {"reconciled": result.get("reconciled", 0),
                                    "reconciled_sessions": result.get("reconciled_sessions", []),
                                    "publication_pending": sum(item.get('publication_pending') is True for item in owned)}}
-        except Exception:
+        except Exception as exc:
+            category = self._error_category(exc, stage)
+            stage_label = self._STAGE_LABELS.get(stage, "retomada")
             terminal = {"state": "error", "email": email,
-                        "error": "A retomada não foi concluída. Confira o acesso da conta, a organização e os arquivos locais; os registros foram preservados."}
+                        "error": (f"A retomada falhou durante {stage_label} ({category}). "
+                                  "Os registros foram preservados; confira o diagnóstico e tente novamente."),
+                        "error_stage": stage, "error_category": category}
         with self._lock:
             self._state = terminal
+
+    @staticmethod
+    def _error_category(exc: Exception, stage: str) -> str:
+        """Return a stable category without copying exception text or secrets."""
+        from .minute_api import AuthError
+        from .upload_types import UploadError
+
+        if isinstance(exc, RecoveryReadError):
+            return f"journal_{exc.code}"
+        if isinstance(exc, AuthError):
+            code = getattr(exc, "account_issue_code", None)
+            allowed = {"authentication", "service", "restricted", "invalid_response",
+                       "identity", "network", "timeout", "missing_access", "rate_limit",
+                       "forbidden", "device", "organization"}
+            return f"minute_{code}" if code in allowed else "minute_authentication"
+        if isinstance(exc, UploadError):
+            phase = getattr(exc, "phase", None)
+            allowed_phases = {"create", "transport", "complete", "evaluate", "finalize",
+                              "query", "preflight", "recovery", "fail", "delete-upload",
+                              "delete-session"}
+            return f"upload_{phase}" if phase in allowed_phases else "upload_failure"
+        if stage == "proxy_assignment":
+            return "proxy_assignment"
+        if stage == "organization_check":
+            return "organization_check"
+        if isinstance(exc, TimeoutError):
+            return "timeout"
+        if isinstance(exc, OSError):
+            return "local_io"
+        if isinstance(exc, ValueError):
+            return "validation"
+        return "operation_failure"

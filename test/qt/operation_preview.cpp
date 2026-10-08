@@ -1859,6 +1859,14 @@ int main(int argc, char** argv) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::recoveryDiagnosticsSmoke(window); });
     return app.exec();
   }
+  if (app.arguments().contains("--recovery-worker-state-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::recoveryWorkerStateSmoke(window); });
+    return app.exec();
+  }
+  if (app.arguments().contains("--recovery-command-close-smoke")) {
+    QTimer::singleShot(100, &window, [&window] { OperationPreview::recoveryCommandCloseSmoke(window); });
+    return app.exec();
+  }
   if (app.arguments().contains("--live-catalog-smoke")) {
     QTimer::singleShot(100, &window, [&window] { OperationPreview::liveCatalogSmoke(window); });
     return app.exec();
