@@ -77,7 +77,213 @@ static void accountServicesSmoke(MainWindow& window) {
   } else qApp->exit(0);
 }
 
+static void accountsCreationBusyGuardSmoke(MainWindow& window) {
+  struct Flow { int preflights=0; int posts=0; int accountWrites=0; int mode=0; };
+  auto flow=std::make_shared<Flow>();
+  auto* server=new QTcpServer(&window);
+  if(!server->listen(QHostAddress::LocalHost)){qApp->exit(260);return;}
+  QObject::connect(server,&QTcpServer::newConnection,server,[server,flow]{
+    auto* socket=server->nextPendingConnection();
+    QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow]{
+      const auto input=socket->property("input").toByteArray()+socket->readAll();socket->setProperty("input",input);
+      const int split=input.indexOf("\r\n\r\n");if(split<0||socket->property("answered").toBool())return;
+      const QRegularExpression length("Content-Length: (\\d+)",QRegularExpression::CaseInsensitiveOption);
+      const auto match=length.match(QString::fromLatin1(input.left(split)));
+      if(match.hasMatch()&&input.size()-split-4<match.captured(1).toInt())return;
+      socket->setProperty("answered",true);QJsonObject out{{"ok",true}};
+      if(input.startsWith("GET /api/accounts/bulk-register/preflight")){
+        ++flow->preflights;QJsonObject checks{{"hostinger",QJsonObject{{"ok",true}}},
+          {"chrome",QJsonObject{{"ok",true}}},{"crowtado_api",QJsonObject{{"ok",true}}},
+          {"minute_api",QJsonObject{{"ok",true}}},{"invite_code",QJsonObject{{"ok",flow->mode!=2}}},
+          {"proxy",QJsonObject{{"ok",true}}}};
+        if(flow->mode==1)checks.remove("minute_api");
+        out={{"ready",true},{"checks",checks}};
+      } else if(input.startsWith("POST /api/accounts/bulk-register ")) ++flow->posts;
+      else if(input.startsWith("POST /api/accounts/")) ++flow->accountWrites;
+      const auto bytes=QJsonDocument(out).toJson(QJsonDocument::Compact);
+      socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(bytes.size())+"\r\n\r\n"+bytes);
+      socket->disconnectFromHost();
+    });
+  });
+  window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+  window._backendReady=true;window._accountsAvailable=true;window._registrationProxiesReady=true;
+  window._bulkRegisterDomain->clear();window._bulkRegisterDomain->addItem("example.invalid","example.invalid");window._bulkRegisterDomain->addItem("other.invalid","other.invalid");
+  window._bulkRegisterProxy->clear();window._bulkRegisterProxy->addItem("Auto","auto");
+  window._bulkRegisterPreflightReady=false;window.checkBulkRegisterDomain();
+  window._accountEmail->setText("fixture@example.invalid");window._accountPassword->setText("fixture-only-password");
+  auto* timer=new QTimer(&window);auto stage=std::make_shared<int>(0);
+  QObject::connect(timer,&QTimer::timeout,&window,[&window,flow,stage]{
+    if(*stage==0&&window._bulkRegisterPreflightReady){
+      if(!window._bulkRegisterStart->isEnabled()){qApp->exit(261);return;}
+      window._accountsCheckRunning=true;window.setAccountTransferBusy(false);
+      if(window._bulkRegisterStart->isEnabled()){qApp->exit(262);return;}
+      window.startBulkRegister();
+      window.addAccount(true);window.resumeAccount("fixture@example.invalid");
+      if(flow->posts||flow->accountWrites){qApp->exit(263);return;}
+      window._accountsCheckRunning=false;window.setAccountTransferBusy(false);
+      if(!window._bulkRegisterStart->isEnabled()){qApp->exit(264);return;}
+      window._orgMigrationRunning=true;window.setAccountTransferBusy(false);
+      if(window._bulkRegisterStart->isEnabled()){qApp->exit(265);return;}
+      window.startBulkRegister();window.addAccount(true);window.resumeAccount("fixture@example.invalid");
+      if(flow->posts||flow->accountWrites){qApp->exit(266);return;}
+      window._orgMigrationRunning=false;window.setAccountTransferBusy(false);
+      if(!window._bulkRegisterStart->isEnabled()){qApp->exit(267);return;}
+      window._accountTransferBusy=true;window._bulkRegisterDomain->setCurrentIndex(1);
+      if(window._bulkRegisterPreflightReady){qApp->exit(268);return;}
+      window.addAccount(true);window.resumeAccount("fixture@example.invalid");
+      if(flow->accountWrites){qApp->exit(268);return;}
+      window._accountTransferBusy=false;window.setAccountTransferBusy(false);flow->mode=1;window.checkBulkRegisterDomain();
+      if(window._bulkRegisterStart->isEnabled()){qApp->exit(268);return;}
+      ++*stage;
+    } else if(*stage==1&&flow->preflights>=2&&!window._bulkRegisterPreflightReady){
+      if(window._bulkRegisterStart->isEnabled()||flow->posts){qApp->exit(269);return;}
+      flow->mode=2;window.checkBulkRegisterDomain();++*stage;
+    } else if(*stage==2&&flow->preflights>=3&&!window._bulkRegisterPreflightReady){
+      if(window._bulkRegisterStart->isEnabled()||flow->posts){qApp->exit(270);return;}
+      qApp->exit(0);
+    }
+  });
+  timer->start(20);QTimer::singleShot(4000,&window,[]{qApp->exit(270);});
+}
+
+static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
+  const QStringList args=qApp->arguments();
+  const bool beforeAdmission=args.contains("--accounts-outcome-before-admission");
+  const bool afterAdmission=args.contains("--accounts-outcome-after-admission");
+  const bool foreign=args.contains("--accounts-outcome-foreign-batch");
+  const bool oldTerminal=args.contains("--accounts-outcome-old-terminal");
+  const bool notAdmitted=args.contains("--accounts-outcome-not-admitted");
+  const bool conflict=args.contains("--accounts-outcome-definitive-conflict");
+  struct Flow { QString state="idle",requestId;QStringList ids;int posts=0,statusReads=0;bool changedToForeign=false; };
+  auto flow=std::make_shared<Flow>();
+  if(oldTerminal){flow->state="done";flow->requestId="previous-batch";}
+  if(notAdmitted){flow->state="failed";flow->requestId.clear();}
+  auto* server=new QTcpServer(&window);
+  if(!server->listen(QHostAddress::LocalHost)){qApp->exit(271);return;}
+  QObject::connect(server,&QTcpServer::newConnection,server,[server,flow,beforeAdmission,afterAdmission,foreign,oldTerminal,notAdmitted,conflict]{
+    auto* socket=server->nextPendingConnection();
+    QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow,beforeAdmission,afterAdmission,foreign,oldTerminal,notAdmitted,conflict]{
+      const auto input=socket->property("input").toByteArray()+socket->readAll();socket->setProperty("input",input);
+      const int split=input.indexOf("\r\n\r\n");if(split<0||socket->property("answered").toBool())return;
+      const QRegularExpression length("Content-Length: (\\d+)",QRegularExpression::CaseInsensitiveOption);
+      const auto match=length.match(QString::fromLatin1(input.left(split)));
+      if(match.hasMatch()&&input.size()-split-4<match.captured(1).toInt())return;
+      socket->setProperty("answered",true);QJsonObject out{{"ok",true}};int httpStatus=200;
+      if(input.startsWith("GET /api/accounts/bulk-register/status ")){
+        ++flow->statusReads;
+        if(foreign&&flow->posts&&!flow->changedToForeign){flow->changedToForeign=true;flow->state="running";flow->requestId="other-batch";}
+        if(flow->state=="running"&&flow->requestId!="other-batch"&&flow->statusReads>=3)flow->state="done";
+        const bool done=flow->state=="done";
+        out={{"state",flow->state},{"request_id",flow->requestId},{"total",1},{"completed",done?1:0},
+          {"created",done?1:0},{"failed",0},{"results",done?QJsonArray{QJsonObject{{"email","new@example.invalid"},
+            {"created",true},{"steps",QJsonObject{}},{"error",QJsonValue()}}}:QJsonArray{}},
+          {"current_email",done?QString():QStringLiteral("new@example.invalid")},{"current_step",done?QString():QStringLiteral("Criando")}};
+      } else if(input.startsWith("GET /api/accounts ")) out={{"accounts",QJsonArray{}}};
+      else if(input.startsWith("GET /api/accounts/migration ")) out={{"state","idle"}};
+      else if(input.startsWith("POST /api/accounts/register?async=1 ")){
+        ++flow->posts;const auto body=QJsonDocument::fromJson(input.mid(split+4)).object();
+        const QString id=body.value("request_id").toString();flow->ids.append(id);
+        if(id.isEmpty()||body.value("password").toString()!=QStringLiteral("fixture-only-password")){qApp->exit(272);return;}
+        if(conflict){httpStatus=409;out={{"error","Criação recusada pelo fixture."}};}
+        else if(notAdmitted){httpStatus=503;out={{"error","Falha ao gravar estado inicial."},{"error_code","request_outcome_unknown"},{"not_admitted",true}};}
+        else if(foreign&&flow->posts==1){httpStatus=503;out={{"error","Resposta inconclusiva."},{"error_code","request_outcome_unknown"}};}
+        else if((beforeAdmission||oldTerminal)&&flow->posts==1){httpStatus=503;out={{"error","Resposta inconclusiva."},{"error_code","request_outcome_unknown"}};}
+        else if(afterAdmission&&flow->posts==1){flow->state="running";flow->requestId=id;httpStatus=503;out={{"error","Resposta perdida depois da admissão."},{"error_code","request_outcome_unknown"}};}
+        else {if(flow->requestId!=id){flow->requestId=id;flow->state="running";}out={{"ok",true},{"request_id",id}};}
+      }
+      const auto bytes=QJsonDocument(out).toJson(QJsonDocument::Compact);
+      socket->write("HTTP/1.1 "+QByteArray::number(httpStatus)+(httpStatus==200?" OK\r\n":" Fixture\r\n")+
+        "Content-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(bytes.size())+"\r\n\r\n"+bytes);
+      socket->disconnectFromHost();
+    });
+  });
+  window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+  window._backendReady=true;window._accountsAvailable=true;
+  window._accountProxy->clear();window._accountProxy->addItem("fixture proxy","fixture-proxy-id");
+  window._accountEmail->setText("new@example.invalid");window._accountPassword->setText("fixture-only-password");
+  window._bulkRegisterTable->setRowCount(1);window._bulkRegisterTable->setItem(0,0,new QTableWidgetItem("prior-result"));
+  window.addAccount(true);
+  auto* timer=new QTimer(&window);
+  QObject::connect(timer,&QTimer::timeout,&window,[&window,flow,foreign,beforeAdmission,afterAdmission,oldTerminal,notAdmitted,conflict]{
+    if(foreign&&flow->changedToForeign){
+      if(flow->posts!=1||window._accountPassword->text()!=QStringLiteral("fixture-only-password")
+          ||window._bulkRegisterTable->rowCount()!=1||window._bulkRegisterTable->item(0,0)->text()!=QStringLiteral("prior-result")
+          ||window._bulkRegisterStop->isEnabled()||window._bulkRegisterPendingRequestId.isEmpty()){qApp->exit(273);return;}
+      qApp->exit(0);return;
+    }
+    if((notAdmitted||conflict)&&window._bulkRegisterPendingRequestId.isEmpty()){
+      if(window._accountPassword->text()!=QStringLiteral("fixture-only-password")||window._bulkRegisterPolling
+          ||window._bulkRegisterTable->rowCount()!=1||window._bulkRegisterTable->item(0,0)->text()!=QStringLiteral("prior-result")){qApp->exit(274);return;}
+      if(notAdmitted&&flow->statusReads!=1){qApp->exit(275);return;}
+      qApp->exit(0);return;
+    }
+    if(flow->state=="done"&&!window._bulkRegisterPolling&&window._bulkRegisterPendingRequestId.isEmpty()){
+      if(window._accountPassword->text()!=QString()||flow->ids.isEmpty()){qApp->exit(276);return;}
+      for(const auto& id:flow->ids)if(id.isEmpty()||id!=flow->ids.first()){qApp->exit(277);return;}
+      if(beforeAdmission&&flow->posts<2){qApp->exit(278);return;}
+      if(afterAdmission&&flow->posts!=1){qApp->exit(279);return;}
+      if(oldTerminal&&flow->posts<2){qApp->exit(280);return;}
+      qApp->exit(0);
+    }
+  });
+  timer->start(25);QTimer::singleShot(7000,&window,[]{qApp->exit(281);});
+}
+
+static void accountsRegistrationNativePreview(MainWindow& window) {
+  window.applyStructuralStyle(qApp->arguments().contains("--dark"));
+  auto* server=new QTcpServer(&window);
+  if(!server->listen(QHostAddress::LocalHost)){qApp->exit(282);return;}
+  QObject::connect(server,&QTcpServer::newConnection,server,[server]{
+    auto* socket=server->nextPendingConnection();
+    QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket]{
+      const auto input=socket->property("input").toByteArray()+socket->readAll();socket->setProperty("input",input);
+      const int split=input.indexOf("\r\n\r\n");if(split<0||socket->property("answered").toBool())return;
+      const QRegularExpression length("Content-Length: (\\d+)",QRegularExpression::CaseInsensitiveOption);
+      const auto match=length.match(QString::fromLatin1(input.left(split)));
+      if(match.hasMatch()&&input.size()-split-4<match.captured(1).toInt())return;
+      socket->setProperty("answered",true);QJsonObject out{{"ok",true}};int status=200;
+      const QJsonObject good{{"ok",true}};
+      if(input.startsWith("POST /api/campaigns/drain "))out={{"ok",true},{"ready",true}};
+      else if(input.startsWith("GET /api/accounts "))out={{"accounts",accountsFixture()}};
+      else if(input.startsWith("GET /api/accounts/migration "))out={{"state","idle"}};
+      else if(input.startsWith("GET /api/accounts/proxies "))out={{"proxies",QJsonArray{QJsonObject{{"id","preview-proxy"},{"label","203.0.113.10:8080"}}}}};
+      else if(input.startsWith("GET /api/accounts/domains "))out={{"domains",QJsonArray{QJsonObject{{"domain","example.invalid"}}}}};
+      else if(input.startsWith("GET /api/accounts/bulk-register/preflight"))out={{"ready",true},{"checks",QJsonObject{{"hostinger",good},{"chrome",good},{"crowtado_api",good},{"minute_api",good},{"invite_code",good},{"proxy",good}}}};
+      else if(input.startsWith("GET /api/accounts/bulk-register/status "))out={{"state","idle"},{"total",0},{"completed",0},{"created",0},{"failed",0},{"results",QJsonArray{}}};
+      else if(input.startsWith("POST /api/accounts/register?async=1 ")||input.startsWith("POST /api/accounts/bulk-register ")){
+        status=409;out={{"error","Prévia local: comandos de criação estão desativados."}};
+      }
+      const auto bytes=QJsonDocument(out).toJson(QJsonDocument::Compact);
+      socket->write("HTTP/1.1 "+QByteArray::number(status)+(status==200?" OK\r\n":" Conflict\r\n")+
+        "Content-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(bytes.size())+"\r\n\r\n"+bytes);
+      socket->disconnectFromHost();
+    });
+  });
+  window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+  window._backendReady=true;window._accountsAvailable=true;window._registrationProxiesReady=true;
+  window._pages->setCurrentIndex(5);window._navigation->setCurrentRow(5);
+  window._pages->widget(5)->findChild<QTabWidget*>()->setCurrentIndex(2);
+  window._bulkRegisterDomain->clear();window._bulkRegisterDomain->addItem("example.invalid","example.invalid");
+  window._bulkRegisterProxy->clear();window._bulkRegisterProxy->addItem("Preview proxy","preview-proxy");
+  window._accountProxy->clear();window._accountProxy->addItem("Preview proxy","preview-proxy");
+  window._accountEmail->clear();window._accountPassword->clear();
+  window.renderAccounts(accountsFixture());
+  window._backendState->setText(QStringLiteral("● Prévia isolada · serviço fictício local"));
+  window.checkBulkRegisterDomain();
+  QTimer::singleShot(10*60*1000,&window,&QWidget::close);
+}
+
 static void accountsQaSmoke(MainWindow& window) {
+  if(qApp->arguments().contains("--registration-native-preview")){accountsRegistrationNativePreview(window);return;}
+  if(qApp->arguments().contains("--accounts-creation-busy-smoke")){accountsCreationBusyGuardSmoke(window);return;}
+  if(qApp->arguments().contains("--accounts-outcome-before-admission")
+      ||qApp->arguments().contains("--accounts-outcome-after-admission")
+      ||qApp->arguments().contains("--accounts-outcome-foreign-batch")
+      ||qApp->arguments().contains("--accounts-outcome-old-terminal")
+      ||qApp->arguments().contains("--accounts-outcome-not-admitted")
+      ||qApp->arguments().contains("--accounts-outcome-definitive-conflict")){
+    accountsRegistrationOutcomeSmoke(window);return;
+  }
   struct Flow { bool malformed=false, dropped=false, imported=false; std::shared_ptr<QTemporaryDir> folder=std::make_shared<QTemporaryDir>(); int posts=0, requests=0, statusReads=0; QString state="idle", requestId; };
   auto flow=std::make_shared<Flow>();
   auto* server=new QTcpServer(&window);
@@ -113,12 +319,13 @@ static void accountsQaSmoke(MainWindow& window) {
           ++flow->posts; flow->requestId=requestId;
           flow->state="running"; flow->statusReads=0;
         }
+        out={{"ok",true},{"request_id",requestId}};
         // Simulate losing the POST response after the server has admitted the job.
         if (!flow->dropped) {flow->dropped=true;socket->disconnectFromHost();return;}
       } else if (input.startsWith("GET /api/accounts/bulk-register/status ")) {
         if (flow->state=="running" && ++flow->statusReads>=2) flow->state="done";
         const bool done=flow->state=="done";
-        out={{"state",flow->state},{"total",1},{"completed",done?1:0},{"created",done?1:0},{"failed",0},
+        out={{"state",flow->state},{"request_id",flow->requestId},{"total",1},{"completed",done?1:0},{"created",done?1:0},{"failed",0},
           {"results",done?QJsonArray{QJsonObject{{"email","new@example.invalid"},{"nome","QA"},{"sobrenome","Fixture"},
             {"gender","female"},{"created",true},{"removed",false},{"removable",true},{"steps",QJsonObject{{"link_minute",QJsonObject{{"status","manual"},{"detail","Confirmar no site"}}}}},{"error",QJsonValue()}}}:QJsonArray{}},
           {"current_email",done?"":"new@example.invalid"},{"current_step",done?"":"Confirmando e-mail"}};

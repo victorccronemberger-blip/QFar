@@ -10,11 +10,10 @@ o mesmo arquivo com um blob DPAPI conferido; não cria backup em texto puro.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import threading
 from pathlib import Path
-from .atomic_io import save_bytes
+from .atomic_io import decode_json_state, save_bytes
 from . import secure_store
 
 SCHEMA = 2
@@ -55,7 +54,7 @@ def _read(path: Path, expected_email: str | None = None,
     try:
         protected = payload.startswith(_MAGIC)
         raw = (secure_store.unprotect_json(payload[len(_MAGIC):]) if protected
-               else json.loads(payload.decode("utf-8-sig")))
+               else decode_json_state(payload))
     except (OSError, RuntimeError, UnicodeError, ValueError):
         return None
     if not isinstance(raw, dict):

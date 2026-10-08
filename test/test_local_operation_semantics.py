@@ -40,6 +40,7 @@ class LocalCredentialInputTests(unittest.TestCase):
 
     def test_registration_passes_exact_password_to_fake_provider(self):
         with patch.object(server, "_hostinger_is_configured", return_value=True), \
+             patch.object(server, "_registration_domains", return_value=[{"domain": "example.invalid"}]), \
              patch.object(server, "_full_register_account",
                           return_value={"steps": {}, "error": None}) as provider:
             response = self.client.post("/api/accounts/register",

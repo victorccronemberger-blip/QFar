@@ -117,6 +117,7 @@ class RegistrationValidationTests(unittest.TestCase):
     def test_manual_save_failure_returns_json_and_completed_steps(self):
         with patch.object(server, "_save_crowtado_cred", side_effect=OSError("disk failure")), \
              patch.object(server, "_hostinger_is_configured", return_value=True), \
+             patch.object(server, "_registration_domains", return_value=[{"domain": "example.invalid"}]), \
              patch.object(server, "ORG_MIGRATION", Mock(running=False)), \
              patch.object(server, "_BULK_REGISTER_STATE", {"state": "idle"}):
             response = server.create_app(for_testing=True).test_client().post("/api/accounts/register", json={
@@ -170,6 +171,59 @@ class RegistrationValidationTests(unittest.TestCase):
 
 
 class RegistrationPreflightTests(unittest.TestCase):
+    def preflight_with_failure(self, exc):
+        from contextlib import ExitStack
+        profiles = [{"token": "fixture-token", "routes": ["good.invalid"]}]
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(server.config, "HOSTINGER_MAIL_PROFILES", profiles))
+            stack.enter_context(patch.object(server.crowtado, "_chrome_exe", return_value="chrome"))
+            stack.enter_context(patch.object(server.hostinger_mail, "test_connection", return_value={"mailboxes": 1}))
+            stack.enter_context(patch.object(tls, "urlopen", side_effect=[response, exc]))
+            return server._preflight_checks("good.invalid")
+
+    def test_arbitrary_error_mentioning_404_is_not_a_healthy_minute_api(self):
+        result = self.preflight_with_failure(RuntimeError("upstream request 404 failed: fixture-private-token"))
+        self.assertFalse(result["ready"])
+        self.assertFalse(result["checks"]["minute_api"]["ok"])
+        self.assertNotIn("fixture-private-token", str(result))
+
+    def test_only_actual_health_endpoint_404_is_accepted(self):
+        from urllib.error import HTTPError
+        result = self.preflight_with_failure(HTTPError("https://minute.invalid/health", 404, "Not Found", {}, None))
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["checks"]["minute_api"]["http_status"], 404)
+
+    def test_health_503_with_not_found_message_is_unavailable(self):
+        from urllib.error import HTTPError
+        result = self.preflight_with_failure(HTTPError("https://minute.invalid/health", 503, "Not Found", {}, None))
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["checks"]["minute_api"]["http_status"], 503)
+
+    def test_preflight_checks_invite_presence_without_echoing_the_code(self):
+        from urllib.error import HTTPError
+        response = HTTPError("https://minute.invalid/health", 404, "Not Found", {}, None)
+        with patch.object(server.config, 'INVITE_CODE', 'FICTIONAL-PRIVATE-INVITE'):
+            result = self.preflight_with_failure(response)
+            self.assertTrue(result['ready'])
+            self.assertNotIn('FICTIONAL-PRIVATE-INVITE', str(result))
+        with patch.object(server.config, 'INVITE_CODE', ''):
+            result = self.preflight_with_failure(response)
+            self.assertFalse(result['ready'])
+            self.assertFalse(result['checks']['invite_code']['ok'])
+
+    def test_provider_exceptions_never_expose_raw_details(self):
+        profiles = [{"token": "fixture-token", "routes": ["good.invalid"]}]
+        with patch.object(server.config, "HOSTINGER_MAIL_PROFILES", profiles), \
+             patch.object(server.crowtado, "_chrome_exe", return_value="chrome"), \
+             patch.object(server.hostinger_mail, "test_connection", return_value={"mailboxes": 1}), \
+             patch.object(tls, "urlopen", side_effect=RuntimeError("fixture-private-token")):
+            result = server._preflight_checks("good.invalid")
+        self.assertFalse(result["ready"])
+        self.assertNotIn("fixture-private-token", str(result))
+
     def test_selected_domain_checks_its_profile_only(self):
         profiles = [{"id": "bad", "token": "invalid-test", "routes": ["bad.invalid"]},
                     {"id": "good", "token": "valid-test", "routes": ["good.invalid"]}]

@@ -74,6 +74,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
@@ -680,16 +681,13 @@ _CROWTADO_SIGNUP_RETRY_DELAY_S = 5.0
 
 def _save_registration_batch() -> None:
     # Called with the batch lock held. Contains progress only, never passwords.
-    save_json(config.DATA_DIR / "account_registration_batch.json", _BULK_REGISTER_STATE)
+    from . import registration_batch
+    registration_batch.save(config.DATA_DIR / "account_registration_batch.json", _BULK_REGISTER_STATE)
 
 
 def _restore_registration_batch() -> None:
-    saved = load_json_state(config.DATA_DIR / "account_registration_batch.json", {"state": "idle"})
-    if saved.get("state") not in ("idle", "running", "stopping", "done", "failed"):
-        _invalid_local_state()
-    for key in ("total", "completed", "created", "failed"):
-        if key in saved and (type(saved[key]) is not int or saved[key] < 0):
-            _invalid_local_state()
+    from . import registration_batch
+    saved = registration_batch.load(config.DATA_DIR / "account_registration_batch.json")
     if saved["state"] in ("running", "stopping"):
         saved.update(state="failed", current_email="", current_step="",
                      error="O serviço reiniciou durante o cadastro. Confira as contas incompletas e retome a mesma conta.")
@@ -719,6 +717,12 @@ def _step_skip(detail: str = "") -> dict[str, str]:
 
 def _step_fail(detail: str = "") -> dict[str, str]:
     return {"status": "fail", "detail": detail}
+
+
+def _valid_registration_name(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) <= 200
+            and not any(unicodedata.category(character) in {"Cc", "Cs"}
+                        for character in value))
 
 
 def _hostinger_is_configured() -> bool:
@@ -801,6 +805,7 @@ def _preflight_checks(domain: str = "") -> dict[str, Any]:
     Retorna um dict com status de cada verificação e um flag 'ready' geral.
     """
     from .. import crowtado
+    from urllib.error import HTTPError
     checks: dict[str, dict[str, Any]] = {}
 
     # 1. Hostinger Mail API
@@ -830,8 +835,8 @@ def _preflight_checks(domain: str = "") -> dict[str, Any]:
         from .. import crowtado
         chrome_path = crowtado._chrome_exe()
         checks["chrome"] = {"ok": True, "detail": chrome_path}
-    except Exception as exc:
-        checks["chrome"] = {"ok": False, "detail": str(exc)}
+    except Exception:
+        checks["chrome"] = {"ok": False, "detail": "Navegador indisponível. Confira a instalação do QMoney."}
 
     # 3. Crowtado Clerk API
     try:
@@ -848,8 +853,11 @@ def _preflight_checks(domain: str = "") -> dict[str, Any]:
                 checks["crowtado_api"] = {"ok": True, "detail": "Clerk API respondendo"}
             else:
                 checks["crowtado_api"] = {"ok": False, "detail": f"status {resp.status}"}
-    except Exception as exc:
-        checks["crowtado_api"] = {"ok": False, "detail": str(exc)}
+    except HTTPError as exc:
+        checks["crowtado_api"] = {"ok": False, "http_status": exc.code,
+                                  "detail": f"A API Crowtado não respondeu normalmente (HTTP {exc.code}). Tente novamente."}
+    except Exception:
+        checks["crowtado_api"] = {"ok": False, "detail": "Não foi possível confirmar a API Crowtado. Confira a conexão e tente novamente."}
 
     # 4. Minute API
     try:
@@ -862,18 +870,22 @@ def _preflight_checks(domain: str = "") -> dict[str, Any]:
         req.add_header("User-Agent", "okhttp/4.12.0")
         with tls.urlopen(req, timeout=10) as resp:
             checks["minute_api"] = {"ok": True, "detail": f"status {resp.status}"}
-    except Exception as exc:
-        # Minute pode não ter /health — status 404 ainda indica que a API está de pé
-        error_str = str(exc)
-        if "404" in error_str or "Not Found" in error_str:
-            checks["minute_api"] = {"ok": True, "detail": "APIrespondendo (sem /health)"}
+    except HTTPError as exc:
+        # Only an actual 404 response to this health endpoint has this meaning.
+        # Exception prose (including another status with 'Not Found') is not evidence.
+        if exc.code == 404:
+            checks["minute_api"] = {"ok": True, "http_status": 404,
+                                    "detail": "API respondendo (sem /health)"}
         else:
-            checks["minute_api"] = {"ok": False, "detail": error_str}
+            checks["minute_api"] = {"ok": False, "http_status": exc.code,
+                                    "detail": f"A API Minute não respondeu normalmente (HTTP {exc.code}). Tente novamente."}
+    except Exception:
+        checks["minute_api"] = {"ok": False, "detail": "Não foi possível confirmar a API Minute. Confira a conexão e tente novamente."}
 
-    # 5. Invite code — tentativa rápida de join (sem commit)
+    # 5. Check local configuration without joining or exposing the code.
     checks["invite_code"] = {
-        "ok": True,
-        "detail": f"código {config.INVITE_CODE} configurado",
+        "ok": bool(config.INVITE_CODE),
+        "detail": "Código de convite configurado." if config.INVITE_CODE else "Configure o código de convite.",
     }
 
     ready = all(check.get("ok", False) for check in checks.values())
@@ -994,6 +1006,8 @@ def _register_account_steps(
         if callable(on_step):
             try:
                 on_step(step_name)
+            except (OSError, JsonStateError):
+                raise
             except Exception:
                 pass
 
@@ -1039,11 +1053,6 @@ def _register_account_steps(
                 crowtado.criar_conta(email, password, ref="")
             else:
                 crowtado.criar_conta(email, password)
-            _record_step("crowtado_signup", _step_ok(
-                "conta criada" if attempt == 1 else f"conta criada (tentativa {attempt})"
-            ))
-            crowtado_signup_ok = True
-            break
         except Exception as exc:
             if getattr(exc, "account_issue_code", None) == "restricted":
                 _record_step("crowtado_signup", failure(exc))
@@ -1063,18 +1072,27 @@ def _register_account_steps(
             )):
                 try:
                     crowtado.login(email, password)
-                    _record_step("crowtado_signup", _step_skip("conta já existia; login OK"))
-                    crowtado_signup_ok = True
-                    crowtado_login_confirmed = True
-                    break
                 except Exception as login_exc:
                     _record_step("crowtado_signup", failure(login_exc))
                     return finish({"steps": steps, "error": f"crowtado: {login_exc}"})
+                # A local checkpoint error is not a remote login error.
+                _record_step("crowtado_signup", _step_skip("conta já existia; login OK"))
+                crowtado_signup_ok = True
+                crowtado_login_confirmed = True
+                break
             last_error = error_msg
             if attempt < _CROWTADO_SIGNUP_RETRIES:
                 logger.info("[register] %s — Crowtado falhou (tentativa %d/%d)",
                              email, attempt, _CROWTADO_SIGNUP_RETRIES)
                 time.sleep(_CROWTADO_SIGNUP_RETRY_DELAY_S)
+        else:
+            # The remote effect succeeded. Stop if its checkpoint cannot be
+            # saved; never interpret disk failure as permission to create again.
+            _record_step("crowtado_signup", _step_ok(
+                "conta criada" if attempt == 1 else f"conta criada (tentativa {attempt})"
+            ))
+            crowtado_signup_ok = True
+            break
     if not crowtado_signup_ok:
         _record_step("crowtado_signup", _step_fail(f"{last_error} (após {_CROWTADO_SIGNUP_RETRIES} tentativas)"))
         return finish({"steps": steps, "error": f"crowtado: {last_error}"})
@@ -1085,10 +1103,10 @@ def _register_account_steps(
     try:
         if not crowtado_login_confirmed:
             crowtado.login(email, password)
-        _record_step("ban_check", _step_ok("Login Crowtado aceito; nenhum bloqueio de autenticação informado."))
     except Exception as exc:
         _record_step("ban_check", failure(exc))
         return finish({"steps": steps, "error": f"verificação Crowtado: {exc}"})
+    _record_step("ban_check", _step_ok("Login Crowtado aceito; nenhum bloqueio de autenticação informado."))
 
     # Existing completed site steps are preserved; unfinished ones belong to the user.
     for name, detail in (("demographics", "Preencher idade, gênero e equipamento manualmente no site Crowtado."),
@@ -1119,11 +1137,11 @@ def _register_account_steps(
             minute_login(email, password)
             existed = True
         _validate_minute_membership(email)
-        _record_step("minute_register", _step_skip("já existia; acesso e organização confirmados")
-                     if existed else _step_ok("registro e organização confirmados"))
     except Exception as exc:
         _record_step("minute_register", failure(exc))
         return finish({"steps": steps, "error": f"minute: {exc}"})
+    _record_step("minute_register", _step_skip("já existia; acesso e organização confirmados")
+                 if existed else _step_ok("registro e organização confirmados"))
 
     _notify("validate")
     try:
@@ -3068,20 +3086,58 @@ def create_app(*, for_testing: bool = False) -> Flask:
         password = body.get("password", "")
         if not isinstance(email, str) or not isinstance(password, str):
             return jsonify({"error": "email e senha devem ser texto", "code": "invalid_credentials"}), 400
-        email = email.strip()
-        if not email or not password:
-            return jsonify({"error": "informe email e senha"}), 400
+        try:
+            email = credential_store.email_key(email)
+        except ValueError:
+            return jsonify({"error": "E-mail de credencial inválido.",
+                            "code": "invalid_credentials"}), 400
+        if not password or len(password) > 4096:
+            return jsonify({"error": "Informe uma senha válida.",
+                            "code": "invalid_credentials"}), 400
+        nome = body.get("nome", email.split("@", 1)[0])
+        sobrenome = body.get("sobrenome", "")
+        if not _valid_registration_name(nome) or not _valid_registration_name(sobrenome):
+            return jsonify({"error": "Nome e sobrenome devem ser textos de até 200 caracteres, sem controles.",
+                            "code": "invalid_identity"}), 400
         if not _hostinger_is_configured():
             return jsonify({"error": "Configure a integração Hostinger (domínio catch-all) antes de criar contas."}), 409
+        domain = email.split("@", 1)[1]
+        configured_domains = {row["domain"].strip().casefold()
+                              for row in _registration_domains()}
+        if domain not in configured_domains:
+            return jsonify({"error": "Selecione um domínio catch-all configurado nas integrações."}), 400
+        from .. import registration_proxy
+        proxy_id = body.get("proxy_id", "")
+        try:
+            registration_proxy.validate_selection(proxy_id)
+        except (OSError, ValueError):
+            return jsonify({"error": "Selecione um proxy disponível ou importe o arquivo TXT."}), 400
         identity_data: dict[str, Any] = {
-            "nome": email.split("@")[0], "sobrenome": "",
+            "nome": nome, "sobrenome": sobrenome,
             "email": email, "senha": password,
             "use_referral": body.get("use_referral", True),
-            "proxy_id": body.get("proxy_id", ""),
+            "proxy_id": proxy_id,
         }
         if type(identity_data["use_referral"]) is not bool:
             return jsonify({"error": "use_referral deve ser booleano."}), 400
-        result = _full_register_account(email, password, identity_data)
+        if RUNNER.running or RECOVERY.running or BALANCES_RUNNER.running:
+            return jsonify({"error": "Pare a operação atual antes de criar contas."}), 409
+        try:
+            result = _full_register_account(email, password, identity_data)
+        except (OSError, JsonStateError):
+            try:
+                saved_steps = registration_state.load().get(email, {}).get("steps", {})
+            except (OSError, JsonStateError):
+                saved_steps = {}
+            partial = False
+            try:
+                partial = credential_store.record_path(config.SECRETS_DIR, email).is_file()
+            except OSError:
+                pass
+            return jsonify({"ok": False, "email": email, "steps": saved_steps,
+                            "partial": partial,
+                            "code": "local_registration_storage_failure",
+                            "error": "O armazenamento local não confirmou o progresso do cadastro. Confira a conta incompleta e retome o mesmo e-mail; as credenciais e etapas já salvas foram preservadas."}), 503
         ok = result["error"] is None
         return jsonify({"ok": ok, "email": email, "partial": result.get("partial", False), "steps": result["steps"],
                          "error": result["error"]}), 200 if ok else 400
@@ -3200,6 +3256,10 @@ def create_app(*, for_testing: bool = False) -> Flask:
                                  "nome": body.get("nome", email.split("@")[0]),
                                  "sobrenome": body.get("sobrenome", ""),
                                   **{key: body[key] for key in ("birth_month", "birth_year", "gender") if key in body}}
+                if (not _valid_registration_name(identity_data["nome"])
+                        or not _valid_registration_name(identity_data["sobrenome"])):
+                    return jsonify({"error": "Nome e sobrenome devem ser textos de até 200 caracteres, sem controles.",
+                                    "code": "invalid_identity"}), 400
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
         try:
@@ -3227,6 +3287,14 @@ def create_app(*, for_testing: bool = False) -> Flask:
         }
 
         with _BULK_REGISTER_LOCK:
+            # Recheck admission after identity/domain/storage reads. In normal
+            # HTTP requests _ACCOUNT_OPERATION_LOCK serializes account writes;
+            # this second check also protects internal callers and state
+            # transitions made by other local workers during that window.
+            if _BULK_REGISTER_STATE.get("state") in ("running", "stopping"):
+                return jsonify({"error": "Já existe uma criação em andamento."}), 409
+            if RUNNER.running or RECOVERY.running or BALANCES_RUNNER.running:
+                return jsonify({"error": "pare a campanha antes de criar contas"}), 409
             _BULK_REGISTER_STATE.clear()
             _BULK_REGISTER_STATE.update({
                 "state": "running",
@@ -3244,13 +3312,15 @@ def create_app(*, for_testing: bool = False) -> Flask:
             })
             try:
                 _save_registration_batch()
-            except OSError:
+            except (OSError, JsonStateError):
                 # No remote work has started. Do not leave the UI locked in a
                 # running state when the initial durable checkpoint failed.
                 _BULK_REGISTER_STATE.update(
-                    state="failed", error="Não foi possível salvar o progresso local. Nenhuma conta foi criada."
+                    state="failed", request_id="", request_fingerprint="",
+                    error="Não foi possível salvar o progresso local. Nenhuma conta foi criada."
                 )
-                return jsonify({"error": _BULK_REGISTER_STATE["error"]}), 503
+                return jsonify({"error": _BULK_REGISTER_STATE["error"],
+                                "not_admitted": True}), 503
 
         def _run_batch() -> bool:
             successes = 0
@@ -3324,6 +3394,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
             try:
                 if _run_batch():
                     terminal = {"state": "done"}
+            except (OSError, JsonStateError):
+                terminal = {
+                    "state": "failed",
+                    "error": "O armazenamento local não confirmou o progresso do cadastro. As credenciais e etapas já salvas foram preservadas; confira a conta incompleta e retome o mesmo e-mail.",
+                }
             except Exception:
                 terminal = {
                     "state": "failed",
@@ -3336,7 +3411,7 @@ def create_app(*, for_testing: bool = False) -> Flask:
                     _BULK_REGISTER_STATE["current_step"] = ""
                     try:
                         _save_registration_batch()
-                    except OSError:
+                    except (OSError, JsonStateError):
                         _BULK_REGISTER_STATE.update(state="failed", error="Não foi possível salvar o progresso local. Confira as credenciais e os cadastros antes de tentar novamente.")
 
         try:
@@ -3344,8 +3419,21 @@ def create_app(*, for_testing: bool = False) -> Flask:
             thread.start()
         except Exception:
             with _BULK_REGISTER_LOCK:
-                _BULK_REGISTER_STATE.update(state="failed", error="Não foi possível iniciar o cadastro.")
-            return jsonify({"error": "Não foi possível iniciar o cadastro."}), 500
+                # Thread.start failed before the worker could perform any
+                # remote effect. A same-ID retry is therefore safe; persist
+                # that this request was not admitted if storage is available.
+                _BULK_REGISTER_STATE.update(
+                    state="failed", request_id="", request_fingerprint="",
+                    error="Não foi possível iniciar o cadastro. Nenhuma conta foi criada."
+                )
+                try:
+                    _save_registration_batch()
+                except (OSError, JsonStateError):
+                    # The previous durable running checkpoint remains
+                    # intentionally conservative across a service restart.
+                    pass
+            return jsonify({"error": "Não foi possível iniciar o cadastro.",
+                            "not_admitted": True}), 500
         return jsonify({"ok": True, "total": count, "domain": domain, "request_id": request_id})
 
     @app.delete("/api/accounts/<email>")

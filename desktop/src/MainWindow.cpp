@@ -4159,6 +4159,18 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
       _bulkRegisterRequestInFlight = false;
       _bulkRegisterStarting = false;
       _accountConnecting = false;
+      if (!_bulkRegisterPendingRequestId.isEmpty() && !_bulkRegisterBaselineReady) {
+        _bulkRegisterPendingRequestId.clear();
+        _bulkRegisterPendingPath.clear();
+        _bulkRegisterPendingBody = {};
+        _bulkRegisterPendingManualRegistration = false;
+        _bulkRegisterPendingClearResults = false;
+        _bulkRegisterOutcomeUnknown = false;
+        _bulkRegisterRetryInFlight = false;
+        _bulkRegisterStatus->setText(QStringLiteral("O serviço reiniciou antes do envio. Nenhum cadastro foi iniciado; os dados digitados foram mantidos."));
+      } else if (!_bulkRegisterPendingRequestId.isEmpty() && !_bulkRegisterOwnRequestAccepted) {
+        _bulkRegisterOutcomeUnknown = true;
+      }
       _bulkRegisterStart->setEnabled(false);
       _bulkRegisterStop->setEnabled(false);
       _accountsAvailable = false;
@@ -4193,6 +4205,8 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
     // quando já existem credenciais protegidas neste computador.
     loadIntegrations();
     loadAccounts();
+    if (!_bulkRegisterPendingRequestId.isEmpty() && _bulkRegisterBaselineReady && !_bulkRegisterOwnRequestAccepted)
+      _bulkRegisterOutcomeUnknown = true;
     beginRegistrationPolling();
     const QString healthPath = qApp->property("updateHealthPath").toString();
     if (!healthPath.isEmpty()) {
@@ -7981,7 +7995,8 @@ void MainWindow::startAccelerator() {
 void MainWindow::setAccountTransferBusy(bool busy) {
   _accountTransferBusy = busy;
   busy = busy || _orgMigrationRunning || _accountConnecting || _accountsCheckRunning
-      || _bulkRegisterStarting || _bulkRegisterPolling || !_backendReady || !_accountsAvailable;
+      || _bulkRegisterStarting || _bulkRegisterPolling || _bulkRegisterOutcomeUnknown
+      || !_backendReady || !_accountsAvailable;
   _accountsImport->setEnabled(!busy);
   _accountsExport->setEnabled(!busy);
   _accountsExportSelected->setEnabled(!busy);
@@ -7994,6 +8009,18 @@ void MainWindow::setAccountTransferBusy(bool busy) {
   _accountsCheckAll->setEnabled(!busy && _accountsTable->rowCount() > 0);
   _accountsTable->setEnabled(!busy);
   _accountsMigrate->setEnabled(!busy && _accountsTable->rowCount() > 0);
+  updateBulkRegisterStartEnabled();
+}
+
+void MainWindow::updateBulkRegisterStartEnabled() {
+  if (!_bulkRegisterStart) return;
+  const bool busy = _accountTransferBusy || _orgMigrationRunning || _accountConnecting
+      || _accountsCheckRunning || _bulkRegisterStarting || _bulkRegisterPolling
+      || _bulkRegisterOutcomeUnknown || !_backendReady || !_accountsAvailable;
+  const bool samePreflight = _bulkRegisterPreflightReady
+      && _bulkRegisterPreflightDomain == _bulkRegisterDomain->currentData().toString()
+      && _bulkRegisterPreflightProxy == _bulkRegisterProxy->currentData().toString();
+  _bulkRegisterStart->setEnabled(!busy && _registrationProxiesReady && samePreflight);
 }
 
 void MainWindow::startOrgMigration() {
@@ -8647,41 +8674,45 @@ void MainWindow::checkAllAccounts() {
 }
 
 void MainWindow::addAccount(bool registerNew) {
-  if (!_backendReady || _accountConnecting || _accountTransferBusy || _bulkRegisterPolling || _bulkRegisterStarting) return;
+  if (!_backendReady || _accountConnecting || _accountTransferBusy || _bulkRegisterPolling || _bulkRegisterStarting
+      || _bulkRegisterOutcomeUnknown || _orgMigrationRunning || _accountsCheckRunning || !_accountsAvailable) return;
   const QString email = _accountEmail->text().trimmed();
   const QString password = _accountPassword->text();
   if (email.isEmpty() || password.isEmpty()) {
     return showError(QStringLiteral("Dados incompletos"), QStringLiteral("Informe email e senha."));
   }
+  const QString endpoint = registerNew ? QStringLiteral("/api/accounts/register?async=1")
+                                       : QStringLiteral("/api/accounts");
   _accountConnecting = true;
   setAccountTransferBusy(_accountTransferBusy);
   _accountAdd->setEnabled(false);
   _accountRegister->setEnabled(false);
-  const QString endpoint = registerNew ? QStringLiteral("/api/accounts/register?async=1")
-                                       : QStringLiteral("/api/accounts");
-  if (registerNew) {
-    setStatus(QStringLiteral("Registrando %1 — fluxo completo (Crowtado + Minute)… pode levar alguns minutos.")
-                  .arg(email));
-  }
-  const int generation = _operationBackendGeneration;
   QJsonObject body{{QStringLiteral("email"), email}, {QStringLiteral("password"), password}};
   if (registerNew) {
     body.insert("request_id", QUuid::createUuid().toString(QUuid::WithoutBraces));
     body.insert("proxy_id", _accountProxy->currentData().toString());
     body.insert("use_referral", _accountUseReferral->isChecked());
+    _bulkRegisterPendingRequestId = body.value("request_id").toString();
+    _bulkRegisterPendingPath = endpoint;
+    _bulkRegisterPendingBody = body;
+    _bulkRegisterPendingManualRegistration = true;
+    _bulkRegisterPendingClearResults = false;
+    _bulkRegisterPendingTotal = 1;
+    _bulkRegisterOwnRequestAccepted = false;
+    _bulkRegisterOutcomeUnknown = false;
+    _bulkRegisterPreflightReady = false;
+    ++_bulkRegisterPreflightRevision;
     _bulkRegisterStarting = true;
+    _pages->widget(5)->findChild<QTabWidget*>()->setCurrentIndex(2);
+    setStatus(QStringLiteral("Registrando %1 — fluxo completo (Crowtado + Minute)… pode levar alguns minutos.")
+                  .arg(email));
+    submitPendingRegistrationRequest();
+    return;
   }
-  _api.post(endpoint, body,
-            [this, email, registerNew, generation](bool ok, const QJsonDocument& doc, const QString& error) {
+  const int generation = _operationBackendGeneration;
+  _api.post(endpoint, body, [this, email, generation](bool ok, const QJsonDocument&, const QString& error) {
     if (!_backendReady || generation != _operationBackendGeneration) return;
     _accountConnecting = false;
-    _bulkRegisterStarting = false;
-    if (registerNew && (ok || doc.object().value("error_code").toString() == "request_outcome_unknown")) {
-      beginRegistrationPolling();
-      _pages->widget(5)->findChild<QTabWidget*>()->setCurrentIndex(2);
-      _accountPassword->clear();
-      return;
-    }
     setAccountTransferBusy(_accountTransferBusy);
     if (!ok) return showError(QStringLiteral("Conta não conectada"), error);
     _accountChecks.remove(email);
@@ -8694,6 +8725,7 @@ void MainWindow::addAccount(bool registerNew) {
 
 void MainWindow::loadRegistrationProxies(bool selectAuto) {
   if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _accountTransferBusy) return;
+  _bulkRegisterPreflightReady = false;
   const int revision=++_registrationProxiesRevision, generation=_operationBackendGeneration;
   _api.get(QStringLiteral("/api/accounts/proxies"), [this,revision,generation,selectAuto](bool ok,const QJsonDocument& doc,const QString& error) {
     if (!_backendReady || generation!=_operationBackendGeneration || revision!=_registrationProxiesRevision
@@ -8751,6 +8783,7 @@ void MainWindow::importRegistrationProxiesFile(const QString& path) {
 void MainWindow::loadBulkRegisterDomains() {
   loadRegistrationProxies();
   if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
+  _bulkRegisterPreflightReady = false;
   const int revision = ++_bulkRegisterDomainsRevision;
   const QString selectedDomain = _bulkRegisterDomain->currentData().toString();
   ++_bulkRegisterPreflightRevision;
@@ -8803,17 +8836,24 @@ void MainWindow::loadBulkRegisterDomains() {
 }
 
 void MainWindow::checkBulkRegisterDomain() {
-    if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _accountTransferBusy || !_registrationProxiesReady) return;
-    const int revision = ++_bulkRegisterPreflightRevision;
     const QString domain = _bulkRegisterDomain->currentData().toString();
-    _bulkRegisterStart->setEnabled(false);
-    if (domain.isEmpty()) return;
+    const QString proxy = _bulkRegisterProxy->currentData().toString();
+    _bulkRegisterPreflightReady = false;
+    const int revision = ++_bulkRegisterPreflightRevision;
+    updateBulkRegisterStartEnabled();
+    if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _bulkRegisterOutcomeUnknown
+        || _accountTransferBusy || _orgMigrationRunning || _accountConnecting || _accountsCheckRunning
+        || !_registrationProxiesReady || domain.isEmpty()) return;
     _bulkRegisterStatus->setText(QStringLiteral("Validando dependências (Hostinger, Chrome, APIs)…"));
     _api.get(QStringLiteral("/api/accounts/bulk-register/preflight?domain=")
                  + QString::fromLatin1(QUrl::toPercentEncoding(domain)) + QStringLiteral("&proxy_id=") + encoded(_bulkRegisterProxy->currentData().toString()),
-             [this, revision](bool ok, const QJsonDocument& doc, const QString& error) {
-      if (revision != _bulkRegisterPreflightRevision || _bulkRegisterPolling || _bulkRegisterStarting) return;
+             [this, revision, domain, proxy](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (revision != _bulkRegisterPreflightRevision || _bulkRegisterPolling || _bulkRegisterStarting
+          || _bulkRegisterOutcomeUnknown || domain != _bulkRegisterDomain->currentData().toString()
+          || proxy != _bulkRegisterProxy->currentData().toString()) return;
       if (!ok) {
+        _bulkRegisterPreflightReady = false;
+        updateBulkRegisterStartEnabled();
         _bulkRegisterStatus->setText(QStringLiteral("Preflight falhou: ") + error);
         return;
       }
@@ -8824,33 +8864,56 @@ void MainWindow::checkBulkRegisterDomain() {
       const QStringList checkKeys = {
           QStringLiteral("hostinger"), QStringLiteral("chrome"),
           QStringLiteral("crowtado_api"), QStringLiteral("minute_api"),
+          QStringLiteral("invite_code"),
       };
       const QStringList checkNames = {
           QStringLiteral("Hostinger"), QStringLiteral("Chrome"),
           QStringLiteral("Crowtado API"), QStringLiteral("Minute API"),
+          QStringLiteral("Código de convite"),
       };
+      bool checksReady = true;
       for (int i = 0; i < checkKeys.size(); ++i) {
-        const auto check = checks.value(checkKeys.at(i)).toObject();
-        if (!check.value(QStringLiteral("ok")).toBool()) {
+        const auto checkValue = checks.value(checkKeys.at(i));
+        const auto check = checkValue.toObject();
+        if (!checkValue.isObject() || !check.value(QStringLiteral("ok")).isBool()
+            || !check.value(QStringLiteral("ok")).toBool()) {
+          checksReady = false;
           issues << QStringLiteral("%1: %2")
                         .arg(checkNames.at(i), check.value(QStringLiteral("detail")).toString());
         }
       }
-      if (checks.contains("proxy") && !checks.value("proxy").toObject().value("ok").toBool())
+      if (!proxy.isEmpty()) {
+        const auto proxyValue = checks.value(QStringLiteral("proxy"));
+        const auto proxyCheck = proxyValue.toObject();
+        if (!proxyValue.isObject() || !proxyCheck.value(QStringLiteral("ok")).isBool()
+            || !proxyCheck.value(QStringLiteral("ok")).toBool()) {
+          checksReady = false;
+          issues.prepend(QStringLiteral("Proxy: ") + proxyCheck.value(QStringLiteral("detail")).toString());
+        }
+      } else if (checks.contains("proxy") && !checks.value("proxy").toObject().value("ok").toBool()) {
+        checksReady = false;
         issues.prepend(QStringLiteral("Proxy: ") + checks.value("proxy").toObject().value("detail").toString());
-      if (ready && _registrationProxiesReady && !_accountTransferBusy) {
+      }
+      _bulkRegisterPreflightReady = ready && checksReady && _registrationProxiesReady;
+      _bulkRegisterPreflightDomain = domain;
+      _bulkRegisterPreflightProxy = proxy;
+      if (_bulkRegisterPreflightReady) {
         _bulkRegisterStatus->setText(QStringLiteral(
             "Pronto para criar Crowtado + Minute. Depois, conclua as etapas manuais no site Crowtado."));
-        _bulkRegisterStart->setEnabled(true);
       } else {
         _bulkRegisterStatus->setText(
             QStringLiteral("Dependências com problema: %1").arg(issues.join(QStringLiteral("; "))));
       }
+      updateBulkRegisterStartEnabled();
     });
 }
 
 void MainWindow::startBulkRegister() {
-  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
+  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _bulkRegisterOutcomeUnknown
+      || _accountTransferBusy || _orgMigrationRunning || _accountConnecting || _accountsCheckRunning
+      || !_accountsAvailable || !_registrationProxiesReady || !_bulkRegisterPreflightReady
+      || _bulkRegisterPreflightDomain != _bulkRegisterDomain->currentData().toString()
+      || _bulkRegisterPreflightProxy != _bulkRegisterProxy->currentData().toString()) return;
   const QString domain = _bulkRegisterDomain->currentData().toString();
   if (domain.isEmpty()) {
     return showError(QStringLiteral("Domínio indisponível"),
@@ -8864,33 +8927,186 @@ void MainWindow::startBulkRegister() {
   _bulkRegisterStart->setEnabled(false);
   _bulkRegisterDomain->setEnabled(false);
   _bulkRegisterCount->setEnabled(false);
-  _bulkRegisterTable->setRowCount(0);
-  _bulkRegisterProgress->setRange(0, count);
-  _bulkRegisterProgress->setValue(0);
+  _bulkRegisterPendingRequestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+  _bulkRegisterPendingPath = QStringLiteral("/api/accounts/bulk-register");
+  _bulkRegisterPendingBody = {{QStringLiteral("proxy_id"), _bulkRegisterProxy->currentData().toString()},
+      {QStringLiteral("count"), count}, {QStringLiteral("domain"), domain},
+      {QStringLiteral("use_referral"), _bulkRegisterUseReferral->isChecked()},
+      {QStringLiteral("request_id"), _bulkRegisterPendingRequestId}};
+  _bulkRegisterPendingManualRegistration = false;
+  _bulkRegisterPendingClearResults = true;
+  _bulkRegisterPendingTotal = count;
+  _bulkRegisterOwnRequestAccepted = false;
+  _bulkRegisterOutcomeUnknown = false;
+  _bulkRegisterPreflightReady = false;
   _bulkRegisterStatus->setText(QStringLiteral("Iniciando criação de %1 contas…").arg(count));
+  submitPendingRegistrationRequest();
+}
+
+void MainWindow::submitPendingRegistrationRequest() {
+  if (!_backendReady || _bulkRegisterPendingRequestId.isEmpty() || _bulkRegisterPendingPath.isEmpty()
+      || _bulkRegisterPendingBody.isEmpty() || _bulkRegisterRequestInFlight) return;
+  if (!_bulkRegisterBaselineReady) {
+    _bulkRegisterStarting = true;
+    _bulkRegisterRequestInFlight = true;
+    setAccountTransferBusy(_accountTransferBusy);
+    const int generation = _operationBackendGeneration;
+    _api.get(QStringLiteral("/api/accounts/bulk-register/status"),
+      [this, generation, expectedRequestId = _bulkRegisterPendingRequestId](bool ok, const QJsonDocument& doc, const QString& error) {
+        if (!_backendReady || generation != _operationBackendGeneration
+            || expectedRequestId != _bulkRegisterPendingRequestId) return;
+        _bulkRegisterRequestInFlight = false;
+        _bulkRegisterStarting = false;
+        const auto root = doc.object();
+        const QString state = root.value(QStringLiteral("state")).toString();
+        const QString requestId = root.value(QStringLiteral("request_id")).toString();
+        const bool knownState = state == QStringLiteral("idle") || state == QStringLiteral("running")
+            || state == QStringLiteral("stopping") || state == QStringLiteral("done")
+            || state == QStringLiteral("failed");
+        if (!ok || !knownState) {
+          const QString detail = !ok ? error : QStringLiteral("o estado atual não pôde ser identificado");
+          _bulkRegisterPendingRequestId.clear();
+          _bulkRegisterPendingPath.clear();
+          _bulkRegisterPendingBody = {};
+          _bulkRegisterPendingManualRegistration = false;
+          _bulkRegisterPendingClearResults = false;
+          _bulkRegisterStarting = false;
+          _accountConnecting = false;
+          _bulkRegisterDomain->setEnabled(true);
+          _bulkRegisterCount->setEnabled(true);
+          _bulkRegisterStatus->setText(QStringLiteral("Não enviei o cadastro porque não consegui confirmar o estado anterior do serviço. Os dados digitados foram mantidos. ") + detail);
+          setAccountTransferBusy(_accountTransferBusy);
+          return;
+        }
+        if (state == QStringLiteral("running") || state == QStringLiteral("stopping")) {
+          _bulkRegisterPendingRequestId.clear();
+          _bulkRegisterPendingPath.clear();
+          _bulkRegisterPendingBody = {};
+          _bulkRegisterPendingManualRegistration = false;
+          _bulkRegisterPendingClearResults = false;
+          _bulkRegisterDomain->setEnabled(true);
+          _bulkRegisterCount->setEnabled(true);
+          _bulkRegisterStatus->setText(QStringLiteral("Já existe uma criação em andamento no serviço. Aguarde antes de iniciar outra."));
+          setAccountTransferBusy(_accountTransferBusy);
+          beginRegistrationPolling();
+          return;
+        }
+        _bulkRegisterBaselineState = state;
+        _bulkRegisterBaselineRequestId = requestId;
+        _bulkRegisterBaselineReady = true;
+        _bulkRegisterBaselineInvalid = false;
+        setAccountTransferBusy(_accountTransferBusy);
+        submitPendingRegistrationRequest();
+      });
+    return;
+  }
+  const bool retry = _bulkRegisterRetryInFlight || _bulkRegisterOutcomeUnknown;
+  _bulkRegisterRetryInFlight = retry;
+  _bulkRegisterStarting = true;
+  _bulkRegisterOutcomeUnknown = false;
+  setAccountTransferBusy(_accountTransferBusy);
   const int generation = _operationBackendGeneration;
-  _api.post(QStringLiteral("/api/accounts/bulk-register"),
-            {{QStringLiteral("proxy_id"), _bulkRegisterProxy->currentData().toString()}, {QStringLiteral("count"), count}, {QStringLiteral("domain"), domain},
-             {QStringLiteral("use_referral"), _bulkRegisterUseReferral->isChecked()},
-             {QStringLiteral("request_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}},
-            [this,generation](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!_backendReady || generation != _operationBackendGeneration) return;
+  const QString expectedRequestId = _bulkRegisterPendingRequestId;
+  const QJsonObject body = _bulkRegisterPendingBody;
+  const QString path = _bulkRegisterPendingPath;
+  _api.post(path, body, [this, generation, expectedRequestId, retry](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (!_backendReady || generation != _operationBackendGeneration
+        || expectedRequestId != _bulkRegisterPendingRequestId) return;
     _bulkRegisterStarting = false;
-    if (!ok) {
-      _bulkRegisterStatus->setText(QStringLiteral("Falha ao iniciar: ") + error);
-      // Recover the server state before permitting another creation request.
-      beginRegistrationPolling();
+    _accountConnecting = false;
+    _bulkRegisterRetryInFlight = false;
+    const auto response = doc.object();
+    const QString responseRequestId = response.value(QStringLiteral("request_id")).toString();
+    if (ok && response.value(QStringLiteral("ok")).toBool()
+        && responseRequestId == expectedRequestId) {
+      acceptPendingRegistrationRequest();
       return;
     }
-    if (!doc.object().value("ok").toBool()) {
-      beginRegistrationPolling(); return;
+    const bool unknown = response.value(QStringLiteral("error_code")).toString()
+        == QStringLiteral("request_outcome_unknown");
+    if (response.value(QStringLiteral("not_admitted")).toBool()) {
+      rejectPendingRegistrationRequest(error.isEmpty()
+          ? response.value(QStringLiteral("error")).toString(QStringLiteral("O serviço confirmou que não iniciou o cadastro."))
+          : error);
+      return;
     }
-    beginRegistrationPolling();
+    if (unknown || retry) {
+      _bulkRegisterOutcomeUnknown = true;
+      setAccountTransferBusy(_accountTransferBusy);
+      _bulkRegisterStatus->setText(unknown
+          ? QStringLiteral("A resposta do cadastro não chegou. Mantive os dados e vou confirmar a solicitação antes de continuar.")
+          : QStringLiteral("A solicitação ainda não foi confirmada. Mantive os dados e vou consultar o serviço antes de tentar novamente."));
+      if (!_bulkRegisterPolling) beginRegistrationPolling();
+      else _bulkRegisterPoll.setInterval(3000);
+      return;
+    }
+    rejectPendingRegistrationRequest(error.isEmpty()
+        ? response.value(QStringLiteral("error")).toString(QStringLiteral("O serviço recusou a solicitação."))
+        : error);
   });
 }
 
+void MainWindow::acceptPendingRegistrationRequest() {
+  if (_bulkRegisterPendingRequestId.isEmpty()) return;
+  _bulkRegisterOwnRequestAccepted = true;
+  _bulkRegisterOutcomeUnknown = false;
+  _bulkRegisterRetryInFlight = false;
+  _bulkRegisterStarting = false;
+  _accountConnecting = false;
+  if (_bulkRegisterPendingManualRegistration
+      && _accountPassword->text() == _bulkRegisterPendingBody.value(QStringLiteral("password")).toString())
+    _accountPassword->clear();
+  if (_bulkRegisterPendingClearResults) {
+    _bulkRegisterTable->setRowCount(0);
+    _bulkRegisterResults = {};
+    _bulkRegisterProgress->setRange(0, _bulkRegisterPendingTotal);
+    _bulkRegisterProgress->setValue(0);
+  }
+  _bulkRegisterPendingPath.clear();
+  _bulkRegisterPendingBody = {};
+  _bulkRegisterPendingManualRegistration = false;
+  _bulkRegisterPendingClearResults = false;
+  setAccountTransferBusy(_accountTransferBusy);
+  if (!_bulkRegisterPolling) beginRegistrationPolling();
+}
+
+void MainWindow::rejectPendingRegistrationRequest(const QString& error) {
+  QString safeError = error;
+  const QString pendingPassword = _bulkRegisterPendingBody.value(QStringLiteral("password")).toString();
+  if (!pendingPassword.isEmpty()) safeError.replace(pendingPassword, QStringLiteral("[oculto]"));
+  _bulkRegisterPoll.stop();
+  _bulkRegisterPolling = false;
+  _bulkRegisterStarting = false;
+  _bulkRegisterOutcomeUnknown = false;
+  _bulkRegisterOwnRequestAccepted = false;
+  _bulkRegisterRetryInFlight = false;
+  _accountConnecting = false;
+  _bulkRegisterPendingRequestId.clear();
+  _bulkRegisterPendingPath.clear();
+  _bulkRegisterPendingBody = {};
+  _bulkRegisterPendingManualRegistration = false;
+  _bulkRegisterPendingClearResults = false;
+  _bulkRegisterBaselineReady = false;
+  _bulkRegisterBaselineInvalid = false;
+  _bulkRegisterBaselineState.clear();
+  _bulkRegisterBaselineRequestId.clear();
+  _bulkRegisterPreflightReady = false;
+  _bulkRegisterDomain->setEnabled(true);
+  _bulkRegisterCount->setEnabled(true);
+  _bulkRegisterStatus->setText(QStringLiteral("Solicitação recusada: ") + safeError);
+  setAccountTransferBusy(_accountTransferBusy);
+}
+
+void MainWindow::retryPendingRegistrationRequest() {
+  if (_bulkRegisterPendingRequestId.isEmpty() || _bulkRegisterOwnRequestAccepted
+      || _bulkRegisterStarting || _bulkRegisterRetryInFlight || !_backendReady
+      || !_bulkRegisterBaselineReady || _bulkRegisterBaselineInvalid) return;
+  _bulkRegisterRetryInFlight = true;
+  submitPendingRegistrationRequest();
+}
+
 void MainWindow::beginRegistrationPolling() {
-  if (!_backendReady || _bulkRegisterStarting) return;
+  if (!_backendReady || _bulkRegisterStarting || _bulkRegisterRequestInFlight) return;
   _bulkRegisterPolling = true;
   ++_bulkRegisterDomainsRevision; ++_bulkRegisterPreflightRevision;
   _bulkRegisterStart->setEnabled(false);
@@ -8901,25 +9117,24 @@ void MainWindow::beginRegistrationPolling() {
 }
 
 void MainWindow::resumeAccount(const QString& email) {
-  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _accountTransferBusy || _accountConnecting) return;
+  if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _bulkRegisterOutcomeUnknown
+      || _accountTransferBusy || _accountConnecting || _orgMigrationRunning || _accountsCheckRunning
+      || !_accountsAvailable) return;
+  _bulkRegisterPendingRequestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+  _bulkRegisterPendingPath = QStringLiteral("/api/accounts/") + encoded(email) + QStringLiteral("/resume");
+  _bulkRegisterPendingBody = {{QStringLiteral("request_id"), _bulkRegisterPendingRequestId}};
+  _bulkRegisterPendingManualRegistration = false;
+  _bulkRegisterPendingClearResults = false;
+  _bulkRegisterPendingTotal = 1;
+  _bulkRegisterOwnRequestAccepted = false;
+  _bulkRegisterOutcomeUnknown = false;
+  _bulkRegisterPreflightReady = false;
   _bulkRegisterStarting = true;
   ++_bulkRegisterDomainsRevision; ++_bulkRegisterPreflightRevision;
   _bulkRegisterStart->setEnabled(false);
   setAccountTransferBusy(_accountTransferBusy);
-  const int generation = _operationBackendGeneration;
-  _api.post(QStringLiteral("/api/accounts/") + encoded(email) + QStringLiteral("/resume"),
-    {{"request_id", QUuid::createUuid().toString(QUuid::WithoutBraces)}},
-    [this,generation](bool ok, const QJsonDocument& doc, const QString& error) {
-      if (!_backendReady || generation != _operationBackendGeneration) return;
-      _bulkRegisterStarting = false;
-      if (ok || doc.object().value("error_code").toString() == "request_outcome_unknown") {
-        _pages->widget(5)->findChild<QTabWidget*>()->setCurrentIndex(2);
-        beginRegistrationPolling();
-      } else {
-        setAccountTransferBusy(_accountTransferBusy); checkBulkRegisterDomain();
-        showError(QStringLiteral("Retomada não iniciada"), error);
-      }
-    });
+  _pages->widget(5)->findChild<QTabWidget*>()->setCurrentIndex(2);
+  submitPendingRegistrationRequest();
 }
 
 void MainWindow::openWebmail() {
@@ -8933,7 +9148,7 @@ void MainWindow::openWebmail() {
 }
 
 void MainWindow::pollBulkRegister() {
-  if (!_backendReady || _bulkRegisterRequestInFlight) return;
+  if (!_backendReady || _bulkRegisterRequestInFlight || _bulkRegisterStarting) return;
   _bulkRegisterRequestInFlight = true;
   const int generation = _operationBackendGeneration;
   _api.get(QStringLiteral("/api/accounts/bulk-register/status"),
@@ -8952,7 +9167,36 @@ void MainWindow::pollBulkRegister() {
       _bulkRegisterStatus->setText(QStringLiteral("Progresso inválido · dados anteriores preservados. Tentando recuperar…"));
       _bulkRegisterPoll.setInterval(3000); return;
     }
+    const QString statusRequestId = root.value(QStringLiteral("request_id")).toString();
+    if (!_bulkRegisterPendingRequestId.isEmpty()) {
+      if (statusRequestId != _bulkRegisterPendingRequestId) {
+        _bulkRegisterStop->setEnabled(false);
+        _bulkRegisterPoll.setInterval(3000);
+        const bool unchangedBaseline = !_bulkRegisterOwnRequestAccepted && _bulkRegisterBaselineReady
+            && !_bulkRegisterBaselineInvalid && state == _bulkRegisterBaselineState
+            && statusRequestId == _bulkRegisterBaselineRequestId
+            && (state == QStringLiteral("idle")
+                || ((state == QStringLiteral("done") || state == QStringLiteral("failed"))
+                    && !_bulkRegisterBaselineRequestId.isEmpty()));
+        if (unchangedBaseline) {
+          _bulkRegisterStatus->setText(QStringLiteral("O estado do serviço permanece igual ao observado antes do envio. Reenviando o mesmo identificador para confirmar com segurança…"));
+          retryPendingRegistrationRequest();
+        } else if (!_bulkRegisterOwnRequestAccepted) {
+          _bulkRegisterBaselineInvalid = true;
+          _bulkRegisterStatus->setText(QStringLiteral("O estado do serviço mudou desde antes do envio e não corresponde a esta solicitação. Mantive os dados bloqueados; não vou reenviar automaticamente."));
+        } else {
+          _bulkRegisterStatus->setText(QStringLiteral("O serviço ainda não confirmou o resultado deste cadastro. Mantive os dados bloqueados e continuarei consultando sem misturar outro lote."));
+        }
+        return;
+      }
+      if (!_bulkRegisterOwnRequestAccepted) acceptPendingRegistrationRequest();
+    }
     if (state == QStringLiteral("idle")) {
+      if (!_bulkRegisterPendingRequestId.isEmpty()) {
+        _bulkRegisterPoll.setInterval(3000);
+        _bulkRegisterStatus->setText(QStringLiteral("O serviço ainda não confirmou o resultado deste cadastro. Mantive os dados bloqueados e continuarei consultando."));
+        return;
+      }
       _bulkRegisterPoll.stop();
       _bulkRegisterPolling = false;
       _bulkRegisterStop->setEnabled(false);
@@ -8961,7 +9205,7 @@ void MainWindow::pollBulkRegister() {
       _bulkRegisterStatus->setText(QStringLiteral(
           "O serviço não possui um lote em andamento. Confira as contas salvas antes de iniciar outro cadastro."));
       loadAccounts();
-      loadBulkRegisterDomains();
+      _bulkRegisterPreflightReady = false;
       setAccountTransferBusy(_accountTransferBusy);
       return;
     }
@@ -9093,6 +9337,14 @@ void MainWindow::pollBulkRegister() {
       _bulkRegisterTable->setCellWidget(row, 3, menuButton);
     }
     if (terminal) {
+      if (!_bulkRegisterPendingRequestId.isEmpty() && statusRequestId == _bulkRegisterPendingRequestId) {
+        _bulkRegisterPendingRequestId.clear();
+        _bulkRegisterOwnRequestAccepted = false;
+        _bulkRegisterBaselineReady = false;
+        _bulkRegisterBaselineInvalid = false;
+        _bulkRegisterBaselineState.clear();
+        _bulkRegisterBaselineRequestId.clear();
+      }
       _bulkRegisterPoll.stop();
       _bulkRegisterPolling = false;
       _bulkRegisterStop->setEnabled(false);
@@ -9108,7 +9360,7 @@ void MainWindow::pollBulkRegister() {
                 .arg(created).arg(failed).arg(total));
       }
       loadAccounts();
-      loadBulkRegisterDomains();
+      _bulkRegisterPreflightReady = false;
       setAccountTransferBusy(_accountTransferBusy);
     } else {
       QString label;
