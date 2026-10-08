@@ -75,6 +75,7 @@ private:
   void installUpdate(const QString& packagePath, const QString& verifiedSha256);
 
   void startBackend();
+  void drainBackendOutput();
   void stopBackend();
   void beginCampaignDrain();
   void completeCampaignDrain();

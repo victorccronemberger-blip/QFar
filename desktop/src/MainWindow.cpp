@@ -4048,14 +4048,7 @@ void MainWindow::startBackend() {
   });
 #endif
   disconnect(&_backend, nullptr, this, nullptr);
-  connect(&_backend, &QProcess::readyReadStandardOutput, this, [this] {
-    const QString output = QString::fromUtf8(_backend.readAllStandardOutput()).trimmed();
-    const QStringList lines = output.split('\n', Qt::SkipEmptyParts);
-    for (const QString& rawLine : lines) {
-      const QString line = rawLine.trimmed();
-      if (!line.contains(QStringLiteral("HTTP/1.1")) && !line.isEmpty()) setStatus(line);
-    }
-  });
+  drainBackendOutput();
   connect(&_backend, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
     if (!_backendReady) setStatus(QStringLiteral("O motor local não pôde ser iniciado."));
   });
@@ -4072,6 +4065,14 @@ void MainWindow::startBackend() {
   _probeAttempts = 0;
   _backendProbe.start();
   QTimer::singleShot(60, this, &MainWindow::probeBackend);
+}
+
+void MainWindow::drainBackendOutput() {
+  connect(&_backend, &QProcess::readyReadStandardOutput, this, [this] {
+    // Subprocess output contains raw server diagnostics and access-log fragments.
+    // Consume it without presenting it as user-facing status.
+    _backend.readAllStandardOutput();
+  });
 }
 
 void MainWindow::stopBackend() {

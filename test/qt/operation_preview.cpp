@@ -37,6 +37,9 @@
 #include <QScrollBar>
 #include <QUrlQuery>
 #include <QFileInfo>
+#include <QThread>
+#include <cstdio>
+#include <cstring>
 
 class OperationPreview {
 public:
@@ -1666,6 +1669,26 @@ public:
     timer->start(25);
     QTimer::singleShot(8000,&window,[]{qApp->exit(13);});
   }
+  static void backendOutputStatusSmoke(MainWindow& window) {
+    window._status->setText(QStringLiteral("Serviço local pronto."));
+    window._backend.disconnect(&window);
+    window.drainBackendOutput();
+    auto readyReadCount = std::make_shared<int>(0);
+    QObject::connect(&window._backend, &QProcess::readyReadStandardOutput,
+                     &window, [readyReadCount] { ++*readyReadCount; });
+    QObject::connect(&window._backend,
+                     qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                     &window, [&window, readyReadCount](int exitCode, QProcess::ExitStatus status) {
+      const bool passed = status == QProcess::NormalExit && exitCode == 0
+          && *readyReadCount >= 2
+          && window._status->text() == QStringLiteral("Serviço local pronto.");
+      qApp->exit(passed ? 0 : 211);
+    });
+    QTimer::singleShot(4000, &window, [] { qApp->exit(212); });
+    window._backend.start(QCoreApplication::applicationFilePath(),
+                          {QStringLiteral("--emit-fragmented-backend-log")});
+  }
+
   static void page(MainWindow& window, int index) {
     const QSignalBlocker blocker(window._navigation);
     window._navigation->setCurrentRow(index);
@@ -1721,6 +1744,16 @@ public:
 
 int main(int argc, char** argv) {
   QApplication app(argc, argv);
+  if (app.arguments().contains("--emit-fragmented-backend-log")) {
+    const char* first = "127.0.0.1 - - [08/Oct/2026 18:28:22] \"GET /api/accounts HTTP/1.";
+    const char* second = "1\" 400 -\n";
+    std::fwrite(first, 1, std::strlen(first), stdout);
+    std::fflush(stdout);
+    QThread::msleep(150);
+    std::fwrite(second, 1, std::strlen(second), stdout);
+    std::fflush(stdout);
+    return 0;
+  }
   if (app.arguments().contains("--export-brand")) {
     return QIcon(QStringLiteral(":/qmoney/icons/brand.svg")).pixmap(256, 256)
         .save(app.arguments().at(1)) ? 0 : 1;
@@ -1741,6 +1774,13 @@ int main(int argc, char** argv) {
   app.setFont(QFont(QStringLiteral("Inter"), 10));
   MainWindow window(style, nullptr, false);
   window.resize(app.arguments().contains("--compact") ? QSize(980, 680) : QSize(1586, 992));
+  if (app.arguments().contains("--backend-output-status-smoke")) {
+    window.show();
+    QTimer::singleShot(100, &window, [&window] {
+      OperationPreview::backendOutputStatusSmoke(window);
+    });
+    return app.exec();
+  }
   if (app.arguments().contains("--account-services-smoke") || app.arguments().contains("--account-services-preview")) {
     window.show();
     QTimer::singleShot(100,&window,[&window] {OperationPreview::accountServicesSmoke(window);});

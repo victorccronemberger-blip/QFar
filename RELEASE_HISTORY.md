@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **140 releases públicas**, atualizado em **08/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **141 releases públicas**, atualizado em **08/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.89](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.89). Destaques: O criador distingue bloqueio de banimento, preserva resultados incertos sem repetir cadastros e respeita o prazo do provedor entre lotes e reinícios.
+Versão atual: [v2.0.90](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.90). Destaques: O rodapé preserva as mensagens do cadastro e do serviço sem ser sobrescrito por fragmentos de logs HTTP. Inclui a recuperação de cadastro e os limites persistentes da 2.0.89.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.90](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.90) | 08/10/2026 | Saída técnica do processo local não sobrescreve o rodapé, inclusive com logs HTTP fragmentados. Preserva os diagnósticos próprios de inicialização e reinício e as proteções de cadastro, retomada e prazo do provedor da 2.0.89. | [Desde v2.0.89](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.89...v2.0.90) |
 | [v2.0.89](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.89) | 08/10/2026 | Distingue lockout e acesso pausado de banimento confirmado. Grava intenção e confirmação remotas separadamente do login; retomada não repete cadastro incerto. Lote para após limite ou bloqueio; cooldown 429 persiste entre reinícios. Preserva diagnóstico sanitizado no arquivo de banidas. | [Desde v2.0.88](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.88...v2.0.89) |
 | [v2.0.88](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.88) | 08/10/2026 | Carrega domínios, conexões e pré-verificação sem atualização manual ao abrir ou restaurar lote concluído. Reconexão invalida respostas antigas. Mantém recuperação pelo próprio pedido, senha preservada, bloqueio de concorrência e proteção contra repetir criações remotas. | [Desde v2.0.87](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.87...v2.0.88) |
 | [v2.0.87](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.87) | 08/10/2026 | Cadastro confere o próprio pedido, preserva senha em resposta perdida e bloqueia operações concorrentes. Falha de armazenamento não repete criação remota; progresso e credenciais legadas ambíguos são preservados. Pré-verificação confere o status HTTP real e evita expor detalhes privados. Rodapé acompanha o resultado final do cadastro. | [Desde v2.0.85](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.85...v2.0.87) |
