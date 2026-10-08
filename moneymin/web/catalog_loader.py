@@ -84,11 +84,13 @@ class CatalogLoader:
 
     def poll_account_exclusion_diagnostic(self, job_id: str, *, key_prefix: tuple,
                                           scope: str | None) -> tuple[dict, int] | None:
-        """Return only this account's archived restriction diagnostic after its token is removed.
+        """Return only this account's archived restriction status after token removal.
 
         This intentionally does not relax :meth:`poll`: callers must separately
         confirm the canonical ban record and absent token before using this
-        narrow terminal-only channel. Success results and other errors cannot
+        narrow channel. While the worker is still returning from that archive,
+        it exposes only pending progress; after completion it exposes only the
+        typed restriction diagnostic. Success results and other errors cannot
         cross an identity fingerprint change.
         """
         if (scope != "campaign-tasks" or not isinstance(key_prefix, tuple)
@@ -102,8 +104,18 @@ class CatalogLoader:
                     continue
                 if (row.get("scope") != scope or len(stored_key) != 6
                         or stored_key[:5] != key_prefix or stored_key[0] != key_prefix[0]
-                        or "finished" not in row):
+                        or row.get("state") not in {"queued", "running"}):
                     return None
+                if "finished" not in row:
+                    # The ban path has already removed the token, but the
+                    # worker has not yet returned its typed result. Do not
+                    # leak an in-flight result or expose ordinary progress
+                    # text through this identity-change exception.
+                    return ({"loading": True, "state": row["state"],
+                             "message": "Finalizando o registro da conta removida.",
+                             "phase": "archiving_removed_account",
+                             "job_id": row["job_id"], "identity_bound": True,
+                             "elapsed_s": max(0, int(now - row["started"]))}, 202)
                 result, status = row.get("result", ({}, 500))
                 if (status != 400 or not isinstance(result, dict)
                         or result.get("code") != "catalog_account_unavailable"

@@ -239,6 +239,40 @@ class CatalogLoadingTests(unittest.TestCase):
         self.assertIsNone(loader.poll_account_exclusion_diagnostic(
             job_id, key_prefix=(*prefix[:-1], 600.0), scope="campaign-tasks"))
 
+    def test_account_exclusion_diagnostic_only_returns_pending_for_own_live_job(self):
+        loader = CatalogLoader()
+        prefix = ("owner@example.invalid", "ego4d", "both", 300.0, 1800.0)
+        key = (*prefix, "original-identity-fingerprint")
+        entered, release = threading.Event(), threading.Event()
+
+        def work(progress):
+            progress("private progress text")
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return {"tasks": [{"name": "must-not-be-returned"}]}, 200
+
+        try:
+            initial = loader.get(key, work, scope="campaign-tasks")[0]
+            self.assertTrue(entered.wait(1))
+            pending = loader.poll_account_exclusion_diagnostic(
+                initial["job_id"], key_prefix=prefix, scope="campaign-tasks")
+            self.assertEqual(pending[1], 202)
+            self.assertEqual(pending[0]["job_id"], initial["job_id"])
+            self.assertTrue(pending[0]["identity_bound"])
+            self.assertTrue(pending[0]["loading"])
+            self.assertNotIn("tasks", pending[0])
+            self.assertNotIn("private progress", str(pending[0]))
+            self.assertIsNone(loader.poll_account_exclusion_diagnostic(
+                initial["job_id"], key_prefix=("other@example.invalid", *prefix[1:]),
+                scope="campaign-tasks"))
+            self.assertIsNone(loader.poll_account_exclusion_diagnostic(
+                initial["job_id"], key_prefix=prefix, scope="other-scope"))
+            self.assertIsNone(loader.poll_account_exclusion_diagnostic(
+                initial["job_id"], key_prefix=(*prefix[:-1], 600.0),
+                scope="campaign-tasks"))
+        finally:
+            release.set()
+
     def test_account_exclusion_diagnostic_rejects_success_and_unconfirmed_errors(self):
         prefix = ("owner@example.invalid", "ego4d", "both", 300.0, 1800.0)
         issue = {"email": prefix[0], "code": "restricted",

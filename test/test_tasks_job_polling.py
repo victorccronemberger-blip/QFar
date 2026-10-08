@@ -406,6 +406,51 @@ class TasksJobPollingTests(unittest.TestCase):
             replaced = self.poll(job_id)
             self.assertEqual(replaced.status_code, 409, replaced.get_json())
 
+    def test_real_ban_poll_is_pending_between_token_deletion_and_worker_return(self):
+        self.sessions.side_effect = AuthError("restricted", code="restricted")
+        archived, release_archive = threading.Event(), threading.Event()
+        archive_checked_ban = server._archive_checked_ban
+
+        def archive_then_pause(email, result):
+            archive_checked_ban(email, result)
+            archived.set()
+            release_archive.wait(5)
+
+        query = dict(self.query)
+        with patch.object(server, "_removed_accounts", side_effect=self.actual_removed_accounts), \
+                patch.object(server, "_archive_checked_ban", side_effect=archive_then_pause):
+            started = self.client.get("/api/tasks", query_string=query)
+            self.assertEqual(started.status_code, 202, started.get_json())
+            job_id = started.json["job_id"]
+            try:
+                self.assertTrue(archived.wait(2), "ban archive did not complete")
+                self.assertIsNone(token_store.load(
+                    config.SECRETS_DIR, self.token["email"], migrate=False))
+
+                pending = self.poll(job_id)
+                self.assertEqual(pending.status_code, 202, pending.get_json())
+                self.assertTrue(pending.json["loading"])
+                self.assertTrue(pending.json["identity_bound"])
+                self.assertEqual(pending.json["job_id"], job_id)
+                self.assertNotIn("tasks", pending.json)
+                self.assertNotIn("issue", pending.json)
+
+                other = self.client.get("/api/tasks", query_string={
+                    **query, "email": "other-owner@example.invalid", "job_id": job_id})
+                self.assertEqual(other.status_code, 409, other.get_json())
+                changed = self.poll(job_id, content_mode="cache")
+                self.assertEqual(changed.status_code, 409, changed.get_json())
+            finally:
+                release_archive.set()
+
+            self.finish_worker()
+            failed = self.poll(job_id)
+
+        self.assertEqual(failed.status_code, 400, failed.get_json())
+        self.assertEqual(failed.json["code"], "catalog_account_unavailable")
+        self.assertIs(failed.json["permanently_removed"], True)
+        self.assertNotIn("tasks", failed.json)
+
 
 if __name__ == "__main__":
     unittest.main()
