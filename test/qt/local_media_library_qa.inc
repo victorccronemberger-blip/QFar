@@ -2,7 +2,7 @@
     // Only inert files and loopback API replies. No player, backend or campaign is started.
     struct Flow {
       int phase = 0, reads = 0, nonceReads = 0, cleanupCalls = 0, preparedRefreshes = 0;
-      QString nonce;
+      QString nonce, preCleanupNonce;
       bool loadingSeen = false, filteredSeen = false;
       std::shared_ptr<QTemporaryDir> root = std::make_shared<QTemporaryDir>();
       std::shared_ptr<QTemporaryDir> outside = std::make_shared<QTemporaryDir>();
@@ -97,7 +97,7 @@
         } else if (url.path() == QStringLiteral("/api/storage/cleanup")) {
           const auto body = QJsonDocument::fromJson(input.mid(headerEnd + 4)).object();
           if (body.value("provider").toString() != "holoassist") { qApp->exit(235); return; }
-          ++flow->cleanupCalls; payload = {{"files", 0}, {"bytes", 0}};
+          ++flow->cleanupCalls; delay = 100; payload = {{"files", 0}, {"bytes", 0}};
         } else if (url.path() == QStringLiteral("/api/holo-cache")) {
           payload = {{"tasks", QJsonArray{"Gardening"}}, {"default_task", "Gardening"},
               {"cache", QJsonObject{{"total", 0}, {"ready", 0}, {"pending", 0}}},
@@ -120,7 +120,11 @@
     window.loadLocalMediaLibrary();
     auto* poll = new QTimer(&window);
     QObject::connect(poll, &QTimer::timeout, &window, [&window, flow, poll] {
-      const auto fail = [](int code) { qApp->exit(code); };
+      const auto fail = [flow](int code) {
+        qWarning() << "local-media-smoke failure" << code << "phase" << flow->phase
+                   << "reads" << flow->reads << "cleanup" << flow->cleanupCalls;
+        qApp->exit(code);
+      };
       if (flow->phase == 0 && window._localMediaVerified && window._localMediaTable->rowCount() == 50) {
         window._localMediaTable->setCurrentCell(0,0);
         if (!flow->loadingSeen || !window._localMediaOpen->isEnabled() || !window._libraryOpenFolder->isEnabled()
@@ -196,14 +200,15 @@
       } else if (flow->phase == 13 && window._localMediaVerified) {
         flow->phase = 14; window._localMediaQuery->clear();
       } else if (flow->phase == 14 && window._localMediaVerified && window._localMediaTable->rowCount() == 50) {
-        flow->phase = 15;
+        flow->phase = 15; flow->preCleanupNonce = flow->nonce;
         window.findChild<QComboBox*>(QStringLiteral("cacheCleanupProvider"))->setCurrentIndex(1);
         QTimer::singleShot(0, &window, [] {
           if (auto* message = qobject_cast<QMessageBox*>(QApplication::activeModalWidget()))
             if (auto* yes = message->button(QMessageBox::Yes)) yes->click();
         });
         window.findChild<QPushButton*>(QStringLiteral("cacheCleanupButton"))->click();
-      } else if (flow->phase == 15 && flow->cleanupCalls && window._localMediaVerified && flow->nonceReads >= 2) {
+      } else if (flow->phase == 15 && flow->cleanupCalls && window._localMediaVerified
+                 && flow->nonce != flow->preCleanupNonce && flow->nonceReads >= 2) {
         if (flow->preparedRefreshes || !window._preparedRefreshPending) { fail(252); return; }
         flow->phase = 16; window._libraryTabs->setCurrentIndex(1);
       } else if (flow->phase == 16 && flow->preparedRefreshes && window._preparedVerified) {
