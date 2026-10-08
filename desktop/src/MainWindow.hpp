@@ -183,8 +183,8 @@ private:
   void addAccount(bool registerNew);
   void importAccounts();
   void exportAccounts(bool selectedOnly);
-  void loadBulkRegisterDomains();
-  void loadRegistrationProxies(bool selectAuto = false);
+  void loadBulkRegisterDomains(bool preserveStatus = false);
+  void loadRegistrationProxies(bool selectAuto = false, bool preserveStatus = false);
   void importRegistrationProxiesFile(const QString& path);
   QComboBox* _accountProxy{};
   QComboBox* _bulkRegisterProxy{};
@@ -192,7 +192,7 @@ private:
   QPushButton* _bulkProxyImport{};
   bool _registrationProxiesReady{false};
   int _registrationProxiesRevision{0};
-  void checkBulkRegisterDomain();
+  void checkBulkRegisterDomain(bool preserveStatus = false);
   void startBulkRegister();
   void pollBulkRegister();
   void updateBulkRegisterStartEnabled();

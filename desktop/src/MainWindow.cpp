@@ -4155,6 +4155,9 @@ void MainWindow::setBackendReady(bool ready, const QString& message) {
       ++_accountsRevision;
       ++_bulkRegisterDomainsRevision;
       ++_bulkRegisterPreflightRevision;
+      ++_registrationProxiesRevision;
+      _registrationProxiesReady = false;
+      _bulkRegisterPreflightReady = false;
       _bulkRegisterPoll.stop();
       _bulkRegisterRequestInFlight = false;
       _bulkRegisterStarting = false;
@@ -8723,17 +8726,18 @@ void MainWindow::addAccount(bool registerNew) {
   });
 }
 
-void MainWindow::loadRegistrationProxies(bool selectAuto) {
+void MainWindow::loadRegistrationProxies(bool selectAuto, bool preserveStatus) {
   if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _accountTransferBusy) return;
   _bulkRegisterPreflightReady = false;
   const int revision=++_registrationProxiesRevision, generation=_operationBackendGeneration;
-  _api.get(QStringLiteral("/api/accounts/proxies"), [this,revision,generation,selectAuto](bool ok,const QJsonDocument& doc,const QString& error) {
+  _api.get(QStringLiteral("/api/accounts/proxies"), [this,revision,generation,selectAuto,preserveStatus](bool ok,const QJsonDocument& doc,const QString& error) {
     if (!_backendReady || generation!=_operationBackendGeneration || revision!=_registrationProxiesRevision
         || _bulkRegisterPolling || _bulkRegisterStarting) return;
     const auto rows=doc.object().value("proxies");
     _registrationProxiesReady=ok && rows.isArray();
     if (!_registrationProxiesReady) {
-      _bulkRegisterStatus->setText(QStringLiteral("Não foi possível carregar os proxies. Atualize antes de criar contas. ")+error);
+      const QString prefix = preserveStatus ? _bulkRegisterStatus->text().section('\n',0,0) + QStringLiteral("\n") : QString();
+      _bulkRegisterStatus->setText(prefix + QStringLiteral("Não foi possível carregar os proxies. Atualize antes de criar contas. ")+error);
       setAccountTransferBusy(_accountTransferBusy); return;
     }
     for (auto* combo : {_accountProxy,_bulkRegisterProxy}) {
@@ -8752,7 +8756,7 @@ void MainWindow::loadRegistrationProxies(bool selectAuto) {
       const auto selected=((selectAuto || initial) && !rows.toArray().isEmpty()) ? QStringLiteral("auto") : previous;
       combo->setCurrentIndex(qMax(0,combo->findData(selected)));
     }
-    setAccountTransferBusy(_accountTransferBusy); checkBulkRegisterDomain();
+    setAccountTransferBusy(_accountTransferBusy); checkBulkRegisterDomain(preserveStatus);
   });
 }
 
@@ -8780,9 +8784,10 @@ void MainWindow::importRegistrationProxiesFile(const QString& path) {
     });
 }
 
-void MainWindow::loadBulkRegisterDomains() {
-  loadRegistrationProxies();
+void MainWindow::loadBulkRegisterDomains(bool preserveStatus) {
+  loadRegistrationProxies(false, preserveStatus);
   if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting) return;
+  const QString statusPrefix = preserveStatus ? _bulkRegisterStatus->text().section('\n',0,0) + QStringLiteral("\n") : QString();
   _bulkRegisterPreflightReady = false;
   const int revision = ++_bulkRegisterDomainsRevision;
   const QString selectedDomain = _bulkRegisterDomain->currentData().toString();
@@ -8792,7 +8797,7 @@ void MainWindow::loadBulkRegisterDomains() {
   _bulkRegisterDomain->clear();
   _bulkRegisterDomain->addItem(QStringLiteral("carregando domínios…"));
   _bulkRegisterDomain->setEnabled(false);
-  _api.get(QStringLiteral("/api/accounts/domains"), [this, revision, selectedDomain](bool ok, const QJsonDocument& doc, const QString& error) {
+  _api.get(QStringLiteral("/api/accounts/domains"), [this, revision, selectedDomain, preserveStatus, statusPrefix](bool ok, const QJsonDocument& doc, const QString& error) {
     if (revision != _bulkRegisterDomainsRevision || _bulkRegisterPolling || _bulkRegisterStarting) return;
     const QSignalBlocker blocker(_bulkRegisterDomain);
     _bulkRegisterDomain->clear();
@@ -8800,7 +8805,7 @@ void MainWindow::loadBulkRegisterDomains() {
     if (!ok) {
       _bulkRegisterDomain->addItem(QStringLiteral("não foi possível carregar"));
       _bulkRegisterDomain->setEnabled(false);
-      _bulkRegisterStatus->setText(QStringLiteral("Falha ao carregar domínios: ") + error);
+      _bulkRegisterStatus->setText(statusPrefix + QStringLiteral("Falha ao carregar domínios: ") + error);
       return;
     }
     const auto root = doc.object();
@@ -8811,9 +8816,9 @@ void MainWindow::loadBulkRegisterDomains() {
       _bulkRegisterDomain->setEnabled(false);
       _bulkRegisterStart->setEnabled(false);
       const QString warning = root.value(QStringLiteral("warning")).toString();
-      _bulkRegisterStatus->setText(warning.isEmpty()
+      _bulkRegisterStatus->setText(statusPrefix + (warning.isEmpty()
           ? QStringLiteral("Nenhum domínio disponível. Em Integrações, use Identificar e conectar com o token da API Mail da Hostinger; depois clique em Atualizar domínios.")
-          : warning);
+          : warning));
       return;
     }
     for (const auto value : domains) {
@@ -8831,11 +8836,12 @@ void MainWindow::loadBulkRegisterDomains() {
               .arg(webmailUrl));
       _bulkRegisterWebmail->show();
     }
-    checkBulkRegisterDomain();
+    checkBulkRegisterDomain(preserveStatus);
   });
 }
 
-void MainWindow::checkBulkRegisterDomain() {
+void MainWindow::checkBulkRegisterDomain(bool preserveStatus) {
+    const QString statusPrefix = preserveStatus ? _bulkRegisterStatus->text().section('\n',0,0) + QStringLiteral("\n") : QString();
     const QString domain = _bulkRegisterDomain->currentData().toString();
     const QString proxy = _bulkRegisterProxy->currentData().toString();
     _bulkRegisterPreflightReady = false;
@@ -8844,17 +8850,18 @@ void MainWindow::checkBulkRegisterDomain() {
     if (!_backendReady || _bulkRegisterPolling || _bulkRegisterStarting || _bulkRegisterOutcomeUnknown
         || _accountTransferBusy || _orgMigrationRunning || _accountConnecting || _accountsCheckRunning
         || !_registrationProxiesReady || domain.isEmpty()) return;
-    _bulkRegisterStatus->setText(QStringLiteral("Validando dependências (Hostinger, Chrome, APIs)…"));
+    if (!preserveStatus)
+      _bulkRegisterStatus->setText(QStringLiteral("Validando dependências (Hostinger, Chrome, APIs)…"));
     _api.get(QStringLiteral("/api/accounts/bulk-register/preflight?domain=")
                  + QString::fromLatin1(QUrl::toPercentEncoding(domain)) + QStringLiteral("&proxy_id=") + encoded(_bulkRegisterProxy->currentData().toString()),
-             [this, revision, domain, proxy](bool ok, const QJsonDocument& doc, const QString& error) {
+             [this, revision, domain, proxy, statusPrefix](bool ok, const QJsonDocument& doc, const QString& error) {
       if (revision != _bulkRegisterPreflightRevision || _bulkRegisterPolling || _bulkRegisterStarting
           || _bulkRegisterOutcomeUnknown || domain != _bulkRegisterDomain->currentData().toString()
           || proxy != _bulkRegisterProxy->currentData().toString()) return;
       if (!ok) {
         _bulkRegisterPreflightReady = false;
         updateBulkRegisterStartEnabled();
-        _bulkRegisterStatus->setText(QStringLiteral("Preflight falhou: ") + error);
+        _bulkRegisterStatus->setText(statusPrefix + QStringLiteral("Preflight falhou: ") + error);
         return;
       }
       const auto root = doc.object();
@@ -8898,11 +8905,11 @@ void MainWindow::checkBulkRegisterDomain() {
       _bulkRegisterPreflightDomain = domain;
       _bulkRegisterPreflightProxy = proxy;
       if (_bulkRegisterPreflightReady) {
-        _bulkRegisterStatus->setText(QStringLiteral(
+        _bulkRegisterStatus->setText(statusPrefix + QStringLiteral(
             "Pronto para criar Crowtado + Minute. Depois, conclua as etapas manuais no site Crowtado."));
       } else {
         _bulkRegisterStatus->setText(
-            QStringLiteral("Dependências com problema: %1").arg(issues.join(QStringLiteral("; "))));
+            statusPrefix + QStringLiteral("Dependências com problema: %1").arg(issues.join(QStringLiteral("; "))));
       }
       updateBulkRegisterStartEnabled();
     });
@@ -9218,6 +9225,10 @@ void MainWindow::pollBulkRegister() {
       loadAccounts();
       _bulkRegisterPreflightReady = false;
       setAccountTransferBusy(_accountTransferBusy);
+      if (!_registrationProxiesReady || _bulkRegisterDomain->currentData().toString().isEmpty())
+        loadBulkRegisterDomains();
+      else
+        checkBulkRegisterDomain();
       return;
     }
     const int total = root.value(QStringLiteral("total")).toInt();
@@ -9376,6 +9387,10 @@ void MainWindow::pollBulkRegister() {
       loadAccounts();
       _bulkRegisterPreflightReady = false;
       setAccountTransferBusy(_accountTransferBusy);
+      if (!_registrationProxiesReady || _bulkRegisterDomain->currentData().toString().isEmpty())
+        loadBulkRegisterDomains(true);
+      else
+        checkBulkRegisterDomain(true);
     } else {
       QString label;
       if (current.isEmpty()) {

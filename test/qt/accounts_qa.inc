@@ -146,6 +146,107 @@ static void accountsCreationBusyGuardSmoke(MainWindow& window) {
   timer->start(20);QTimer::singleShot(4000,&window,[]{qApp->exit(270);});
 }
 
+static void accountsCatalogAutoInitializationSmoke(MainWindow& window) {
+  const bool restoredDone=qApp->arguments().contains("--accounts-catalog-auto-restored-done");
+  struct Flow {
+    int domains=0,proxies=0,preflights=0,statusReads=0,posts=0,stage=0;
+    int baseDomains=0,baseProxies=0,basePreflights=0,baseStatusReads=0;
+  };
+  auto flow=std::make_shared<Flow>();
+  auto* server=new QTcpServer(&window);
+  if(!server->listen(QHostAddress::LocalHost)){qApp->exit(286);return;}
+  QObject::connect(server,&QTcpServer::newConnection,server,[server,flow,restoredDone]{
+    auto* socket=server->nextPendingConnection();
+    QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,flow,restoredDone]{
+      const auto input=socket->property("input").toByteArray()+socket->readAll();socket->setProperty("input",input);
+      const int split=input.indexOf("\r\n\r\n");if(split<0||socket->property("answered").toBool())return;
+      const QRegularExpression length("Content-Length: (\\d+)",QRegularExpression::CaseInsensitiveOption);
+      const auto match=length.match(QString::fromLatin1(input.left(split)));
+      if(match.hasMatch()&&input.size()-split-4<match.captured(1).toInt())return;
+      socket->setProperty("answered",true);
+      QJsonObject out{{"ok",true}};
+      if(input.startsWith("GET /api/accounts/domains ")){
+        ++flow->domains;
+        out={{"domains",QJsonArray{QJsonObject{{"domain","fixture.invalid"},{"profile_name","Fixture"}}}}};
+      } else if(input.startsWith("GET /api/accounts/proxies ")){
+        ++flow->proxies;
+        out={{"proxies",QJsonArray{QJsonObject{{"id","fixture-proxy"},{"label","Proxy fixture"}}}}};
+      } else if(input.startsWith("GET /api/accounts/bulk-register/preflight")){
+        ++flow->preflights;
+        const QJsonObject good{{"ok",true}};
+        out={{"ready",true},{"checks",QJsonObject{{"hostinger",good},{"chrome",good},
+          {"crowtado_api",good},{"minute_api",good},{"invite_code",good},{"proxy",good}}}};
+      } else if(input.startsWith("GET /api/accounts/bulk-register/status ")){
+        ++flow->statusReads;
+        out=restoredDone
+          ? QJsonObject{{"state","done"},{"request_id","fixture-old-batch"},{"total",0},
+              {"completed",0},{"created",0},{"failed",0},{"results",QJsonArray{}}}
+          : QJsonObject{{"state","idle"},{"request_id",""},{"total",0},
+              {"completed",0},{"created",0},{"failed",0},{"results",QJsonArray{}}};
+      } else if(input.startsWith("GET /api/accounts ")){
+        out={{"accounts",QJsonArray{}}};
+      } else if(input.startsWith("GET /api/accounts/migration ")){
+        out={{"state","idle"}};
+      } else if(input.startsWith("GET /api/integrations ")){
+        out={{"ego4d",QJsonObject{}},{"hostinger",QJsonObject{}},
+          {"holoassist",QJsonObject{}},{"runtime",QJsonObject{}},{"security",QJsonObject{}}};
+      } else if(input.startsWith("POST /api/accounts/")){
+        ++flow->posts;out={{"error","Cadastro desativado nesta fixture."}};
+      }
+      const auto bytes=QJsonDocument(out).toJson(QJsonDocument::Compact);
+      socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+QByteArray::number(bytes.size())+"\r\n\r\n"+bytes);
+      socket->disconnectFromHost();
+    });
+  });
+  window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
+  window._pages->setCurrentIndex(5);window._navigation->setCurrentRow(5);
+  window._pages->widget(5)->findChild<QTabWidget*>()->setCurrentIndex(2);
+  if(window._registrationProxiesReady||!window._bulkRegisterDomain->currentData().toString().isEmpty()
+      ||!window._bulkRegisterProxy->currentData().toString().isEmpty()) {qApp->exit(287);return;}
+  window.setBackendReady(true);
+  auto* timer=new QTimer(&window);
+  QObject::connect(timer,&QTimer::timeout,&window,[&window,flow,restoredDone]{
+    if(flow->posts){qApp->exit(288);return;}
+    const bool ready=window._bulkRegisterPreflightReady&&window._bulkRegisterStart->isEnabled();
+    if(flow->stage==0&&flow->domains>0&&flow->proxies>0&&flow->preflights>0&&ready){
+      if(window._bulkRegisterDomain->currentData().toString()!=QStringLiteral("fixture.invalid")
+          ||window._bulkRegisterProxy->currentData().toString()!=QStringLiteral("auto")
+          ||!window._registrationProxiesReady||!window._accountsAvailable
+          ||(restoredDone&&(flow->statusReads==0
+              ||!window._bulkRegisterStatus->text().startsWith(QStringLiteral("Concluído:"))))){qApp->exit(289);return;}
+      flow->basePreflights=flow->preflights;
+      flow->baseStatusReads=flow->statusReads;
+      flow->stage=1;
+      window.beginRegistrationPolling();
+      return;
+    }
+    if(flow->stage==1&&flow->statusReads>flow->baseStatusReads
+        &&flow->preflights>flow->basePreflights&&ready){
+      if(window._bulkRegisterDomain->currentData().toString()!=QStringLiteral("fixture.invalid")
+          ||window._bulkRegisterProxy->currentData().toString()!=QStringLiteral("auto")
+          ||!window._registrationProxiesReady||!window._accountsAvailable
+          ||(restoredDone&&!window._bulkRegisterStatus->text().startsWith(QStringLiteral("Concluído:")))){qApp->exit(291);return;}
+      flow->baseDomains=flow->domains;
+      flow->baseProxies=flow->proxies;
+      flow->basePreflights=flow->preflights;
+      flow->baseStatusReads=flow->statusReads;
+      flow->stage=2;
+      window.setBackendReady(false,QStringLiteral("Reconexão de fixture"));
+      window.setBackendReady(true);
+      return;
+    }
+    if(flow->stage==2&&flow->domains>flow->baseDomains&&flow->proxies>flow->baseProxies
+        &&flow->preflights>flow->basePreflights&&flow->statusReads>flow->baseStatusReads&&ready){
+      if(window._bulkRegisterDomain->currentData().toString()!=QStringLiteral("fixture.invalid")
+          ||window._bulkRegisterProxy->currentData().toString()!=QStringLiteral("auto")
+          ||!window._registrationProxiesReady||!window._accountsAvailable
+          ||(restoredDone&&!window._bulkRegisterStatus->text().startsWith(QStringLiteral("Concluído:")))){qApp->exit(292);return;}
+      qApp->exit(0);
+    }
+  });
+  timer->start(20);QTimer::singleShot(8000,&window,[]{qApp->exit(290);});
+}
+
 static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
   const QStringList args=qApp->arguments();
   const bool beforeAdmission=args.contains("--accounts-outcome-before-admission");
@@ -182,6 +283,11 @@ static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
         if(pollRecovery&&flow->posts&&flow->pollFailures==0){++flow->pollFailures;httpStatus=503;out={{"error","Consulta temporariamente indisponível."}};}
       } else if(input.startsWith("GET /api/accounts ")) out={{"accounts",QJsonArray{}}};
       else if(input.startsWith("GET /api/accounts/migration ")) out={{"state","idle"}};
+      else if(input.startsWith("GET /api/accounts/bulk-register/preflight")){
+        const QJsonObject good{{"ok",true}};
+        out={{"ready",true},{"checks",QJsonObject{{"hostinger",good},{"chrome",good},
+          {"crowtado_api",good},{"minute_api",good},{"invite_code",good},{"proxy",good}}}};
+      }
       else if(input.startsWith("POST /api/accounts/register?async=1 ")){
         ++flow->posts;const auto body=QJsonDocument::fromJson(input.mid(split+4)).object();
         const QString id=body.value("request_id").toString();flow->ids.append(id);
@@ -201,6 +307,9 @@ static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
   });
   window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server->serverPort()));
   window._backendReady=true;window._accountsAvailable=true;
+  window._registrationProxiesReady=true;
+  window._bulkRegisterDomain->clear();window._bulkRegisterDomain->addItem("fixture.invalid","fixture.invalid");
+  window._bulkRegisterProxy->clear();window._bulkRegisterProxy->addItem("Fixture proxy","fixture-proxy-id");
   window._accountProxy->clear();window._accountProxy->addItem("fixture proxy","fixture-proxy-id");
   window._accountEmail->setText("new@example.invalid");window._accountPassword->setText("fixture-only-password");
   window._bulkRegisterTable->setRowCount(1);window._bulkRegisterTable->setItem(0,0,new QTableWidgetItem("prior-result"));
@@ -225,9 +334,14 @@ static void accountsRegistrationOutcomeSmoke(MainWindow& window) {
       if(notAdmitted&&flow->statusReads!=1){qApp->exit(275);return;}
       qApp->exit(0);return;
     }
-    if(flow->state=="done"&&!window._bulkRegisterPolling&&window._bulkRegisterPendingRequestId.isEmpty()){
+    if(flow->state=="done"&&!window._bulkRegisterPolling&&window._bulkRegisterPendingRequestId.isEmpty()
+        &&window._bulkRegisterStart->isEnabled()){
+      const auto creatorStatus=window._bulkRegisterStatus->text();
+      const int detailSeparator=creatorStatus.indexOf('\n');
+      const auto expectedFooter=detailSeparator<0?creatorStatus:creatorStatus.left(detailSeparator);
       if(window._accountPassword->text()!=QString()||flow->ids.isEmpty()
-          ||window._status->text()!=window._bulkRegisterStatus->text()){qApp->exit(276);return;}
+          ||!creatorStatus.startsWith(QStringLiteral("Concluído:"))
+          ||window._status->text()!=expectedFooter){qApp->exit(276);return;}
       for(const auto& id:flow->ids)if(id.isEmpty()||id!=flow->ids.first()){qApp->exit(277);return;}
       if(beforeAdmission&&flow->posts<2){qApp->exit(278);return;}
       if(afterAdmission&&flow->posts!=1){qApp->exit(279);return;}
@@ -290,6 +404,10 @@ static void accountsRegistrationNativePreview(MainWindow& window) {
 static void accountsQaSmoke(MainWindow& window) {
   if(qApp->arguments().contains("--registration-native-preview")){accountsRegistrationNativePreview(window);return;}
   if(qApp->arguments().contains("--accounts-creation-busy-smoke")){accountsCreationBusyGuardSmoke(window);return;}
+  if(qApp->arguments().contains("--accounts-catalog-auto-idle")
+      ||qApp->arguments().contains("--accounts-catalog-auto-restored-done")){
+    accountsCatalogAutoInitializationSmoke(window);return;
+  }
   if(qApp->arguments().contains("--accounts-outcome-before-admission")
       ||qApp->arguments().contains("--accounts-outcome-after-admission")
       ||qApp->arguments().contains("--accounts-outcome-foreign-batch")

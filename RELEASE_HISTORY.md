@@ -1,14 +1,15 @@
 # Histórico de releases do QMoney
 
-Índice das **138 releases públicas**, atualizado em **08/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
+Índice das **139 releases públicas**, atualizado em **08/10/2026**. Cada versão tem um link para seus arquivos, um resumo das notas e a comparação com a release pública anterior.
 
 
 As datas são as publicações originais, no fuso America/Sao_Paulo. Os resumos vêm das notas existentes; as declarações históricas de testes e resultados não foram reexecutadas nesta organização do histórico.
 
-Versão atual: [v2.0.87](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.87). Destaques: O criador preserva credenciais em respostas inconclusivas, acompanha o próprio pedido e interrompe falhas locais sem repetir criações remotas.
+Versão atual: [v2.0.88](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.88). Destaques: O criador carrega domínios, conexões e pré-verificação automaticamente ao abrir e ao restaurar um lote encerrado, mantendo a recuperação segura dos pedidos.
 
 | Versão | Publicação (São Paulo) | Mudanças registradas | Comparação |
 |---|---|---|---|
+| [v2.0.88](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.88) | 08/10/2026 | Carrega domínios, conexões e pré-verificação sem atualização manual ao abrir ou restaurar lote concluído. Reconexão invalida respostas antigas. Mantém recuperação pelo próprio pedido, senha preservada, bloqueio de concorrência e proteção contra repetir criações remotas. | [Desde v2.0.87](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.87...v2.0.88) |
 | [v2.0.87](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.87) | 08/10/2026 | Cadastro confere o próprio pedido, preserva senha em resposta perdida e bloqueia operações concorrentes. Falha de armazenamento não repete criação remota; progresso e credenciais legadas ambíguos são preservados. Pré-verificação confere o status HTTP real e evita expor detalhes privados. Rodapé acompanha o resultado final do cadastro. | [Desde v2.0.85](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.85...v2.0.87) |
 | [v2.0.85](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.85) | 08/10/2026 | Aguarda a janela entre a remoção das credenciais e o retorno do trabalho de arquivamento da conta restrita. Evita HTTP 409 nessa janela e mantém a escolha automática da próxima conta. Progresso e diagnóstico continuam vinculados ao trabalho e à seleção; resultados mantêm a checagem de identidade. | [Desde v2.0.84](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.84...v2.0.85) |
 | [v2.0.84](https://github.com/victorccronemberger-blip/QFar/releases/tag/v2.0.84) | 08/10/2026 | A remoção de credenciais deixa de invalidar o diagnóstico de exclusão produzido pelo próprio trabalho de categorias. A resposta de exclusão é vinculada à conta, seleção e trabalho; resultados de categorias preservam a checagem estrita da identidade atual. Mantém execução sem meta, retomada e limpeza após confirmação. | [Desde v2.0.83](https://github.com/victorccronemberger-blip/QFar/compare/v2.0.83...v2.0.84) |
