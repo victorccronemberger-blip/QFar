@@ -184,7 +184,8 @@
           if (window._localMediaTable->item(0,0)->text() != "race-current.mp4") { qApp->exit(248); return; }
           flow->phase = 11; window._localMediaQuery->setText("hidden");
         });
-      } else if (flow->phase == 11 && window._localMediaPoll.isActive()) {
+      } else if (flow->phase == 11 && window._localMediaPoll.isActive() &&
+                 window._localMediaInFlightKey.isEmpty()) {
         flow->phase = 12; window._libraryTabs->setCurrentIndex(1);
         const int reads = flow->reads;
         QTimer::singleShot(1350, &window, [&window, flow, reads] {

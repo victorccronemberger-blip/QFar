@@ -1739,8 +1739,9 @@ class _ClipPrefetch:
             max_workers=1, thread_name_prefix="moneymin-prefetch")
         self._fut: Future[dict[str, Any]] | None = None
         self._uid: str | None = None
+        self._clip_info: dict[str, Any] | None = None
         self._guard_paths: set[Path] = set()
-        self._retired: list[tuple[Future[dict[str, Any]], set[Path]]] = []
+        self._retired: list[tuple[Future[dict[str, Any]], set[Path], dict[str, Any] | None]] = []
 
     def start(self, clip_info: dict[str, Any]) -> None:
         uid = str(clip_info.get("clip_uid") or "")
@@ -1750,6 +1751,7 @@ class _ClipPrefetch:
             return
         self.cancel()
         self._uid = uid
+        self._clip_info = dict(clip_info)
         self._guard_paths = set(_expected_prefetch_paths(clip_info, self.work_dir))
         if clip_info.get("source") == "holoassist":
             self._fut = self._pool.submit(
@@ -1765,10 +1767,12 @@ class _ClipPrefetch:
             clip, video = _ego_clip_inputs(clip_info)
         except Exception:  # noqa: BLE001
             self._uid = None
+            self._clip_info = None
             self._guard_paths = set()
             return
         if clip is None or video is None:
             self._uid = None
+            self._clip_info = None
             self._guard_paths = set()
             return
         self._fut = self._pool.submit(prepare_clip, clip, video, self.work_dir)
@@ -1779,6 +1783,7 @@ class _ClipPrefetch:
         fut = self._fut
         self._fut = None
         self._uid = None
+        self._clip_info = None
         self._guard_paths = set()
         try:
             return fut.result()
@@ -1790,21 +1795,33 @@ class _ClipPrefetch:
             if not self._fut.cancel():
                 # Um ffmpeg/download já iniciado não pode ser cancelado à
                 # força. Guarde os caminhos só enquanto ele ainda os usa.
-                self._retired.append((self._fut, set(self._guard_paths)))
+                self._retired.append((self._fut, set(self._guard_paths), self._clip_info))
             self._fut = None
             self._uid = None
+            self._clip_info = None
             self._guard_paths = set()
 
     def protected_paths(self) -> set[Path]:
         """Arquivos que um prefetch ativo ou já pronto ainda pode consumir."""
         active = set(self._guard_paths) if self._fut is not None else set()
-        remaining: list[tuple[Future[dict[str, Any]], set[Path]]] = []
-        for future, paths in self._retired:
+        remaining: list[tuple[Future[dict[str, Any]], set[Path], dict[str, Any] | None]] = []
+        for future, paths, _clip_info in self._retired:
             if not future.done():
                 active.update(paths)
-                remaining.append((future, paths))
+            # Keep completed orphan outputs discoverable by cleanup_candidates
+            # until a stop cleanup has joined and released them.
+            remaining.append((future, paths, _clip_info))
         self._retired = remaining
         return active
+
+    def cleanup_candidates(self) -> list[tuple[dict[str, Any] | None, set[Path]]]:
+        """Return paths that may hold unconsumed prefetch output after join."""
+        candidates = []
+        if self._fut is not None:
+            candidates.append((self._clip_info, set(self._guard_paths)))
+        candidates.extend((clip, set(paths)) for future, paths, clip in self._retired
+                          if not future.cancelled())
+        return candidates
 
     def shutdown(self) -> None:
         self.cancel()
@@ -2151,6 +2168,37 @@ def _cleanup_rejected_prepare(clip: dict[str, Any], work_dir: Path) -> dict[str,
                                    "seq_id": clip.get("seq_id"),
                                    "_content_candidate": clip,
                                    "_cleanup_paths": [str(path) for path in paths]}, work_dir)
+
+
+def _cleanup_stopped_prepared_media(
+    item: dict[str, Any] | None,
+    clip: dict[str, Any] | None,
+    work_dir: Path,
+    prefetch: _ClipPrefetch,
+    *,
+    cleanup_candidate: bool = True,
+) -> list[dict[str, Any]]:
+    """Join prefetch consumers, then release only owned, unreferenced media."""
+    prefetch_items = prefetch.cleanup_candidates()
+    prefetch.shutdown()
+    from . import recovery
+    recovery.reconcile_confirmed(refresh=False)
+    results = []
+    if cleanup_candidate:
+        clip = clip or {}
+        results.append(_cleanup_uploaded_item(item, work_dir) if item is not None
+                       else _cleanup_rejected_prepare(clip, work_dir))
+    for prefetched_clip, paths in prefetch_items:
+        if not paths:
+            continue
+        prefetched_clip = prefetched_clip or {}
+        results.append(_cleanup_uploaded_item({
+            "source": prefetched_clip.get("source"),
+            "seq_id": prefetched_clip.get("seq_id"),
+            "_content_candidate": prefetched_clip,
+            "_cleanup_paths": [str(path) for path in paths],
+        }, work_dir))
+    return results
 
 
 @cleanup_operation
@@ -3130,6 +3178,51 @@ def _run_campaign(
             pass
         _emit("log", message=msg)
 
+    def _cleanup_on_stop(
+        item: dict[str, Any] | None,
+        clip: dict[str, Any] | None,
+        *,
+        cleanup_candidate: bool = True,
+    ) -> None:
+        if not config.cleanup_after_upload:
+            return
+        try:
+            results = _cleanup_stopped_prepared_media(
+                item, clip, work_dir, prefetch, cleanup_candidate=cleanup_candidate)
+        except Exception as exc:
+            with log._save_lock:
+                log.issues.append({"kind": "storage_cleanup_error",
+                                   "clip_uid": (clip or {}).get("clip_uid"),
+                                   "error_type": type(exc).__name__})
+                log.save()
+            _emit("storage_cleanup", clip_uid=(clip or {}).get("clip_uid"),
+                  files=0, bytes=0, errors=[type(exc).__name__],
+                  protected=0, retained_managed=1, retained_bytes=0)
+            _log(f"  armazenamento: mídia preservada após parada ({type(exc).__name__})")
+            return
+        for result in results:
+            _emit("storage_cleanup", clip_uid=(clip or {}).get("clip_uid"),
+                  files=result["files"], bytes=result["bytes"],
+                  errors=result["errors"], protected=result["protected"],
+                  retained_managed=result.get("retained_managed", 0),
+                  retained_bytes=result.get("retained_bytes", 0))
+            if result["errors"]:
+                with log._save_lock:
+                    log.issues.append({"kind": "storage_cleanup_error",
+                                       "clip_uid": (clip or {}).get("clip_uid"),
+                                       "errors": list(result["errors"])})
+                    log.save()
+                _log("  armazenamento: houve erro ao limpar mídia após a parada; detalhes no histórico")
+            elif result.get("retained_managed", 0):
+                with log._save_lock:
+                    log.issues.append({"kind": "storage_retained_after_stop",
+                                       "clip_uid": (clip or {}).get("clip_uid"),
+                                       "retained_managed": result.get("retained_managed", 0),
+                                       "retained_bytes": result.get("retained_bytes", 0),
+                                       "protected": result.get("protected", 0)})
+                    log.save()
+                _log("  armazenamento: mídia gerenciada preservada por proteção local; detalhes no evento de limpeza")
+
     def _maybe_shuffle(items: list) -> list:
         out = list(items)
         if config.shuffle_schedule and len(out) > 1:
@@ -3190,6 +3283,7 @@ def _run_campaign(
         if should_stop and should_stop():
             _log("  [!] campanha interrompida pelo usuário")
             _emit("campaign_stopped", reason="parada pelo usuário")
+            _cleanup_on_stop(None, None, cleanup_candidate=False)
             break
         display_name = tsk.task_label or tsk.task_name or tsk.scenario
         registry_key = tsk.registry_key
@@ -3372,6 +3466,7 @@ def _run_campaign(
             if should_stop and should_stop():
                 _log("  [!] campanha interrompida pelo usuário")
                 _emit("campaign_stopped", reason="parada pelo usuário")
+                _cleanup_on_stop(None, clip_info, cleanup_candidate=False)
                 break
             # anti-desperdício: se TODAS as contas da campanha já receberam este
             # clipe (seleção explícita do wizard ou corrida entre campanhas),
@@ -3424,6 +3519,7 @@ def _run_campaign(
                         _log("  [!] campanha interrompida durante o intervalo")
                         _emit("campaign_stopped",
                               reason="parada durante o intervalo")
+                        _cleanup_on_stop(None, clip_info, cleanup_candidate=False)
                         break
                 delay_pending = False
             _log(f"  clipe: {clip_info['clip_uid'][:12]} "
@@ -3431,6 +3527,7 @@ def _run_campaign(
                  f"device={clip_info.get('device')}")
             _emit("clip_prepare_start", clip_uid=clip_info["clip_uid"],
                   task=tsk.scenario, dur_s=clip_info["dur_s"])
+            item: dict[str, Any] | None = None
             try:
                 item = prefetch.take(clip_info["clip_uid"])
                 if item is None:
@@ -3484,6 +3581,7 @@ def _run_campaign(
             except Exception as exc:  # noqa: BLE001 — pula o clipe, segue a campanha
                 if should_stop and should_stop():
                     _emit("campaign_stopped", reason="parada durante aquisição ou preparo")
+                    _cleanup_on_stop(item, clip_info)
                     break
                 imu_fail = any(reason in str(exc).lower() for reason in (
                         "cobertura imu insuficiente", "sem amostras válidas de imu",
@@ -3684,6 +3782,7 @@ def _run_campaign(
             if should_stop and should_stop():
                 _log("  [!] campanha interrompida pelo usuário")
                 _emit("campaign_stopped", reason="parada pelo usuário")
+                _cleanup_on_stop(item, clip_info)
                 break
 
             if pending_accounts and not config.share_clips:
@@ -3718,6 +3817,7 @@ def _run_campaign(
                     _log("  [!] campanha interrompida fora do horário de envio")
                     _emit("campaign_stopped", reason="parada fora do horário")
                     _stop_warm()
+                    _cleanup_on_stop(item, clip_info)
                     break
 
             def _send_account(
@@ -4085,6 +4185,7 @@ def _run_campaign(
                 _log("  [!] campanha interrompida pelo usuário")
                 _emit("campaign_stopped", reason="parada pelo usuário")
                 _stop_warm()
+                _cleanup_on_stop(item, clip_info)
                 break
             retained_accounts = [a for a in pending_accounts
                                  if not account_results.get(a.email, {}).get("excluded_from_campaign")]

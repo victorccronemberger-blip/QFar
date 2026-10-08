@@ -38,8 +38,21 @@ class CampaignParallelProtocolTests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         blocked = threading.Event()
         initial_owners, blocked_threads, wire, closed = set(), set(), [], []
+        cleanup_observations = []
         instance = fixture.instance
         real_checkpoint = instance._checkpoint
+
+        if control in {'stop', 'drain'}:
+            def capture_cleanup(item, work_dir, **kwargs):
+                with guard:
+                    wire_before_cleanup = list(wire)
+                rows_before_cleanup = [
+                    upload.load_sidecar(f'protocol-{index}', chunk)
+                    for index in range(2) for chunk in range(2)
+                ]
+                cleanup_observations.append((wire_before_cleanup, rows_before_cleanup))
+                return {'files': 0, 'bytes': 0, 'errors': [], 'protected': 0}
+            fixture.cleanup.side_effect = capture_cleanup
 
         def checkpoint():
             if instance.pause_requested:
@@ -211,7 +224,20 @@ class CampaignParallelProtocolTests(unittest.TestCase):
                     self.assertEqual(data, original)
                     self.assertEqual(sum(kind == 'blocklist' and identity == filename
                                          for kind, identity, _, _ in wire), 1)
-        fixture.cleanup.assert_not_called() if control in {'stop', 'drain'} else None
+        fixture.cleanup.assert_called_once()
+        if control in {'stop', 'drain'}:
+            self.assertEqual(len(cleanup_observations), 1)
+            wire_before_cleanup, rows_before_cleanup = cleanup_observations[0]
+            self.assertEqual(sum(kind == 'create' for kind, _, _, _ in wire_before_cleanup), 4)
+            self.assertEqual(sum(kind == 'complete' for kind, _, _, _ in wire_before_cleanup), 4)
+            self.assertEqual(sum(kind == 'evaluate' for kind, _, _, _ in wire_before_cleanup), 4)
+            self.assertEqual(sum(kind == 'finalize' for kind, _, _, _ in wire_before_cleanup), 2)
+            self.assertEqual({identity for kind, identity, _, _ in wire_before_cleanup
+                              if kind == 'create'}, set(fixture.emails[:2]))
+            self.assertTrue(all(row['finalized'] is True
+                                and row['evaluation_verified'] is True
+                                and row['campaign_reconciled'] is True
+                                for row in rows_before_cleanup))
         if control == 'drain':
             self.assertIs(fixture.client.post('/api/campaigns/drain').get_json()['ready'], True)
             self.assertEqual(fixture.client.post('/api/campaigns', json=fixture.body).status_code, 409)

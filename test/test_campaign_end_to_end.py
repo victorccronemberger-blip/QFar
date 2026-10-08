@@ -628,7 +628,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         snap, log = self.finish()
         self.assertEqual((snap["state"], log["status"]), ("stopped", "stopped"))
         self.send.assert_not_called()
-        self.cleanup.assert_not_called()
+        self.cleanup.assert_called_once()
 
     def test_explicit_readiness_failure_blocks_start(self):
         with patch.object(server.readiness, "campaign_readiness", return_value={"ready": False, "checks": []}):
@@ -696,7 +696,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual((snap["state"], log["status"]), ("stopped", "stopped"))
         self.assertTrue(snap["log_path"])
         self.assertEqual(self.send.call_count, 1)
-        self.cleanup.assert_not_called()
+        self.cleanup.assert_called_once()
         self.assertFalse(any(e["kind"] == "campaign_done" for e in snap["events"]))
 
     def test_pause_holds_next_account_slot_until_resume(self):
@@ -770,7 +770,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual({row["email"] for row in history["items"][0]["accounts"]}, set(self.emails[:2]))
         self.assertEqual(snapshot["totals"]["ok_sends"], 2)
         self.assertEqual(self.mark.call_count, 2)
-        self.cleanup.assert_not_called()
+        self.cleanup.assert_called_once()
         self.assertFalse(any(event["kind"] == "campaign_done" for event in snapshot["events"]))
 
     def test_invalid_input_is_rejected_before_start_or_provider_access(self):

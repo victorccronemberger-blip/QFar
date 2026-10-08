@@ -7,7 +7,10 @@ import unittest
 from unittest.mock import patch
 
 from moneymin import campaign
+from moneymin import upload
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
+
+REAL_CLEANUP_UPLOADED_ITEM = campaign._cleanup_uploaded_item
 
 
 class OnDemandCampaignTests(unittest.TestCase):
@@ -267,6 +270,229 @@ class OnDemandCampaignTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(self.prepare.call_count, 1)
         self.prefetch.assert_not_called()
+
+    def _stop_while_third_account_waits(self, *, pending_first=False, cleanup_failure=False):
+        self.accounts = [AccountSpec(f"account{index}@example.invalid", "fixture-org")
+                         for index in range(3)]
+        self.cfg.accounts = self.accounts
+        self.cfg.realistic_timeline = True
+        stopped = threading.Event()
+        waits = []
+        epoch = [0]
+
+        def reserve(email, duration_s, *, now=None):
+            epoch[0] += 1
+            end = float(now) if epoch[0] < 3 else float(now) + 600
+            return campaign.recording_timeline.RecordingSlot(email, float(now), end)
+
+        def stop_at_recording_wait(delay, should_stop, emit, *, kind, tick_every):
+            if kind == "recording_wait_tick":
+                waits.append(kind)
+                stopped.set()
+                return True
+            return False
+
+        def prepare(clip, *args, **kwargs):
+            path = Path(self.cfg.work_dir) / "fixture_native.mp4"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"inert generated native video")
+            campaign._record_generated_media(path, root=Path(self.cfg.work_dir),
+                                             role="native")
+            return {"duration_ms": 300000, "video_path": str(path), "imu_real": True}
+
+        def deliver(item, account, *args, **kwargs):
+            if pending_first and account is self.accounts[0]:
+                upload.save_sidecar({
+                    "session_id": "pending-stop-fixture", "chunk_index": 0,
+                    "expected_chunk_count": 1, "account_email": account.email,
+                    "org_key": account.org_key, "task_id": self.task.task_id,
+                    "upload_id": "", "state": "failed", "phase": "create",
+                    "create_attempted": True, "finalized": False,
+                    "video_path": item["video_path"],
+                    "campaign_context": {"registry_key": item["registry_key"],
+                                          "clip_uid": item["clip_uid"]},
+                })
+                return {"email": account.email, "ok": False, "finalized": False,
+                        "session_id": "pending-stop-fixture"}
+            return {"email": account.email, "ok": True, "finalized": True}
+
+        self.prepare.side_effect = prepare
+        self.send.side_effect = deliver
+        self.stack.enter_context(patch.object(campaign.recording_timeline, "reserve",
+                                              side_effect=reserve))
+        self.stack.enter_context(patch.object(campaign, "_interruptible_sleep",
+                                              side_effect=stop_at_recording_wait))
+        cleanup_patch = (patch.object(campaign, "_cleanup_uploaded_item", return_value={
+            "files": 0, "bytes": 0, "errors": ["fixture: PermissionError"],
+            "protected": 0, "retained_managed": 1, "retained_bytes": 20,
+        }) if cleanup_failure else patch.object(
+            campaign, "_cleanup_uploaded_item", side_effect=REAL_CLEANUP_UPLOADED_ITEM))
+        self.stack.enter_context(cleanup_patch)
+        return stopped, waits
+
+    def test_stop_during_recording_wait_cleans_confirmed_owned_media(self):
+        stopped, waits = self._stop_while_third_account_waits()
+        log = campaign.run_campaign(self.cfg, should_stop=stopped.is_set)
+        video = Path(self.cfg.work_dir) / "fixture_native.mp4"
+        self.assertEqual(log.status, "stopped")
+        self.assertEqual(waits, ["recording_wait_tick"])
+        self.assertEqual(self.send.call_count, 2)
+        self.assertFalse(video.exists())
+        self.assertFalse(video.with_name(video.name + ".managed.json").exists())
+
+    def test_stop_cleanup_preserves_owned_media_referenced_by_pending_journal(self):
+        stopped, _waits = self._stop_while_third_account_waits(pending_first=True)
+        log = campaign.run_campaign(self.cfg, should_stop=stopped.is_set)
+        video = Path(self.cfg.work_dir) / "fixture_native.mp4"
+        self.assertEqual(log.status, "stopped")
+        self.assertTrue(video.is_file())
+        self.assertTrue(video.with_name(video.name + ".managed.json").is_file())
+        self.assertTrue(upload._sidecar_path("pending-stop-fixture", 0).is_file())
+
+    def test_stop_with_cleanup_disabled_retains_owned_media(self):
+        stopped, _waits = self._stop_while_third_account_waits()
+        self.cfg.cleanup_after_upload = False
+        campaign.run_campaign(self.cfg, should_stop=stopped.is_set)
+        video = Path(self.cfg.work_dir) / "fixture_native.mp4"
+        self.assertTrue(video.is_file())
+        self.assertTrue(video.with_name(video.name + ".managed.json").is_file())
+
+    def test_stop_cleanup_failure_is_saved_and_emitted(self):
+        stopped, _waits = self._stop_while_third_account_waits(cleanup_failure=True)
+        events = []
+        log = campaign.run_campaign(self.cfg, should_stop=stopped.is_set,
+                                    progress=lambda kind, payload: events.append((kind, payload)))
+        self.assertEqual(log.status, "stopped")
+        self.assertTrue(any(issue.get("kind") == "storage_cleanup_error" for issue in log.issues))
+        cleanup_event = next(payload for kind, payload in events if kind == "storage_cleanup")
+        self.assertIn("PermissionError", cleanup_event["errors"][0])
+
+    def test_cancelled_prefetch_is_joined_before_owned_temp_cleanup(self):
+        current = Path(self.cfg.work_dir) / "current_native.mp4"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.write_bytes(b"current inert media")
+        campaign._record_generated_media(current, root=Path(self.cfg.work_dir), role="native")
+        next_path = Path(self.cfg.work_dir) / "next_native.mp4"
+        entered, release = threading.Event(), threading.Event()
+        clip = {"clip_uid": "next", "parent_video_uid": "next", "dur_s": 300,
+                "source": "ego4d"}
+
+        def prepare(_clip, _video, work_dir):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("fixture prefetch timed out")
+            next_path.write_bytes(b"prefetched inert media")
+            campaign._record_generated_media(next_path, root=Path(work_dir), role="native")
+            return {"duration_ms": 300000, "video_path": str(next_path), "imu_real": True}
+
+        prefetch = campaign._ClipPrefetch(Path(self.cfg.work_dir))
+        cleanup_errors = []
+        cleanup_results = []
+        worker = None
+        try:
+            with patch.object(campaign, "prepare_clip", side_effect=prepare), \
+                    patch.object(campaign, "_ego_clip_inputs", return_value=(clip, {})), \
+                    patch.object(campaign, "_cleanup_uploaded_item",
+                                 side_effect=REAL_CLEANUP_UPLOADED_ITEM), \
+                    patch("moneymin.recovery.reconcile_confirmed", return_value=[]):
+                prefetch.start(clip)
+                self.assertTrue(entered.wait(3))
+
+                def cleanup():
+                    try:
+                        cleanup_results.extend(campaign._cleanup_stopped_prepared_media(
+                            {"video_path": str(current)}, {"clip_uid": "current", "source": "ego4d"},
+                            Path(self.cfg.work_dir), prefetch))
+                    except Exception as exc:
+                        cleanup_errors.append(exc)
+
+                worker = threading.Thread(target=cleanup)
+                worker.start()
+                self.assertTrue(current.is_file())
+                self.assertTrue(next_path.is_file() is False)
+                self.assertTrue(entered.is_set())
+                # The cleanup worker must be blocked in shutdown until the
+                # producer releases its output path.
+                worker.join(0.05)
+                self.assertTrue(worker.is_alive())
+                self.assertTrue(current.is_file())
+                release.set()
+                worker.join(5)
+        finally:
+            release.set()
+            if worker is not None:
+                worker.join(5)
+            prefetch.shutdown()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(cleanup_errors, [])
+        self.assertEqual([row["files"] for row in cleanup_results], [2, 2], cleanup_results)
+        self.assertFalse(current.exists())
+        self.assertFalse(next_path.exists())
+
+    def test_early_stop_between_clips_or_in_delay_cleans_retired_prefetch_only(self):
+        for stop_point in ("between_clips", "delay"):
+            with self.subTest(stop_point=stop_point):
+                self.cfg.accounts = self.accounts[:1]
+                self.cfg.account_workers = 1
+                self.cfg.delay_mode = "fixed" if stop_point == "delay" else "off"
+                self.cfg.delay_s = 1
+                stopped = threading.Event()
+                first = {"clip_uid": "one", "parent_video_uid": "one", "dur_s": 300,
+                         "source": "ego4d"}
+                following = {"clip_uid": "two", "parent_video_uid": "two", "dur_s": 300,
+                             "source": "ego4d"}
+                current_path = Path(self.cfg.work_dir) / "one_native.mp4"
+                prefetched_path = Path(self.cfg.work_dir) / "two_native.mp4"
+                produced = []
+
+                def prepare(clip, _video, work_dir, **_kwargs):
+                    path = (prefetched_path if clip["clip_uid"] == "two" else current_path)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(f"owned {clip['clip_uid']} fixture".encode())
+                    campaign._record_generated_media(path, root=Path(work_dir), role="native")
+                    produced.append(clip["clip_uid"])
+                    return {"duration_ms": 300000, "video_path": str(path), "imu_real": True}
+
+                prefetch = campaign._ClipPrefetch(Path(self.cfg.work_dir))
+                try:
+                    with patch.object(campaign, "prepare_clip", side_effect=prepare), \
+                            patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})):
+                        prefetch.start(following)
+                        self.assertEqual(prefetch._fut.result(timeout=5)["video_path"],
+                                         str(prefetched_path))
+                    prefetch.cancel()
+                    self.assertEqual(prefetch.protected_paths(), set())
+                    self.assertEqual(len(prefetch.cleanup_candidates()), 1,
+                                     "completed retired output must remain discoverable")
+                    self.cfg.candidate_plan = {self.task.task_id: [first, following]}
+                    self.prepare.side_effect = prepare
+                    self.send.side_effect = self.deliver
+                    self.send.reset_mock()
+
+                    def progress(kind, _payload):
+                        if stop_point == "between_clips" and kind == "item_done":
+                            stopped.set()
+
+                    sleep_patch = (patch.object(campaign, "_interruptible_sleep",
+                                                side_effect=lambda *_a, **_k: (
+                                                    stopped.set() or True))
+                                   if stop_point == "delay" else patch.object(
+                                       campaign, "_interruptible_sleep", side_effect=lambda *_a, **_k: False))
+                    with patch.object(campaign, "_ClipPrefetch", return_value=prefetch), \
+                            patch.object(campaign, "_cleanup_uploaded_item",
+                                         side_effect=REAL_CLEANUP_UPLOADED_ITEM), \
+                            patch("moneymin.recovery.reconcile_confirmed", return_value=[]), \
+                            sleep_patch:
+                        log = campaign.run_campaign(self.cfg, should_stop=stopped.is_set,
+                                                    progress=progress)
+                finally:
+                    prefetch.shutdown()
+
+                self.assertEqual(log.status, "stopped")
+                self.assertEqual(self.send.call_count, 1)
+                self.assertEqual(produced, ["two", "one"])
+                self.assertFalse(current_path.exists())
+                self.assertFalse(prefetched_path.exists())
 
 
 if __name__ == "__main__":
