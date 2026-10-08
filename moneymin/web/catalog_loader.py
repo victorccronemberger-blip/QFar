@@ -82,6 +82,50 @@ class CatalogLoader:
             return {"error": "A consulta anterior não está mais disponível. Recarregue as categorias.",
                     "code": "catalog_job_unavailable"}, 409
 
+    def poll_account_exclusion_diagnostic(self, job_id: str, *, key_prefix: tuple,
+                                          scope: str | None) -> tuple[dict, int] | None:
+        """Return only this account's archived restriction diagnostic after its token is removed.
+
+        This intentionally does not relax :meth:`poll`: callers must separately
+        confirm the canonical ban record and absent token before using this
+        narrow terminal-only channel. Success results and other errors cannot
+        cross an identity fingerprint change.
+        """
+        if (scope != "campaign-tasks" or not isinstance(key_prefix, tuple)
+                or len(key_prefix) != 5 or not isinstance(key_prefix[0], str)):
+            return None
+        with self._lock:
+            now = time.monotonic()
+            self._expire(now)
+            for stored_key, row in self._jobs.items():
+                if row.get("job_id") != job_id:
+                    continue
+                if (row.get("scope") != scope or len(stored_key) != 6
+                        or stored_key[:5] != key_prefix or stored_key[0] != key_prefix[0]
+                        or "finished" not in row):
+                    return None
+                result, status = row.get("result", ({}, 500))
+                if (status != 400 or not isinstance(result, dict)
+                        or result.get("code") != "catalog_account_unavailable"
+                        or result.get("permanently_removed") is not True
+                        or result.get("removal_failed") is True or "tasks" in result):
+                    return None
+                issue = result.get("issue")
+                if (not isinstance(issue, dict) or issue.get("email") != key_prefix[0]
+                        or issue.get("code") != "restricted"
+                        or issue.get("stage") != "Carregamento remoto de categorias"
+                        or issue.get("restriction_confirmed") is not True
+                        or not isinstance(issue.get("reason"), str)
+                        or not isinstance(issue.get("action"), str)):
+                    return None
+                safe_issue = {field: issue[field] for field in
+                              ("email", "code", "stage", "reason", "action", "restriction_confirmed")}
+                row.setdefault("delivered", now)
+                return ({"error": safe_issue["reason"] + " " + safe_issue["action"],
+                         "code": "catalog_account_unavailable", "issue": safe_issue,
+                         "permanently_removed": True}, 400)
+            return None
+
     def _expire(self, now: float) -> None:
         # An unobserved terminal result survives the normal TTL, including
         # after a 504 paused the UI. Bound this retention by result count.

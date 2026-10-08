@@ -8,6 +8,17 @@ from moneymin.web.catalog_loader import CatalogLoader
 
 
 class CatalogLoadingTests(unittest.TestCase):
+    def _finished_job(self, loader, key, result, status):
+        started, accepted = loader.get(key, lambda _progress: (result, status),
+                                       scope="campaign-tasks")
+        self.assertEqual(accepted, 202)
+        job_id = started["job_id"]
+        for _ in range(100):
+            if not loader.busy:
+                return job_id
+            time.sleep(.01)
+        self.fail("catalog job did not finish")
+
     def test_pending_reads_return_immediately_and_share_one_build(self):
         loader = CatalogLoader()
         entered, release = threading.Event(), threading.Event()
@@ -199,6 +210,59 @@ class CatalogLoadingTests(unittest.TestCase):
             self.assertEqual(status, 409)
             self.assertEqual(body["code"], "catalog_job_unavailable")
         self.assertEqual(work.call_count, 1)
+
+    def test_account_exclusion_diagnostic_survives_unobserved_ttl_and_is_narrowly_bound(self):
+        loader = CatalogLoader(ttl_s=.01)
+        prefix = ("owner@example.invalid", "ego4d", "both", 300.0, 1800.0)
+        key = (*prefix, "original-identity-fingerprint")
+        issue = {"email": prefix[0], "code": "restricted",
+                 "stage": "Carregamento remoto de categorias",
+                 "reason": "Restrição confirmada.", "action": "Procure o suporte.",
+                 "restriction_confirmed": True, "detail": "must-not-be-returned"}
+        body = {"error": "private text that is reconstructed", "code": "catalog_account_unavailable",
+                "issue": issue, "permanently_removed": True}
+        job_id = self._finished_job(loader, key, body, 400)
+        time.sleep(.03)  # The completed result remains until first delivery.
+
+        diagnostic = loader.poll_account_exclusion_diagnostic(
+            job_id, key_prefix=prefix, scope="campaign-tasks")
+        self.assertEqual(diagnostic[1], 400)
+        self.assertEqual(diagnostic[0]["code"], "catalog_account_unavailable")
+        self.assertEqual(diagnostic[0]["issue"]["email"], prefix[0])
+        self.assertNotIn("detail", diagnostic[0]["issue"])
+        self.assertNotIn("tasks", diagnostic[0])
+        self.assertNotIn("private text", diagnostic[0]["error"])
+        self.assertEqual(loader.poll_account_exclusion_diagnostic(
+            job_id, key_prefix=prefix, scope="campaign-tasks"), diagnostic)
+        self.assertIsNone(loader.poll_account_exclusion_diagnostic(
+            job_id, key_prefix=prefix, scope="different-scope"))
+        self.assertIsNone(loader.poll_account_exclusion_diagnostic(
+            job_id, key_prefix=(*prefix[:-1], 600.0), scope="campaign-tasks"))
+
+    def test_account_exclusion_diagnostic_rejects_success_and_unconfirmed_errors(self):
+        prefix = ("owner@example.invalid", "ego4d", "both", 300.0, 1800.0)
+        issue = {"email": prefix[0], "code": "restricted",
+                 "stage": "Carregamento remoto de categorias",
+                 "reason": "Restrição confirmada.", "action": "Procure o suporte.",
+                 "restriction_confirmed": True}
+        candidates = [
+            ({"code": "catalog_account_unavailable", "issue": issue}, 400),
+            ({"code": "catalog_account_unavailable", "issue": {**issue,
+              "restriction_confirmed": False}, "permanently_removed": True}, 400),
+            ({"code": "catalog_account_unavailable", "issue": {**issue,
+              "stage": "Preparação local do catálogo"}, "permanently_removed": True}, 400),
+            ({"code": "catalog_account_unavailable", "issue": issue,
+              "permanently_removed": True, "tasks": []}, 400),
+            ({"code": "catalog_account_unavailable", "issue": issue,
+              "permanently_removed": True}, 200),
+        ]
+        for index, (result, status) in enumerate(candidates):
+            with self.subTest(index=index):
+                loader = CatalogLoader()
+                key = (*prefix, f"identity-{index}")
+                job_id = self._finished_job(loader, key, result, status)
+                self.assertIsNone(loader.poll_account_exclusion_diagnostic(
+                    job_id, key_prefix=prefix, scope="campaign-tasks"))
 
     def test_worker_exception_is_terminal_and_does_not_leak_secrets(self):
         loader = CatalogLoader()

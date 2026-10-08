@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from moneymin import config
+from moneymin import config, secure_store, token_store
 from moneymin.minute_api import AuthError
 from moneymin.web import server
 from moneymin.web.catalog_loader import CatalogLoader
@@ -21,13 +21,25 @@ class TasksJobPollingTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
-        for name, value in (("DATA_DIR", self.root / "state"),
-                            ("MEDIA_DATA_DIR", self.root / "library"),
-                            ("SECRETS_DIR", self.root / "fixture-access")):
-            value.mkdir()
+        self.install, self.library = self.root / "installation", self.root / "library"
+        for name, value in (("ROOT", self.install), ("LIBRARY_ROOT", self.library),
+                            ("DATA_DIR", self.install / "data"),
+                            ("MEDIA_DATA_DIR", self.library / "data"),
+                            ("SECRETS_DIR", self.install / "secrets")):
+            value.mkdir(parents=True)
             self.stack.enter_context(patch.object(config, name, value))
+        for name, value in (("PREFS_PATH", config.DATA_DIR / "webui_prefs.json"),
+                            ("BALANCES_PATH", config.DATA_DIR / "balances.json"),
+                            ("CROWTADO_PW_PATH", config.SECRETS_DIR / "crowtado_passwords.json"),
+                            ("ACCOUNT_HEALTH_PATH", config.DATA_DIR / "account_health.json")):
+            self.stack.enter_context(patch.object(server, name, value))
+        self.stack.enter_context(patch.object(secure_store, "protect_json",
+                                             side_effect=lambda value: json.dumps(value).encode()))
+        self.stack.enter_context(patch.object(secure_store, "unprotect_json",
+                                             side_effect=lambda payload: json.loads(payload)))
         self.stack.enter_context(patch.dict(os.environ, {"QMONEY_LOCAL_API_TOKEN": ""}))
         self.removed = set()
+        self.actual_removed_accounts = server._removed_accounts
         self.stack.enter_context(patch.object(server, "_removed_accounts",
                                              side_effect=lambda: self.removed.copy()))
         self.stack.enter_context(patch.object(server, "ORG_MIGRATION", Mock(running=False)))
@@ -344,6 +356,55 @@ class TasksJobPollingTests(unittest.TestCase):
         self.assertEqual(failed.json["code"], "task_catalog_unavailable")
         self.assertNotIn("permanently_removed", failed.json)
         archive.assert_not_called()
+
+    def test_real_ban_allows_only_own_terminal_exclusion_poll(self):
+        self.sessions.side_effect = AuthError("restricted", code="restricted")
+        query = dict(self.query)
+        with patch.object(server, "_removed_accounts", self.actual_removed_accounts):
+            started = self.client.get("/api/tasks", query_string=query)
+            self.assertEqual(started.status_code, 202, started.get_json())
+            job_id = started.json["job_id"]
+            self.finish_worker()
+
+            # The ban mechanism writes the canonical archive and removes the actual
+            # token file; no mocked permanence flag is involved in this recovery.
+            self.assertIsNone(token_store.load(config.SECRETS_DIR, self.token["email"], migrate=False))
+            archive = server.banned_store.load(config.DATA_DIR / "banned_accounts.json")
+            record = next(row for row in archive["accounts"]
+                          if row["email"] == self.token["email"])
+            self.assertIs(record["restriction_confirmed"], True)
+            self.assertEqual(record["stage"], "Carregamento remoto de categorias")
+
+            failed = self.poll(job_id)
+            self.assertEqual(failed.status_code, 400, failed.get_json())
+            self.assertEqual(failed.json["code"], "catalog_account_unavailable")
+            self.assertEqual(failed.json["issue"]["email"], self.token["email"])
+            self.assertIs(failed.json["issue"]["restriction_confirmed"], True)
+            self.assertIs(failed.json["permanently_removed"], True)
+            self.assertNotIn("tasks", failed.json)
+            repeated = self.poll(job_id)
+            self.assertEqual(repeated.status_code, 400, repeated.get_json())
+            self.assertEqual(repeated.json, failed.json)
+
+            other_email = "other-owner@example.invalid"
+            token_store.save(config.SECRETS_DIR, other_email, {
+                "email": other_email, "localId": "other-subject", "idToken": "other-id",
+                "refreshToken": "other-refresh"})
+            other = self.client.get("/api/tasks", query_string={
+                **query, "email": other_email, "job_id": job_id})
+            self.assertEqual(other.status_code, 409, other.get_json())
+
+            changed_mode = self.poll(job_id, content_mode="cache")
+            self.assertEqual(changed_mode.status_code, 409, changed_mode.get_json())
+            changed_duration = self.poll(job_id, min_dur_s=600)
+            self.assertEqual(changed_duration.status_code, 409, changed_duration.get_json())
+
+            # Even a replacement token for the same stable subject must fail closed.
+            token_store.save(config.SECRETS_DIR, self.token["email"], {
+                "email": self.token["email"], "localId": self.token["localId"],
+                "idToken": "replacement-id", "refreshToken": "replacement-refresh"})
+            replaced = self.poll(job_id)
+            self.assertEqual(replaced.status_code, 409, replaced.get_json())
 
 
 if __name__ == "__main__":

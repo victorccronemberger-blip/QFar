@@ -2236,6 +2236,23 @@ def _catalog_account_failure(email: str, error: Exception) -> tuple[dict, int]:
     return body, 400
 
 
+def _catalog_ban_record_confirms_exclusion(email: str) -> bool:
+    """Prove the account was archived and has no replacement token before diagnostic polling."""
+    try:
+        if token_store.load(config.SECRETS_DIR, email, migrate=False) is not None:
+            return False
+        archive = banned_store.load(config.DATA_DIR / "banned_accounts.json",
+                                    {"schema": 1, "accounts": []})
+    except Exception:
+        return False
+    matches = [row for row in archive.get("accounts", [])
+               if isinstance(row, dict) and isinstance(row.get("email"), str)
+               and row["email"].strip().casefold() == email.strip().casefold()]
+    return (len(matches) == 1
+            and matches[0].get("restriction_confirmed") is True
+            and matches[0].get("stage") == "Carregamento remoto de categorias")
+
+
 def _preflight_fingerprint(emails: list[str], *, _include_cached_org: bool = True) -> str:
     """Vincula a prévia à identidade/configuração, não à rotação da sessão."""
     digest = hashlib.sha256()
@@ -3451,6 +3468,11 @@ def create_app(*, for_testing: bool = False) -> Flask:
             job_id = str(request.args.get("job_id", "")).strip()
             if job_id:
                 result, status = task_catalog.poll(job_id, key=key, scope="campaign-tasks")
+                if status == 409 and _catalog_ban_record_confirms_exclusion(email):
+                    diagnostic = task_catalog.poll_account_exclusion_diagnostic(
+                        job_id, key_prefix=key[:5], scope="campaign-tasks")
+                    if diagnostic is not None:
+                        result, status = diagnostic
                 return jsonify(result), status
 
             def load(progress):
