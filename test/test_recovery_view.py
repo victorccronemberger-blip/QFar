@@ -74,6 +74,98 @@ class RecoveryViewTests(unittest.TestCase):
         self.assertEqual(reads.count(history), 1)
         directory.assert_called_once()
 
+    def test_targeted_resume_describes_only_requested_session_in_large_store(self):
+        for index in range(200):
+            row = {**self.row, "account_email": "other@example.com",
+                   "session_id": f"old-session-{index}", "campaign_reconciled": True}
+            row.pop("campaign_context")
+            self.save(row, name=f"old-session-{index}.json")
+        target = {**self.row, "session_id": "target-session",
+                  "state": "quarantine", "phase": "evaluation_review",
+                  "finalize_requested": True, "finalized": False,
+                  "evaluation_required": True, "evaluation_verified": False,
+                  "evaluation_http_status": -1}
+        self.save(target, name="target-session.json")
+
+        session = Mock()
+        with patch.object(recovery, "_describe", wraps=recovery._describe) as describe, \
+             patch.object(recovery.campaign.Session, "from_email", return_value=session), \
+             patch.object(upload, "pump_pending") as pump, \
+             patch.object(recovery, "reconcile_confirmed", return_value={"resumed": True}), \
+             patch.object(recovery.campaign, "_legacy_upload_contexts",
+                          wraps=recovery.campaign._legacy_upload_contexts) as legacy_contexts:
+            result = recovery.resume_account(
+                self.row["account_email"], lambda _email: self.row["org_key"],
+                session_id="target-session")
+
+        self.assertEqual(result, {"resumed": True})
+        self.assertEqual(describe.call_count, 1)
+        self.assertEqual(describe.call_args.args[0][0]["session_id"], "target-session")
+        legacy_contexts.assert_not_called()
+        pump.assert_called_once()
+        self.assertEqual(pump.call_args.kwargs["session_ids"], {"target-session"})
+
+    def test_account_resume_batches_selected_legacy_contexts_with_full_journal_evidence(self):
+        rows = []
+        accounts = []
+        for email, sid in (("one@example.com", "legacy-one"),
+                           ("one@example.com", "legacy-two"),
+                           ("other@example.com", "unrelated-legacy")):
+            row = {**self.row, "account_email": email, "session_id": sid,
+                   "state": "quarantine", "phase": "evaluation_review",
+                   "finalize_requested": True, "finalized": False,
+                   "evaluation_required": True, "evaluation_verified": False,
+                   "evaluation_http_status": -1}
+            row.pop("campaign_context")
+            self.save(row, name=f"{sid}.json")
+            rows.append(row)
+            accounts.append({"session_id": sid, "email": email})
+        (self.root / "campaign_legacy.json").write_text(json.dumps({"items": [{
+            "clip_uid": "clip", "registry_key": "task", "task_id": "task",
+            "accounts": accounts}]}), encoding="utf-8")
+
+        session = Mock()
+        with patch.object(recovery.campaign.Session, "from_email", return_value=session), \
+             patch.object(upload, "pump_pending") as pump, \
+             patch.object(recovery, "reconcile_confirmed", return_value={"resumed": True}), \
+             patch.object(recovery.campaign, "_legacy_upload_contexts",
+                          wraps=recovery.campaign._legacy_upload_contexts) as legacy_contexts:
+            result = recovery.resume_account(
+                "one@example.com", lambda _email: "org")
+
+        self.assertEqual(result, {"resumed": True})
+        legacy_contexts.assert_called_once()
+        wanted, evidence = legacy_contexts.call_args.args
+        self.assertEqual(wanted, {("legacy-one", "one@example.com"),
+                                  ("legacy-two", "one@example.com")})
+        self.assertEqual({row["session_id"] for row in evidence},
+                         {"legacy-one", "legacy-two", "unrelated-legacy"})
+        self.assertEqual(pump.call_args.kwargs["session_ids"],
+                         {"legacy-one", "legacy-two"})
+
+    def test_targeted_resume_still_fails_closed_on_unrelated_corruption_or_sid_conflict(self):
+        target = {**self.row, "state": "quarantine", "phase": "evaluation_review",
+                  "finalize_requested": True, "finalized": False,
+                  "evaluation_required": True, "evaluation_verified": False,
+                  "evaluation_http_status": -1}
+        self.save(target)
+        with patch.object(recovery.campaign.Session, "from_email") as from_email, \
+             patch.object(upload, "pump_pending") as pump:
+            broken = self.journals / "unrelated.json"
+            broken.write_text("{", encoding="utf-8")
+            with self.assertRaises(RecoveryReadError):
+                recovery.resume_account("one@example.com", lambda _email: "org",
+                                        session_id="session1")
+            broken.unlink()
+
+            self.save({**target, "account_email": "other@example.com", "chunk_index": 1,
+                       "expected_chunk_count": 2}, "session1__1.json")
+            with self.assertRaises(RecoveryReadError):
+                recovery.resume_account("one@example.com", lambda _email: "org",
+                                        session_id="session1")
+        from_email.assert_not_called()
+        pump.assert_not_called()
+
     def test_snapshot_does_not_export_secrets_or_paths(self):
         self.save({**self.row, "blob_url": "secret-signed-url", "video_path": "C:/private/file",
                    "error": "secret-token"})

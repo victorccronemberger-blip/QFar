@@ -372,11 +372,29 @@ def reconcile_confirmed(*, refresh=True) -> dict:
 @campaign_state_operation
 def resume_account(email: str, resolve_org, *, session_id: str | None = None) -> dict:
     """Resume only reviewed, existing sessions of one authenticated account."""
+    # Validate the complete journal store before filtering, but avoid describing
+    # unrelated sessions. A description can resolve legacy history and confirm
+    # a publication; those indexes are expensive and should be shared for the
+    # selected account (or one explicitly requested SID).
+    all_groups = _groups(include_reconciled=True)
+    all_rows = [row for rows in all_groups for row in rows]
+    groups = [rows for rows in all_groups
+              if rows[0]["account_email"] == email
+              and (session_id is None or rows[0]["session_id"] == session_id)]
+    publications = _read_required_publications(groups)
+    groups = _visible_groups(groups, publications)
+    missing = {(rows[0]["session_id"], rows[0]["account_email"])
+               for rows in groups if not rows[0].get("campaign_context")}
+    legacy_contexts = (campaign._legacy_upload_contexts(
+        missing, all_rows) if missing else {})
+    reset_checker = (sent_registry.recovery_reset_checker()
+                     if any(_complete_chunk_group(rows) and all(
+                         journal_delivery_confirmed(row) for row in rows)
+                         for rows in groups) else None)
     selected = []
-    for rows in _groups():
-        item = _describe(rows)
-        if (item and item["email"] == email and item["can_resume"]
-                and (session_id is None or item["session_id"] == session_id)):
+    for rows in groups:
+        item = _describe(rows, legacy_contexts, reset_checker, publications)
+        if item and item["can_resume"]:
             selected.append(rows)
     if not selected:
         raise ValueError("Nenhuma sessão desta conta permite retomada automática.")
